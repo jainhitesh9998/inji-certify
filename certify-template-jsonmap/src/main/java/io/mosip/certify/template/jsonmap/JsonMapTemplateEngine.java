@@ -36,7 +36,7 @@ public class JsonMapTemplateEngine implements TemplateEngine {
     public static final String ID = "jsonmap";
     public static final String ERROR_TEMPLATE_RENDER = "template_render_failed";
     public static final String ERROR_MISSING_CLAIM = "template_missing_claim";
-    static final DateTimeFormatter TIMESTAMP = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'").withZone(ZoneOffset.UTC);
+    static final DateTimeFormatter TIMESTAMP = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC); // Constants.UTC_DATETIME_PATTERN, as the legacy issuance writes validFrom/validUntil
     private static final Pattern PLACEHOLDER = Pattern.compile("\\$\\{([^}|]+)(?:\\|([^}]*))?}");
     private static final String SPREAD = "$claims";
 
