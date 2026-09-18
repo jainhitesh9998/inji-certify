@@ -64,6 +64,7 @@ mvn -B -pl certify-service test -Dtest='*ArchitectureTest'                     #
 mvn -B -Dgpg.skip=true verify -Ptestcontainers    # repository and migration tests on PostgreSQL (after P0-05)
 mvn -B -pl certify-service spring-boot:run -Dspring-boot.run.profiles=local    # run with TestBearer tokens and the mock CSV data provider
 docker compose -f docker-compose/docker-compose-injistack/docker-compose.yml up   # full local stack, see its README
+java -jar certify-cli/target/certify-cli.jar keys generate -k keys.p12 -p pw --alias issuer --alg ES256   # CLI: keys, sign jws|cose (P1-14)
 ```
 
 Java 21 and Maven 3.9 are required; Docker is required for Testcontainers and the conformance jobs. Two local-build facts that are not obvious:

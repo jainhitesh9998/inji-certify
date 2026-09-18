@@ -119,6 +119,7 @@
 		<module>certify-keyprovider-keymanager</module>
 		<module>certify-spi</module>
 		<module>certify-issuance</module>
+		<module>certify-cli</module>
 	</modules>
 	
 	<dependencies>
