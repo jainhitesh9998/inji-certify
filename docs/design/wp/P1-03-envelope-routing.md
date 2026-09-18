@@ -35,9 +35,17 @@ Tests replaced, not adapted: the previous generator and SD-JWT tests asserted th
 | --- | --- | --- | --- |
 | `MDocProcessor.signMSO` | keymanager `coseSign1` (alg protected, x5chain unprotected via `includeCertificate`, untagged, hex out) | `CoseEnvelope.sign1` with `CoseHeaderPolicy.mdocIssuerAuth()` | mDoc golden (IssuerAuth verified with JCA against the x5chain leaf; MSO summary golden records the header layout) plus JCA-verified unit tests |
 
-## Slice 4 (open)
+## Slice 4 (branch `wp/p1-03-envelope-routing-4`): claim-169 CWT
 
-`Credential.signQRData` (claim-169 `cwtSign`) and `Credential.addProof` (`vc` format) need a vector with independent verification first. `JwksServiceImpl` and `DIDDocumentUtil` move to `KeyPublisher` in P1-04; `SystemInfoController` keeps `KeymanagerService` (certificate upload and CSR are keymanager administration).
+| Path | Before | After | Guard |
+| --- | --- | --- | --- |
+| `Credential.signQRData` | keymanager `cwtSign` (kid protected, no chain, tag 18 in tag 61, `exp`/`nbf`/`iat` from keymanager defaults, claim 169 = `bstr .cbor` of the PixelPass CBOR, hex out) | `CwtEnvelope.sign` with `CoseHeaderPolicy.cwt()` (kid in the protected header, no chain) and `CwtSigningProperties` (`certify.signing.cwt.exp-days` 180, `nbf-days` 0) | claim-169 golden (CWT verified with JCA against the JWKS key named by kid; summary golden records the header and claim labels) plus a JCA-verified unit test |
+
+`CoseHeaderPolicy` gained `kidInProtected`; including the certificate chain in the CWT stays a change for the new surface (decision log).
+
+## Open
+
+`Credential.addProof` (`vc` format, abstract default with no live caller) and the `Credential` constructor still take keymanager's `SignatureService`; they go with the formatter extraction (P1-05/P1-13). `SystemInfoController` keeps `KeymanagerService` (certificate upload and CSR are keymanager administration). `JwksServiceImpl` and `DIDDocumentUtil` move to `KeyPublisher` in P1-04; `SystemInfoController` keeps `KeymanagerService` (certificate upload and CSR are keymanager administration).
 
 ## Acceptance criteria (slice 1)
 
