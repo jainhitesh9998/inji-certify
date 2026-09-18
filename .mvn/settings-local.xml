@@ -1,0 +1,11 @@
+<settings>
+  <!-- Local-only: route jitpack.io and the transitive sovrin repo to Maven Central so Maven never asks
+       JitPack to build arbitrary missing coordinates (it hangs) nor hits sovrin's broken TLS. The google
+       repo stays: verify-core needs com.android.identity and androidx artifacts from maven.google.com.
+       JitPack-only artifacts (com.github.multiformats:java-multibase) must already be in ~/.m2;
+       use -Dmaven.legacyLocalRepo=true so cached artifacts are accepted regardless of origin repo id. -->
+  <mirrors>
+    <mirror><id>central-for-jitpack</id><mirrorOf>jitpack.io</mirrorOf><url>https://repo1.maven.org/maven2</url></mirror>
+    <mirror><id>central-for-sovrin</id><mirrorOf>sovrin</mirrorOf><url>https://repo1.maven.org/maven2</url></mirror>
+  </mirrors>
+</settings>
