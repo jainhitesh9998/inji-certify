@@ -73,6 +73,51 @@ class JpaConfigurationRegistryTest {
     }
 
     @Test
+    void v2ColumnsReadExactlyAsTheLegacyColumns() {
+        CredentialConfiguration legacy = registry.toConfiguration(farmer());
+        CredentialConfig v2 = farmer();
+        ConfigV2Columns.fill(v2);
+        assertTrue(JpaConfigurationRegistry.isV2(v2));
+        CredentialConfiguration fromV2 = registry.toConfiguration(v2);
+
+        assertEquals(legacy.tenantId(), fromV2.tenantId());
+        assertEquals(legacy.id(), fromV2.id());
+        assertEquals(legacy.format(), fromV2.format());
+        assertEquals(legacy.formatConfig().selectorKey(), fromV2.formatConfig().selectorKey());
+        assertEquals(legacy.formatConfig().raw(), fromV2.formatConfig().raw());
+        assertEquals(legacy.signing().keyRef().toString(), fromV2.signing().keyRef().toString());
+        assertEquals(legacy.signing().algorithm(), fromV2.signing().algorithm());
+        assertEquals(legacy.signing().cryptosuite(), fromV2.signing().cryptosuite());
+        assertEquals(legacy.signing().issuerDid(), fromV2.signing().issuerDid());
+        assertEquals(legacy.status(), fromV2.status());
+        assertEquals(legacy.strategy(), fromV2.strategy());
+        assertEquals(legacy.template(), fromV2.template());
+        assertEquals(legacy.display().order(), fromV2.display().order());
+
+        CredentialConfig sd = farmer();
+        sd.setCredentialFormat("dc+sd-jwt");
+        sd.setSdJwtVct("FarmerCredential");
+        sd.setSdClaim("$.fullName,$.address.city");
+        sd.setContext(null);
+        sd.setCredentialType(null);
+        CredentialConfiguration sdLegacy = registry.toConfiguration(sd);
+        ConfigV2Columns.fill(sd);
+        CredentialConfiguration sdV2 = registry.toConfiguration(sd);
+        assertEquals(sdLegacy.formatConfig().raw(), sdV2.formatConfig().raw());
+        assertEquals("FarmerCredential", sdV2.formatConfig().selectorKey());
+
+        CredentialConfig external = farmer();
+        ConfigV2Columns.fill(external);
+        external.setIssuanceStrategy("SUPPLIED");
+        external.setDataSourceId("vc-api");
+        CredentialConfiguration supplied = registry.toConfiguration(external);
+        assertEquals(IssuanceStrategy.SUPPLIED, supplied.strategy(), "a v2 row may name its strategy");
+        assertEquals("vc-api", supplied.dataSourceId());
+        external.setIssuanceStrategy("TEMPLATE");
+        assertEquals(IssuanceStrategy.TEMPLATE, registry.toConfiguration(external).strategy(), "the backfilled default still follows the plugin mode");
+    }
+
+    @Test
     void selectorsResolvePerFormat() {
         CredentialConfig sd = farmer();
         sd.setCredentialConfigKeyId("FarmerSdJwt");

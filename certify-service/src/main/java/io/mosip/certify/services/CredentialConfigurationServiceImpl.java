@@ -5,6 +5,8 @@
  */
 package io.mosip.certify.services;
 
+import io.mosip.certify.registry.ConfigV2Columns;
+
 import io.mosip.certify.core.constants.Constants;
 import io.mosip.certify.core.constants.ErrorConstants;
 import io.mosip.certify.core.constants.VCFormats;
@@ -109,6 +111,7 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
         credentialConfig.setCredentialSigningAlgValuesSupported(Collections.singletonList(credentialConfig.getSignatureCryptoSuite()));
         credentialConfig.setProofTypesSupported(proofTypesSupported);
 
+        ConfigV2Columns.fill(credentialConfig); // the v1 API writes both shapes (docs/design/08-database.md)
         CredentialConfig savedConfig = credentialConfigRepository.save(credentialConfig);
         log.info("Added credential configuration: {}", savedConfig.getConfigId());
 
@@ -269,6 +272,7 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
 
         credentialConfig.setCredentialSigningAlgValuesSupported(Collections.singletonList(credentialConfig.getSignatureCryptoSuite()));
 
+        ConfigV2Columns.fill(credentialConfig); // the v1 API writes both shapes (docs/design/08-database.md)
         CredentialConfig savedConfig = credentialConfigRepository.save(credentialConfig);
         log.info("Updated credential configuration: {}", savedConfig.getConfigId());
 
