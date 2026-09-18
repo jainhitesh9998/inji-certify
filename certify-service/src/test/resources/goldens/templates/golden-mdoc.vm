@@ -1,0 +1,15 @@
+{
+    "docType": "org.iso.18013.5.1.mDL",
+    "validityInfo": {
+        "validFrom": "${_validFrom}",
+        "validUntil": "${_validUntil}",
+        "signed": "${_signed}"
+    },
+    "nameSpaces": {
+        "org.iso.18013.5.1": [
+            {"digestID": 0, "elementIdentifier": "family_name", "elementValue": "${fullName}"},
+            {"digestID": 1, "elementIdentifier": "birth_date", "elementValue": "${dateOfBirth}"},
+            {"digestID": 2, "elementIdentifier": "resident_city", "elementValue": "${city}"}
+        ]
+    }
+}

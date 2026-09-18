@@ -52,7 +52,9 @@ import java.util.Date;
 import java.util.List;
 import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -82,7 +84,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
         "mosip.certify.data-provider-plugin.did-url=did:web:localhost:certify",
         "mosip.certify.data-provider-plugin.vc-expiry-duration=P365D",
         "mosip.certify.signature-algo.key-alias-mapper={'EdDSA': {{'CERTIFY_VC_SIGN_ED25519','ED25519_SIGN'}}, 'ES256': {{'CERTIFY_VC_SIGN_EC_R1','EC_SECP256R1_SIGN'}}, 'ES256K': {{'CERTIFY_VC_SIGN_EC_K1','EC_SECP256K1_SIGN'}}, 'RS256': {{'CERTIFY_VC_SIGN_RSA',''}}}",
-        "mosip.certify.credential-config.credential-signing-alg-values-supported={'Ed25519Signature2020': {'EdDSA'}, 'Ed25519Signature2018': {'EdDSA'}, 'EcdsaSecp256r1Signature2019': {'ES256'}, 'EcdsaSecp256k1Signature2019': {'ES256K'}, 'eddsa-rdfc-2022': {'EdDSA'}, 'ecdsa-rdfc-2019': {'ES256'}, 'RsaSignature2018': {'RS256'}}",
+        "mosip.certify.credential-config.credential-signing-alg-values-supported={'Ed25519Signature2020': {'EdDSA'}, 'Ed25519Signature2018': {'EdDSA'}, 'EcdsaSecp256r1Signature2019': {'ES256'}, 'EcdsaSecp256k1Signature2019': {'ES256K'}, 'eddsa-rdfc-2022': {'EdDSA'}, 'ecdsa-rdfc-2019': {'ES256'}, 'RsaSignature2018': {'RS256'}, 'ES256': {'ES256'}}",
         "mosip.certify.oauth.grant-types-supported=authorization_code,urn:ietf:params:oauth:grant-type:pre-authorized_code",
         "mosip.certify.credential-config.cryptographic-binding-methods-supported={'ldp_vc': {'did:jwk','did:web'}, 'dc+sd-jwt': {'did:jwk','did:web'}, 'mso_mdoc': {'cose_key'}}",
         "mosip.certify.credential-config.proof-types-supported={'jwt': {'proof_signing_alg_values_supported': {'ES256','EdDSA','RS256','PS256'}}}"
@@ -96,6 +98,7 @@ class IssuanceGoldenTest {
     static final String EC_R1_ID = "GoldenEcR1Credential";
     static final String EC_K1_ID = "GoldenEcK1Credential";
     static final String ED_2018_ID = "GoldenEd2018Credential";
+    static final String MDOC_ID = "GoldenMdlCredential";
     static final String SCOPE = "sample_vc_ldp"; // the scope LocalAccessTokenValidationFilter injects
 
     @Autowired MockMvc mockMvc;
@@ -130,6 +133,9 @@ class IssuanceGoldenTest {
         addLegacySuiteConfig(EC_R1_ID, "golden-ldp-ecr1.vm", "CERTIFY_VC_SIGN_EC_R1", "EC_SECP256R1_SIGN", "ES256", "EcdsaSecp256r1Signature2019");
         addLegacySuiteConfig(EC_K1_ID, "golden-ldp-eck1.vm", "CERTIFY_VC_SIGN_EC_K1", "EC_SECP256K1_SIGN", "ES256K", "EcdsaSecp256k1Signature2019");
         addLegacySuiteConfig(ED_2018_ID, "golden-ldp-ed2018.vm", "CERTIFY_VC_SIGN_ED25519", "ED25519_SIGN", "EdDSA", "Ed25519Signature2018");
+        if (credentialConfigRepository.findByCredentialConfigKeyId(MDOC_ID).isEmpty()) {
+            credentialConfigurationService.addCredentialConfiguration(mdocConfig());
+        }
     }
 
     private void addLegacySuiteConfig(String id, String templateFile, String appId, String refId, String algo, String suite) throws Exception {
@@ -312,6 +318,80 @@ class IssuanceGoldenTest {
         Goldens.assertGolden("v1/issuance/ldp_vc-secp256r1-2019-response", body);
     }
 
+    /**
+     * mso_mdoc: the IssuerAuth COSE_Sign1 is verified with plain JCA against the x5chain leaf certificate; the MSO is
+     * decoded with the CBOR library and checked structurally (ISO/IEC 18013-5 §9.1.2.4), including the device key
+     * derived from the holder proof.
+     */
+    @Test
+    void mdocIssuanceGoldenAndIndependentVerification() throws Exception {
+        ECKey holder = new ECKeyGenerator(Curve.P_256).generate();
+        MvcResult result = issue(MDOC_ID, proofJwt(nonce(), holder));
+        JsonNode body = objectMapper.readTree(result.getResponse().getContentAsString());
+        assertEquals(200, result.getResponse().getStatus(), body.toString());
+        String credential = body.get("credentials").get(0).get("credential").asText();
+
+        com.upokecenter.cbor.CBORObject issuerSigned = com.upokecenter.cbor.CBORObject.DecodeFromBytes(Base64.getUrlDecoder().decode(credential));
+        assertTrue(issuerSigned.ContainsKey("nameSpaces"), "IssuerSigned.nameSpaces");
+        com.upokecenter.cbor.CBORObject issuerAuth = issuerSigned.get("issuerAuth");
+        assertEquals(4, issuerAuth.size(), "untagged COSE_Sign1 [protected, unprotected, payload, signature]");
+        assertFalse(issuerAuth.isTagged(), "IssuerAuth is not tagged inside IssuerSigned");
+        byte[] protectedBytes = issuerAuth.get(0).GetByteString();
+        com.upokecenter.cbor.CBORObject protectedHeader = com.upokecenter.cbor.CBORObject.DecodeFromBytes(protectedBytes);
+        assertEquals(-7, protectedHeader.get(com.upokecenter.cbor.CBORObject.FromObject(1)).AsInt32(), "alg ES256 in the protected header");
+        com.upokecenter.cbor.CBORObject unprotectedHeader = issuerAuth.get(1);
+        com.upokecenter.cbor.CBORObject x5chain = unprotectedHeader.get(com.upokecenter.cbor.CBORObject.FromObject(33));
+        assertNotNull(x5chain, "x5chain (33) in the unprotected header");
+        byte[] leafDer = x5chain.getType() == com.upokecenter.cbor.CBORType.Array ? x5chain.get(0).GetByteString() : x5chain.GetByteString();
+        java.security.cert.X509Certificate leaf = (java.security.cert.X509Certificate) java.security.cert.CertificateFactory.getInstance("X.509")
+                .generateCertificate(new java.io.ByteArrayInputStream(leafDer));
+        byte[] payload = issuerAuth.get(2).GetByteString();
+        byte[] signature = issuerAuth.get(3).GetByteString();
+        byte[] sigStructure = com.upokecenter.cbor.CBORObject.NewArray().Add("Signature1").Add(protectedBytes).Add(new byte[0]).Add(payload).EncodeToBytes();
+        java.security.Signature verifier = java.security.Signature.getInstance("SHA256withECDSA");
+        verifier.initVerify(leaf.getPublicKey());
+        verifier.update(sigStructure);
+        assertTrue(verifier.verify(com.nimbusds.jose.crypto.impl.ECDSA.transcodeSignatureToDER(signature)), "IssuerAuth must verify with JCA against the x5chain leaf");
+        JWKSet jwks = JWKSet.parse(getJson("/.well-known/jwks.json").toString());
+        assertTrue(jwks.getKeys().stream().anyMatch(k -> {
+            try { return k.toECKey().toECPublicKey().equals(leaf.getPublicKey()); } catch (Exception e) { return false; }
+        }), "the x5chain leaf key is one of the published JWKS keys");
+
+        com.upokecenter.cbor.CBORObject msoWrapped = com.upokecenter.cbor.CBORObject.DecodeFromBytes(payload);
+        com.upokecenter.cbor.CBORObject mso = msoWrapped.HasMostOuterTag(24)
+                ? com.upokecenter.cbor.CBORObject.DecodeFromBytes(msoWrapped.Untag().GetByteString()) : msoWrapped;
+        assertEquals("org.iso.18013.5.1.mDL", mso.get("docType").AsString());
+        assertEquals("SHA-256", mso.get("digestAlgorithm").AsString());
+        com.upokecenter.cbor.CBORObject digests = mso.get("valueDigests").get("org.iso.18013.5.1");
+        assertEquals(3, digests.size(), "one digest per namespace element");
+        com.upokecenter.cbor.CBORObject deviceKey = mso.get("deviceKeyInfo").get("deviceKey");
+        assertEquals(2, deviceKey.get(com.upokecenter.cbor.CBORObject.FromObject(1)).AsInt32(), "kty EC2");
+        assertEquals(1, deviceKey.get(com.upokecenter.cbor.CBORObject.FromObject(-1)).AsInt32(), "crv P-256");
+        assertArrayEquals(holder.getX().decode(), deviceKey.get(com.upokecenter.cbor.CBORObject.FromObject(-2)).GetByteString(), "device key x is the holder's");
+        assertArrayEquals(holder.getY().decode(), deviceKey.get(com.upokecenter.cbor.CBORObject.FromObject(-3)).GetByteString(), "device key y is the holder's");
+        for (String field : List.of("signed", "validFrom", "validUntil")) {
+            assertTrue(mso.get("validityInfo").ContainsKey(field), "validityInfo." + field);
+        }
+        com.upokecenter.cbor.CBORObject items = issuerSigned.get("nameSpaces").get("org.iso.18013.5.1");
+        assertEquals(3, items.size(), "three IssuerSignedItems");
+
+        com.fasterxml.jackson.databind.node.ObjectNode summary = objectMapper.createObjectNode();
+        summary.put("docType", mso.get("docType").AsString());
+        summary.put("version", mso.get("version").AsString());
+        summary.put("digestAlgorithm", mso.get("digestAlgorithm").AsString());
+        summary.put("digests", digests.size());
+        summary.put("issuerSignedItems", items.size());
+        summary.put("protectedAlg", protectedHeader.get(com.upokecenter.cbor.CBORObject.FromObject(1)).AsInt32());
+        summary.put("unprotectedHeaderLabels", unprotectedHeader.getKeys().toString());
+        summary.put("deviceKeyKty", deviceKey.get(com.upokecenter.cbor.CBORObject.FromObject(1)).AsInt32());
+        summary.put("deviceKeyCrv", deviceKey.get(com.upokecenter.cbor.CBORObject.FromObject(-1)).AsInt32());
+        summary.put("validityInfoKeys", mso.get("validityInfo").getKeys().toString());
+        com.fasterxml.jackson.databind.node.ObjectNode responseShape = body.deepCopy();
+        ((com.fasterxml.jackson.databind.node.ObjectNode) responseShape.get("credentials").get(0)).put("credential", "<mso_mdoc>");
+        Goldens.assertGolden("v1/issuance/mso_mdoc-response", responseShape);
+        Goldens.assertGolden("v1/issuance/mso_mdoc-summary", summary);
+    }
+
     /** The flow docs/design/VALIDATE.md drives by hand: offer, offer fetch, token; the access token is verified against jwks.json. */
     @Test
     void preAuthorizedCodeFlowGoldenAndAccessTokenVerification() throws Exception {
@@ -414,7 +494,10 @@ class IssuanceGoldenTest {
 
     /** A holder proof as a wallet builds it: ES256, typ openid4vci-proof+jwt, public jwk in the header. */
     private String proofJwt(String nonce) throws Exception {
-        ECKey holder = new ECKeyGenerator(Curve.P_256).generate();
+        return proofJwt(nonce, new ECKeyGenerator(Curve.P_256).generate());
+    }
+
+    private String proofJwt(String nonce, ECKey holder) throws Exception {
         JWSHeader header = new JWSHeader.Builder(JWSAlgorithm.ES256).type(new JOSEObjectType("openid4vci-proof+jwt"))
                 .jwk(holder.toPublicJWK()).build();
         JWTClaimsSet claims = new JWTClaimsSet.Builder().audience(issuerIdentifier).issueTime(new Date())
@@ -493,6 +576,26 @@ class IssuanceGoldenTest {
         dto.setMetaDataDisplay(List.of(display("Golden Credential")));
         dto.setDisplayOrder(List.of("fullName", "dateOfBirth", "city"));
         dto.setClaims(Map.of("fullName", claim("Full name"), "dateOfBirth", claim("Date of birth"), "city", claim("City")));
+        return dto;
+    }
+
+    /** mso_mdoc: docType, namespace claims, ES256 with the EC_R1 key; the validator wants a cryptosuite key of the signing-alg map. */
+    private static CredentialConfigurationDTO mdocConfig() throws Exception {
+        CredentialConfigurationDTO dto = new CredentialConfigurationDTO();
+        dto.setCredentialConfigKeyId(MDOC_ID);
+        dto.setCredentialFormat("mso_mdoc");
+        dto.setVcTemplate(template("golden-mdoc.vm"));
+        dto.setDocType("org.iso.18013.5.1.mDL");
+        dto.setDidUrl("did:web:localhost:certify");
+        dto.setKeyManagerAppId("CERTIFY_VC_SIGN_EC_R1");
+        dto.setKeyManagerRefId("EC_SECP256R1_SIGN");
+        dto.setSignatureAlgo("ES256");
+        dto.setSignatureCryptoSuite("ES256");
+        dto.setScope(SCOPE);
+        dto.setMetaDataDisplay(List.of(display("Golden mDL")));
+        dto.setDisplayOrder(List.of("family_name", "birth_date"));
+        ClaimsDisplayFieldsConfigDTO familyName = new ClaimsDisplayFieldsConfigDTO();
+        dto.setMsoMdocClaims(Map.of("org.iso.18013.5.1", Map.of("family_name", familyName)));
         return dto;
     }
 

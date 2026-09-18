@@ -1,0 +1,12 @@
+{
+  "deviceKeyCrv" : 1,
+  "deviceKeyKty" : 2,
+  "digestAlgorithm" : "SHA-256",
+  "digests" : 3,
+  "docType" : "org.iso.18013.5.1.mDL",
+  "issuerSignedItems" : 3,
+  "protectedAlg" : -7,
+  "unprotectedHeaderLabels" : "[33]",
+  "validityInfoKeys" : "[\"signed\", \"validFrom\", \"validUntil\"]",
+  "version" : "1.0"
+}
