@@ -555,6 +555,47 @@ class IssuanceGoldenTest {
     }
 
     @Test
+    void oid4vciMdocIssuanceGoldenAndIndependentVerification() throws Exception {
+        ECKey holder = new ECKeyGenerator(Curve.P_256).generate();
+        MvcResult result = issueOid4vci(MDOC_ID, proofJwt(nonce(), holder));
+        JsonNode body = objectMapper.readTree(result.getResponse().getContentAsString());
+        assertEquals(200, result.getResponse().getStatus(), body.toString());
+        String credential = body.get("credentials").get(0).get("credential").asText();
+
+        com.upokecenter.cbor.CBORObject issuerSigned = com.upokecenter.cbor.CBORObject.DecodeFromBytes(Base64.getUrlDecoder().decode(credential));
+        com.upokecenter.cbor.CBORObject issuerAuth = issuerSigned.get("issuerAuth");
+        assertEquals(4, issuerAuth.size());
+        assertFalse(issuerAuth.isTagged());
+        byte[] protectedBytes = issuerAuth.get(0).GetByteString();
+        com.upokecenter.cbor.CBORObject protectedHeader = com.upokecenter.cbor.CBORObject.DecodeFromBytes(protectedBytes);
+        assertEquals(-7, protectedHeader.get(com.upokecenter.cbor.CBORObject.FromObject(1)).AsInt32());
+        com.upokecenter.cbor.CBORObject x5chain = issuerAuth.get(1).get(com.upokecenter.cbor.CBORObject.FromObject(33));
+        byte[] leafDer = x5chain.getType() == com.upokecenter.cbor.CBORType.Array ? x5chain.get(0).GetByteString() : x5chain.GetByteString();
+        java.security.cert.X509Certificate leaf = (java.security.cert.X509Certificate) java.security.cert.CertificateFactory.getInstance("X.509")
+                .generateCertificate(new java.io.ByteArrayInputStream(leafDer));
+        byte[] payload = issuerAuth.get(2).GetByteString();
+        byte[] sigStructure = com.upokecenter.cbor.CBORObject.NewArray().Add("Signature1").Add(protectedBytes).Add(new byte[0]).Add(payload).EncodeToBytes();
+        java.security.Signature verifier = java.security.Signature.getInstance("SHA256withECDSA");
+        verifier.initVerify(leaf.getPublicKey());
+        verifier.update(sigStructure);
+        assertTrue(verifier.verify(com.nimbusds.jose.crypto.impl.ECDSA.transcodeSignatureToDER(issuerAuth.get(3).GetByteString())), "IssuerAuth from the new surface verifies with JCA");
+        com.upokecenter.cbor.CBORObject msoWrapped = com.upokecenter.cbor.CBORObject.DecodeFromBytes(payload);
+        com.upokecenter.cbor.CBORObject mso = msoWrapped.HasMostOuterTag(24)
+                ? com.upokecenter.cbor.CBORObject.DecodeFromBytes(msoWrapped.Untag().GetByteString()) : msoWrapped;
+        assertEquals("org.iso.18013.5.1.mDL", mso.get("docType").AsString());
+        com.upokecenter.cbor.CBORObject deviceKey = mso.get("deviceKeyInfo").get("deviceKey");
+        assertArrayEquals(holder.getX().decode(), deviceKey.get(com.upokecenter.cbor.CBORObject.FromObject(-2)).GetByteString(), "device key is the holder's");
+        com.fasterxml.jackson.databind.node.ObjectNode summary = objectMapper.createObjectNode();
+        summary.put("docType", mso.get("docType").AsString());
+        summary.put("digests", mso.get("valueDigests").get("org.iso.18013.5.1").size());
+        summary.put("issuerSignedItems", issuerSigned.get("nameSpaces").get("org.iso.18013.5.1").size());
+        summary.put("protectedLabels", protectedHeader.getKeys().toString());
+        summary.put("unprotectedLabels", issuerAuth.get(1).getKeys().toString());
+        summary.put("validityInfoKeys", mso.get("validityInfo").getKeys().toString());
+        Goldens.assertGolden("v2/oid4vci/mso_mdoc-summary", summary);
+    }
+
+    @Test
     void oid4vciErrorsFollowTheSpec() throws Exception {
         // the local profile's TestBearer filter authenticates every request, so the 401 path is covered by the controller unit only
         MvcResult unknown = issueOid4vci("NoSuchCredential", proofJwt(nonce()));
