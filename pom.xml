@@ -120,6 +120,7 @@
 		<module>certify-spi</module>
 		<module>certify-issuance</module>
 		<module>certify-cli</module>
+		<module>certify-template-velocity</module>
 	</modules>
 	
 	<dependencies>
