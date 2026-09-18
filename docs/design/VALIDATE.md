@@ -60,13 +60,15 @@ Expected: `["FarmerCredential", ...]` and a token endpoint under Certify's own U
 `/pre-authorized-data` is unauthenticated in the stack configuration (`mosip.certify.security.ignore-auth-urls`).
 Claim keys must be among the configuration's `claims` metadata (last path segment); anything else is refused with
 `unknown_claims`, and note the refusal comes back as HTTP 200 with an `errors` array (legacy envelope, logged as a
-finding). For `FarmerCredential` the seed lists `fullName`, `phone`, `dateOfBirth`, ... — the mock CSV plugin then
-resolves the row it serves:
-
+finding). With Certify as its own authorization server the identity data *is* the offer's claims: the `rebuild`
+profile selects `PreAuthDataProviderPlugin` (the CSV plugin expects an eSignet subject, the CSV row id in `sub`,
+which this flow never produces). For `FarmerCredential` the seed allows `fullName`, `phone`, `dateOfBirth` and
+`gender`; template fields the offer does not carry render as their literal placeholder (`${state}`), so add the
+fields you need to the configuration's `claims` (v1 or v2 API) or send all four:
 ```bash
 curl -s http://localhost:8090/v1/certify/pre-authorized-data \
   -H 'Content-Type: application/json' \
-  -d '{"credential_configuration_id":"FarmerCredential","claims":{"fullName":"Gorge Cooper"},"expires_in":600,"tx_code":"1234"}'
+  -d '{"credential_configuration_id":"FarmerCredential","claims":{"fullName":"Gorge Cooper","phone":"9876543210","dateOfBirth":"1990-05-25","gender":"Male"},"expires_in":600,"tx_code":"1234"}'
 ```
 
 The response is `{"credential_offer_uri":"openid-credential-offer://?credential_offer_uri=..."}`. Show it as a QR
