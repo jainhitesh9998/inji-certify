@@ -23,6 +23,10 @@ import org.springframework.web.bind.annotation.RestController;
 @RequestMapping("/issuance")
 public class VCIssuanceController {
 
+    /** The compatibility credential endpoint (docs/design/09-api-compatibility.md): deprecated from 1.1.0, replaced by {@code POST /oid4vci/credential}. */
+    public static final String DEPRECATION_NAME = "oid4vci-v1-compat-credential";
+    public static final String DEPRECATED_SINCE = "2026-09-19";
+
     @Autowired
     private VCIssuanceService vcIssuanceService;
 
@@ -35,6 +39,7 @@ public class VCIssuanceController {
      * @return Credential Response w.r.t requested format
      * @throws CertifyException
      */
+    @io.mosip.certify.deprecation.DeprecatedEndpoint(name = DEPRECATION_NAME, since = DEPRECATED_SINCE, replacement = "/oid4vci/credential")
     @PostMapping(value = "/credential",produces = "application/json")
     public CredentialResponse getCredential(@Valid @RequestBody CredentialRequest credentialRequest) throws CertifyException {
         log.info("Get credential request received for credential configuration id: {}", credentialRequest.getCredentialConfigId());

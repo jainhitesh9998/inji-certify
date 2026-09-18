@@ -74,6 +74,21 @@ public class VCIssuanceControllerTest {
     }
 
     @Test
+    public void getVerifiableCredential_isDeprecatedWithHeaders() throws Exception {
+        CredentialRequest credentialRequest = new CredentialRequest();
+        credentialRequest.setProofs(Map.of(ProofType.JWT, List.of("dummy_jwt_proof")));
+        credentialRequest.setCredentialConfigId("FarmerCredential");
+        org.mockito.Mockito.when(vcIssuanceService.getCredential(org.mockito.ArgumentMatchers.any())).thenReturn(new io.mosip.certify.core.dto.CredentialResponse());
+        long since = java.time.LocalDate.parse(VCIssuanceController.DEPRECATED_SINCE).atStartOfDay(java.time.ZoneOffset.UTC).toEpochSecond();
+        mockMvc.perform(post("/issuance/credential")
+                        .content(objectMapper.writeValueAsBytes(credentialRequest))
+                        .contentType(org.springframework.http.MediaType.APPLICATION_JSON_VALUE))
+                .andExpect(status().isOk())
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.header().string("Deprecation", "@" + since))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.header().string("Link", org.hamcrest.Matchers.containsString("rel=\"deprecation\"")));
+    }
+
+    @Test
     public void getVerifiableCredential_withInvalid_CredentialConfigId_thenFail() throws Exception {
         CredentialRequest credentialRequest = new CredentialRequest();
         credentialRequest.setCredentialConfigId(null);
