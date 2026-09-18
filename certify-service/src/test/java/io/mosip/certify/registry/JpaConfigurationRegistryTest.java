@@ -26,7 +26,8 @@ import static org.mockito.Mockito.when;
 class JpaConfigurationRegistryTest {
 
     final CredentialConfigRepository repository = mock(CredentialConfigRepository.class);
-    final JpaConfigurationRegistry registry = new JpaConfigurationRegistry(repository, new ObjectMapper(), "DataProvider");
+    final io.mosip.certify.repository.CredentialTemplateRepository templates = mock(io.mosip.certify.repository.CredentialTemplateRepository.class);
+    final JpaConfigurationRegistry registry = new JpaConfigurationRegistry(repository, templates, new ObjectMapper(), "DataProvider");
 
     static CredentialConfig farmer() {
         CredentialConfig row = new CredentialConfig();
@@ -131,6 +132,31 @@ class JpaConfigurationRegistryTest {
     }
 
     @Test
+    void templateRowIsPreferredOverTheBlobAndTheBlobIsTheFallback() {
+        CredentialConfig row = farmer();
+        row.setConfigId("cfg-1");
+        row.setTemplateId("cfg-1");
+        row.setTemplateVersion(1);
+        io.mosip.certify.entity.CredentialTemplate stored = new io.mosip.certify.entity.CredentialTemplate();
+        stored.setId("cfg-1");
+        stored.setVersion(1);
+        stored.setEngine("velocity");
+        stored.setMode("FULL_DOCUMENT");
+        stored.setContent("{\"issuer\": \"${_issuer}\"}");
+        when(templates.findByIdAndVersion("cfg-1", 1)).thenReturn(Optional.of(stored));
+        CredentialConfiguration c = registry.toConfiguration(row);
+        assertEquals("cfg-1", c.template().templateId());
+        assertEquals(1, c.template().version());
+        assertEquals("{\"issuer\": \"${_issuer}\"}", c.template().content(), "the decoded text of the template row");
+        assertEquals("did:web:issuer.example", c.template().params().get("didUrl"));
+
+        row.setTemplateVersion(null);
+        when(templates.findFirstByIdOrderByVersionDesc("cfg-1")).thenReturn(Optional.empty());
+        assertEquals("e30=", registry.toConfiguration(row).template().content(), "no row, the legacy blob");
+        assertEquals("FarmerCredential", registry.toConfiguration(row).template().templateId());
+    }
+
+    @Test
     void selectorsResolvePerFormat() {
         CredentialConfig sd = farmer();
         sd.setCredentialConfigKeyId("FarmerSdJwt");
@@ -174,7 +200,7 @@ class JpaConfigurationRegistryTest {
         assertTrue(registry.all("acme").isEmpty());
         assertTrue(registry.byId("acme", "FarmerCredential").isEmpty());
 
-        JpaConfigurationRegistry external = new JpaConfigurationRegistry(repository, new ObjectMapper(), "VCIssuance");
+        JpaConfigurationRegistry external = new JpaConfigurationRegistry(repository, templates, new ObjectMapper(), "VCIssuance");
         assertEquals(IssuanceStrategy.EXTERNAL, external.toConfiguration(farmer()).strategy());
         assertFalse(external.toConfiguration(farmer()).template().params().isEmpty());
     }

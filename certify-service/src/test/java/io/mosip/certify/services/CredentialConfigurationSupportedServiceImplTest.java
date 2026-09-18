@@ -39,6 +39,9 @@ public class CredentialConfigurationSupportedServiceImplTest {
     @Mock
     private CredentialConfigMapper credentialConfigMapper;
 
+    @Mock
+    private io.mosip.certify.repository.CredentialTemplateRepository credentialTemplateRepository;
+
     @InjectMocks
     private CredentialConfigurationServiceImpl credentialConfigurationService;
 

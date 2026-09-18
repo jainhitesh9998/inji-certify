@@ -159,3 +159,16 @@ CREATE TABLE IF NOT EXISTS credential_status_transaction (
     processed_dtimes TIMESTAMP,
     is_processed BOOLEAN NOT NULL DEFAULT FALSE
 );
+
+-- 1.1.0 (V1_1_0_000__config_v2_and_tenancy.sql): versioned templates, decoded from the base64 blob
+CREATE TABLE IF NOT EXISTS credential_template (
+    id VARCHAR(128) NOT NULL,
+    version INT NOT NULL DEFAULT 1,
+    tenant_id VARCHAR(64) NOT NULL DEFAULT 'default',
+    engine VARCHAR(32) NOT NULL,
+    mode VARCHAR(16) NOT NULL,
+    content VARCHAR NOT NULL,
+    checksum VARCHAR(64),
+    cr_dtimes TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_credential_template PRIMARY KEY (id, version)
+);

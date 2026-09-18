@@ -194,6 +194,9 @@ class IssuanceGoldenTest {
         assertEquals(2, row.getConfigVersion(), "the v1 API writes both shapes");
         assertTrue(io.mosip.certify.registry.JpaConfigurationRegistry.isV2(row), "the registry reads the JSONB columns");
         assertEquals("default", row.getTenantId());
+        assertEquals(row.getConfigId(), ldp.template().templateId(), "the template is read from credential_template (P2-04)");
+        assertEquals(1, ldp.template().version());
+        assertTrue(ldp.template().content().trim().startsWith("{"), "stored decoded, not as base64");
         assertEquals("ldp_vc", ldpVcFormatter.formatId());
         // the row stores the types sorted alphabetically (finding: credential_definition.type order), the fragment reads them as stored
         assertEquals(java.util.List.of("GoldenCredential", "VerifiableCredential"), ((java.util.Map<?, ?>) ldpVcFormatter.metadataFragment(ldp, io.mosip.certify.spi.ProtocolVersion.OID4VCI_1_0).get("credential_definition")).get("type"));
