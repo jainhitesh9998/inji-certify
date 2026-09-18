@@ -42,6 +42,7 @@ Record every decision taken while building, newest first. A work package that ne
 
 | Date | Decision | Options considered | Chosen | By | Affects |
 | --- | --- | --- | --- | --- | --- |
+| 2026-09-18 | The new protocol-agnostic core module is `certify-issuance`, not `certify-core`: the existing `certify-core` artifact (DTOs, `ParsedAccessToken`, `CredentialRegistry`, Spring Web uses) keeps its name and coordinates so plugins built against it keep resolving; it shrinks over Phase 1 and becomes a compatibility shell | rename existing module and reuse `certify-core`; new name | new name `certify-issuance`; design docs read `certify-core` as this module | judgement | P1-*, plugin compatibility, ArchUnit |
 | 2026-09-18 | Work lands on branches of `jainhitesh9998/inji-certify` only; integration branch `design/extensibility`; no PRs to upstream | upstream PRs; integration branch; fork only | fork only | project owner | automation, CI |
 | 2026-09-18 | Flyway runs from a Helm pre-upgrade Job in Kubernetes and at startup in docker-compose; the application only validates at boot; CI is GitHub Actions on the fork with Docker for Testcontainers | Job; startup everywhere; manual | Job + compose startup | project owner (judgement delegated) | P0-04, P0-05, CI |
 | 2026-09-18 | HAIP on both sides: resource-server behaviour works behind any HAIP-capable AS (eSignet is one of several), and `certify-as` implements PAR, PKCE, DPoP-bound access tokens and wallet attestation | issuer half only; both | both | project owner | P4, certify-as, certify-authz |

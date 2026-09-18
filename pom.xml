@@ -116,6 +116,8 @@
 		<module>certify-integration-api</module>
 		<module>certify-signing</module>
 		<module>certify-keyprovider-jca</module>
+		<module>certify-spi</module>
+		<module>certify-issuance</module>
 	</modules>
 	
 	<dependencies>
