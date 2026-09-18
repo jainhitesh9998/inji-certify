@@ -145,10 +145,10 @@ Protocol adapters and mounting:
 
 | Adapter | Mount | Notes |
 | --- | --- | --- |
-| `oid4vci-d13` | `/issuance/credential` accepting the 0.14.0 body, \`/issuance/vd11 | vd12/credential` ,  `/.well-known/openid-credential-issuer?version=` ;  `credential\_issuer\` unchanged |
-| `oid4vci-v1` | Develop's paths, plus `/oid4vci/deferred_credential`, `/oid4vci/notification`; optionally its own `credential_issuer` at `{domain}{servletPath}/oid4vci` when a deployment wants two metadata documents | HAIP is a profile switch on this adapter |
+| `oid4vci-v1` | New issuer identifier `{domain}{servletPath}/oid4vci` with `/oid4vci/credential`, `/oid4vci/nonce`, `/oid4vci/deferred_credential`, `/oid4vci/notification` and its own metadata document; the same adapter also serves today's `/issuance/credential` and `/nonce` in compatibility mode, deprecated | The clean surface is where new features and `profile=haip` land; the compatibility mode is the same code with the old DTO names |
+| `oid4vci-d13` | Today's `/issuance/credential` accepting the 0.14.0 body, \`/issuance/vd11 | vd12/credential` ,  `/.well-known/openid-credential-issuer?version=` ;  `credential\_issuer\` unchanged; on by default, deprecated from day one |
 | `vc-api` | `/vc-api/credentials/issue`, `/vc-api/credentials/status` | Namespaced to avoid the existing `POST /credentials/status` |
-| `certify-as` | Unchanged `/oauth/*`, `/nonce` stays with the issuer, `/pre-authorized-data`, `/credential-offer-data/{id}` | Same JVM or split; the issuer never reads AS caches directly |
+| `certify-as` | Unchanged `/oauth/*`, `/pre-authorized-data`, `/credential-offer-data/{id}` | Same JVM or split; the issuer never reads AS caches directly |
 | `certify-cli` | No HTTP; `certify sign`, `certify issue`, `certify batch`, `certify keys`, `certify verify` | Builds `IssuanceCommand` with `AuthorizationContext.NONE` and an in-memory or database-backed registry |
 
 Plugin loading and SPI versioning: implementations are discovered through Spring `AutoConfiguration.imports` (or `ServiceLoader` for non-Spring jars and the CLI) instead of `scan-base-package`; `certify-spi` follows semver with `@since` on every method; `certify-integration-api` stays published and its `LegacyDataProviderAdapter` and `LegacyExternalIssuerAdapter` wrap old plugins for at least two minor releases.

@@ -23,12 +23,15 @@ The two largest risks are shipping develop to a deployment whose wallets still s
 
 Decisions needed from the team before P2:
 
-- [ ] Which wallet versions in production speak draft 13 today, and must the first develop-based release serve them (decides whether `oid4vci-d13` is on by default)?
-- [ ] One `credential_issuer` serving both protocol versions on the same path, or a second issuer URL under `/oid4vci` for 1.0?
+- [x] Draft-13 wallets: decided 2026-09-18, `oid4vci-d13` is built in P1 and on by default, deprecated from day one.
+- [x] Issuer surface: decided 2026-09-18, a new spec-clean surface under `{domain}{servletPath}/oid4vci` with today's paths kept as a deprecated compatibility surface.
+- [x] Keymanager: decided 2026-09-18, kernel-keymanager stays the embedded default provider; other key managers plug in above it; no remote keymanager.
+- [ ] Where do agent work packages land: PRs straight to `develop` behind the gates, an integration branch, or the fork only for now?
+- [ ] Flyway run mode: Helm pre-upgrade Job plus startup in compose (recommended), startup everywhere, or baseline only for now? Is Docker available on the CI runners for Testcontainers?
 - [ ] HAIP: is the embedded `certify-as` or eSignet the authorization server for PAR and wallet attestation?
-- [ ] Which additional key provider comes first: PKCS#11, a specific cloud KMS, or the file provider only for tests and the CLI?
+- [ ] Which additional key provider comes first: a cloud KMS, Vault, or the file provider only for tests and the CLI?
 - [ ] Tenant isolation to prepare for: shared schema with `tenant_id` (recommended default), schema per tenant, or database per tenant?
-- [ ] Should the nonce endpoint be advertised by default in 1.0.0 (`allow-c-nonce=true`) as the spec expects?
+- [ ] Should the nonce endpoint be advertised by default on the compatibility surface too (`allow-c-nonce=true`)?
 - [ ] Keep Velocity as the default engine and add `jsonmap`, or move the shipped samples to `jsonmap` and keep Velocity for compatibility only?
 - [ ] Status for SD-JWT and mDoc: IETF Token Status List, or Bitstring referenced from a `status` claim?
 - [ ] Do the `verify-core` tables stay in the `certify` schema with a `verify_` prefix, or move to their own schema?
@@ -41,6 +44,9 @@ Record every decision taken while building, newest first. A work package that ne
 
 | Date | Decision | Options considered | Chosen | By | Affects |
 | --- | --- | --- | --- | --- | --- |
-| 2026-09-18 | Keymanager stays an embedded library and the default key provider; no HTTP or remote keymanager option | embedded library; remote keymanager service | embedded, wrapped as `certify-keyprovider-keymanager` | project owner | signing, database, CLI |
+| 2026-09-18 | Draft-13 support: `oid4vci-d13` adapter built in P1, on by default, deprecated from day one | not supported; built but off; on by default | on by default | project owner | P0-02, P1-12, deprecation counters |
+| 2026-09-18 | Protocol surface: new spec-clean OpenID4VCI 1.0 surface under `{domain}{servletPath}/oid4vci` with its own issuer identifier; today's paths kept as a deprecated compatibility surface over the same core | same path only; second issuer URL only; both | new surface plus deprecated old surface | project owner | `oid4vci-v1`, API compatibility, metadata, tenancy prefix |
+| 2026-09-18 | Keymanager: MOSIP kernel-keymanager stays an embedded library and the default key provider; no HTTP or remote keymanager option; keymanager already covers HSM backends (PKCS#11, PKCS#12, offline), so Certify's `KeyProvider` SPI is for other key managers (cloud KMS, Vault, file, X.509 providers, other libraries) | embedded library; remote keymanager service | embedded, wrapped as `certify-keyprovider-keymanager` | project owner | signing, database, CLI |
+| 2026-09-18 | PKI-based formats (mDoc/mDL, SD-JWT VC with `x5c`) get a separate `x509` provider family, a per-format `CertificateChainPolicy` and trust-anchor publication, usable without keymanager tables | keymanager CSR flow only; separate providers | separate providers plus policy | project owner | signing, mDoc, SD-JWT, database (`trust_anchor`) |
 | 2026-09-18 | Multi-tenancy is off by default but the code is tenant-ready (`TenantContext`, defaulted `tenant_id` columns) | none; tenant-ready; full multi-tenant | tenant-ready | project owner | core, persistence, adapters |
 | 2026-09-18 | Design baseline is `develop` (`a1cfd63`), not the 0.14.0 release | master; develop | develop | project owner | everything |

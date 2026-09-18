@@ -10,6 +10,7 @@ Baseline: `inji/inji-certify` `develop` at commit `a1cfd63` (1.0.0-beta.1-SNAPSH
 | 04 | [Capability gaps](./04-capability-gaps.md) | You are asked why a feature is hard |
 | 05 | [Target architecture](./05-target-architecture.md) | Before any Phase 1 or later work package |
 | 06 | [Signing](./06-signing.md) | Anything under `certify-signing`, key providers, JWKS, DID documents, the CLI |
+| 06a | [X.509 PKI and mDoc/mDL](./06a-x509-pki-and-mdoc.md) | mDoc/mDL, SD-JWT `x5c`, issuers with their own PKI or without keymanager |
 | 07 | [Templating](./07-templating.md) | Anything touching Velocity, `VCFormatter`, templates, QR settings |
 | 08 | [Database](./08-database.md) | Any migration, entity, cache or tenancy change |
 | 09 | [API compatibility](./09-api-compatibility.md) | Any endpoint, DTO, property or plugin-interface change |
