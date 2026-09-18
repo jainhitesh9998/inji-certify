@@ -9,7 +9,8 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  * off until the v1 goldens prove both modes on CI, then the default flips and the legacy service is removed.
  */
 @ConfigurationProperties(prefix = "certify.protocol.oid4vci-v1")
-public record Oid4vciV1Properties(@DefaultValue CompatCore compatCore, @DefaultValue Notification notification) {
+public record Oid4vciV1Properties(@DefaultValue CompatCore compatCore, @DefaultValue Notification notification,
+                                  @DefaultValue Nonce nonce, @DefaultValue Batch batch) {
 
     public static final String COMPAT_CORE_PREFIX = "certify.protocol.oid4vci-v1.compat-core";
 
@@ -21,4 +22,13 @@ public record Oid4vciV1Properties(@DefaultValue CompatCore compatCore, @DefaultV
      */
     public record Notification(@DefaultValue("P1D") java.time.Duration retention,
                                @DefaultValue("PT1H") java.time.Duration purgeInterval) {}
+
+    /** {@code single-use}: a c_nonce from the nonce endpoint is consumed by the credential request it authorised. */
+    public record Nonce(@DefaultValue("true") boolean singleUse) {}
+
+    /**
+     * {@code size}: the largest {@code proofs} array a credential request may carry (one credential per proof),
+     * advertised as {@code batch_credential_issuance.batch_size} when above 1.
+     */
+    public record Batch(@DefaultValue("10") int size) {}
 }

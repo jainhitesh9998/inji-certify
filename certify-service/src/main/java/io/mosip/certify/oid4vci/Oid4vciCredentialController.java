@@ -42,14 +42,17 @@ public class Oid4vciCredentialController {
     private final IssuanceService issuanceService;
     private final ConfigurationRegistry configurations;
     private final AuthorizationContext authorizationContext;
-    private final ProofValidator.NonceCheck nonceCheck;
+    private final CacheNonceCheck nonceCheck;
     private final String issuerIdentifier;
+    private final Oid4vciV1Properties properties;
 
     private final TenantContexts tenants;
 
     public Oid4vciCredentialController(IssuanceService oid4vciIssuanceService, ConfigurationRegistry configurations,
-                                       AuthorizationContext authorizationContext, CacheNonceCheck nonceCheck, Oid4vciIssuer issuer, TenantContexts tenants) {
+                                       AuthorizationContext authorizationContext, CacheNonceCheck nonceCheck, Oid4vciIssuer issuer, TenantContexts tenants,
+                                       Oid4vciV1Properties properties) {
         this.tenants = tenants;
+        this.properties = properties;
         this.issuanceService = oid4vciIssuanceService;
         this.configurations = configurations;
         this.authorizationContext = authorizationContext;
@@ -70,6 +73,10 @@ public class Oid4vciCredentialController {
         if (request.getProofs() != null) {
             request.getProofs().forEach((type, values) -> values.forEach(value -> proofs.add(new ProofValidator.ProofInput(type.name().toLowerCase(), value))));
         }
+        int batchSize = Math.max(1, properties.batch().size());
+        if (proofs.size() > batchSize) {
+            throw new IssuanceException(IssuanceException.INVALID_CREDENTIAL_REQUEST, "proofs carries " + proofs.size() + " entries; batch_size is " + batchSize);
+        }
         // a tenant with its own issuer identifier gets this surface's suffix on it (Oid4vciIssuer); the default keeps the deployment's
         TenantContext tenant = tenants.forRequest(authorizationContext.getTenantId(), issuerIdentifier, null);
         if (!issuerIdentifier.equals(tenant.issuerIdentifier())) {
@@ -77,11 +84,15 @@ public class Oid4vciCredentialController {
         }
         ProofValidator.ProofPolicy policy = new ProofValidator.ProofPolicy(allowedProofAlgorithms(tenant.tenantId(), request.getCredentialConfigId()), tenant.issuerIdentifier(), true,
                 authorization.clientId(), Map.of());
+        RecordingNonceCheck recording = new RecordingNonceCheck(nonceCheck);
         IssuanceCommand command = IssuanceCommand.builder(request.getCredentialConfigId())
-                .tenant(tenant).authorization(authorization).proofs(proofs).proofPolicy(policy).nonceCheck(nonceCheck)
+                .tenant(tenant).authorization(authorization).proofs(proofs).proofPolicy(policy).nonceCheck(recording)
                 .protocol(ProtocolVersion.OID4VCI_1_0).correlationId(UUID.randomUUID().toString()).build();
 
         IssuanceResult result = issuanceService.issue(command);
+        if (result instanceof IssuanceResult.Issued && properties.nonce().singleUse()) {
+            recording.nonces().forEach(nonceCheck::consume); // a c_nonce authorises one credential request
+        }
         List<Map<String, Object>> credentials = new ArrayList<>();
         if (result instanceof IssuanceResult.Issued issued) {
             for (IssuedCredential credential : issued.credentials()) {

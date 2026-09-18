@@ -28,8 +28,10 @@ public class TenantIssuerMetadata {
 
     private final ConfigurationRegistry configurations;
     private final List<CredentialFormatter> formatters;
+    private final Oid4vciV1Properties properties;
 
-    public TenantIssuerMetadata(ConfigurationRegistry configurations, List<CredentialFormatter> formatters) {
+    public TenantIssuerMetadata(ConfigurationRegistry configurations, List<CredentialFormatter> formatters, Oid4vciV1Properties properties) {
+        this.properties = properties;
         this.configurations = configurations;
         this.formatters = formatters;
     }
@@ -41,6 +43,9 @@ public class TenantIssuerMetadata {
         document.put("credential_endpoint", issuer.credentialEndpoint());
         document.put("nonce_endpoint", issuer.nonceEndpoint());
         document.put("notification_endpoint", issuer.notificationEndpoint());
+        if (properties.batch().size() > 1) {
+            document.put("batch_credential_issuance", Map.of("batch_size", properties.batch().size()));
+        }
         if (deployment.getDisplay() != null) {
             document.put("display", deployment.getDisplay());
         }
