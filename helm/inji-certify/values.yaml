@@ -454,3 +454,17 @@ istio:
       port: 80
 
 installHSMPlugin: true
+
+## Database migration Job (Flyway) run as a pre-install/pre-upgrade hook with the service image.
+## The service itself only validates the schema at startup when this is enabled; set enabled=false to let
+## the service apply migrations at startup instead (single-replica or docker-compose style deployments).
+dbMigration:
+  enabled: true
+  backoffLimit: 2
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 1500Mi
+    requests:
+      cpu: 200m
+      memory: 512Mi

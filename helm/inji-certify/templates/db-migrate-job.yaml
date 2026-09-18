@@ -1,0 +1,72 @@
+{{- if .Values.dbMigration.enabled }}
+# Runs the Flyway migrations before the new release is rolled out (docs/design/08-database.md).
+# Uses the service image and its configuration; starts no web server (io.mosip.certify.tools.MigrateOnly).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ template "common.names.fullname" . }}-db-migrate
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "common.labels.standard" . | nindent 4 }}
+    app.kubernetes.io/component: db-migrate
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.dbMigration.backoffLimit }}
+  template:
+    metadata:
+      labels: {{- include "common.labels.standard" . | nindent 8 }}
+        app.kubernetes.io/component: db-migrate
+    spec:
+      restartPolicy: Never
+      {{- include "inji-certify.imagePullSecrets" . | nindent 6 }}
+      serviceAccountName: {{ template "inji-certify.serviceAccountName" . }}
+      containers:
+        - name: db-migrate
+          image: {{ template "inji-certify.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["java"]
+          args:
+            - "-Dloader.main=io.mosip.certify.tools.MigrateOnly"
+            - "-Dloader.path=/home/mosip/additional_jars/"
+            - "-Dspring.cloud.config.label=$(spring_config_label_env)"
+            - "-Dspring.profiles.active=$(active_profile_env)"
+            - "-Dspring.cloud.config.uri=$(spring_config_url_env)"
+            - "-jar"
+            - "certify-service.jar"
+          env:
+            - name: container_user
+              value: {{ .Values.containerSecurityContext.runAsUser | quote }}
+            {{- if .Values.additionalResources.javaOpts }}
+            - name: JDK_JAVA_OPTIONS
+              value: {{ .Values.additionalResources.javaOpts }}
+            {{- end }}
+            {{- if .Values.springConfigNameEnv }}
+            - name: spring_config_name_env
+              value: {{ .Values.springConfigNameEnv }}
+            {{- end }}
+            {{- if .Values.activeProfileEnv }}
+            - name: active_profile_env
+              value: {{ .Values.activeProfileEnv }}
+            {{- end }}
+            {{- if .Values.extraEnvVars }}
+            {{- include "common.tplvalues.render" (dict "value" .Values.extraEnvVars "context" $) | nindent 12 }}
+            {{- end }}
+          envFrom:
+            {{- if .Values.extraEnvVarsCM }}
+              {{- range .Values.extraEnvVarsCM }}
+              - configMapRef:
+                  name: {{ . }}
+              {{- end }}
+              {{- end }}
+              {{- if .Values.extraEnvVarsSecret }}
+              {{- range .Values.extraEnvVarsSecret }}
+              - secretRef:
+                  name: {{ . }}
+              {{- end }}
+              {{- end }}
+          {{- if .Values.dbMigration.resources }}
+          resources: {{- toYaml .Values.dbMigration.resources | nindent 12 }}
+          {{- end }}
+{{- end }}

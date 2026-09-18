@@ -104,6 +104,10 @@
 		<springdoc-openapi-webmvc-ui-version>2.5.0</springdoc-openapi-webmvc-ui-version>
 		<commons.validator.version>1.7</commons.validator.version>
 		<google.guava.version>18.0</google.guava.version>
+		<!-- Docker Engine 29 dropped API versions below 1.44; the Testcontainers managed by Boot 3.2 (1.19.5) cannot talk to it -->
+		<testcontainers.version>1.21.4</testcontainers.version>
+		<!-- Docker Engine 28+ validates the Host header on the unix socket; docker-java below 3.5 is rejected with 400 -->
+		<docker-java.version>3.5.3</docker-java.version>
 	</properties>
 
 	<modules>
@@ -151,6 +155,21 @@
 
 	<dependencyManagement>
 		<dependencies>
+			<dependency>
+				<groupId>com.github.docker-java</groupId>
+				<artifactId>docker-java-api</artifactId>
+				<version>${docker-java.version}</version>
+			</dependency>
+			<dependency>
+				<groupId>com.github.docker-java</groupId>
+				<artifactId>docker-java-transport</artifactId>
+				<version>${docker-java.version}</version>
+			</dependency>
+			<dependency>
+				<groupId>com.github.docker-java</groupId>
+				<artifactId>docker-java-transport-zerodep</artifactId>
+				<version>${docker-java.version}</version>
+			</dependency>
 			<dependency>
 				<groupId>org.springframework.cloud</groupId>
 				<artifactId>spring-cloud-dependencies</artifactId>

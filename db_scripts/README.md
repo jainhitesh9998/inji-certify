@@ -1,32 +1,20 @@
-# Certify Database
+# Database scripts
 
+Two ways to create or upgrade the `inji_certify` database, backed by the same SQL:
 
-## Overview
-This folder containers various SQL scripts to create database and tables in postgres.
-The tables are described under `<db name>/ddl/`.
-Default data that's populated in the tables is present under `<db name>/dml` folder.
+- **Flyway (recommended, since 1.0.0).** `certify-service` bundles per-module baseline migrations under
+  `src/main/resources/db/migration/{core,keymanager,verify,as}` (generated from `inji_certify/ddl` by
+  `generate_flyway_baseline.sh`). A fresh database gets the schema from them; a database created with the
+  psql scripts is baselined at version `1.0.0.003` and left untouched (`spring.flyway.baseline-on-migrate`
+  defaults to `true`, see `io.mosip.certify.db.FlywayDefaults`). Later schema changes ship as new versioned
+  migrations in the same folders. Run them before a rollout with
+  `java -Dloader.main=io.mosip.certify.tools.MigrateOnly -jar certify-service.jar` (the Helm chart's
+  pre-upgrade Job does this when `dbMigration.enabled` is true), or let the service apply them at startup
+  (docker-compose). Rollback scripts for every migration stay under `../db_upgrade_script`.
+- **psql scripts (`inji_certify/`).** `db.sql`, `ddl.sql`, `dml.sql` as before, for operators who provision the
+  database by hand. Keep `ddl/` and the Flyway baselines in sync by re-running `generate_flyway_baseline.sh`
+  only for the baseline; after 1.0.0 the psql DDL is a snapshot and Flyway is the source of truth.
 
-## Prerequisites
-* Make sure DB changes for IDA and PMS are up to date.
-* If not upgraded, IDA DB using the [release script](https://github.com/mosip/id-authentication/tree/develop/db_release_scripts).
-* If not upgraded, PMS DB using the [release script](https://github.com/mosip/partner-management-services/tree/develop/db_release_scripts).
-* Command line utilities:
-  - kubectl
-  - helm
-* Helm repos:
-  ```sh
-  helm repo add bitnami https://charts.bitnami.com/bitnami
-  helm repo add mosip https://mosip.github.io/mosip-helm
-  ```
-
-## Install in existing MOSIP K8 Cluster
-These scripts are automatically run with below mentioned script in existing k8 cluster with Postgres installed.
-### Install
-* Set your kube_config file or kube_config variable on PC.
-* Update `init_values.yaml` with db-common-password from the postgres namespace in the required field `dbUserPasswords.dbuserPassword` and ensure `databases.inji_certify` is enabled.
-  ```
-  ./init_db.sh`
-  ```
-
-## Install for developers
-Developers may run the SQLs using `<db name>/deploy.sh` script.
+Tests: `certify-service/src/test/java/io/mosip/certify/db/FlywayMigrationTest.java` (Testcontainers PostgreSQL)
+proves that both roads produce the same columns, indexes and constraints, and that an existing database is
+baselined without running any migration.
