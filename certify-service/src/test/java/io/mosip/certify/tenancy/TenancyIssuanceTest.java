@@ -84,6 +84,7 @@ class TenancyIssuanceTest {
     @Autowired io.mosip.certify.core.spi.CredentialRegistry credentialRegistry;
     @MockBean DataProviderPlugin dataProviderPlugin;
     @Value("${mosip.certify.identifier}") String issuerIdentifier;
+    @Autowired io.mosip.certify.config.contextloader.StaticContextLoader staticContextLoader;
 
     @BeforeEach
     void setUp() throws Exception {
@@ -109,6 +110,32 @@ class TenancyIssuanceTest {
         JsonNode credential = acmeBody.get("credentials").get(0).get("credential");
         assertEquals("did:web:acme.localhost", credential.get("issuer").asText(), "the tenant's issuer DID reaches the template");
         assertEquals("Tenant Farmer", credential.get("credentialSubject").get("fullName").asText());
+        String verificationMethod = credential.get("proof").get("verificationMethod").asText();
+        org.junit.jupiter.api.Assertions.assertTrue(verificationMethod.startsWith("did:web:acme.localhost#"),
+                "the proof names a verification method under the tenant's DID: " + verificationMethod);
+
+        // the tenant's host publishes the tenant's DID document, and the credential verifies from it with danubetech
+        JsonNode acmeDid = objectMapper.readTree(mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get("/.well-known/did.json")
+                .header("Host", ACME_HOST)).andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
+        assertEquals("did:web:acme.localhost", acmeDid.get("id").asText());
+        assertEquals("did:web:acme.localhost", acmeDid.get("assertionMethod").get(0).asText());
+        byte[] publicKey = null;
+        for (JsonNode method : acmeDid.get("verificationMethod")) {
+            org.junit.jupiter.api.Assertions.assertTrue(method.get("id").asText().startsWith("did:web:acme.localhost#"), method.toString());
+            assertEquals("did:web:acme.localhost", method.get("controller").asText());
+            if (verificationMethod.equals(method.get("id").asText())) {
+                byte[] decoded = io.ipfs.multibase.Multibase.decode(method.get("publicKeyMultibase").asText());
+                publicKey = java.util.Arrays.copyOfRange(decoded, 2, decoded.length); // strip the 0xed01 multicodec prefix
+            }
+        }
+        org.junit.jupiter.api.Assertions.assertNotNull(publicKey, "the tenant's did.json lists the verification method of its credential");
+        foundation.identity.jsonld.JsonLDObject jsonLd = foundation.identity.jsonld.JsonLDObject.fromJson(credential.toString());
+        jsonLd.setDocumentLoader(staticContextLoader);
+        org.junit.jupiter.api.Assertions.assertTrue(new info.weboftrust.ldsignatures.verifier.Ed25519Signature2020LdVerifier(publicKey).verify(jsonLd),
+                "the tenant's credential must verify with danubetech from the tenant's DID document");
+        JsonNode defaultDid = objectMapper.readTree(mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get("/.well-known/did.json"))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
+        assertEquals("did:web:localhost:certify", defaultDid.get("id").asText(), "the default host keeps the deployment's document");
 
         MvcResult wrongAudience = issue(ACME_ID, ACME_HOST, proofJwt(nonce(ACME_HOST), issuerIdentifier + "/oid4vci"));
         assertEquals(400, wrongAudience.getResponse().getStatus(), "a proof for the deployment's identifier is not a proof for acme");
