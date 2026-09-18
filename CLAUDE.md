@@ -6,6 +6,14 @@ This branch carries the extensibility rebuild of Inji Certify. Read this file fi
 
 Inji Certify (`develop`, 1.0.0-beta.1) is an OpenID4VCI 1.0 credential issuer whose issuance, formatting, templating, signing and configuration are fused in one Spring Boot module. The rebuild re-layers it without changing what wallets or operators see: a protocol-agnostic core (`certify-core`) behind `certify-spi`, protocol adapters (`oid4vci-v1` serving a new spec-clean surface under `/oid4vci` with its own issuer identifier plus today's paths in deprecated compatibility mode, `oid4vci-d13` restored from release 0.14.0 and on by default, `vc-api`), a signing library (`certify-signing`) shared with a command-line tool (`certify-cli`), MOSIP kernel-keymanager kept as the embedded default key provider (it already covers PKCS#11, PKCS#12 and offline HSM keystores) next to cloud KMS, Vault, file and X.509 providers for issuers with their own PKI or no keymanager at all, Velocity kept as the default template engine next to a JSON mapping engine, and Flyway-managed additive migrations. Full design: `docs/design/`.
 
+## Non-negotiables, in priority order
+
+1. Spec correctness. Every credential, metadata document, error and header follows the specification it claims: OpenID4VCI 1.0 (and draft 13 on the compatibility surface), HAIP, W3C VC Data Model 1.1 and 2.0, Data Integrity cryptosuites, SD-JWT VC, ISO/IEC 18013-5, RFC 9449 DPoP. When the code and the spec disagree, the spec wins and the deviation is fixed behind the compatibility surface, never carried into the new one. Conformance suites and independent verifiers are the proof, not our own tests.
+2. Structural soundness of the VC. An issued credential must verify with libraries Certify did not write, carry a complete and valid certificate chain or verification method, have correct types, contexts, validity fields, status entries and disclosures, and be rejected before signing when it would not. Output validation and `CertificateChainPolicy` are mandatory steps, not options.
+3. Easy upgrade for previous-version users. A deployment on 0.14.0 or 1.0.0-beta.1 upgrades by running migrations and restarting: same endpoints, same plugins, same properties, same keymanager setup, same signature bytes, with deprecations announced by headers and counters and removed only after two minor releases.
+
+Every other rule below serves these three; when they conflict, this order decides.
+
 ## Rules that every change must respect
 
 1. Zero wire-byte change until Phase 3. The golden tests (`goldens/v1`, `goldens/d13`) and the signature vectors are the definition of "unchanged"; if a change cannot keep them green, the change is wrong.
