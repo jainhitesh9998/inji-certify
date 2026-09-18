@@ -7,9 +7,6 @@ import io.mosip.certify.core.dto.CertificateResponseDTO;
 import io.mosip.certify.core.exception.CertifyException;
 import io.mosip.certify.entity.CredentialConfig;
 import io.mosip.certify.repository.CredentialConfigRepository;
-import io.mosip.kernel.keymanagerservice.dto.AllCertificatesDataResponseDto;
-import io.mosip.kernel.keymanagerservice.dto.CertificateDataResponseDto;
-import io.mosip.kernel.keymanagerservice.service.KeymanagerService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -31,13 +28,63 @@ import static org.mockito.Mockito.when;
 @RunWith(MockitoJUnitRunner.class)
 class DIDDocumentUtilTest {
 
-    @Mock
-    private KeymanagerService keymanagerService;
 
     @Mock
     private CredentialConfigRepository credentialConfigRepository;
 
     private DIDDocumentUtil didDocumentUtil;
+    private FakeKeyProvider fake;
+
+    /** A "keymanager"-named provider fed with the test certificates; publicKeys(ref) returns every certificate of an alias. */
+    static final class FakeKeyProvider implements io.mosip.certify.signing.KeyProvider {
+        final Map<String, List<io.mosip.certify.signing.PublicKeyDescriptor>> byAlias = new java.util.HashMap<>();
+
+        void add(String alias, String kid, String pem) {
+            try {
+                java.security.cert.X509Certificate c = (java.security.cert.X509Certificate) java.security.cert.CertificateFactory.getInstance("X.509")
+                        .generateCertificate(new java.io.ByteArrayInputStream(pem.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+                add(alias, new io.mosip.certify.signing.PublicKeyDescriptor(kid, algorithmFor(c.getPublicKey()), c.getPublicKey(),
+                        io.mosip.certify.signing.CertificateChain.of(c), c.getNotBefore().toInstant(), c.getNotAfter().toInstant(), "vc-signing"));
+            } catch (java.security.cert.CertificateException e) {
+                throw new IllegalArgumentException(e);
+            }
+        }
+
+        void add(String alias, io.mosip.certify.signing.PublicKeyDescriptor descriptor) {
+            byAlias.computeIfAbsent(alias, k -> new java.util.ArrayList<>()).add(descriptor);
+        }
+
+        static io.mosip.certify.signing.SignatureAlgorithm algorithmFor(java.security.PublicKey key) {
+            if (key instanceof java.security.interfaces.RSAPublicKey) return io.mosip.certify.signing.SignatureAlgorithm.RS256;
+            if (key instanceof java.security.interfaces.ECPublicKey ec) {
+                com.nimbusds.jose.jwk.Curve curve = com.nimbusds.jose.jwk.Curve.forECParameterSpec(ec.getParams());
+                return curve != null && "secp256k1".equals(curve.getName()) ? io.mosip.certify.signing.SignatureAlgorithm.ES256K : io.mosip.certify.signing.SignatureAlgorithm.ES256;
+            }
+            return io.mosip.certify.signing.SignatureAlgorithm.EdDSA;
+        }
+
+        public String id() { return "keymanager"; }
+
+        public io.mosip.certify.signing.SigningKey resolve(io.mosip.certify.signing.KeyRef ref) {
+            java.time.Instant now = java.time.Instant.now();
+            return byAlias.getOrDefault(ref.alias(), List.of()).stream().filter(d -> d.isValidAt(now))
+                    .max(java.util.Comparator.comparing(io.mosip.certify.signing.PublicKeyDescriptor::notAfter))
+                    .map(d -> new io.mosip.certify.signing.SigningKey(ref, d, "fake"))
+                    .orElseThrow(() -> new io.mosip.certify.signing.SigningException("No valid certificate for " + ref));
+        }
+
+        public List<io.mosip.certify.signing.PublicKeyDescriptor> publicKeys(io.mosip.certify.signing.KeyRef ref) {
+            return byAlias.getOrDefault(ref.alias(), List.of());
+        }
+
+        public List<io.mosip.certify.signing.PublicKeyDescriptor> publicKeys(io.mosip.certify.signing.KeyFilter filter) {
+            return byAlias.values().stream().flatMap(List::stream).toList();
+        }
+
+        public java.util.Set<io.mosip.certify.signing.SignatureAlgorithm> supportedAlgorithms() { return java.util.EnumSet.allOf(io.mosip.certify.signing.SignatureAlgorithm.class); }
+
+        public byte[] signRaw(byte[] data, io.mosip.certify.signing.SigningKey key, io.mosip.certify.signing.SignatureAlgorithm algorithm) { throw new UnsupportedOperationException(); }
+    }
 
     private AutoCloseable mocks;
 
@@ -52,7 +99,8 @@ class DIDDocumentUtilTest {
     @BeforeEach
     void setUp() {
         mocks = MockitoAnnotations.openMocks(this);
-        didDocumentUtil = new DIDDocumentUtil(keymanagerService, credentialConfigRepository);
+        fake = new FakeKeyProvider();
+        didDocumentUtil = new DIDDocumentUtil(new io.mosip.certify.issuance.KeyProviderRegistry(List.of(fake)), credentialConfigRepository);
         LinkedHashMap<String, List<String>> signingMap = new LinkedHashMap<>();
         signingMap.put(SignatureAlg.ED25519_SIGNATURE_SUITE_2018, List.of(JWSAlgorithm.EdDSA));
         signingMap.put(SignatureAlg.ED25519_SIGNATURE_SUITE_2020, List.of(JWSAlgorithm.EdDSA));
@@ -145,13 +193,8 @@ class DIDDocumentUtilTest {
         config.setKeyManagerRefId("ed-ref");
         config.setSignatureCryptoSuite(SignatureAlg.ED25519_SIGNATURE_SUITE_2020);
 
-        CertificateDataResponseDto certificate = new CertificateDataResponseDto();
-        certificate.setCertificateData(ED25519_CERTIFICATE);
-        certificate.setKeyId("ed-kid");
-
         when(credentialConfigRepository.findAll()).thenReturn(List.of(config));
-        when(keymanagerService.getAllCertificates("ed-app", Optional.of("ed-ref")))
-                .thenReturn(new AllCertificatesDataResponseDto(new CertificateDataResponseDto[]{certificate}));
+        fake.add("ed-app/ed-ref", "ed-kid", ED25519_CERTIFICATE);
 
         Map<String, Object> didDocument = didDocumentUtil.generateDIDDocument(DID_URL);
         List<String> contexts = (List<String>) didDocument.get("@context");
@@ -175,19 +218,9 @@ class DIDDocumentUtilTest {
         rsaConfig.setKeyManagerRefId("rsa-ref");
         rsaConfig.setSignatureAlgo(JWSAlgorithm.RS256);
 
-        CertificateDataResponseDto edCertificate = new CertificateDataResponseDto();
-        edCertificate.setCertificateData(ED25519_CERTIFICATE);
-        edCertificate.setKeyId("ed-kid");
-
-        CertificateDataResponseDto rsaCertificate = new CertificateDataResponseDto();
-        rsaCertificate.setCertificateData(RSA_CERTIFICATE);
-        rsaCertificate.setKeyId("rsa-kid");
-
         when(credentialConfigRepository.findAll()).thenReturn(List.of(edConfig, rsaConfig));
-        when(keymanagerService.getAllCertificates("ed-app", Optional.of("ed-ref")))
-                .thenReturn(new AllCertificatesDataResponseDto(new CertificateDataResponseDto[]{edCertificate}));
-        when(keymanagerService.getAllCertificates("rsa-app", Optional.of("rsa-ref")))
-                .thenReturn(new AllCertificatesDataResponseDto(new CertificateDataResponseDto[]{rsaCertificate}));
+        fake.add("ed-app/ed-ref", "ed-kid", ED25519_CERTIFICATE);
+        fake.add("rsa-app/rsa-ref", "rsa-kid", RSA_CERTIFICATE);
 
         Map<String, Object> didDocument = didDocumentUtil.generateDIDDocument(DID_URL);
         List<String> contexts = (List<String>) didDocument.get("@context");
@@ -199,37 +232,23 @@ class DIDDocumentUtilTest {
 
     @Test
     void testGetCertificateDataResponseDtoSuccess() {
-        String appId = "app";
-        String refId = "ref";
+        io.mosip.certify.signing.PublicKeyDescriptor current = new io.mosip.certify.keyprovider.jca.JcaKeyProvider("x")
+                .generate("k", io.mosip.certify.signing.SignatureAlgorithm.ES256, "CN=k", "vc-signing").descriptor();
+        fake.add("app/ref", new io.mosip.certify.signing.PublicKeyDescriptor("kid-expired", current.algorithm(), current.publicKey(), current.chain(),
+                java.time.Instant.now().minus(java.time.Duration.ofDays(400)), java.time.Instant.now().minus(java.time.Duration.ofDays(1)), "vc-signing"));
+        fake.add("app/ref", new io.mosip.certify.signing.PublicKeyDescriptor("kid-valid", current.algorithm(), current.publicKey(), current.chain(),
+                current.notBefore(), current.notAfter(), "vc-signing"));
 
-        CertificateDataResponseDto expired = new CertificateDataResponseDto();
-        expired.setCertificateData("expired");
-        expired.setExpiryAt(LocalDateTime.now().minusDays(1));
-        expired.setKeyId("kid-expired");
+        CertificateResponseDTO response = didDocumentUtil.getCertificateDataResponseDto("app", "ref");
 
-        CertificateDataResponseDto valid = new CertificateDataResponseDto();
-        valid.setCertificateData("valid");
-        valid.setExpiryAt(LocalDateTime.now().plusDays(10));
-        valid.setKeyId("kid-valid");
-
-        when(keymanagerService.getAllCertificates(appId, Optional.of(refId)))
-                .thenReturn(new AllCertificatesDataResponseDto(new CertificateDataResponseDto[]{expired, valid}));
-
-        CertificateResponseDTO response = didDocumentUtil.getCertificateDataResponseDto(appId, refId);
-        assertEquals("valid", response.getCertificateData());
         assertEquals("kid-valid", response.getKeyId());
+        assertTrue(response.getCertificateData().startsWith("-----BEGIN CERTIFICATE-----"));
     }
 
     @Test
     void testGetCertificateDataResponseDtoNoCertificatesFound() {
-        String appId = "app";
-        String refId = "ref";
-        when(keymanagerService.getAllCertificates(appId, Optional.of(refId)))
-                .thenReturn(new AllCertificatesDataResponseDto(null));
-
-        assertThrows(CertifyException.class, () ->
-                didDocumentUtil.getCertificateDataResponseDto(appId, refId)
-        );
+        CertifyException e = assertThrows(CertifyException.class, () -> didDocumentUtil.getCertificateDataResponseDto("missing", "ref"));
+        assertTrue(e.getMessage().contains("No valid certificates found"));
     }
 
     @Test
@@ -257,13 +276,8 @@ class DIDDocumentUtilTest {
         config.setKeyManagerRefId("ec-ref");
         config.setSignatureAlgo(JWSAlgorithm.ES256K);
 
-        CertificateDataResponseDto certificate = new CertificateDataResponseDto();
-        certificate.setCertificateData(SECP256K1_CERTIFICATE);
-        certificate.setKeyId("ec-kid");
-
         when(credentialConfigRepository.findAll()).thenReturn(List.of(config));
-        when(keymanagerService.getAllCertificates("ec-app", Optional.of("ec-ref")))
-                .thenReturn(new AllCertificatesDataResponseDto(new CertificateDataResponseDto[]{certificate}));
+        fake.add("ec-app/ec-ref", "ec-kid", SECP256K1_CERTIFICATE);
 
         Map<String, Object> didDocument = didDocumentUtil.generateDIDDocument(DID_URL);
         List<String> contexts = (List<String>) didDocument.get("@context");

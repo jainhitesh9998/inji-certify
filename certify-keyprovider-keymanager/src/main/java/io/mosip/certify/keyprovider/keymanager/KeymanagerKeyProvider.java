@@ -110,6 +110,15 @@ public class KeymanagerKeyProvider implements KeyProvider {
         return out;
     }
 
+    /** All certificates keymanager holds for the alias, expired ones included (the DID document lists rotated keys). */
+    @Override
+    public List<PublicKeyDescriptor> publicKeys(KeyRef ref) {
+        if (!ID.equals(ref.provider())) {
+            throw new SigningException("KeyRef " + ref + " is not for provider " + ID);
+        }
+        return descriptors(KeymanagerAlias.of(ref));
+    }
+
     /** The aliases this provider publishes (from configuration); any other alias can still be resolved on demand. */
     public List<KeymanagerAlias> knownAliases() {
         return knownAliases;

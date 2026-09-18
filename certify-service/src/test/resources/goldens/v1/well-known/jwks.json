@@ -1,0 +1,50 @@
+{
+  "keys" : [ {
+    "crv" : "P-256",
+    "exp" : "<exp>",
+    "kid" : "<kid>",
+    "kty" : "EC",
+    "use" : "sig",
+    "x" : "<x>",
+    "x5c" : "<x5c>",
+    "x5t#S256" : "<x5t#S256>",
+    "y" : "<y>"
+  }, {
+    "crv" : "secp256k1",
+    "exp" : "<exp>",
+    "kid" : "<kid>",
+    "kty" : "EC",
+    "use" : "sig",
+    "x" : "<x>",
+    "x5c" : "<x5c>",
+    "x5t#S256" : "<x5t#S256>",
+    "y" : "<y>"
+  }, {
+    "crv" : "Ed25519",
+    "exp" : "<exp>",
+    "kid" : "<kid>",
+    "kty" : "OKP",
+    "use" : "sig",
+    "x" : "<x>",
+    "x5c" : "<x5c>",
+    "x5t#S256" : "<x5t#S256>"
+  }, {
+    "e" : "<e>",
+    "exp" : "<exp>",
+    "kid" : "<kid>",
+    "kty" : "RSA",
+    "n" : "<n>",
+    "use" : "sig",
+    "x5c" : "<x5c>",
+    "x5t#S256" : "<x5t#S256>"
+  }, {
+    "e" : "<e>",
+    "exp" : "<exp>",
+    "kid" : "<kid>",
+    "kty" : "RSA",
+    "n" : "<n>",
+    "use" : "sig",
+    "x5c" : "<x5c>",
+    "x5t#S256" : "<x5t#S256>"
+  } ]
+}

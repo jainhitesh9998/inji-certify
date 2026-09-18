@@ -156,6 +156,34 @@ class IssuanceGoldenTest {
         Goldens.assertGolden("v1/well-known/openid-credential-issuer", metadata);
     }
 
+    /** The published keys: one JWK per certificate of every mapped alias plus CERTIFY_SERVICE; key material masked. */
+    @Test
+    void jwksGolden() throws Exception {
+        JsonNode jwks = getJson("/.well-known/jwks.json");
+        assertTrue(jwks.get("keys").size() >= 5, "four signing keys and the service key: " + jwks);
+        for (JsonNode key : jwks.get("keys")) {
+            assertTrue(key.hasNonNull("kid") && key.hasNonNull("kty"), "kid and kty on every JWK: " + key);
+        }
+        Goldens.assertGolden("v1/well-known/jwks", jwks);
+    }
+
+    /**
+     * The DID document: one verification method per (suite, key) of the signing-alg map. Finding (PROGRESS.md):
+     * assertionMethod and authentication list the DID itself instead of verification method ids.
+     */
+    @Test
+    void didDocumentGolden() throws Exception {
+        JsonNode did = getJson("/.well-known/did.json");
+        assertEquals("did:web:localhost:certify", did.get("id").asText());
+        assertTrue(did.get("verificationMethod").size() >= 4, did.toString());
+        for (JsonNode method : did.get("verificationMethod")) {
+            assertEquals("did:web:localhost:certify", method.get("controller").asText());
+            assertTrue(method.get("id").asText().startsWith("did:web:localhost:certify#"), method.get("id").asText());
+        }
+        assertEquals("did:web:localhost:certify", did.get("assertionMethod").get(0).asText(), "documents today's behaviour, see findings");
+        Goldens.assertGolden("v1/well-known/did", did);
+    }
+
     @Test
     void ldpVcIssuanceGoldenAndIndependentVerification() throws Exception {
         MvcResult result = issue(LDP_ID, proofJwt(nonce()));

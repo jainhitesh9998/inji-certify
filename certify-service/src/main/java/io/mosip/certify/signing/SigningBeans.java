@@ -14,4 +14,9 @@ public class SigningBeans {
     public KeyProviderRegistry keyProviderRegistry(List<KeyProvider> providers) {
         return new KeyProviderRegistry(providers);
     }
+
+    @Bean
+    public KeyPublisher keyPublisher(List<KeyProvider> providers) {
+        return new KeyPublisher(providers);
+    }
 }
