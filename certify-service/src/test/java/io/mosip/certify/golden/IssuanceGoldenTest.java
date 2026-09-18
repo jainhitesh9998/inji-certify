@@ -99,6 +99,7 @@ class IssuanceGoldenTest {
     static final String EC_K1_ID = "GoldenEcK1Credential";
     static final String ED_2018_ID = "GoldenEd2018Credential";
     static final String MDOC_ID = "GoldenMdlCredential";
+    static final String QR_ID = "GoldenQrCredential";
     static final String SCOPE = "sample_vc_ldp"; // the scope LocalAccessTokenValidationFilter injects
 
     @Autowired MockMvc mockMvc;
@@ -135,6 +136,15 @@ class IssuanceGoldenTest {
         addLegacySuiteConfig(ED_2018_ID, "golden-ldp-ed2018.vm", "CERTIFY_VC_SIGN_ED25519", "ED25519_SIGN", "EdDSA", "Ed25519Signature2018");
         if (credentialConfigRepository.findByCredentialConfigKeyId(MDOC_ID).isEmpty()) {
             credentialConfigurationService.addCredentialConfiguration(mdocConfig());
+        }
+        if (credentialConfigRepository.findByCredentialConfigKeyId(QR_ID).isEmpty()) {
+            CredentialConfigurationDTO qr = ldpConfig(QR_ID, "golden-ldp-qr.vm", "https://www.w3.org/2018/credentials/v1",
+                    "CERTIFY_VC_SIGN_ED25519", "ED25519_SIGN", "EdDSA", "Ed25519Signature2020");
+            qr.setCredentialTypes(List.of("VerifiableCredential", QR_ID));
+            // claim-169 QR: PixelPass maps these display names to numeric claim keys; the CWT is signed with the EdDSA key
+            qr.setQrSettings(List.of(Map.of("Full Name", "${fullName}", "Date of Birth", "${dateOfBirth}")));
+            qr.setQrSignatureAlgo("EdDSA");
+            credentialConfigurationService.addCredentialConfiguration(qr);
         }
     }
 
@@ -418,6 +428,69 @@ class IssuanceGoldenTest {
         ((com.fasterxml.jackson.databind.node.ObjectNode) responseShape.get("credentials").get(0)).put("credential", "<mso_mdoc>");
         Goldens.assertGolden("v1/issuance/mso_mdoc-response", responseShape);
         Goldens.assertGolden("v1/issuance/mso_mdoc-summary", summary);
+    }
+
+    /**
+     * Claim-169 QR (the compose FarmerCredential uses this): the template embeds the PixelPass-encoded CWT; decoded here,
+     * the COSE_Sign1 (tag 61 around tag 18) is verified with plain JCA against the x5chain certificate and the claims
+     * checked (iss, claim 169 with the mapped values).
+     */
+    @Test
+    void claim169QrGoldenAndIndependentVerification() throws Exception {
+        JsonNode body = issuedBody(QR_ID);
+        JsonNode credential = body.get("credentials").get(0).get("credential");
+        String qr = credential.get("credentialSubject").get("qr").asText();
+        assertFalse(qr.isBlank(), "claim_169_values rendered into the credential");
+
+        String decoded = new io.mosip.pixelpass.PixelPass().decode(qr);
+        byte[] cwtBytes = java.util.HexFormat.of().parseHex(decoded);
+        com.upokecenter.cbor.CBORObject outer = com.upokecenter.cbor.CBORObject.DecodeFromBytes(cwtBytes);
+        assertTrue(outer.HasMostOuterTag(61), "CWT tag 61");
+        com.upokecenter.cbor.CBORObject taggedSign1 = outer.UntagOne();
+        assertTrue(taggedSign1.HasMostOuterTag(18), "COSE_Sign1 tag 18");
+        com.upokecenter.cbor.CBORObject sign1 = taggedSign1.UntagOne();
+        assertEquals(4, sign1.size());
+        byte[] protectedBytes = sign1.get(0).GetByteString();
+        com.upokecenter.cbor.CBORObject protectedHeader = com.upokecenter.cbor.CBORObject.DecodeFromBytes(protectedBytes);
+        assertEquals(-8, protectedHeader.get(com.upokecenter.cbor.CBORObject.FromObject(1)).AsInt32(), "alg EdDSA");
+        // Finding (PROGRESS.md): Credential.signQRData asks keymanager for x5c+kid, but keymanager only emits kid; the
+        // certificate chain is absent from both headers, so a verifier must resolve the key by kid (jwks.json).
+        assertFalse(protectedHeader.ContainsKey(com.upokecenter.cbor.CBORObject.FromObject(33)) || sign1.get(1).ContainsKey(com.upokecenter.cbor.CBORObject.FromObject(33)),
+                "documents today's behaviour: no x5chain in the CWT");
+        assertTrue(protectedHeader.ContainsKey(com.upokecenter.cbor.CBORObject.FromObject(4)), "kid in the protected header");
+        String kid = new String(protectedHeader.get(com.upokecenter.cbor.CBORObject.FromObject(4)).GetByteString(), StandardCharsets.UTF_8);
+        JWKSet jwks = JWKSet.parse(getJson("/.well-known/jwks.json").toString());
+        JWK jwk = jwks.getKeyByKeyId(kid);
+        assertNotNull(jwk, "CWT kid " + kid + " must be in jwks.json");
+        byte[] rawX = jwk.toOctetKeyPair().getX().decode();
+        byte[] spki = new byte[12 + 32];
+        System.arraycopy(java.util.HexFormat.of().parseHex("302a300506032b6570032100"), 0, spki, 0, 12);
+        System.arraycopy(rawX, 0, spki, 12, 32);
+        java.security.PublicKey issuerKey = java.security.KeyFactory.getInstance("Ed25519").generatePublic(new java.security.spec.X509EncodedKeySpec(spki));
+        byte[] payload = sign1.get(2).GetByteString();
+        byte[] sigStructure = com.upokecenter.cbor.CBORObject.NewArray().Add("Signature1").Add(protectedBytes).Add(new byte[0]).Add(payload).EncodeToBytes();
+        java.security.Signature verifier = java.security.Signature.getInstance("Ed25519");
+        verifier.initVerify(issuerKey);
+        verifier.update(sigStructure);
+        assertTrue(verifier.verify(sign1.get(3).GetByteString()), "CWT signature must verify with JCA against the JWKS key named by kid");
+
+        com.upokecenter.cbor.CBORObject claims = com.upokecenter.cbor.CBORObject.DecodeFromBytes(payload);
+        assertEquals(domainUrl, claims.get(com.upokecenter.cbor.CBORObject.FromObject(1)).AsString(), "iss is the domain URL");
+        com.upokecenter.cbor.CBORObject claim169 = claims.get(com.upokecenter.cbor.CBORObject.FromObject(169));
+        assertNotNull(claim169, "claim 169 present");
+        assertEquals(com.upokecenter.cbor.CBORType.ByteString, claim169.getType(), "claim 169 is bstr .cbor");
+        com.upokecenter.cbor.CBORObject claim169Map = com.upokecenter.cbor.CBORObject.DecodeFromBytes(claim169.GetByteString());
+        assertEquals(com.upokecenter.cbor.CBORType.Map, claim169Map.getType());
+        assertTrue(claim169Map.getValues().stream().map(com.upokecenter.cbor.CBORObject::AsString).toList().contains("Golden Farmer"), claim169Map.toString());
+
+        com.fasterxml.jackson.databind.node.ObjectNode summary = objectMapper.createObjectNode();
+        summary.put("outerTag", 61).put("innerTag", 18);
+        summary.put("protectedLabels", protectedHeader.getKeys().toString());
+        summary.put("unprotectedLabels", sign1.get(1).getKeys().toString());
+        summary.put("claimLabels", claims.getKeys().toString());
+        summary.put("claim169Keys", claim169Map.getKeys().toString());
+        Goldens.assertGolden("v1/issuance/ldp_vc-qr-response", body);
+        Goldens.assertGolden("v1/issuance/claim169-cwt-summary", summary);
     }
 
     /** The flow docs/design/VALIDATE.md drives by hand: offer, offer fetch, token; the access token is verified against jwks.json. */
