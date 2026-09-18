@@ -32,7 +32,8 @@ public class Oid4vciIssuanceConfiguration {
 
     @Bean
     public Oid4vciIssuer oid4vciIssuer(Environment environment) {
-        return Oid4vciIssuer.derive(environment.getRequiredProperty("mosip.certify.identifier"), environment.getProperty("certify.oid4vci.issuer-identifier"));
+        return Oid4vciIssuer.derive(environment.getRequiredProperty("mosip.certify.identifier"), environment.getProperty("server.servlet.path", ""),
+                environment.getProperty("certify.oid4vci.issuer-identifier"));
     }
 
     @Bean

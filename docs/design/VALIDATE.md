@@ -24,7 +24,7 @@ service image. Take them from there instead of resolving snapshot artifacts:
 cd docker-compose/docker-compose-injistack
 mkdir -p loader_path/certify data/CERTIFY_PKCS12
 id=$(docker create injistackdev/inji-certify-with-plugins:develop)
-docker cp "$id":/home/mosip/additional_jars/. loader_path/certify/
+docker cp "$id":/home/inji/additional_jars/. loader_path/certify/   # the published image runs as user inji
 docker rm "$id"
 ls loader_path/certify   # mock-certify-plugin-*.jar and friends
 ```
@@ -45,6 +45,7 @@ authorization server, which is what the pre-authorized code flow needs.
 ## 4. Run
 
 ```bash
+docker network inspect mosip_network >/dev/null 2>&1 || docker network create mosip_network   # the compose file expects it
 docker compose -f docker-compose.yaml -f docker-compose.rebuild.yaml up -d --build
 docker compose logs -f certify | grep -m1 'INJI Certify -- Started'
 curl -s http://localhost:8090/v1/certify/.well-known/openid-credential-issuer | jq '.credential_configurations_supported | keys'
