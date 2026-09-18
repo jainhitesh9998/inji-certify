@@ -11,6 +11,18 @@
     <name>certify-keyprovider-keymanager</name>
     <description>The default KeyProvider: MOSIP kernel-keymanager embedded as a library (HSM via PKCS#11, PKCS#12 or offline keystores; keys in key_store). This module is the only place that references io.mosip.kernel (docs/design/06-signing-extensibility.md).</description>
 
+    <repositories>
+        <!-- java-multibase (needed here directly) is published on JitPack only; Central stays first so nothing else is asked of JitPack -->
+        <repository>
+            <id>central</id>
+            <url>https://repo1.maven.org/maven2</url>
+        </repository>
+        <repository>
+            <id>jitpack.io</id>
+            <url>https://jitpack.io</url>
+        </repository>
+    </repositories>
+
     <dependencies>
         <dependency>
             <groupId>io.inji.certify</groupId>

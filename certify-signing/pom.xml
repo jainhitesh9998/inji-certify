@@ -11,6 +11,18 @@
     <name>certify-signing</name>
     <description>Signing library: key-provider and signer contracts, algorithm registry, JWS/COSE/CWT envelope builders. No Spring Web, no JPA (see docs/design/06-signing.md).</description>
 
+    <repositories>
+        <!-- java-multibase (needed here directly) is published on JitPack only; Central stays first so nothing else is asked of JitPack -->
+        <repository>
+            <id>central</id>
+            <url>https://repo1.maven.org/maven2</url>
+        </repository>
+        <repository>
+            <id>jitpack.io</id>
+            <url>https://jitpack.io</url>
+        </repository>
+    </repositories>
+
     <dependencies>
         <dependency>
             <!-- Linked Data proof envelopes (legacy suites and Data Integrity) share danubetech's canonicalizers and proof types -->
