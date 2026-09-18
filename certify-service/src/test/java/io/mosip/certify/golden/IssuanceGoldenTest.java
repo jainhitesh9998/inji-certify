@@ -107,6 +107,7 @@ class IssuanceGoldenTest {
     @Autowired CredentialConfigurationService credentialConfigurationService;
     @Autowired CredentialConfigRepository credentialConfigRepository;
     @Autowired StaticContextLoader staticContextLoader;
+    @Autowired io.mosip.certify.issuance.ConfigurationRegistry configurationRegistry;
     @MockBean DataProviderPlugin dataProviderPlugin;
     @Value("${mosip.certify.identifier}") String issuerIdentifier;   // proof audience
     @Value("${mosip.certify.domain.url}") String domainUrl;           // metadata credential_issuer (a second identity key, see docs/design/14-configuration.md)
@@ -164,6 +165,21 @@ class IssuanceGoldenTest {
         assertEquals(domainUrl, metadata.get("credential_issuer").asText());
         assertTrue(metadata.get("credential_configurations_supported").has(LDP_ID));
         Goldens.assertGolden("v1/well-known/openid-credential-issuer", metadata);
+    }
+
+    /** The new core's view of the same rows: every golden configuration maps, with the key the legacy columns name. */
+    @Test
+    void configurationRegistryMapsTheGoldenConfigurations() {
+        io.mosip.certify.spi.CredentialConfiguration ldp = configurationRegistry.byId("default", LDP_ID).orElseThrow();
+        assertEquals("keymanager:CERTIFY_VC_SIGN_ED25519/ED25519_SIGN", ldp.signing().keyRef().toString());
+        assertEquals("Ed25519Signature2020", ldp.signing().cryptosuite());
+        assertEquals(io.mosip.certify.spi.TemplateRef.Mode.FULL_DOCUMENT, ldp.template().mode());
+        io.mosip.certify.spi.CredentialConfiguration sd = configurationRegistry.bySelector("default", "dc+sd-jwt", "GoldenCredential").orElseThrow();
+        assertEquals(SDJWT_ID, sd.id());
+        io.mosip.certify.spi.CredentialConfiguration mdoc = configurationRegistry.bySelector("default", "mso_mdoc", "org.iso.18013.5.1.mDL").orElseThrow();
+        assertEquals(MDOC_ID, mdoc.id());
+        assertTrue(configurationRegistry.all("default").size() >= 9, "all nine golden configurations are visible: " + configurationRegistry.all("default").size());
+        assertTrue(configurationRegistry.all("acme").isEmpty(), "single tenant");
     }
 
     /** The published keys: one JWK per certificate of every mapped alias plus CERTIFY_SERVICE; key material masked. */
