@@ -513,6 +513,44 @@ class IssuanceGoldenTest {
         Goldens.assertGolden("v1/issuance/claim169-cwt-summary", summary);
     }
 
+    // ---- the new surface: POST /oid4vci/credential through DefaultIssuanceService (goldens under v2) ------------
+
+    @Test
+    void oid4vciLdpVcIssuanceGoldenAndIndependentVerification() throws Exception {
+        MvcResult result = issueOid4vci(LDP_ID, proofJwt(nonce()));
+        JsonNode body = objectMapper.readTree(result.getResponse().getContentAsString());
+        assertEquals(200, result.getResponse().getStatus(), body.toString());
+        JsonNode credential = body.get("credentials").get(0).get("credential");
+        assertEquals("Ed25519Signature2020", credential.get("proof").get("type").asText());
+        assertEquals("Golden Farmer", credential.get("credentialSubject").get("fullName").asText());
+        assertEquals("did:web:localhost:certify", credential.get("issuer").asText(), "_issuer from the configuration's didUrl");
+        assertTrue(credential.get("credentialSubject").get("id").asText().startsWith("did:jwk:"), "holder bound from the proof");
+        byte[] publicKey = ed25519PublicKeyFromDidDocument(credential.get("proof").get("verificationMethod").asText());
+        JsonLDObject jsonLd = JsonLDObject.fromJson(credential.toString());
+        jsonLd.setDocumentLoader(staticContextLoader);
+        assertTrue(new Ed25519Signature2020LdVerifier(publicKey).verify(jsonLd), "ldp_vc from the new surface must verify with danubetech");
+        Goldens.assertGolden("v2/oid4vci/ldp_vc-response", body);
+    }
+
+    @Test
+    void oid4vciErrorsFollowTheSpec() throws Exception {
+        // the local profile's TestBearer filter authenticates every request, so the 401 path is covered by the controller unit only
+        MvcResult unknown = issueOid4vci("NoSuchCredential", proofJwt(nonce()));
+        assertEquals(400, unknown.getResponse().getStatus());
+        assertEquals("invalid_credential_request", objectMapper.readTree(unknown.getResponse().getContentAsString()).get("error").asText());
+
+        nonce();
+        MvcResult badNonce = issueOid4vci(LDP_ID, proofJwt("not-the-nonce"));
+        assertEquals(400, badNonce.getResponse().getStatus());
+        assertEquals("invalid_nonce", objectMapper.readTree(badNonce.getResponse().getContentAsString()).get("error").asText());
+    }
+
+    private MvcResult issueOid4vci(String configurationId, String proof) throws Exception {
+        String body = objectMapper.writeValueAsString(Map.of("credential_configuration_id", configurationId, "proofs", Map.of("jwt", List.of(proof))));
+        return mockMvc.perform(post("/oid4vci/credential").header("Authorization", "TestBearer demo")
+                .contentType(MediaType.APPLICATION_JSON).content(body)).andReturn();
+    }
+
     /** The flow docs/design/VALIDATE.md drives by hand: offer, offer fetch, token; the access token is verified against jwks.json. */
     @Test
     void preAuthorizedCodeFlowGoldenAndAccessTokenVerification() throws Exception {

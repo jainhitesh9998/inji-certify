@@ -68,11 +68,9 @@ public class JsonMapTemplateEngine implements TemplateEngine {
             throw new FormatException(ERROR_TEMPLATE_RENDER, "Template " + template.templateId() + " is not a JSON object: " + e.getMessage(), e);
         }
         Map<String, Object> values = new LinkedHashMap<>(model.claims().claims());
-        if (model.tenant() != null) {
-            String issuer = model.tenant().issuerDid() != null ? model.tenant().issuerDid() : model.tenant().issuerIdentifier();
-            if (issuer != null) {
-                values.put("_issuer", issuer);
-            }
+        String issuer = issuerOf(model);
+        if (issuer != null) {
+            values.put("_issuer", issuer);
         }
         if (model.holder() != null && model.holder().isBound()) {
             values.put("_holderId", model.holder().value());
@@ -88,6 +86,20 @@ public class JsonMapTemplateEngine implements TemplateEngine {
         @SuppressWarnings("unchecked")
         Map<String, Object> rendered = (Map<String, Object>) fill(document, values, model.params(), model.claims().claims());
         return new RenderedDocument(rendered);
+    }
+
+    /** The tenant's issuer DID or identifier, else the configuration's {@code didUrl} template parameter (legacy rows). */
+    static String issuerOf(TemplateModel model) {
+        if (model.tenant() != null) {
+            if (model.tenant().issuerDid() != null) {
+                return model.tenant().issuerDid();
+            }
+            if (model.tenant().issuerIdentifier() != null) {
+                return model.tenant().issuerIdentifier();
+            }
+        }
+        Object didUrl = model.params().get("didUrl");
+        return didUrl == null || String.valueOf(didUrl).isBlank() ? null : String.valueOf(didUrl);
     }
 
     private Object fill(Object node, Map<String, Object> values, Map<String, Object> params, Map<String, Object> claims) {

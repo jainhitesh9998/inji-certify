@@ -92,6 +92,12 @@ curl -s -X POST http://localhost:8090/v1/certify/nonce -i | grep -i 'c_nonce\|^H
 The credential request itself needs a holder-signed proof, which is what the wallet contributes; the golden test
 builds one in-process if you want to see the exact shape.
 
+## 6b. The new surface
+
+`POST /v1/certify/oid4vci/credential` (same request body, same access token) issues `ldp_vc` through the rebuilt core;
+the wallet flow above still uses the compatibility path `/issuance/credential`. Issuer metadata and the nonce endpoint
+under `/oid4vci` arrive with the next slices, so a wallet cannot discover the new surface yet.
+
 ## 7. Verify the credential independently
 
 The wallet shows the credential; to check it with a third-party verifier, paste the `ldp_vc` JSON into any

@@ -52,11 +52,9 @@ public class VelocityTemplateEngine implements TemplateEngine {
         }
         Map<String, Object> parameters = new HashMap<>(model.claims().claims());
         parameters.putAll(model.params());
-        if (model.tenant() != null) {
-            String issuer = model.tenant().issuerDid() != null ? model.tenant().issuerDid() : model.tenant().issuerIdentifier();
-            if (issuer != null) {
-                parameters.put("_issuer", issuer);
-            }
+        String issuer = issuerOf(model);
+        if (issuer != null) {
+            parameters.put("_issuer", issuer);
         }
         if (model.holder() != null && model.holder().isBound()) {
             parameters.put("_holderId", model.holder().value());
@@ -79,6 +77,20 @@ public class VelocityTemplateEngine implements TemplateEngine {
         } catch (Exception e) {
             throw new FormatException(ERROR_TEMPLATE_RENDER, "Template " + template.templateId() + " did not render a JSON object: " + e.getMessage(), e);
         }
+    }
+
+    /** The tenant's issuer DID or identifier, else the configuration's {@code didUrl} template parameter (legacy rows). */
+    static String issuerOf(TemplateModel model) {
+        if (model.tenant() != null) {
+            if (model.tenant().issuerDid() != null) {
+                return model.tenant().issuerDid();
+            }
+            if (model.tenant().issuerIdentifier() != null) {
+                return model.tenant().issuerIdentifier();
+            }
+        }
+        Object didUrl = model.params().get("didUrl");
+        return didUrl == null || String.valueOf(didUrl).isBlank() ? null : String.valueOf(didUrl);
     }
 
     /** Configurations store the template base64-encoded; inline templates are plain text. */
