@@ -28,7 +28,7 @@ Arrows point inward only: adapters and the CLI know the core, the core knows the
 | `certify-spi` | The interfaces and value types in the sketch below; semver-versioned, published for plugin authors | JDK only |
 | `certify-signing` | `KeyProvider` and `Signer` contracts, envelope builders (JWS, COSE\_Sign1, CWT, Data Integrity, legacy LD suites), `AlgorithmRegistry`, `KidStrategy`, `KeyPublisher` (JWKS and DID document) | `certify-spi`, nimbus, danubetech, BouncyCastle |
 | `certify-keyprovider-keymanager`, `-pkcs11`, `-jca`, `-kms-*` | One `KeyProvider` + `Signer` each; keymanager is the default and the only one that needs keymanager's own JPA tables | `certify-signing` |
-| `certify-core` | `IssuanceService`, `CredentialRegistry`, `CredentialConfiguration` model, `IssuanceContext`, ports for nonce, transaction and configuration storage | `certify-spi`, `certify-signing` |
+| `certify-core` (built as `certify-issuance`; the existing `certify-core` artifact keeps its name for plugin compatibility, see decision log) | `IssuanceService`, `CredentialRegistry`, `CredentialConfiguration` model, `IssuanceContext`, ports for nonce, transaction and configuration storage | `certify-spi`, `certify-signing` |
 | `certify-format-ldp-vc`, `-sd-jwt`, `-mdoc`, `-jwt-vc` | One `CredentialFormatter` each, owning envelope, request validation, metadata fragment, config schema | `certify-spi`, `certify-signing` |
 | `certify-template-velocity`, `certify-template-jsonmap` | `TemplateEngine` implementations | `certify-spi` |
 | `certify-persistence` | JPA entities, repositories, Flyway migrations, storage-port implementations | `certify-core` |

@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>io.inji.certify</groupId>
+        <artifactId>certify-parent</artifactId>
+        <version>1.0.0-beta.1-SNAPSHOT</version>
+    </parent>
+    <artifactId>certify-issuance</artifactId>
+    <name>certify-issuance</name>
+    <description>Protocol-agnostic issuance core: IssuanceService over the certify-spi extension points and the certify-signing library. No Spring Web, no JPA, no Velocity (docs/design/05-target-architecture.md; named certify-issuance because certify-core is the existing DTO module).</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.inji.certify</groupId>
+            <artifactId>certify-spi</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.inji.certify</groupId>
+            <artifactId>certify-keyprovider-jca</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.tngtech.archunit</groupId>
+            <artifactId>archunit-junit5</artifactId>
+            <version>1.3.0</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.google.crypto.tink</groupId>
+            <artifactId>tink</artifactId>
+            <version>1.13.0</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>
