@@ -64,6 +64,11 @@ public class JwtProofValidator implements ProofValidator {
 
     @Override
     public boolean validate(String clientId, String cNonce, String proofJwt, Map<String, Object> proofConfiguration) {
+        return validate(clientId, cNonce, proofJwt, proofConfiguration, credentialIdentifier);
+    }
+
+    /** Same checks with an explicit expected audience (the new surface has its own issuer identifier). */
+    public boolean validate(String clientId, String cNonce, String proofJwt, Map<String, Object> proofConfiguration, String expectedAudience) {
         if(proofJwt == null || proofJwt.isBlank()) {
             log.error("Found invalid jwt in the credential proof");
             return false;
@@ -93,7 +98,7 @@ public class JwtProofValidator implements ProofValidator {
             }
 
             JWTClaimsSet.Builder proofJwtClaimsBuilder = new JWTClaimsSet.Builder()
-                    .audience(credentialIdentifier);
+                    .audience(expectedAudience == null ? credentialIdentifier : expectedAudience);
             if (!StringUtils.isEmpty(cNonce)) {
                 proofJwtClaimsBuilder = proofJwtClaimsBuilder
                         .claim("nonce", cNonce);

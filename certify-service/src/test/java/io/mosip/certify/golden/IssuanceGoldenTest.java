@@ -517,7 +517,7 @@ class IssuanceGoldenTest {
 
     @Test
     void oid4vciLdpVcIssuanceGoldenAndIndependentVerification() throws Exception {
-        MvcResult result = issueOid4vci(LDP_ID, proofJwt(nonce()));
+        MvcResult result = issueOid4vci(LDP_ID, oid4vciProof(new ECKeyGenerator(Curve.P_256).generate()));
         JsonNode body = objectMapper.readTree(result.getResponse().getContentAsString());
         assertEquals(200, result.getResponse().getStatus(), body.toString());
         JsonNode credential = body.get("credentials").get(0).get("credential");
@@ -534,7 +534,7 @@ class IssuanceGoldenTest {
 
     @Test
     void oid4vciSdJwtIssuanceGoldenAndIndependentVerification() throws Exception {
-        MvcResult result = issueOid4vci(SDJWT_ID, proofJwt(nonce()));
+        MvcResult result = issueOid4vci(SDJWT_ID, oid4vciProof(new ECKeyGenerator(Curve.P_256).generate()));
         JsonNode body = objectMapper.readTree(result.getResponse().getContentAsString());
         assertEquals(200, result.getResponse().getStatus(), body.toString());
         String sdJwt = body.get("credentials").get(0).get("credential").asText();
@@ -544,7 +544,7 @@ class IssuanceGoldenTest {
         assertEquals("dc+sd-jwt", jws.getHeader().getType().getType());
         JsonNode payload = objectMapper.readTree(jws.getPayload().toString());
         assertEquals("GoldenCredential", payload.get("vct").asText());
-        assertEquals(issuerIdentifier, payload.get("iss").asText());
+        assertEquals(issuerIdentifier + "/oid4vci", payload.get("iss").asText(), "iss is the identifier of the surface that issued it");
         assertTrue(payload.get("cnf").get("kid").asText().startsWith("did:jwk:"));
         JWKSet jwks = JWKSet.parse(getJson("/.well-known/jwks.json").toString());
         JWK key = jwks.getKeyByKeyId(jws.getHeader().getKeyID());
@@ -557,7 +557,7 @@ class IssuanceGoldenTest {
     @Test
     void oid4vciMdocIssuanceGoldenAndIndependentVerification() throws Exception {
         ECKey holder = new ECKeyGenerator(Curve.P_256).generate();
-        MvcResult result = issueOid4vci(MDOC_ID, proofJwt(nonce(), holder));
+        MvcResult result = issueOid4vci(MDOC_ID, oid4vciProof(holder));
         JsonNode body = objectMapper.readTree(result.getResponse().getContentAsString());
         assertEquals(200, result.getResponse().getStatus(), body.toString());
         String credential = body.get("credentials").get(0).get("credential").asText();
@@ -596,16 +596,38 @@ class IssuanceGoldenTest {
     }
 
     @Test
+    void oid4vciIssuerMetadataGolden() throws Exception {
+        JsonNode metadata = getJson("/oid4vci/.well-known/openid-credential-issuer");
+        assertEquals(issuerIdentifier + "/oid4vci", metadata.get("credential_issuer").asText(), "the new surface has its own identifier");
+        assertEquals(issuerIdentifier + "/oid4vci/credential", metadata.get("credential_endpoint").asText());
+        assertEquals(issuerIdentifier + "/oid4vci/nonce", metadata.get("nonce_endpoint").asText());
+        assertTrue(metadata.get("credential_configurations_supported").has(LDP_ID));
+        assertTrue(metadata.get("credential_configurations_supported").has(MDOC_ID));
+        Goldens.assertGolden("v2/oid4vci/openid-credential-issuer", metadata);
+    }
+
+    @Test
     void oid4vciErrorsFollowTheSpec() throws Exception {
         // the local profile's TestBearer filter authenticates every request, so the 401 path is covered by the controller unit only
-        MvcResult unknown = issueOid4vci("NoSuchCredential", proofJwt(nonce()));
+        MvcResult unknown = issueOid4vci("NoSuchCredential", oid4vciProof(new ECKeyGenerator(Curve.P_256).generate()));
         assertEquals(400, unknown.getResponse().getStatus());
         assertEquals("invalid_credential_request", objectMapper.readTree(unknown.getResponse().getContentAsString()).get("error").asText());
 
-        nonce();
-        MvcResult badNonce = issueOid4vci(LDP_ID, proofJwt("not-the-nonce"));
+        MvcResult badNonce = issueOid4vci(LDP_ID, proofJwt("not-the-nonce", new ECKeyGenerator(Curve.P_256).generate(), issuerIdentifier + "/oid4vci"));
         assertEquals(400, badNonce.getResponse().getStatus());
         assertEquals("invalid_nonce", objectMapper.readTree(badNonce.getResponse().getContentAsString()).get("error").asText());
+
+        // a proof for the compatibility surface (its audience) is refused on the new surface
+        MvcResult wrongAudience = issueOid4vci(LDP_ID, proofJwt(nonce()));
+        assertEquals(400, wrongAudience.getResponse().getStatus());
+        assertEquals("invalid_proof", objectMapper.readTree(wrongAudience.getResponse().getContentAsString()).get("error").asText());
+    }
+
+    /** A proof for the new surface: audience = its issuer identifier, nonce from its nonce endpoint. */
+    private String oid4vciProof(ECKey holder) throws Exception {
+        String nonce = objectMapper.readTree(mockMvc.perform(post("/oid4vci/nonce")).andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString()).get("c_nonce").asText();
+        return proofJwt(nonce, holder, issuerIdentifier + "/oid4vci");
     }
 
     private MvcResult issueOid4vci(String configurationId, String proof) throws Exception {
@@ -720,9 +742,13 @@ class IssuanceGoldenTest {
     }
 
     private String proofJwt(String nonce, ECKey holder) throws Exception {
+        return proofJwt(nonce, holder, issuerIdentifier);
+    }
+
+    private String proofJwt(String nonce, ECKey holder, String audience) throws Exception {
         JWSHeader header = new JWSHeader.Builder(JWSAlgorithm.ES256).type(new JOSEObjectType("openid4vci-proof+jwt"))
                 .jwk(holder.toPublicJWK()).build();
-        JWTClaimsSet claims = new JWTClaimsSet.Builder().audience(issuerIdentifier).issueTime(new Date())
+        JWTClaimsSet claims = new JWTClaimsSet.Builder().audience(audience).issueTime(new Date())
                 .claim("nonce", nonce).build();
         SignedJWT jwt = new SignedJWT(header, claims);
         jwt.sign(new ECDSASigner(holder));

@@ -94,9 +94,11 @@ builds one in-process if you want to see the exact shape.
 
 ## 6b. The new surface
 
-`POST /v1/certify/oid4vci/credential` (same request body, same access token) issues `ldp_vc` through the rebuilt core;
-the wallet flow above still uses the compatibility path `/issuance/credential`. Issuer metadata and the nonce endpoint
-under `/oid4vci` arrive with the next slices, so a wallet cannot discover the new surface yet.
+The rebuilt core serves `ldp_vc`, `dc+sd-jwt` and `mso_mdoc` at `POST /v1/certify/oid4vci/credential`, discovered
+through `GET /v1/certify/oid4vci/.well-known/openid-credential-issuer` (its own `credential_issuer`, ending in
+`/oid4vci`) with `POST /v1/certify/oid4vci/nonce`. A wallet whose issuer entry points at that metadata completes the
+same pre-authorized flow on the new surface (the token comes from the same `/oauth/token`; the proof's `aud` must be
+the new `credential_issuer`). The wallet flow above still uses the compatibility path `/issuance/credential`.
 
 ## 7. Verify the credential independently
 
