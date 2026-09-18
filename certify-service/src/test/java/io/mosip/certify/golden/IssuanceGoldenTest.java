@@ -839,7 +839,7 @@ class IssuanceGoldenTest {
     }
 
     /** mso_mdoc: docType, namespace claims, ES256 with the EC_R1 key; the validator wants a cryptosuite key of the signing-alg map. */
-    private static CredentialConfigurationDTO mdocConfig() throws Exception {
+    static CredentialConfigurationDTO mdocConfig() throws Exception {
         CredentialConfigurationDTO dto = new CredentialConfigurationDTO();
         dto.setCredentialConfigKeyId(MDOC_ID);
         dto.setCredentialFormat("mso_mdoc");
@@ -858,7 +858,7 @@ class IssuanceGoldenTest {
         return dto;
     }
 
-    private static CredentialConfigurationDTO sdJwtConfig() throws Exception {
+    static CredentialConfigurationDTO sdJwtConfig() throws Exception {
         CredentialConfigurationDTO dto = new CredentialConfigurationDTO();
         dto.setCredentialConfigKeyId(SDJWT_ID);
         dto.setCredentialFormat("dc+sd-jwt");

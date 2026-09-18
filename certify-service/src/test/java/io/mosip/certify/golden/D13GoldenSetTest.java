@@ -1,7 +1,6 @@
 package io.mosip.certify.golden;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
@@ -13,8 +12,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * The draft-13 golden set recorded from release 0.14.0 (docs/design/wp/p0-02-recorder). Until the oid4vci-d13 adapter
- * exists (P1-12) nothing can replay it; this test keeps the set complete, parseable and free of unmasked volatile values.
+ * The draft-13 golden set recorded from release 0.14.0 (docs/design/wp/p0-02-recorder): complete, parseable and free of
+ * unmasked volatile values. {@link D13GoldenReplayTest} replays it against the oid4vci-d13 adapter.
  */
 class D13GoldenSetTest {
 
@@ -45,10 +44,5 @@ class D13GoldenSetTest {
             long count = files.filter(p -> p.toString().endsWith(".json")).count();
             assertTrue(count == EXPECTED.size(), "unexpected golden files under d13: " + count + " vs " + EXPECTED.size());
         }
-    }
-
-    @Test
-    @Disabled("replayed against the oid4vci-d13 adapter once P1-12 lands")
-    void replayAgainstTheD13Adapter() {
     }
 }

@@ -35,6 +35,8 @@ public class SdJwtFormatter implements CredentialFormatter {
 
     public static final String FORMAT = "dc+sd-jwt";
     public static final String ALIAS_VC_SD_JWT = "vc+sd-jwt";
+    /** Protocol parameter naming the format string the wallet asked for; a draft-13 {@code vc+sd-jwt} request keeps that {@code typ}. */
+    public static final String PARAM_REQUESTED_FORMAT = "requestedFormat";
     public static final String ERROR_SD_CLAIMS = "sd_claims_parse_error";
     public static final String ATTRIBUTE_DISCLOSURES = "disclosures";
     static final String RAW_VCT = "vct";
@@ -97,6 +99,16 @@ public class SdJwtFormatter implements CredentialFormatter {
         return new UnsignedCredential(FORMAT, builder.build(), Map.of(ATTRIBUTE_DISCLOSURES, encoded));
     }
 
+    /** {@code typ dc+sd-jwt}, except for a draft-13 request that named {@code vc+sd-jwt}: 0.14.0 answered with that typ and its wallets check it. */
+    static JwsHeaderPolicy headerPolicy(IssuanceContext context) {
+        JwsHeaderPolicy policy = JwsHeaderPolicy.sdJwtVc();
+        if (context != null && context.protocol() == ProtocolVersion.OID4VCI_D13
+                && ALIAS_VC_SD_JWT.equals(context.protocolParams().get(PARAM_REQUESTED_FORMAT))) {
+            return policy.withTyp(ALIAS_VC_SD_JWT);
+        }
+        return policy;
+    }
+
     @Override
     public IssuedCredential sign(UnsignedCredential credential, SigningContext signing, IssuanceContext context) {
         String payload;
@@ -105,7 +117,7 @@ public class SdJwtFormatter implements CredentialFormatter {
         } catch (Exception e) {
             throw new FormatException(ERROR_SD_CLAIMS, "SD-JWT payload is not serializable: " + e.getMessage(), e);
         }
-        String jws = JwsEnvelope.sign(payload, JwsHeaderPolicy.sdJwtVc(), signing.key(), signing.signer());
+        String jws = JwsEnvelope.sign(payload, headerPolicy(context), signing.key(), signing.signer());
         @SuppressWarnings("unchecked")
         List<String> disclosures = (List<String>) credential.attributes().getOrDefault(ATTRIBUTE_DISCLOSURES, List.of());
         StringBuilder out = new StringBuilder(jws).append('~');
