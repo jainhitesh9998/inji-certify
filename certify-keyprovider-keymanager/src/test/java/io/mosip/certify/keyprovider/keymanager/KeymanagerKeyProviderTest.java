@@ -145,6 +145,13 @@ class KeymanagerKeyProviderTest {
     }
 
     @Test
+    void publicKeysOfAnAliasIncludeRotatedOutCertificates() {
+        List<PublicKeyDescriptor> keys = provider.publicKeys(ED.toKeyRef());
+        assertEquals(List.of(edExpiredKid, edCurrentKid), keys.stream().map(PublicKeyDescriptor::kid).toList());
+        assertThrows(SigningException.class, () -> provider.publicKeys(KeyRef.parse("jca:x")));
+    }
+
+    @Test
     void certificatesAreCachedForTheTtlAndEvictable() {
         provider.resolve(ED.toKeyRef());
         provider.resolve(ED.toKeyRef());

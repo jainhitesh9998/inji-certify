@@ -28,7 +28,9 @@ public final class Goldens {
     static final Set<String> VOLATILE_KEYS = Set.of(
             "id", "issuanceDate", "expirationDate", "validFrom", "validUntil", "created", "proofValue", "jws",
             "iat", "exp", "nbf", "jti", "c_nonce", "nonce", "_sd", "sd_alg", "cnf", "signature", "x5c", "x5t#S256", "kid",
-            "pre-authorized_code", "access_token", "credential_offer_uri");
+            "pre-authorized_code", "access_token", "credential_offer_uri",
+            // published key material regenerates with the test keystore on every run
+            "publicKeyMultibase", "publicKeyJwk", "publicKeyPem", "x", "y", "n", "e");
 
     private static final ObjectMapper MAPPER = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT)
             .enable(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS);

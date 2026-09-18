@@ -23,4 +23,12 @@ public interface KeyProvider extends Signer {
 
     /** Creates the keys a deployment needs when the provider can; default is to do nothing. */
     default void ensureKeys(List<KeyRequirement> required) {}
+
+    /**
+     * Every key the alias has had, current one included: what a DID document or a JWKS lists so credentials signed
+     * before a rotation still verify. Providers without rotation history return the current key only.
+     */
+    default List<PublicKeyDescriptor> publicKeys(KeyRef ref) {
+        return List.of(resolve(ref).descriptor());
+    }
 }

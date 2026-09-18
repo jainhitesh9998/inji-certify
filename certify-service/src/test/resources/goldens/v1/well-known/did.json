@@ -1,0 +1,29 @@
+{
+  "@context" : [ "https://www.w3.org/ns/did/v1", "https://w3id.org/security/v1", "https://w3id.org/security/suites/ecdsa-2019/v1", "https://w3id.org/security/suites/ed25519-2020/v1" ],
+  "alsoKnownAs" : [ ],
+  "assertionMethod" : [ "did:web:localhost:certify" ],
+  "authentication" : [ "did:web:localhost:certify" ],
+  "id" : "<id>",
+  "service" : [ ],
+  "verificationMethod" : [ {
+    "controller" : "did:web:localhost:certify",
+    "id" : "<id>",
+    "publicKeyJwk" : "<publicKeyJwk>",
+    "type" : "EcdsaSecp256k1VerificationKey2019"
+  }, {
+    "controller" : "did:web:localhost:certify",
+    "id" : "<id>",
+    "publicKeyPem" : "<publicKeyPem>",
+    "type" : "RsaVerificationKey2018"
+  }, {
+    "controller" : "did:web:localhost:certify",
+    "id" : "<id>",
+    "publicKeyMultibase" : "<publicKeyMultibase>",
+    "type" : "EcdsaSecp256r1VerificationKey2019"
+  }, {
+    "controller" : "did:web:localhost:certify",
+    "id" : "<id>",
+    "publicKeyMultibase" : "<publicKeyMultibase>",
+    "type" : "Ed25519VerificationKey2020"
+  } ]
+}

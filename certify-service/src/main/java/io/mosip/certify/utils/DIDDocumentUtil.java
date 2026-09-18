@@ -19,16 +19,19 @@ import com.nimbusds.jose.jwk.ECKey;
 import io.mosip.certify.core.dto.CertificateResponseDTO;
 import io.mosip.certify.entity.CredentialConfig;
 import io.mosip.certify.repository.CredentialConfigRepository;
-import io.mosip.kernel.keymanagerservice.dto.AllCertificatesDataResponseDto;
-import io.mosip.kernel.keymanagerservice.dto.CertificateDataResponseDto;
-import io.mosip.kernel.keymanagerservice.service.KeymanagerService;
-import org.bouncycastle.jcajce.provider.asymmetric.edec.BCEdDSAPublicKey;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import io.ipfs.multibase.Multibase;
 import org.springframework.beans.factory.annotation.Value;
 import io.mosip.certify.core.constants.ErrorConstants;
 import io.mosip.certify.core.constants.SignatureAlg;
 import io.mosip.certify.core.exception.CertifyException;
+import io.mosip.certify.issuance.KeyProviderRegistry;
+import io.mosip.certify.signing.KeyProvider;
+import io.mosip.certify.signing.KeyRef;
+import io.mosip.certify.signing.LegacyKeyRefs;
+import io.mosip.certify.signing.PublicKeyDescriptor;
+import io.mosip.certify.signing.SigningException;
+import io.mosip.certify.signing.SigningKey;
 import lombok.extern.slf4j.Slf4j;
 import org.bouncycastle.util.BigIntegers;
 import org.springframework.cache.annotation.Cacheable;
@@ -38,7 +41,7 @@ import org.springframework.stereotype.Component;
 @Component
 public class DIDDocumentUtil {
 
-    private final KeymanagerService keymanagerService;
+    private final KeyProviderRegistry keyProviders;
     private final CredentialConfigRepository credentialConfigRepository;
 
     @Value("#{${mosip.certify.credential-config.credential-signing-alg-values-supported}}")
@@ -55,9 +58,9 @@ public class DIDDocumentUtil {
             Map.entry("EcdsaSecp256k1VerificationKey2019", "https://w3id.org/security/v1")
     );
 
-    public DIDDocumentUtil(KeymanagerService keymanagerService,
+    public DIDDocumentUtil(KeyProviderRegistry keyProviders,
                            CredentialConfigRepository credentialConfigRepository) {
-        this.keymanagerService = keymanagerService;
+        this.keyProviders = keyProviders;
         this.credentialConfigRepository = credentialConfigRepository;
     }
 
@@ -101,43 +104,43 @@ public class DIDDocumentUtil {
             Set<String> contextList) {
 
         List<String> keyParams = entry.getValue();
-        AllCertificatesDataResponseDto kidResponse = fetchCertificates(keyParams);
-
-        return Arrays.stream(kidResponse.getAllCertificates())
-                .map(certificateData -> processCertificateData(certificateData, keyParams, didUrl, uniqueIds, contextList))
+        return fetchKeys(keyParams).stream()
+                .map(descriptor -> processKey(descriptor, keyParams, didUrl, uniqueIds, contextList))
                 .filter(Objects::nonNull);
     }
 
-    private AllCertificatesDataResponseDto fetchCertificates(List<String> keyParams) {
+    /** Every key the alias has had, so rotated-out keys stay resolvable for older credentials. */
+    private List<PublicKeyDescriptor> fetchKeys(List<String> keyParams) {
         String appId = keyParams.get(0);
         String refId = keyParams.get(1);
-        AllCertificatesDataResponseDto kidResponse = keymanagerService.getAllCertificates(appId,
-                refId != null ? Optional.of(refId) : Optional.empty());
-
-        if (kidResponse == null || kidResponse.getAllCertificates() == null) {
+        KeyRef ref = LegacyKeyRefs.keymanager(appId, refId);
+        List<PublicKeyDescriptor> keys;
+        try {
+            keys = keyProviders.provider(ref.provider()).publicKeys(ref);
+        } catch (SigningException e) {
+            log.error("No certificates found for appId: {} and refId: {}", appId, refId, e);
+            throw new CertifyException("No certificates found");
+        }
+        if (keys == null || keys.isEmpty()) {
             log.error("No certificates found for appId: {} and refId: {}", appId, refId);
             throw new CertifyException("No certificates found");
         }
-        return kidResponse;
+        return keys;
     }
 
-    private Map<String, Object> processCertificateData(
-            CertificateDataResponseDto certificateData,
+    private Map<String, Object> processKey(
+            PublicKeyDescriptor descriptor,
             List<String> keyParams,
             String didUrl,
             Set<String> uniqueIds,
             Set<String> contextList) {
-
-        String certificateString = certificateData.getCertificateData();
-        String kid = certificateData.getKeyId();
         Map<String, Object> verificationMethod = generateVerificationMethod(
                 keyParams.get(2),
                 keyParams.size() > 3 ? keyParams.get(3) : null,
-                certificateString,
+                descriptor.publicKey(),
                 didUrl,
-                kid
+                descriptor.kid()
         );
-
         String verificationId = (String) verificationMethod.get("id");
         if (uniqueIds.add(verificationId)) {
             String type = (String) verificationMethod.get("type");
@@ -156,7 +159,11 @@ public class DIDDocumentUtil {
 
     private static Map<String, Object> generateVerificationMethod(String signatureAlgo, String signatureCryptoSuite,
                                                                   String certificateString, String didUrl, String kid) {
-        PublicKey publicKey = loadPublicKeyFromCertificate(certificateString);
+        return generateVerificationMethod(signatureAlgo, signatureCryptoSuite, loadPublicKeyFromCertificate(certificateString), didUrl, kid);
+    }
+
+    private static Map<String, Object> generateVerificationMethod(String signatureAlgo, String signatureCryptoSuite,
+                                                                  PublicKey publicKey, String didUrl, String kid) {
 
         Map<String, Object> verificationMethod = switch (signatureAlgo) {
             case JWSAlgorithm.ES256K -> generateECK1VerificationMethod(publicKey, didUrl);
@@ -210,8 +217,12 @@ public class DIDDocumentUtil {
 
     private static Map<String, Object> generateEd25519VerificationMethod(PublicKey publicKey, String didUrl,
                                                                          String signatureCryptoSuite) {
-        BCEdDSAPublicKey edKey = (BCEdDSAPublicKey) publicKey;
-        byte[] rawBytes = edKey.getPointEncoding();
+        // raw 32-byte key from the SubjectPublicKeyInfo (RFC 8410), whichever JCA provider produced the key object
+        byte[] spki = publicKey.getEncoded();
+        if (spki == null || spki.length != 44) {
+            throw new CertifyException(ErrorConstants.INVALID_CERTIFICATE);
+        }
+        byte[] rawBytes = Arrays.copyOfRange(spki, 12, 44);
         byte[] multicodecBytes = HexFormat.of().parseHex(MULTICODEC_PREFIX);
         byte[] finalBytes = new byte[multicodecBytes.length + rawBytes.length];
         System.arraycopy(multicodecBytes, 0, finalBytes, 0, multicodecBytes.length);
@@ -265,25 +276,27 @@ public class DIDDocumentUtil {
 
     @Cacheable(value = "certificatedatacache", key = "#appId + '-' + #refId")
     public CertificateResponseDTO getCertificateDataResponseDto(String appId, String refId) {
-        AllCertificatesDataResponseDto kidResponse = keymanagerService.getAllCertificates(appId, Optional.of(refId));
-        if (kidResponse == null || kidResponse.getAllCertificates() == null || kidResponse.getAllCertificates().length == 0) {
-            log.error("No certificates found for appId: {} and refId: {}", appId, refId);
-            throw new CertifyException("No certificates found");
+        KeyRef ref = LegacyKeyRefs.keymanager(appId, refId);
+        SigningKey key;
+        try {
+            key = keyProviders.provider(ref.provider()).resolve(ref); // the latest-expiring certificate valid now
+        } catch (SigningException e) {
+            log.error("No valid certificates found for appId: {} and refId: {}", appId, refId, e);
+            throw new CertifyException("No valid certificates found");
         }
-
-        CertificateDataResponseDto certificateData = Arrays.stream(kidResponse.getAllCertificates())
-                .filter(cert -> cert.getExpiryAt() != null && cert.getExpiryAt().isAfter(LocalDateTime.now()))
-                .max(Comparator.comparing(CertificateDataResponseDto::getExpiryAt))
-                .orElseThrow(() -> {
-                    log.error("No valid certificates found for appId: {} and refId: {}", appId, refId);
-                    return new CertifyException("No valid certificates found");
-                });
-
         CertificateResponseDTO certificateResponseDTO = new CertificateResponseDTO();
-        certificateResponseDTO.setCertificateData(certificateData.getCertificateData());
-        certificateResponseDTO.setKeyId(certificateData.getKeyId());
-
+        certificateResponseDTO.setCertificateData(key.chain().leaf().map(DIDDocumentUtil::toPem).orElse(null));
+        certificateResponseDTO.setKeyId(key.kid());
         return certificateResponseDTO;
+    }
+
+    private static String toPem(java.security.cert.X509Certificate certificate) {
+        try {
+            return "-----BEGIN CERTIFICATE-----\n" + java.util.Base64.getMimeEncoder(64, "\n".getBytes()).encodeToString(certificate.getEncoded())
+                    + "\n-----END CERTIFICATE-----\n";
+        } catch (java.security.cert.CertificateEncodingException e) {
+            throw new CertifyException("Cannot encode certificate");
+        }
     }
 
     private Map<String, List<String>> getSignatureCryptoSuiteMap() {
