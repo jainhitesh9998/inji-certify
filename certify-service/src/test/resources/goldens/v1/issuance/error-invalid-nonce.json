@@ -1,0 +1,7 @@
+{
+  "body" : {
+    "error" : "invalid_nonce",
+    "error_description" : "c_nonce is invalid or expired"
+  },
+  "status" : 400
+}

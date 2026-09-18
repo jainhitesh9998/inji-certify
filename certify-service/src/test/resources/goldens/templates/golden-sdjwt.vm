@@ -1,0 +1,7 @@
+{
+    "fullName": "${fullName}",
+    "dateOfBirth": "${dateOfBirth}",
+    "address": {
+        "city": "${city}"
+    }
+}

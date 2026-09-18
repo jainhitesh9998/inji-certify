@@ -1,0 +1,7 @@
+{
+  "body" : {
+    "error" : "invalid_credential_request",
+    "error_description" : "No credential configuration found for credential_configuration_id"
+  },
+  "status" : 400
+}
