@@ -1,0 +1,8 @@
+#
+#Fri Sep 18 20:48:10 IST 2026
+VCFormats\ is\ referenced\ only\ from\ certify-spi\ and\ formatter\ modules=8639735c-4b27-4196-8f34-8483a1de038f
+certify-core\ depends\ on\ no\ web,\ JPA,\ Velocity,\ danubetech\ or\ keymanager\ types=715e25c7-d4a1-43bf-a967-aa2f19224d0a
+certify-signing\ depends\ on\ no\ web,\ JPA\ or\ Velocity\ types=865e174b-4e6f-49fb-8068-da7777b029ed
+controllers\ do\ not\ depend\ on\ repositories\ or\ entities=8fa3b079-b00b-4c05-833a-d80f8fbb0d09
+io.mosip.kernel\ is\ referenced\ only\ from\ certify-keyprovider-keymanager=b451ea4b-b1ba-436f-a5d5-05bec91c410b
+template\ engines\ do\ not\ read\ repositories=04ec8741-2ffd-4d4f-afe6-468f76861896
