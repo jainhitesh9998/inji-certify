@@ -100,6 +100,21 @@ through `GET /v1/certify/oid4vci/.well-known/openid-credential-issuer` (its own 
 same pre-authorized flow on the new surface (the token comes from the same `/oauth/token`; the proof's `aud` must be
 the new `credential_issuer`). The wallet flow above still uses the compatibility path `/issuance/credential`.
 
+## 6c. Draft-13 wallets and the compatibility path through the core
+
+A wallet that still speaks OpenID4VCI draft 13 (release 0.14.0) posts the 0.14.0 body to the same
+`POST /v1/certify/issuance/credential` (`format` plus `credential_definition`, `vct` or `doctype`, one `proof`) or to
+`/v1/certify/issuance/vd12/credential` and `/v1/certify/issuance/vd11/credential`; it discovers the issuer through
+`GET /v1/certify/.well-known/openid-credential-issuer?version=latest|vd12|vd11` or the `/v1/certify/issuance/.well-known/`
+aliases. A wrong or missing nonce is answered with `invalid_proof` carrying the `c_nonce` to use next, as 0.14.0 did.
+Every draft-13 answer carries `Deprecation` and `Link` headers and counts in `certify.deprecated.calls`;
+`certify.protocol.oid4vci-d13.enabled=false` removes the adapter, `mosip.certify.deprecated.<endpoint>.enabled=false`
+turns one endpoint into `410 Gone`.
+
+The 1.0 body on `/issuance/credential` is still served by the legacy issuance service unless
+`certify.protocol.oid4vci-v1.compat-core.enabled=true` (DataProvider plugin mode), which routes it through the new
+core; the golden tests run both modes, so the wallet flow above is the same either way.
+
 ## 7. Verify the credential independently
 
 The wallet shows the credential; to check it with a third-party verifier, paste the `ldp_vc` JSON into any
