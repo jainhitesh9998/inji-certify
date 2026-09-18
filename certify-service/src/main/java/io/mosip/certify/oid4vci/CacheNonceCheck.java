@@ -28,6 +28,11 @@ public class CacheNonceCheck implements ProofValidator.NonceCheck {
         this.clock = clock;
     }
 
+    /** Drops a nonce the credential request has used, so the same proof cannot be replayed (OpenID4VCI 1.0, nonce endpoint). */
+    public void consume(String nonce) {
+        cache.evictNonceTransaction(nonce);
+    }
+
     @Override
     public void check(String nonce) throws ProofValidationException {
         VCIssuanceTransaction transaction = cache.getNonceTransaction(nonce);

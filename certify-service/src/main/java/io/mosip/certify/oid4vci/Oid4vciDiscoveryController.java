@@ -25,16 +25,18 @@ public class Oid4vciDiscoveryController {
     private final io.mosip.certify.core.dto.AuthorizationContext authorizationContext;
     private final io.mosip.certify.tenancy.TenantContexts tenants;
     private final TenantIssuerMetadata tenantMetadata;
+    private final Oid4vciV1Properties properties;
 
     public Oid4vciDiscoveryController(CredentialRegistry registry, NonceService nonceService, Oid4vciIssuer issuer,
                                       io.mosip.certify.core.dto.AuthorizationContext authorizationContext,
-                                      io.mosip.certify.tenancy.TenantContexts tenants, TenantIssuerMetadata tenantMetadata) {
+                                      io.mosip.certify.tenancy.TenantContexts tenants, TenantIssuerMetadata tenantMetadata, Oid4vciV1Properties properties) {
         this.registry = registry;
         this.nonceService = nonceService;
         this.issuer = issuer;
         this.authorizationContext = authorizationContext;
         this.tenants = tenants;
         this.tenantMetadata = tenantMetadata;
+        this.properties = properties;
     }
 
     /** The default tenant's document is develop's (goldens); another tenant's is built from the core under its own identifier. */
@@ -53,6 +55,9 @@ public class Oid4vciDiscoveryController {
         metadata.setCredentialEndpoint(issuer.credentialEndpoint());
         metadata.setNonceEndpoint(issuer.nonceEndpoint());
         metadata.setNotificationEndpoint(issuer.notificationEndpoint());
+        if (properties.batch().size() > 1) {
+            metadata.setBatchCredentialIssuance(java.util.Map.of("batch_size", properties.batch().size()));
+        }
         metadata.setCredentialConfigurationSupportedDTO(legacy.getCredentialConfigurationSupportedDTO());
         return metadata;
     }

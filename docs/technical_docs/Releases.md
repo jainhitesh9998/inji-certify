@@ -12,6 +12,10 @@ The OpenID4VCI draft-13 credential endpoints of release 0.14.0 are served again 
 
 `POST`, `GET`, `PUT` and `DELETE /v2/credential-configurations` take and return the configuration model the rebuilt core reads (`formatConfig`, `signing`, `template`, `issuanceStrategy`, `status`, `display`, `protocol`), version templates in `credential_template`, and dry-run a body that carries `sampleClaims` through the template engine and formatter before saving it (`400 template_render_failed` otherwise). `POST /v2/credential-configurations/{id}/preview` renders a saved configuration against given claims without signing. Rows written through v2 carry every v1 column too, so `/credential-configurations` (v1), the compatibility endpoints and the issuer metadata see them unchanged. The v1 API is unchanged and not yet deprecated.
 
+## Single-use nonces and batch issuance on the new surface
+
+A `c_nonce` from `POST /oid4vci/nonce` now authorises one credential request: after the credentials are issued the nonce is dropped, and a replayed proof answers `400 invalid_nonce` (`certify.protocol.oid4vci-v1.nonce.single-use=false` restores the previous behaviour). The issuer metadata under `/oid4vci` advertises `batch_credential_issuance.batch_size` (`certify.protocol.oid4vci-v1.batch.size`, default 10); a request whose `proofs` exceed it answers `400 invalid_credential_request`. The compatibility endpoints and the draft-13 endpoints are unchanged.
+
 # Changes in release 0.11.0
 
 ## Removal of  Artifactory dependency

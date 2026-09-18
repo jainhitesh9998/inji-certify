@@ -92,6 +92,14 @@ public class VCICacheService {
         return cache.get("txn:" + cNonce, VCIssuanceTransaction.class);
     }
 
+    /** Drops a nonce-endpoint nonce once the credential request it authorised has been answered. */
+    public void evictNonceTransaction(String cNonce) {
+        Cache cache = cacheManager.getCache(NONCE_CACHE);
+        if (cache != null) {
+            cache.evict("txn:" + cNonce);
+        }
+    }
+
     public void setPreAuthCodeData(String code, PreAuthCodeData data) {
         String key = Constants.PRE_AUTH_CODE_PREFIX + code;
         cacheManager.getCache("preAuthCodeCache").put(key, data);

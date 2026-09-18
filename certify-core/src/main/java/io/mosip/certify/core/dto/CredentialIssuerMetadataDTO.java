@@ -26,6 +26,9 @@ public class CredentialIssuerMetadataDTO {
     @JsonProperty("notification_endpoint")
     private String notificationEndpoint;
 
+    @JsonProperty("batch_credential_issuance")
+    private Map<String, Object> batchCredentialIssuance;
+
     private List<Map<String, Object>> display;
 
     @JsonProperty("credential_configurations_supported")
