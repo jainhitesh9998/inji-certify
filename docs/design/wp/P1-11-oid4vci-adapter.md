@@ -15,7 +15,7 @@ The spec-clean surface exists and issues a credential end to end through `Defaul
 
 ## Not in this slice
 
-SD-JWT and mDoc formatters (P1-06, P1-07: the new surface answers `unsupported_credential_format` for them today), issuer metadata and nonce endpoints under `/oid4vci`, deferred and notification endpoints, credential response encryption, status attachment and ledger/audit listeners (P1-10), the credential `id`/`credentialStatus` post-processing the legacy `VCFormatter` performs, deprecation headers on the old paths (P3), HAIP profile.
+the mDoc formatter (P1-07: the new surface answers `unsupported_credential_format` for `mso_mdoc` today; SD-JWT arrived with P1-06), issuer metadata and nonce endpoints under `/oid4vci`, deferred and notification endpoints, credential response encryption, status attachment and ledger/audit listeners (P1-10), the credential `id`/`credentialStatus` post-processing the legacy `VCFormatter` performs, deprecation headers on the old paths (P3), HAIP profile.
 
 ## Acceptance criteria
 

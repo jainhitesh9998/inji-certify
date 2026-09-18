@@ -90,16 +90,14 @@ public class JsonMapTemplateEngine implements TemplateEngine {
 
     /** The tenant's issuer DID or identifier, else the configuration's {@code didUrl} template parameter (legacy rows). */
     static String issuerOf(TemplateModel model) {
-        if (model.tenant() != null) {
-            if (model.tenant().issuerDid() != null) {
-                return model.tenant().issuerDid();
-            }
-            if (model.tenant().issuerIdentifier() != null) {
-                return model.tenant().issuerIdentifier();
-            }
+        if (model.tenant() != null && model.tenant().issuerDid() != null) {
+            return model.tenant().issuerDid();
         }
         Object didUrl = model.params().get("didUrl");
-        return didUrl == null || String.valueOf(didUrl).isBlank() ? null : String.valueOf(didUrl);
+        if (didUrl != null && !String.valueOf(didUrl).isBlank()) {
+            return String.valueOf(didUrl);
+        }
+        return model.tenant() == null ? null : model.tenant().issuerIdentifier();
     }
 
     private Object fill(Object node, Map<String, Object> values, Map<String, Object> params, Map<String, Object> claims) {

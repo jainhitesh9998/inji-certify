@@ -123,6 +123,7 @@
 		<module>certify-template-velocity</module>
 		<module>certify-template-jsonmap</module>
 		<module>certify-format-ldp-vc</module>
+		<module>certify-format-sd-jwt</module>
 	</modules>
 	
 	<dependencies>
