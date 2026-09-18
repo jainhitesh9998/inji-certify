@@ -61,7 +61,8 @@ mvn -B -q -DskipTests -Dgpg.skip=true install     # build all modules (JAVA_HOME
 mvn -B -pl certify-service test                   # unit tests
 mvn -B -pl certify-service test -Dtest=GoldenReplayTest,SignatureVectorTest   # wire and signature guards (after P0-01, P0-03)
 mvn -B -pl certify-service test -Dtest='*ArchitectureTest'                     # ArchUnit (after P0-06)
-mvn -B -pl certify-service test -Dtest=FlywayMigrationTest,StatusListPostgresTest   # PostgreSQL via Testcontainers; skipped without Docker, part of the full suite when Docker is up
+mvn -B -pl certify-service test -Dtest=FlywayMigrationTest,UpgradeFrom014Test,StatusListPostgresTest   # PostgreSQL via Testcontainers; skipped without Docker, part of the full suite when Docker is up
+python3 docs/design/tools/smoke.py http://localhost:8090/v1/certify FarmerCredential   # end-to-end smoke run against a running stack (docs/design/VALIDATE.md 6d)
 mvn -B -pl certify-service spring-boot:run -Dspring-boot.run.profiles=local    # run with TestBearer tokens and the mock CSV data provider
 docker compose -f docker-compose/docker-compose-injistack/docker-compose.yml up   # full local stack, see its README
 java -jar certify-cli/target/certify-cli.jar keys generate -k keys.p12 -p pw --alias issuer --alg ES256   # CLI: keys, sign jws|cose (P1-14)
@@ -72,6 +73,7 @@ Java 21 and Maven 3.9 are required; Docker is required for Testcontainers and th
 - Maven must itself run on JDK 21, not just have a JDK 21 on `PATH`: JDK 23 and later disable implicit annotation processing, so Lombok never runs and `certify-integration-api` fails with `cannot find symbol setClientId`. On macOS: `export JAVA_HOME=$(/usr/libexec/java_home -v 21)` before any `mvn` command.
 - The parent pom binds `maven-gpg-plugin:sign` to `verify` for Maven Central publishing; add `-Dgpg.skip=true` to every `verify` or `install` locally and in CI.
 - `certify-service/pom.xml` lists `jitpack.io` first among repositories, and `verify-core`'s POM pulls transitive repositories (`sovrin`, with a broken TLS certificate). Maven asks JitPack to build any coordinate it cannot find locally and JitPack hangs for minutes. Locally, pass `-s .mvn/settings-local.xml -Dmaven.legacyLocalRepo=true` (routes `jitpack.io` and `sovrin` to Central; keeps `google` because `verify-core` needs `com.android.identity` from maven.google.com). The only JitPack-only artifact, `com.github.multiformats:java-multibase`, must be in `~/.m2` (fetch it once with `curl` from `https://jitpack.io/com/github/multiformats/java-multibase/v1.1.1/`).
+- `CertifyApplicationTests` boots the application on port 8090, so stop any local or compose Certify on that port before the full suite.
 - Testcontainers needs a running Docker daemon; on macOS start Docker Desktop and, if detection fails, `export DOCKER_HOST=unix://$HOME/.docker/run/docker.sock`. Docker Engine 29 removed API versions below 1.44, so the pinned Testcontainers 1.21.4 and docker-java 3.5.3 in the parent pom must not be downgraded.
 - In a `git worktree`, add `-Dmaven.gitcommitid.skip=true` (the `git-commit-id-plugin` cannot read a worktree's HEAD).
 - Full local recipe: `export JAVA_HOME=$(/usr/libexec/java_home -v 21); mvn -B -ntp -s .mvn/settings-local.xml -Dmaven.legacyLocalRepo=true -Dgpg.skip=true -DskipTests install` (about 10 s once dependencies are cached); baseline on `develop`: 858 tests green.

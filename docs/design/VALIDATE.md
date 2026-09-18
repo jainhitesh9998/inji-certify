@@ -147,6 +147,24 @@ The 1.0 body on `/issuance/credential` is still served by the legacy issuance se
 `certify.protocol.oid4vci-v1.compat-core.enabled=true` (DataProvider plugin mode), which routes it through the new
 core; the golden tests run both modes, so the wallet flow above is the same either way.
 
+## 6d. Scripted smoke run
+
+`docs/design/tools/smoke.py` walks the whole flow without a wallet: metadata on both surfaces, offer, token, nonce,
+`POST /issuance/credential`, `POST /oid4vci/credential` with `notification_id`, the notification endpoint, a
+replayed nonce (refused), the request without a token (401), `did.json` listing the proof's verification method,
+and the v2 configuration API (list, get, preview). It needs Python 3 with `pyjwt` and `cryptography`:
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install pyjwt cryptography
+.venv/bin/python docs/design/tools/smoke.py http://localhost:8090/v1/certify FarmerCredential
+```
+
+The stack's `mosip_certify_domain_url` decides the identifiers the script must use as proof audiences; with the
+compose default (`http://certify-nginx:80`) run it from inside the network or start the stack with the URL the
+script reaches, for example an override file setting `mosip_certify_domain_url=http://localhost:8090` on the
+`certify` service. On 2026-09-19 the run passed every check except the deprecation header on
+`/issuance/credential`, which waits for the owner's decision (P1-11f).
+
 ## 7. Verify the credential independently
 
 The wallet shows the credential; to check it with a third-party verifier, paste the `ldp_vc` JSON into any
