@@ -50,6 +50,10 @@ public class StatusListCredentialService {
     @PersistenceContext
     private EntityManager entityManager;
 
+    /** JSON-LD contexts of the legacy suites a status list may be signed with (the ones the context loader serves). */
+    static final Map<String, String> SUITE_CONTEXTS = Map.of(
+            "Ed25519Signature2020", "https://w3id.org/security/suites/ed25519-2020/v1");
+
     @Value("${mosip.certify.status-list.signature-crypto-suite:Ed25519Signature2020}")
     private String signatureCryptoSuite;
 
@@ -137,6 +141,12 @@ public class StatusListCredentialService {
 
             JSONArray contextList = new JSONArray();
             contextList.put("https://www.w3.org/ns/credentials/v2");
+            // The VC 2.0 context defines DataIntegrityProof only: a legacy suite needs its own context, or verifiers
+            // that expand the document before checking it see an undefined proof type.
+            String suiteContext = SUITE_CONTEXTS.get(signatureCryptoSuite);
+            if (suiteContext != null) {
+                contextList.put(suiteContext);
+            }
             statusListData.put("@context", contextList);
 
             JSONArray typeList = new JSONArray();
