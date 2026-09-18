@@ -7,6 +7,7 @@ import io.mosip.certify.core.dto.*;
 import io.mosip.certify.core.exception.CertifyException;
 import io.mosip.certify.core.exception.InvalidRequestException;
 import io.mosip.certify.core.spi.CredentialConfigurationService;
+import io.mosip.certify.core.spi.CredentialRegistry;
 import io.mosip.certify.entity.CredentialConfig;
 import io.mosip.certify.repository.CredentialConfigRepository;
 import io.mosip.certify.utils.AccessTokenJwtUtil;
@@ -41,6 +42,9 @@ public class PreAuthorizedCodeServiceTest {
     private CredentialConfigurationService credentialConfigurationService;
 
     @Mock
+    private CredentialRegistry credentialRegistry;
+
+    @Mock
     private CredentialConfigRepository credentialConfigRepository;
 
     @Mock
@@ -56,8 +60,7 @@ public class PreAuthorizedCodeServiceTest {
     private PreAuthorizedCodeService preAuthorizedCodeService;
     @Before
     public void setup() throws Exception {
-        preAuthorizedCodeService = new PreAuthorizedCodeService(
-                vciCacheService,
+        preAuthorizedCodeService = new PreAuthorizedCodeService(vciCacheService, credentialRegistry,
                 accessTokenJwtUtil,
                 objectMapper,
                 credentialConfigurationService,
@@ -120,7 +123,7 @@ public class PreAuthorizedCodeServiceTest {
         when(metadataDTO.getCredentialConfigurationSupportedDTO()).thenReturn(supportedDTOMap);
 
         // KEY FIX: Mock the credentialConfigurationService to return metadataDTO
-        when(credentialConfigurationService.fetchCredentialIssuerMetadata()).thenReturn(metadataDTO);
+        when(credentialRegistry.issuerMetadata()).thenReturn(metadataDTO);
 
         // Mock credentialConfigRepository
         CredentialConfig credentialConfig = new CredentialConfig();

@@ -135,6 +135,12 @@ public class VCIssuanceUtil {
             return Optional.empty();
         }
 
+        return Optional.of(toCredentialConfigurationSupported(credentialConfigId, credentialConfig));
+    }
+
+    /** The issuance-time view of one advertised configuration; shared by the registry and the issuance services. */
+    public static CredentialConfigurationSupported toCredentialConfigurationSupported(String credentialConfigId,
+                                                                                        CredentialConfigurationSupportedDTO credentialConfig) {
         CredentialConfigurationSupported credentialConfigurationSupported = new CredentialConfigurationSupported();
         credentialConfigurationSupported.setFormat(credentialConfig.getFormat());
         credentialConfigurationSupported.setScope(credentialConfig.getScope());
@@ -144,14 +150,11 @@ public class VCIssuanceUtil {
             credentialConfigurationSupported.setTypes(credentialConfig.getCredentialDefinition().getType());
             credentialConfigurationSupported.setContext(credentialConfig.getCredentialDefinition().getContext());
         }
-
-        if(credentialConfig.getFormat().equals(VCFormats.DC_SD_JWT)) {
+        if (VCFormats.DC_SD_JWT.equals(credentialConfig.getFormat())) {
             credentialConfigurationSupported.setVct(credentialConfig.getVct());
-        } else if(credentialConfig.getFormat().equals(VCFormats.MSO_MDOC)) {
+        } else if (VCFormats.MSO_MDOC.equals(credentialConfig.getFormat())) {
             credentialConfigurationSupported.setDocType(credentialConfig.getDocType());
         }
-
-
-        return Optional.of(credentialConfigurationSupported);
+        return credentialConfigurationSupported;
     }
 }

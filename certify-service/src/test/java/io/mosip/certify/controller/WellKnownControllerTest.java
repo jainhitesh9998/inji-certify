@@ -4,6 +4,7 @@ import io.mosip.certify.core.dto.CredentialIssuerMetadataDTO;
 import io.mosip.certify.core.dto.ParsedAccessToken;
 import io.mosip.certify.core.exception.InvalidRequestException;
 import io.mosip.certify.core.spi.CredentialConfigurationService;
+import io.mosip.certify.core.spi.CredentialRegistry;
 import io.mosip.certify.core.spi.JwksService;
 import io.mosip.certify.core.spi.VCIssuanceService;
 import org.junit.jupiter.api.BeforeEach;
@@ -32,6 +33,9 @@ class WellKnownControllerTest {
     private CredentialConfigurationService credentialConfigurationService;
 
     @MockBean
+    private CredentialRegistry credentialRegistry;
+
+    @MockBean
     private VCIssuanceService vcIssuanceService;
 
     @MockBean
@@ -56,10 +60,10 @@ class WellKnownControllerTest {
     @Test
     void getCredentialIssuerMetadata() throws Exception {
         CredentialIssuerMetadataDTO mockMetadata = mock(CredentialIssuerMetadataDTO.class);
-        when(credentialConfigurationService.fetchCredentialIssuerMetadata()).thenReturn(mockMetadata);
+        when(credentialRegistry.issuerMetadata()).thenReturn(mockMetadata);
         mockMvc.perform(get("/.well-known/openid-credential-issuer"))
                 .andExpect(status().isOk());
-        verify(credentialConfigurationService, times(1)).fetchCredentialIssuerMetadata();
+        verify(credentialRegistry, times(1)).issuerMetadata();
     }
 
     @Test

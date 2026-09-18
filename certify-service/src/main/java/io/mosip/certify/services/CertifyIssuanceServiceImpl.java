@@ -19,7 +19,7 @@ import io.mosip.certify.core.constants.*;
 import io.mosip.certify.core.dto.*;
 import io.mosip.certify.core.exception.CertifyException;
 import io.mosip.certify.core.exception.NotAuthenticatedException;
-import io.mosip.certify.core.spi.CredentialConfigurationService;
+import io.mosip.certify.core.spi.CredentialRegistry;
 import io.mosip.certify.core.spi.CredentialLedgerService;
 import io.mosip.certify.core.spi.VCIssuanceService;
 import io.mosip.certify.credential.Credential;
@@ -95,7 +95,7 @@ public class CertifyIssuanceServiceImpl implements VCIssuanceService {
     private Map<String, Object> didDocument;
 
     @Autowired
-    private CredentialConfigurationService credentialConfigurationService;
+    private CredentialRegistry credentialRegistry;
 
     @Value("${mosip.certify.identifier}")
     private String certifyIssuer;
@@ -139,7 +139,7 @@ public class CertifyIssuanceServiceImpl implements VCIssuanceService {
         // 2. Scope Validation
         String scopeClaim = (String) parsedAccessToken.getClaims().getOrDefault("scope", "");
         CredentialConfigurationSupported credentialConfigurationSupported = null;
-        CredentialIssuerMetadataDTO credentialIssuerMetadataDTO = credentialConfigurationService.fetchCredentialIssuerMetadata();
+        CredentialIssuerMetadataDTO credentialIssuerMetadataDTO = credentialRegistry.issuerMetadata();
         for(String scope : scopeClaim.split(Constants.SPACE)) {
             Optional<CredentialConfigurationSupported> result = getScopeCredentialMapping(
                     scope, credentialRequest.getCredentialConfigId(), credentialIssuerMetadataDTO);

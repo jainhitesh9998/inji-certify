@@ -27,6 +27,7 @@ import io.mosip.certify.core.exception.CertifyException;
 import io.mosip.certify.core.exception.InvalidRequestException;
 import io.mosip.certify.core.exception.NotAuthenticatedException;
 import io.mosip.certify.core.spi.CredentialConfigurationService;
+import io.mosip.certify.core.spi.CredentialRegistry;
 import io.mosip.certify.core.spi.CredentialLedgerService;
 import io.mosip.certify.core.util.SecurityHelperService;
 import io.mosip.certify.credential.CredentialFactory;
@@ -97,6 +98,9 @@ public class CertifyIssuanceServiceImplTest {
 
     @Mock
     private VelocityEnvConfig velocityEnvConfig;
+
+    @Mock
+    private CredentialRegistry credentialRegistry;
 
     @InjectMocks
     private CertifyIssuanceServiceImpl issuanceService;
@@ -204,7 +208,7 @@ public class CertifyIssuanceServiceImplTest {
 
         mockGlobalCredentialIssuerMetadataDTO.setCredentialConfigurationSupportedDTO(supportedCredsMap);
 
-        when(credentialConfigurationService.fetchCredentialIssuerMetadata())
+        when(credentialRegistry.issuerMetadata())
                 .thenReturn(mockGlobalCredentialIssuerMetadataDTO); // Default mock
     }
 
@@ -340,7 +344,7 @@ public class CertifyIssuanceServiceImplTest {
         when(parsedAccessToken.getClaims()).thenReturn(claimsFromAccessToken);
         when(vciCacheService.getNonceTransaction(anyString())).thenReturn(transaction);
         when(proofValidatorFactory.getProofValidator(anyString())).thenReturn(proofValidator);
-        when(credentialConfigurationService.fetchCredentialIssuerMetadata()).thenReturn(mockGlobalCredentialIssuerMetadataDTO);
+        when(credentialRegistry.issuerMetadata()).thenReturn(mockGlobalCredentialIssuerMetadataDTO);
 
         // Stub getKeyMaterial, its result is used in templateParams for createCredential
         when(proofValidator.getKeyMaterial(anyString())).thenReturn("");
@@ -396,7 +400,7 @@ public class CertifyIssuanceServiceImplTest {
         when(parsedAccessToken.getClaims()).thenReturn(claimsFromAccessToken);
         when(vciCacheService.getNonceTransaction(anyString())).thenReturn(transaction);
         when(proofValidatorFactory.getProofValidator(anyString())).thenReturn(proofValidator);
-        when(credentialConfigurationService.fetchCredentialIssuerMetadata()).thenReturn(mockGlobalCredentialIssuerMetadataDTO);
+        when(credentialRegistry.issuerMetadata()).thenReturn(mockGlobalCredentialIssuerMetadataDTO);
 
         // Stub getKeyMaterial, its result is used in templateParams for createCredential
         when(proofValidator.getKeyMaterial(anyString())).thenReturn("");
@@ -452,7 +456,7 @@ public class CertifyIssuanceServiceImplTest {
         when(proofValidator.validate(anyString(), anyString(), anyString(),any())).thenReturn(true);
         when(dataProviderPlugin.fetchData(anyMap())).thenReturn(new JSONObject());
         when(proofValidator.getKeyMaterial(anyString())).thenReturn("did:example:holder123");
-        when(credentialConfigurationService.fetchCredentialIssuerMetadata()).thenReturn(mockGlobalCredentialIssuerMetadataDTO);
+        when(credentialRegistry.issuerMetadata()).thenReturn(mockGlobalCredentialIssuerMetadataDTO);
         when(credentialFactory.getCredential(DEFAULT_FORMAT_LDP)).thenReturn(Optional.empty());
 
         CertifyException ex = assertThrows(CertifyException.class, () -> issuanceService.getCredential(request));

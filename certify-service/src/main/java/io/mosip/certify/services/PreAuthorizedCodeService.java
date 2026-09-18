@@ -8,6 +8,7 @@ import io.mosip.certify.core.dto.*;
 import io.mosip.certify.core.exception.CertifyException;
 import io.mosip.certify.core.exception.InvalidRequestException;
 import io.mosip.certify.core.spi.CredentialConfigurationService;
+import io.mosip.certify.core.spi.CredentialRegistry;
 import io.mosip.certify.core.util.CommonUtil;
 import io.mosip.certify.repository.CredentialConfigRepository;
 import io.mosip.certify.utils.AccessTokenJwtUtil;
@@ -37,6 +38,7 @@ public class PreAuthorizedCodeService {
     private final ObjectMapper objectMapper;
 
     private final CredentialConfigurationService credentialConfigurationService;
+    private final CredentialRegistry credentialRegistry;
 
     private final CredentialConfigRepository credentialConfigRepository;
 
@@ -68,6 +70,7 @@ public class PreAuthorizedCodeService {
 
     @Autowired
     public PreAuthorizedCodeService(VCICacheService vciCacheService,
+                                    CredentialRegistry credentialRegistry,
                                     AccessTokenJwtUtil accessTokenJwtUtil,
                                     ObjectMapper objectMapper,
                                     CredentialConfigurationService credentialConfigurationService,
@@ -77,6 +80,7 @@ public class PreAuthorizedCodeService {
         this.accessTokenJwtUtil = accessTokenJwtUtil;
         this.objectMapper = objectMapper;
         this.credentialConfigurationService = credentialConfigurationService;
+        this.credentialRegistry = credentialRegistry;
         this.credentialConfigRepository = credentialConfigRepository;
         this.validator = validator;
     }
@@ -111,7 +115,7 @@ public class PreAuthorizedCodeService {
     }
 
     private void validatePreAuthorizedRequest(PreAuthorizedRequest request) {
-        CredentialIssuerMetadataDTO metadata = credentialConfigurationService.fetchCredentialIssuerMetadata();
+        CredentialIssuerMetadataDTO metadata = credentialRegistry.issuerMetadata();
         Map<String, CredentialConfigurationSupportedDTO> supportedConfigs = metadata
                 .getCredentialConfigurationSupportedDTO();
 

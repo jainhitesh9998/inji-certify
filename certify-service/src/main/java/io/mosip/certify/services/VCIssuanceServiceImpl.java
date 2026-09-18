@@ -21,7 +21,7 @@ import io.mosip.certify.core.dto.*;
 import io.mosip.certify.core.exception.CertifyException;
 import io.mosip.certify.core.exception.InvalidRequestException;
 import io.mosip.certify.core.exception.NotAuthenticatedException;
-import io.mosip.certify.core.spi.CredentialConfigurationService;
+import io.mosip.certify.core.spi.CredentialRegistry;
 import io.mosip.certify.core.spi.VCIssuanceService;
 import io.mosip.certify.proof.ProofValidator;
 import io.mosip.certify.proof.ProofValidatorFactory;
@@ -55,7 +55,7 @@ public class VCIssuanceServiceImpl implements VCIssuanceService {
     private AuditPlugin auditWrapper;
 
     @Autowired
-    private CredentialConfigurationService credentialConfigurationService;
+    private CredentialRegistry credentialRegistry;
 
     @Override
     public CredentialResponse getCredential(CredentialRequest credentialRequest) {
@@ -66,7 +66,7 @@ public class VCIssuanceServiceImpl implements VCIssuanceService {
 
         String scopeClaim = (String) parsedAccessToken.getClaims().getOrDefault("scope", "");
         CredentialConfigurationSupported credentialConfigurationSupported = null;
-        CredentialIssuerMetadataDTO credentialIssuerMetadataDTO = credentialConfigurationService.fetchCredentialIssuerMetadata();
+        CredentialIssuerMetadataDTO credentialIssuerMetadataDTO = credentialRegistry.issuerMetadata();
 
         for(String scope : scopeClaim.split(Constants.SPACE)) {
             Optional<CredentialConfigurationSupported> result = VCIssuanceUtil.getScopeCredentialMapping(

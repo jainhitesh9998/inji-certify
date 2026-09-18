@@ -28,6 +28,7 @@ import io.mosip.certify.core.exception.CertifyException;
 import io.mosip.certify.core.exception.InvalidRequestException;
 import io.mosip.certify.core.exception.NotAuthenticatedException;
 import io.mosip.certify.core.spi.CredentialConfigurationService;
+import io.mosip.certify.core.spi.CredentialRegistry;
 import io.mosip.certify.core.util.SecurityHelperService;
 import io.mosip.certify.proof.ProofValidator;
 import io.mosip.certify.proof.ProofValidatorFactory;
@@ -67,6 +68,9 @@ public class VCIssuanceServiceImplTest {
     private ProofValidator proofValidator;
     @Mock
     private CredentialConfigurationService credentialConfigurationService; // Added mock
+
+    @Mock
+    private CredentialRegistry credentialRegistry;
 
     @InjectMocks
     private VCIssuanceServiceImpl issuanceService;
@@ -152,7 +156,7 @@ public class VCIssuanceServiceImplTest {
 
 
         mockGlobalCredentialIssuerMetadataDTO.setCredentialConfigurationSupportedDTO(supportedCredsMap);
-        when(credentialConfigurationService.fetchCredentialIssuerMetadata())
+        when(credentialRegistry.issuerMetadata())
                 .thenReturn(mockGlobalCredentialIssuerMetadataDTO);
     }
 
