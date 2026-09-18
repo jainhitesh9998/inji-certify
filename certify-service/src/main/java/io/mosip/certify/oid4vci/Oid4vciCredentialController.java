@@ -34,7 +34,7 @@ import java.util.UUID;
  * {@code {"credentials":[{"credential":...}]}} and OpenID4VCI error bodies ({@code error}, {@code error_description}).
  */
 @RestController
-@RequestMapping("/oid4vci")
+@RequestMapping({"/oid4vci", "/t/{tenant}/oid4vci"}) // the second form serves path-resolved tenants (certify.tenancy.resolver=path)
 public class Oid4vciCredentialController {
 
     static final List<String> DEFAULT_PROOF_ALGORITHMS = List.of("ES256", "EdDSA", "RS256", "PS256", "ES256K");

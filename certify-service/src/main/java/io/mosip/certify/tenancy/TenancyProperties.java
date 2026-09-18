@@ -18,6 +18,7 @@ public record TenancyProperties(@DefaultValue("false") boolean enabled, @Default
     public static final String PREFIX = "certify.tenancy";
     public static final String RESOLVER_FIXED = "fixed";
     public static final String RESOLVER_HOST = "host";
+    public static final String RESOLVER_PATH = "path";
 
     public record Tenant(@DefaultValue List<String> hosts, String issuerIdentifier, String issuerDid, String keyNamespace) {}
 

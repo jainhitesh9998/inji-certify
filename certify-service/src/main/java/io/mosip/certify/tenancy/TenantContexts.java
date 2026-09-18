@@ -24,7 +24,7 @@ public class TenantContexts {
             return new TenantContext(id, defaultIssuerIdentifier, defaultIssuerDid, null);
         }
         return new TenantContext(id,
-                blank(tenant.issuerIdentifier()) ? defaultIssuerIdentifier : tenant.issuerIdentifier().replaceAll("/+$", ""),
+                blank(tenant.issuerIdentifier()) ? pathIdentifier(id, defaultIssuerIdentifier) : tenant.issuerIdentifier().replaceAll("/+$", ""),
                 blank(tenant.issuerDid()) ? defaultIssuerDid : tenant.issuerDid(),
                 blank(tenant.keyNamespace()) ? null : tenant.keyNamespace());
     }
@@ -32,6 +32,23 @@ public class TenantContexts {
     /** The tenant's issuer identifier if it overrides the deployment's, else the given default. */
     public String issuerIdentifier(String tenantId, String defaultIssuerIdentifier) {
         return forRequest(tenantId, defaultIssuerIdentifier, null).issuerIdentifier();
+    }
+
+    /**
+     * A path-resolved tenant without its own issuer identifier lives under {@code {deployment}/t/{tenant}}: the
+     * deployment's identifier with the new surface's suffix taken off, so the adapter appends it again.
+     */
+    private String pathIdentifier(String tenantId, String defaultIssuerIdentifier) {
+        if (defaultIssuerIdentifier == null || !TenancyProperties.RESOLVER_PATH.equalsIgnoreCase(properties.resolver())
+                || TenantContext.DEFAULT_TENANT_ID.equals(tenantId)) {
+            return defaultIssuerIdentifier;
+        }
+        String base = defaultIssuerIdentifier.replaceAll("/+$", "");
+        String suffix = io.mosip.certify.oid4vci.Oid4vciIssuer.SUFFIX;
+        if (base.endsWith(suffix)) {
+            base = base.substring(0, base.length() - suffix.length());
+        }
+        return base + PathTenantResolver.PREFIX + tenantId;
     }
 
     private static boolean blank(String value) {

@@ -19,7 +19,7 @@ public class Oid4vciSecurityConfiguration {
     @Bean
     @Order(Ordered.HIGHEST_PRECEDENCE + 10)
     public SecurityFilterChain oid4vciSecurityFilterChain(HttpSecurity http) throws Exception {
-        http.securityMatcher("/oid4vci/**")
+        http.securityMatcher("/oid4vci/**", "/t/*/oid4vci/**")
                 .csrf(csrf -> csrf.disable())
                 .authorizeHttpRequests(requests -> requests.anyRequest().permitAll())
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS));

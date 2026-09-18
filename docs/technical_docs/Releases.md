@@ -16,6 +16,10 @@ The OpenID4VCI draft-13 credential endpoints of release 0.14.0 are served again 
 
 A `c_nonce` from `POST /oid4vci/nonce` now authorises one credential request: after the credentials are issued the nonce is dropped, and a replayed proof answers `400 invalid_nonce` (`certify.protocol.oid4vci-v1.nonce.single-use=false` restores the previous behaviour). The issuer metadata under `/oid4vci` advertises `batch_credential_issuance.batch_size` (`certify.protocol.oid4vci-v1.batch.size`, default 10); a request whose `proofs` exceed it answers `400 invalid_credential_request`. The compatibility endpoints and the draft-13 endpoints are unchanged.
 
+## Path-based tenants
+
+`certify.tenancy.resolver=path` serves each configured tenant under `{domain}{servletPath}/t/{tenant}/oid4vci/...` with `.../t/{tenant}/oid4vci` as its Credential Issuer Identifier, next to the host resolver. Unconfigured path tenants answer as the default tenant.
+
 ## Tenant DID documents
 
 With `certify.tenancy` enabled, a tenant configured with `issuer-did` issues under that DID (the proof's `verificationMethod` is `<tenant did>#<kid>`) and `GET /.well-known/did.json` on the tenant's host publishes the deployment's keys under the tenant's DID, so a verifier resolves the tenant's credentials from the tenant's own document. Single-tenant deployments are unchanged.
