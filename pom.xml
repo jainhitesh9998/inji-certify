@@ -121,6 +121,7 @@
 		<module>certify-issuance</module>
 		<module>certify-cli</module>
 		<module>certify-template-velocity</module>
+		<module>certify-template-jsonmap</module>
 	</modules>
 	
 	<dependencies>
