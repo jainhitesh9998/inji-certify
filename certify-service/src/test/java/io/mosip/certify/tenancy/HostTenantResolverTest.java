@@ -12,8 +12,8 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 class HostTenantResolverTest {
 
     static final TenancyProperties PROPERTIES = new TenancyProperties(true, "host", Map.of(
-            "acme", new TenancyProperties.Tenant(List.of("acme.example.org", "ACME.localhost"), "https://acme.example.org/v1/certify/", "did:web:acme.example.org", "acme"),
-            "bare", new TenancyProperties.Tenant(List.of("bare.example.org"), null, null, null)));
+            "acme", new TenancyProperties.Tenant(List.of("acme.example.org", "ACME.localhost"), "https://acme.example.org/v1/certify/", "did:web:acme.example.org", "acme", java.util.List.of(), java.util.List.of()),
+            "bare", new TenancyProperties.Tenant(List.of("bare.example.org"), null, null, null, java.util.List.of(), java.util.List.of())));
 
     @Test
     void hostNamesTheTenantOrTheDefault() {

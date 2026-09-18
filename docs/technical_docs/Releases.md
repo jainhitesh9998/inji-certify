@@ -18,7 +18,7 @@ A `c_nonce` from `POST /oid4vci/nonce` now authorises one credential request: af
 
 ## Path-based tenants
 
-`certify.tenancy.resolver=path` serves each configured tenant under `{domain}{servletPath}/t/{tenant}/oid4vci/...` with `.../t/{tenant}/oid4vci` as its Credential Issuer Identifier, next to the host resolver. Unconfigured path tenants answer as the default tenant.
+`certify.tenancy.resolver=path` serves each configured tenant under `{domain}{servletPath}/t/{tenant}/oid4vci/...` with `.../t/{tenant}/oid4vci` as its Credential Issuer Identifier, next to the host resolver. Unconfigured path tenants answer as the default tenant. A tenant may also set `certify.tenancy.tenants.<id>.display` and `.authorization-servers` for its metadata document; token validation still uses the deployment's authorization server.
 
 ## Tenant DID documents
 
