@@ -10,9 +10,14 @@ import io.mosip.certify.core.constants.ErrorConstants;
 import io.mosip.certify.core.exception.CertifyException;
 import io.mosip.certify.entity.IarSession;
 import io.mosip.certify.services.KeyManagerConstants;
-import io.mosip.kernel.signature.dto.JWSSignatureRequestDto;
-import io.mosip.kernel.signature.dto.JWTSignatureResponseDto;
-import io.mosip.kernel.signature.service.SignatureService;
+import io.mosip.certify.issuance.KeyProviderRegistry;
+import io.mosip.certify.signing.JwsEnvelope;
+import io.mosip.certify.signing.JwsHeaderPolicy;
+import io.mosip.certify.signing.KeyProvider;
+import io.mosip.certify.signing.KeyRef;
+import io.mosip.certify.signing.LegacyKeyRefs;
+import io.mosip.certify.signing.SignatureAlgorithm;
+import io.mosip.certify.signing.SigningKey;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -33,7 +38,7 @@ import java.util.Map;
 public class AccessTokenJwtUtil {
 
     @Autowired
-    private SignatureService signatureService;
+    private KeyProviderRegistry keyProviders;
 
     @Autowired
     private ObjectMapper objectMapper;
@@ -108,23 +113,12 @@ public class AccessTokenJwtUtil {
 
             // Convert payload to JSON string
             String payloadJson = objectMapper.writeValueAsString(payload);
-            String base64Payload = Base64.getUrlEncoder().withoutPadding().encodeToString(payloadJson.getBytes());
 
-            // Create JWT signature request
-            JWSSignatureRequestDto signatureRequest = new JWSSignatureRequestDto();
-            signatureRequest.setApplicationId(KeyManagerConstants.CERTIFY_SERVICE_APP_ID);
-            signatureRequest.setReferenceId(KeyManagerConstants.EMPTY_REF_ID);
-            signatureRequest.setDataToSign(base64Payload);
-            signatureRequest.setIncludePayload(true);
-            signatureRequest.setIncludeCertificate(false);
-            signatureRequest.setIncludeCertHash(false);
-            signatureRequest.setValidateJson(true);
-            signatureRequest.setB64JWSHeaderParam(true);
-            signatureRequest.setSignAlgorithm("RS256");
-
-            // Sign using keymanager service
-            JWTSignatureResponseDto response = signatureService.jwsSign(signatureRequest);
-            String jwtString = response.getJwtSignedData();
+            // Sign through the key provider that holds the CERTIFY_SERVICE key (header: alg RS256, kid)
+            KeyRef ref = LegacyKeyRefs.keymanager(KeyManagerConstants.CERTIFY_SERVICE_APP_ID, KeyManagerConstants.EMPTY_REF_ID);
+            KeyProvider provider = keyProviders.provider(ref.provider());
+            SigningKey key = provider.resolve(ref).withAlgorithm(SignatureAlgorithm.RS256);
+            String jwtString = JwsEnvelope.sign(payloadJson, JwsHeaderPolicy.compact(null), key, provider);
 
             log.debug("Generated JWT access token for client_id: {}", clientId);
 
