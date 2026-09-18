@@ -172,3 +172,19 @@ CREATE TABLE IF NOT EXISTS credential_template (
     cr_dtimes TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT pk_credential_template PRIMARY KEY (id, version)
 );
+
+-- 1.1.0: one row per issuance on the new surface
+CREATE TABLE IF NOT EXISTS issuance_transaction (
+    id UUID NOT NULL,
+    tenant_id VARCHAR(64) NOT NULL DEFAULT 'default',
+    access_token_hash VARCHAR(255),
+    credential_config_id VARCHAR(2048),
+    protocol_version VARCHAR(32),
+    state VARCHAR(16) NOT NULL,
+    holder_bindings VARCHAR,
+    notification_id VARCHAR(128),
+    credential_ids VARCHAR,
+    cr_dtimes TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP,
+    CONSTRAINT pk_issuance_transaction PRIMARY KEY (id)
+);

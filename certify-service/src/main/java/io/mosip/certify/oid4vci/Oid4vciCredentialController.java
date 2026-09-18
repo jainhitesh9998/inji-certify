@@ -90,6 +90,9 @@ public class Oid4vciCredentialController {
         }
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("credentials", credentials);
+        if (result instanceof IssuanceResult.Issued issued) {
+            body.put("notification_id", issued.transactionId()); // the transaction the wallet reports back on (notification endpoint)
+        }
         if (result instanceof IssuanceResult.Deferred deferred) {
             body.put("transaction_id", deferred.transactionId());
             return ResponseEntity.accepted().body(body);

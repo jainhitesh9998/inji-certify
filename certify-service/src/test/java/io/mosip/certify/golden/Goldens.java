@@ -33,7 +33,7 @@ public final class Goldens {
             "publicKeyMultibase", "publicKeyJwk", "publicKeyPem", "x", "y", "n", "e",
             "qr", "statusListIndex", "statusListCredential",
             // the shared status list's bits depend on which credentials were revoked before the golden was taken
-            "encodedList",
+            "encodedList", "notification_id",
             // the MOSIP error envelope stamps the response time
             "responseTime");
 

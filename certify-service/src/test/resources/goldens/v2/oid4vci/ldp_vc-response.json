@@ -25,5 +25,6 @@
       },
       "type" : [ "VerifiableCredential", "GoldenCredential" ]
     }
-  } ]
+  } ],
+  "notification_id" : "<notification_id>"
 }

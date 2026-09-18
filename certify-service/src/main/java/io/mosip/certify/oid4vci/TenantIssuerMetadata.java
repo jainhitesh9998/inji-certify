@@ -40,6 +40,7 @@ public class TenantIssuerMetadata {
         document.put("authorization_servers", deployment.getAuthorizationServers());
         document.put("credential_endpoint", issuer.credentialEndpoint());
         document.put("nonce_endpoint", issuer.nonceEndpoint());
+        document.put("notification_endpoint", issuer.notificationEndpoint());
         if (deployment.getDisplay() != null) {
             document.put("display", deployment.getDisplay());
         }
