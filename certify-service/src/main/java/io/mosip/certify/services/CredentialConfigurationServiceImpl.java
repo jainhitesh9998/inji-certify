@@ -5,6 +5,8 @@
  */
 package io.mosip.certify.services;
 
+import java.time.LocalDateTime;
+
 import io.mosip.certify.registry.ConfigV2Columns;
 
 import io.mosip.certify.core.constants.Constants;
@@ -46,6 +48,9 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
 
     @Autowired
     private CredentialConfigMapper credentialConfigMapper;
+
+    @Autowired
+    private io.mosip.certify.repository.CredentialTemplateRepository credentialTemplateRepository;
 
     @Value("${mosip.certify.domain.url}")
     private String credentialIssuer;
@@ -102,6 +107,39 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
         return saveCredentialConfiguration(credentialConfig);
     }
 
+    /**
+     * The v1 API keeps the base64 blob in vc_template and mirrors it as credential_template version 1 (as the 1.1.0
+     * migration does for existing rows); an update rewrites version 1 in place, versioning comes with the v2 API.
+     */
+    private void storeTemplate(CredentialConfig config) {
+        if (config.getVcTemplate() == null || config.getVcTemplate().isBlank() || config.getConfigId() == null) {
+            return;
+        }
+        io.mosip.certify.entity.CredentialTemplate template = credentialTemplateRepository.findByIdAndVersion(config.getConfigId(), 1)
+                .orElseGet(io.mosip.certify.entity.CredentialTemplate::new);
+        template.setId(config.getConfigId());
+        template.setVersion(1);
+        template.setTenantId(config.getTenantId() == null ? "default" : config.getTenantId());
+        template.setEngine(io.mosip.certify.entity.CredentialTemplate.ENGINE_VELOCITY);
+        template.setMode(io.mosip.certify.entity.CredentialTemplate.MODE_FULL_DOCUMENT);
+        template.setContent(decodeTemplate(config.getVcTemplate()));
+        template.setChecksum(org.springframework.util.DigestUtils.md5DigestAsHex(config.getVcTemplate().getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        if (template.getCreatedTimes() == null) {
+            template.setCreatedTimes(LocalDateTime.now());
+        }
+        credentialTemplateRepository.save(template);
+        config.setTemplateId(config.getConfigId());
+        config.setTemplateVersion(1);
+    }
+
+    private static String decodeTemplate(String vcTemplate) {
+        try {
+            return new String(java.util.Base64.getDecoder().decode(vcTemplate), java.nio.charset.StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException e) {
+            return vcTemplate; // stored as text already
+        }
+    }
+
     private CredentialConfigResponse saveCredentialConfiguration(CredentialConfig credentialConfig) {
         credentialConfig.setConfigId(UUID.randomUUID().toString());
         credentialConfig.setStatus(Constants.ACTIVE);
@@ -112,6 +150,7 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
         credentialConfig.setProofTypesSupported(proofTypesSupported);
 
         ConfigV2Columns.fill(credentialConfig); // the v1 API writes both shapes (docs/design/08-database.md)
+        storeTemplate(credentialConfig);
         CredentialConfig savedConfig = credentialConfigRepository.save(credentialConfig);
         log.info("Added credential configuration: {}", savedConfig.getConfigId());
 
@@ -273,6 +312,7 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
         credentialConfig.setCredentialSigningAlgValuesSupported(Collections.singletonList(credentialConfig.getSignatureCryptoSuite()));
 
         ConfigV2Columns.fill(credentialConfig); // the v1 API writes both shapes (docs/design/08-database.md)
+        storeTemplate(credentialConfig);
         CredentialConfig savedConfig = credentialConfigRepository.save(credentialConfig);
         log.info("Updated credential configuration: {}", savedConfig.getConfigId());
 

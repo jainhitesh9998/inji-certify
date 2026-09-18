@@ -5,8 +5,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.mosip.certify.core.constants.Constants;
 import io.mosip.certify.core.constants.VCFormats;
 import io.mosip.certify.entity.CredentialConfig;
+import io.mosip.certify.entity.CredentialTemplate;
 import io.mosip.certify.issuance.ConfigurationRegistry;
 import io.mosip.certify.repository.CredentialConfigRepository;
+import io.mosip.certify.repository.CredentialTemplateRepository;
 import io.mosip.certify.signing.KeyRef;
 import io.mosip.certify.signing.LegacyKeyRefs;
 import io.mosip.certify.signing.SignatureAlgorithm;
@@ -48,12 +50,14 @@ public class JpaConfigurationRegistry implements ConfigurationRegistry {
     private static final String SELECTOR_SEPARATOR = "|";
 
     private final CredentialConfigRepository repository;
+    private final CredentialTemplateRepository templates;
     private final ObjectMapper objectMapper;
     private final String pluginMode;
 
-    public JpaConfigurationRegistry(CredentialConfigRepository repository, ObjectMapper objectMapper,
+    public JpaConfigurationRegistry(CredentialConfigRepository repository, CredentialTemplateRepository templates, ObjectMapper objectMapper,
                                     @Value("${mosip.certify.plugin-mode:DataProvider}") String pluginMode) {
         this.repository = repository;
+        this.templates = templates;
         this.objectMapper = objectMapper;
         this.pluginMode = pluginMode;
     }
@@ -203,12 +207,31 @@ public class JpaConfigurationRegistry implements ConfigurationRegistry {
         raw.values().removeIf(java.util.Objects::isNull); // unset optional columns; FormatConfig copies the map and refuses nulls
     }
 
+    /** The credential_template row the configuration names (1.1.0), else the legacy base64 blob in vc_template. */
     private TemplateRef template(CredentialConfig row) {
+        Map<String, Object> params = Map.of(Constants.DID_URL, row.getDidUrl() == null ? "" : row.getDidUrl());
+        if (row.getTemplateId() != null && !row.getTemplateId().isBlank()) {
+            Optional<CredentialTemplate> stored = row.getTemplateVersion() != null
+                    ? templates.findByIdAndVersion(row.getTemplateId(), row.getTemplateVersion())
+                    : templates.findFirstByIdOrderByVersionDesc(row.getTemplateId());
+            if (stored.isPresent()) {
+                CredentialTemplate t = stored.get();
+                return new TemplateRef(t.getEngine() == null ? TEMPLATE_ENGINE_VELOCITY : t.getEngine(), t.getId(), t.getVersion(), mode(t.getMode()), t.getContent(), params);
+            }
+        }
         boolean templated = row.getVcTemplate() != null && !row.getVcTemplate().isBlank();
         return templated
                 ? new TemplateRef(TEMPLATE_ENGINE_VELOCITY, row.getCredentialConfigKeyId(), null, TemplateRef.Mode.FULL_DOCUMENT, row.getVcTemplate(),
                         Map.of(Constants.DID_URL, row.getDidUrl() == null ? "" : row.getDidUrl()))
                 : TemplateRef.NONE;
+    }
+
+    private static TemplateRef.Mode mode(String stored) {
+        try {
+            return stored == null ? TemplateRef.Mode.FULL_DOCUMENT : TemplateRef.Mode.valueOf(stored.trim().toUpperCase());
+        } catch (IllegalArgumentException e) {
+            return TemplateRef.Mode.FULL_DOCUMENT;
+        }
     }
 
     private DisplayConfig display(CredentialConfig row) {
