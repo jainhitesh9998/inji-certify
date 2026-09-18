@@ -15,28 +15,9 @@ import org.springframework.scheduling.annotation.EnableAsync;
 
 @EnableAsync
 @EnableCaching
+// kernel-keymanager (component scan, JPA, key provisioning) is auto-configured by certify-keyprovider-keymanager
 @Import(io.inji.verify.config.AppConfig.class)
 @SpringBootApplication(scanBasePackages = "io.mosip.certify," +
-        "io.mosip.kernel.crypto," +
-        "io.mosip.kernel.keymanager.hsm," +
-        "io.mosip.kernel.cryptomanager," +
-        "io.mosip.kernel.keymanagerservice.validator," +
-        "io.mosip.kernel.keymanager," +
-        "io.mosip.kernel.cryptomanager.util," +
-        "io.mosip.kernel.keymanagerservice.helper," +
-        "io.mosip.kernel.keymanagerservice.repository," +
-        "io.mosip.kernel.keymanagerservice.service," +
-        "io.mosip.kernel.keymanagerservice.util," +
-        "io.mosip.kernel.keygenerator.bouncycastle," +
-        "io.mosip.kernel.signature.service," +
-        "io.mosip.kernel.signature.util," +
-        "io.mosip.kernel.signature.builder," +
-        "io.mosip.kernel.signature.*," +
-        "io.mosip.kernel.pdfgenerator.*," +
-        "io.mosip.kernel.partnercertservice.service," +
-        "io.mosip.kernel.keymanagerservice.repository," +
-        "io.mosip.kernel.keymanagerservice.entity," +
-        "io.mosip.kernel.partnercertservice.helper," +
         "io.inji.verify.services," +
         "io.inji.verify.key.impl," +
         "io.inji.verify.repository," +

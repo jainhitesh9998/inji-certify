@@ -32,7 +32,7 @@ public class KeyProviderRegistry {
     public SigningContext signingContext(SigningConfig config) {
         KeyRef ref = config.keyRef();
         KeyProvider provider = provider(ref.provider());
-        SigningKey key = provider.resolve(ref);
+        SigningKey key = provider.resolve(ref).withAlgorithm(config.algorithm());
         return new SigningContext(config, key, provider);
     }
 
