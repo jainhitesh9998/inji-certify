@@ -98,6 +98,15 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
         JWSAlgorithm.RS256.getName(), COSEAlgorithms.RS256         
     );
 
+    /** The deployment-wide values the v1 API applies to every configuration; the v2 API applies them when a body omits them. */
+    public ProtocolDefaults protocolDefaults(String format) {
+        return new ProtocolDefaults(cryptographicBindingMethodsSupportedMap == null ? null : cryptographicBindingMethodsSupportedMap.get(format),
+                proofTypesSupported, allowedCredentialStatusPurposes);
+    }
+
+    public record ProtocolDefaults(List<String> cryptographicBindingMethodsSupported, Map<String, Object> proofTypesSupported,
+                                   List<String> allowedStatusPurposes) {}
+
     @Override
     @CacheEvict(cacheNames = CredentialRegistry.CACHE_NAME, allEntries = true)
     public CredentialConfigResponse addCredentialConfiguration(CredentialConfigurationDTO credentialConfigurationDTO) {

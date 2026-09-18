@@ -100,8 +100,8 @@ public class JpaConfigurationRegistry implements ConfigurationRegistry {
         return row.getStatus() == null || Constants.ACTIVE.equalsIgnoreCase(row.getStatus());
     }
 
-    /** How one row reads for the new core; package-private so tests can check it on a plain entity. */
-    CredentialConfiguration toConfiguration(CredentialConfig row) {
+    /** How one row reads for the new core; public so the v2 configuration API can dry-run an unsaved row. */
+    public CredentialConfiguration toConfiguration(CredentialConfig row) {
         return isV2(row) ? fromV2Columns(row) : fromLegacyColumns(row);
     }
 
