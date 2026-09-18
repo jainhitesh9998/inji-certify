@@ -4,6 +4,7 @@ Newest first. One entry per work package or notable finding. Branch names are on
 
 | When (UTC) | WP | State | Branch | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-09-18 | P0-09 Deprecation infrastructure | done | `wp/p0-09-deprecation-infra` | `@DeprecatedEndpoint` + `DeprecationInterceptor`: RFC 9745 `Deprecation`, RFC 8594 `Sunset`, `Link rel=deprecation/successor-version`, Micrometer `certify.deprecated.calls{endpoint,enabled}`, hourly log throttle, kill switch `mosip.certify.deprecated.<name>.enabled=false` answering 410 JSON; OpenAPI `deprecated` flag when springdoc is present. No endpoint annotated yet. |
 | 2026-09-18 | P0-06 ArchUnit rules | done | `wp/p0-06-archunit-rules` | Six frozen rules; store holds 246 `io.mosip.kernel` references outside a provider module, 5 Spring Web uses in `certify-core`, 4 repository reads in the template engine; controllers and VCFormats rules currently clean (VCFormats constants are inlined by javac, so that rule bites only after P1) |
 | 2026-09-18 | Baseline | done | `design/extensibility` | Existing suite on JDK 21: 858 tests, 0 failures, 1 skipped, BUILD SUCCESS. Build needs `JAVA_HOME` on JDK 21, `-Dgpg.skip=true`, and locally `.mvn/settings-local.xml` because JitPack hangs on missing coordinates; see CLAUDE.md |
 
