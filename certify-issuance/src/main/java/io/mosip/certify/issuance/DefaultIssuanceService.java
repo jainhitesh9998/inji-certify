@@ -13,6 +13,7 @@ import io.mosip.certify.spi.IssuanceStrategy;
 import io.mosip.certify.spi.IssuedCredential;
 import io.mosip.certify.spi.ProofValidationException;
 import io.mosip.certify.spi.ProofValidator;
+import io.mosip.certify.spi.SigningConfig;
 import io.mosip.certify.spi.SigningContext;
 import io.mosip.certify.spi.StatusProvider;
 import io.mosip.certify.spi.TemplateEngine;
@@ -188,7 +189,11 @@ public class DefaultIssuanceService implements IssuanceService {
         for (IssuanceListener listener : listeners) {
             unsigned = listener.beforeSign(unsigned, configuration, context);
         }
-        SigningContext signing = keyProviders.signingContext(configuration.signing());
+        // a tenant with its own DID issues under it: the proof's verification method and the issuer must resolve together
+        String tenantDid = context.tenant() == null ? null : context.tenant().issuerDid();
+        SigningConfig signingConfig = tenantDid == null || tenantDid.isBlank() || tenantDid.equals(configuration.signing().issuerDid())
+                ? configuration.signing() : configuration.signing().withIssuerDid(tenantDid);
+        SigningContext signing = keyProviders.signingContext(signingConfig);
         return new Issued(formatter.sign(unsigned, signing, context), claims);
     }
 

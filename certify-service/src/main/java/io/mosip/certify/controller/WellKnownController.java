@@ -32,9 +32,42 @@ public class WellKnownController {
         return credentialRegistry.issuerMetadata();
     }
 
+    @Autowired
+    private org.springframework.beans.factory.ObjectProvider<io.mosip.certify.tenancy.TenantContexts> tenants;
+
+    @Autowired
+    private org.springframework.beans.factory.ObjectProvider<io.mosip.certify.core.dto.AuthorizationContext> authorizationContext;
+
+    @Autowired
+    private org.springframework.beans.factory.ObjectProvider<io.mosip.certify.utils.DIDDocumentUtil> didDocuments;
+
+    /**
+     * The deployment's DID document, or the tenant's when the request resolved to a tenant with its own issuer DID
+     * (`certify.tenancy.tenants.<id>.issuer-did`): the same keys, published under the DID the tenant's credentials name.
+     */
     @GetMapping(value = "/.well-known/did.json", produces = "application/json")
     public Map<String, Object> getDIDDocument() {
+        String tenantDid = tenantDid();
+        if (tenantDid != null) {
+            io.mosip.certify.utils.DIDDocumentUtil util = didDocuments.getIfAvailable();
+            if (util != null) {
+                return util.generateDIDDocument(tenantDid);
+            }
+        }
         return vcIssuanceService.getDIDDocument();
+    }
+
+    private String tenantDid() {
+        io.mosip.certify.core.dto.AuthorizationContext context = authorizationContext.getIfAvailable();
+        io.mosip.certify.tenancy.TenantContexts contexts = tenants.getIfAvailable();
+        if (context == null || contexts == null) {
+            return null;
+        }
+        String tenantId = context.getTenantId();
+        if (tenantId == null || io.mosip.certify.spi.TenantContext.DEFAULT_TENANT_ID.equals(tenantId)) {
+            return null;
+        }
+        return contexts.forRequest(tenantId, null, null).issuerDid();
     }
 
     @GetMapping(value = "/.well-known/jwks.json", produces = "application/json")
