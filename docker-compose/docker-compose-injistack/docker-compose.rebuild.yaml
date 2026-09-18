@@ -1,0 +1,20 @@
+# Runs the injistack with an inji-certify image built from this checkout instead of the published
+# injistackdev/inji-certify-with-plugins:develop image. See docs/design/VALIDATE.md.
+#
+#   docker compose -f docker-compose.yaml -f docker-compose.rebuild.yaml up -d --build
+services:
+  certify:
+    image: inji-certify:rebuild
+    pull_policy: build
+    build:
+      context: ../../certify-service
+      args:
+        container_user: mosip
+        container_user_group: mosip
+    environment:
+      - active_profile_env=default, csvdp-farmer, rebuild
+    volumes:
+      # plugin jars extracted from the published with-plugins image (VALIDATE.md step 2)
+      - ./loader_path/certify/:/home/mosip/additional_jars/
+      # Certify as its own authorization server, so the pre-authorized code flow needs no eSignet
+      - ./config/certify-rebuild.properties:/home/mosip/config/certify-rebuild.properties
