@@ -24,6 +24,10 @@ A `c_nonce` from `POST /oid4vci/nonce` now authorises one credential request: af
 
 With `certify.tenancy` enabled, a tenant configured with `issuer-did` issues under that DID (the proof's `verificationMethod` is `<tenant did>#<kid>`) and `GET /.well-known/did.json` on the tenant's host publishes the deployment's keys under the tenant's DID, so a verifier resolves the tenant's credentials from the tenant's own document. Single-tenant deployments are unchanged.
 
+## Compatibility credential endpoint deprecated
+
+`POST /issuance/credential` with the 1.0.0-beta.1 body (`credential_configuration_id`, `proofs`) keeps working and is deprecated from this release: every answer carries `Deprecation` and `Link` headers, calls are counted in `certify.deprecated.calls{endpoint=oid4vci-v1-compat-credential}`, and `mosip.certify.deprecated.oid4vci-v1-compat-credential.enabled=false` answers `410 Gone`. Replacement: `POST /oid4vci/credential` (OpenID4VCI 1.0, advertised by `GET /oid4vci/.well-known/openid-credential-issuer`). `POST /nonce` stays. Removal no earlier than two minor releases after this one, never in a patch.
+
 # Changes in release 0.11.0
 
 ## Removal of  Artifactory dependency

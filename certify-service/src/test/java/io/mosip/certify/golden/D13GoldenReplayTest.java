@@ -239,7 +239,7 @@ class D13GoldenReplayTest {
         JsonNode body = objectMapper.readTree(result.getResponse().getContentAsString());
         assertEquals(200, result.getResponse().getStatus(), body.toString());
         assertTrue(body.has("credentials"), "the 1.0 body is answered by the 1.0 controller");
-        assertNull(result.getResponse().getHeader("Deprecation"), "the 1.0 handler is not deprecated in this phase");
+        org.junit.jupiter.api.Assertions.assertNotNull(result.getResponse().getHeader("Deprecation"), "the 1.0 handler is deprecated from 1.1.0 (P1-11f)");
         assertFalse(body.has("credential"));
     }
 
