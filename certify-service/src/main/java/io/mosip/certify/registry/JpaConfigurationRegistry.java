@@ -141,7 +141,10 @@ public class JpaConfigurationRegistry implements ConfigurationRegistry {
         String algorithmName = jose;
         SignatureAlgorithm algorithm = SignatureAlgorithm.fromJose(jose == null ? "" : jose)
                 .orElseThrow(() -> new IllegalStateException("credential_config " + row.getCredentialConfigKeyId() + " names no usable signature algorithm: " + algorithmName));
-        KeyRef keyRef = LegacyKeyRefs.keymanager(row.getKeyManagerAppId(), row.getKeyManagerRefId());
+        // a provider-prefixed key column ("x509-file:issuer-es256") names another KeyProvider; plain columns are keymanager's
+        KeyRef keyRef = row.getKeyManagerAppId() != null && row.getKeyManagerAppId().contains(":")
+                ? KeyRef.parse(row.getKeyManagerAppId())
+                : LegacyKeyRefs.keymanager(row.getKeyManagerAppId(), row.getKeyManagerRefId());
         SigningConfig signing = new SigningConfig(keyRef, algorithm, blankToNull(row.getSignatureCryptoSuite()), null, null, row.getDidUrl());
 
         IssuanceStrategy strategy = "DataProvider".equalsIgnoreCase(pluginMode) ? IssuanceStrategy.TEMPLATE : IssuanceStrategy.EXTERNAL;
