@@ -17,6 +17,7 @@ import io.mosip.certify.spi.IssuedCredential;
 import io.mosip.certify.spi.ProofValidator;
 import io.mosip.certify.spi.ProtocolVersion;
 import io.mosip.certify.spi.TenantContext;
+import io.mosip.certify.tenancy.TenantContexts;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -57,6 +58,7 @@ public class D13IssuanceHandler {
     private final AuthorizationContext authorizationContext;
     private final ProofValidator.NonceCheck sharedNonceCheck;
     private final VCICacheService cache;
+    private final TenantContexts tenants;
     private final String issuerIdentifier;
     private final int cNonceExpireSeconds;
     private final Clock clock;
@@ -64,14 +66,16 @@ public class D13IssuanceHandler {
     @Autowired
     public D13IssuanceHandler(@Qualifier("oid4vciIssuanceService") IssuanceService issuanceService, ConfigurationRegistry configurations,
                               AuthorizationContext authorizationContext, CacheNonceCheck sharedNonceCheck, VCICacheService cache,
-                              Environment environment) {
-        this(issuanceService, configurations, authorizationContext, sharedNonceCheck, cache,
+                              TenantContexts tenants, Environment environment) {
+        this(issuanceService, configurations, authorizationContext, sharedNonceCheck, cache, tenants,
                 environment.getRequiredProperty(PROPERTY_IDENTIFIER),
                 environment.getProperty(PROPERTY_C_NONCE_EXPIRE_SECONDS, Integer.class, 300), Clock.systemUTC());
     }
 
     D13IssuanceHandler(IssuanceService issuanceService, ConfigurationRegistry configurations, AuthorizationContext authorizationContext,
-                       ProofValidator.NonceCheck sharedNonceCheck, VCICacheService cache, String issuerIdentifier, int cNonceExpireSeconds, Clock clock) {
+                       ProofValidator.NonceCheck sharedNonceCheck, VCICacheService cache, TenantContexts tenants, String issuerIdentifier,
+                       int cNonceExpireSeconds, Clock clock) {
+        this.tenants = tenants;
         this.issuanceService = issuanceService;
         this.configurations = configurations;
         this.authorizationContext = authorizationContext;
@@ -84,18 +88,19 @@ public class D13IssuanceHandler {
 
     public Map<String, Object> issue(D13CredentialRequest request, boolean echoFormat) {
         Authorization authorization = authorization();
+        TenantContext tenant = tenants.forRequest(authorizationContext.getTenantId(), issuerIdentifier, null);
         String format = request.getFormat();
-        CredentialConfiguration configuration = resolve(request, authorization);
+        CredentialConfiguration configuration = resolve(request, authorization, tenant.tenantId());
         D13CredentialRequest.Proof proof = request.getProof();
         Object proofValue = "cwt".equalsIgnoreCase(proof.getProof_type()) ? proof.getCwt() : proof.getJwt();
         if (proofValue == null || proofValue.toString().isBlank()) {
             throw new IssuanceException(IssuanceException.INVALID_PROOF, "Error encountered during proof jwt parsing.");
         }
         List<ProofValidator.ProofInput> proofs = List.of(new ProofValidator.ProofInput(proof.getProof_type().toLowerCase(), proofValue));
-        ProofValidator.ProofPolicy policy = new ProofValidator.ProofPolicy(allowedProofAlgorithms(configuration), issuerIdentifier, true,
+        ProofValidator.ProofPolicy policy = new ProofValidator.ProofPolicy(allowedProofAlgorithms(configuration), tenant.issuerIdentifier(), true,
                 authorization.clientId(), Map.of());
         IssuanceCommand command = IssuanceCommand.builder(configuration.id())
-                .tenant(TenantContext.defaultTenant(issuerIdentifier, null)).authorization(authorization).proofs(proofs).proofPolicy(policy)
+                .tenant(tenant).authorization(authorization).proofs(proofs).proofPolicy(policy)
                 .nonceCheck(new D13NonceCheck(authorization, cache, sharedNonceCheck, clock))
                 .protocol(ProtocolVersion.OID4VCI_D13).protocolParams(Map.of(SdJwtFormatter.PARAM_REQUESTED_FORMAT, format))
                 .correlationId(UUID.randomUUID().toString()).build();
@@ -134,7 +139,7 @@ public class D13IssuanceHandler {
     }
 
     /** 0.14.0's scope-then-selector lookup, with its error codes and messages. */
-    CredentialConfiguration resolve(D13CredentialRequest request, Authorization authorization) {
+    CredentialConfiguration resolve(D13CredentialRequest request, Authorization authorization, String tenantId) {
         String format = request.getFormat();
         if (!Set.of(FORMAT_LDP_VC, FORMAT_MSO_MDOC, FORMAT_DC_SD_JWT, FORMAT_VC_SD_JWT).contains(format)) {
             throw new IssuanceException(IssuanceException.UNSUPPORTED_CREDENTIAL_FORMAT, IssuanceException.UNSUPPORTED_CREDENTIAL_FORMAT);
@@ -142,7 +147,7 @@ public class D13IssuanceHandler {
         requireSelector(request);
         List<String> scopes = Arrays.stream(authorization.scope() == null ? new String[0] : authorization.scope().split(" "))
                 .filter(s -> !s.isBlank()).toList();
-        List<CredentialConfiguration> all = configurations.all(TenantContext.DEFAULT_TENANT_ID);
+        List<CredentialConfiguration> all = configurations.all(tenantId);
         for (String scope : scopes) {
             List<CredentialConfiguration> inScope = all.stream().filter(c -> scope.equals(c.scope())).toList();
             if (inScope.isEmpty()) {

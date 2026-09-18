@@ -21,6 +21,7 @@ import io.mosip.certify.spi.IssuedCredential;
 import io.mosip.certify.spi.ProofValidator;
 import io.mosip.certify.spi.ProtocolVersion;
 import io.mosip.certify.spi.TenantContext;
+import io.mosip.certify.tenancy.TenantContexts;
 import io.mosip.certify.utils.DIDDocumentUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -64,9 +65,12 @@ public class CoreBackedVCIssuanceService implements VCIssuanceService {
     private final String didUrl;
     private final String pluginMode;
 
+    private final TenantContexts tenants;
+
     public CoreBackedVCIssuanceService(@Qualifier("oid4vciIssuanceService") IssuanceService issuanceService, ConfigurationRegistry configurations,
                                        AuthorizationContext authorizationContext, CacheNonceCheck nonceCheck, DIDDocumentUtil didDocumentUtil,
-                                       Environment environment) {
+                                       TenantContexts tenants, Environment environment) {
+        this.tenants = tenants;
         this.issuanceService = issuanceService;
         this.configurations = configurations;
         this.authorizationContext = authorizationContext;
@@ -89,10 +93,11 @@ public class CoreBackedVCIssuanceService implements VCIssuanceService {
         if (request.getProofs() != null) {
             request.getProofs().forEach((type, values) -> values.forEach(value -> proofs.add(new ProofValidator.ProofInput(type.name().toLowerCase(), value))));
         }
-        ProofValidator.ProofPolicy policy = new ProofValidator.ProofPolicy(allowedProofAlgorithms(request.getCredentialConfigId()), issuerIdentifier, true,
+        TenantContext tenant = tenants.forRequest(authorizationContext.getTenantId(), issuerIdentifier, null);
+        ProofValidator.ProofPolicy policy = new ProofValidator.ProofPolicy(allowedProofAlgorithms(tenant.tenantId(), request.getCredentialConfigId()), tenant.issuerIdentifier(), true,
                 authorization.clientId(), Map.of());
         IssuanceCommand command = IssuanceCommand.builder(request.getCredentialConfigId())
-                .tenant(TenantContext.defaultTenant(issuerIdentifier, null)).authorization(authorization).proofs(proofs).proofPolicy(policy).nonceCheck(nonceCheck)
+                .tenant(tenant).authorization(authorization).proofs(proofs).proofPolicy(policy).nonceCheck(nonceCheck)
                 .protocol(ProtocolVersion.OID4VCI_1_0).protocolParams(Map.of(PARAM_SURFACE, SURFACE_COMPAT)).correlationId(UUID.randomUUID().toString()).build();
         IssuanceResult result;
         try {
@@ -136,8 +141,8 @@ public class CoreBackedVCIssuanceService implements VCIssuanceService {
     }
 
     @SuppressWarnings("unchecked")
-    private List<String> allowedProofAlgorithms(String configurationId) {
-        return configurations.byId(TenantContext.DEFAULT_TENANT_ID, configurationId)
+    private List<String> allowedProofAlgorithms(String tenantId, String configurationId) {
+        return configurations.byId(tenantId, configurationId)
                 .map(c -> c.formatConfig() == null ? null : c.formatConfig().raw().get("proofTypesSupported"))
                 .filter(Map.class::isInstance)
                 .map(m -> ((Map<String, Object>) m).get("jwt"))
