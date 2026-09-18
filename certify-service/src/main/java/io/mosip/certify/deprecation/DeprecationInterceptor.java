@@ -5,6 +5,7 @@ import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.annotation.AnnotatedElementUtils;
 import org.springframework.core.env.Environment;
@@ -52,6 +53,7 @@ public class DeprecationInterceptor implements HandlerInterceptor {
     @Value("${mosip.certify.deprecation.log-interval:PT1H}")
     private Duration logInterval = Duration.ofHours(1);
 
+    @Autowired
     public DeprecationInterceptor(MeterRegistry meterRegistry, Environment environment, ObjectMapper objectMapper) {
         this(meterRegistry, environment, objectMapper, Clock.systemUTC());
     }

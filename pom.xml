@@ -110,6 +110,8 @@
 		<module>certify-service</module>
 		<module>certify-core</module>
 		<module>certify-integration-api</module>
+		<module>certify-signing</module>
+		<module>certify-keyprovider-jca</module>
 	</modules>
 	
 	<dependencies>
