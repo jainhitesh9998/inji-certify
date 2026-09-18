@@ -2,6 +2,8 @@ package io.mosip.certify.deprecation;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import org.springframework.beans.factory.ObjectProvider;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.extern.slf4j.Slf4j;
@@ -53,9 +55,13 @@ public class DeprecationInterceptor implements HandlerInterceptor {
     @Value("${mosip.certify.deprecation.log-interval:PT1H}")
     private Duration logInterval = Duration.ofHours(1);
 
+    /**
+     * The meter registry is resolved lazily: web-slice tests ({@code @WebMvcTest}) and minimal contexts have none,
+     * and the interceptor must never be the reason a context fails to start.
+     */
     @Autowired
-    public DeprecationInterceptor(MeterRegistry meterRegistry, Environment environment, ObjectMapper objectMapper) {
-        this(meterRegistry, environment, objectMapper, Clock.systemUTC());
+    public DeprecationInterceptor(ObjectProvider<MeterRegistry> meterRegistry, Environment environment, ObjectMapper objectMapper) {
+        this(meterRegistry.getIfAvailable(SimpleMeterRegistry::new), environment, objectMapper, Clock.systemUTC());
     }
 
     DeprecationInterceptor(MeterRegistry meterRegistry, Environment environment, ObjectMapper objectMapper, Clock clock) {
