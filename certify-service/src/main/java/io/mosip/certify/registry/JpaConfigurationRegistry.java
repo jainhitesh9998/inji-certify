@@ -14,6 +14,7 @@ import io.mosip.certify.spi.CredentialConfiguration;
 import io.mosip.certify.spi.DisplayConfig;
 import io.mosip.certify.spi.FormatConfig;
 import io.mosip.certify.spi.IssuanceStrategy;
+import io.mosip.certify.spi.ProtocolVersion;
 import io.mosip.certify.spi.SigningConfig;
 import io.mosip.certify.spi.StatusConfig;
 import io.mosip.certify.spi.TemplateRef;
@@ -97,6 +98,124 @@ public class JpaConfigurationRegistry implements ConfigurationRegistry {
 
     /** How one row reads for the new core; package-private so tests can check it on a plain entity. */
     CredentialConfiguration toConfiguration(CredentialConfig row) {
+        return isV2(row) ? fromV2Columns(row) : fromLegacyColumns(row);
+    }
+
+    /** The read path prefers the JSONB model once the row carries it (config_version >= 2), docs/design/08-database.md. */
+    public static boolean isV2(CredentialConfig row) {
+        return row.getConfigVersion() != null && row.getConfigVersion() >= ConfigV2Columns.VERSION_V2
+                && row.getFormatConfig() != null && row.getSigningConfig() != null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private CredentialConfiguration fromV2Columns(CredentialConfig row) {
+        String format = row.getCredentialFormat();
+        Map<String, Object> model = row.getFormatConfig();
+        Map<String, Object> raw = new LinkedHashMap<>();
+        String selector;
+        switch (format) {
+            case VCFormats.LDP_VC -> {
+                raw.put("context", join(model.get("context")));
+                raw.put("credentialType", join(model.get("types")));
+                selector = raw.get("context") + SELECTOR_SEPARATOR + raw.get("credentialType");
+            }
+            case VCFormats.DC_SD_JWT, "vc+sd-jwt" -> {
+                raw.put("vct", model.get("vct"));
+                raw.put("sdClaim", join(model.get("sdClaims")));
+                raw.put("sdJwtClaims", model.get("sdJwtClaims") == null ? Map.of() : model.get("sdJwtClaims")); // the legacy path reads an unset column as an empty map
+                selector = String.valueOf(model.get("vct"));
+            }
+            case VCFormats.MSO_MDOC -> {
+                raw.put("docType", model.get("doctype"));
+                raw.put("msoMdocClaims", model.get("mdocClaims") == null ? Map.of() : model.get("mdocClaims"));
+                selector = String.valueOf(model.get("doctype"));
+            }
+            default -> selector = row.getCredentialConfigKeyId();
+        }
+        commonRaw(row, raw);
+        FormatConfig formatConfig = new FormatConfig.Generic(raw, selector);
+
+        Map<String, Object> signingModel = row.getSigningConfig();
+        String jose = signingModel.get("alg") == null ? null : signingModel.get("alg").toString();
+        if ((jose == null || jose.isBlank()) && row.getCredentialSigningAlgValuesSupported() != null && !row.getCredentialSigningAlgValuesSupported().isEmpty()) {
+            jose = row.getCredentialSigningAlgValuesSupported().get(0);
+        }
+        String algorithmName = jose;
+        SignatureAlgorithm algorithm = SignatureAlgorithm.fromJose(jose == null ? "" : jose)
+                .orElseThrow(() -> new IllegalStateException("credential_config " + row.getCredentialConfigKeyId() + " names no usable signature algorithm: " + algorithmName));
+        String provider = signingModel.get("provider") == null ? ConfigV2Columns.PROVIDER_KEYMANAGER : signingModel.get("provider").toString();
+        String alias = signingModel.get("alias") == null ? "" : signingModel.get("alias").toString();
+        KeyRef keyRef = KeyRef.parse(provider + ":" + alias);
+        String cryptosuite = signingModel.get("cryptosuite") == null ? null : blankToNull(signingModel.get("cryptosuite").toString());
+        String didUrl = signingModel.get("didUrl") == null ? row.getDidUrl() : signingModel.get("didUrl").toString();
+        SigningConfig signing = new SigningConfig(keyRef, algorithm, cryptosuite, null, null, didUrl);
+
+        StatusConfig status = StatusConfig.NONE;
+        if (row.getStatusConfig() != null && row.getStatusConfig().get("purposes") instanceof List<?> purposes && !purposes.isEmpty()) {
+            Object mechanism = row.getStatusConfig().get("mechanism");
+            status = new StatusConfig(mechanism == null ? STATUS_MECHANISM_BITSTRING : mechanism.toString(), purposes.stream().map(String::valueOf).toList());
+        }
+        IssuanceStrategy strategy = strategyOf(row);
+        Map<ProtocolVersion, Map<String, Object>> overrides = new LinkedHashMap<>();
+        if (row.getProtocolOverrides() != null) {
+            row.getProtocolOverrides().forEach((key, value) -> {
+                try {
+                    if (value instanceof Map<?, ?> map) {
+                        overrides.put(ProtocolVersion.valueOf(key), (Map<String, Object>) map);
+                    }
+                } catch (IllegalArgumentException ignored) {
+                    // an override for a protocol this build does not know is left where it is
+                }
+            });
+        }
+        String tenantId = row.getTenantId() == null || row.getTenantId().isBlank() ? TenantContext.DEFAULT_TENANT_ID : row.getTenantId();
+        return new CredentialConfiguration(tenantId, row.getCredentialConfigKeyId(), row.getScope(), format, formatConfig,
+                template(row), signing, strategy, blankToNull(row.getDataSourceId()), status, display(row), Map.copyOf(overrides));
+    }
+
+    /** Backfilled rows keep the default TEMPLATE, so the plugin mode still decides unless the column names another strategy. */
+    private IssuanceStrategy strategyOf(CredentialConfig row) {
+        String column = row.getIssuanceStrategy();
+        if (column != null && !column.isBlank() && !IssuanceStrategy.TEMPLATE.name().equalsIgnoreCase(column)) {
+            try {
+                return IssuanceStrategy.valueOf(column.trim().toUpperCase());
+            } catch (IllegalArgumentException ignored) {
+                // fall through to the plugin mode
+            }
+        }
+        return "DataProvider".equalsIgnoreCase(pluginMode) ? IssuanceStrategy.TEMPLATE : IssuanceStrategy.EXTERNAL;
+    }
+
+    private static String join(Object list) {
+        if (list instanceof List<?> values) {
+            return values.isEmpty() ? null : String.join(",", values.stream().map(String::valueOf).toList());
+        }
+        return list == null ? null : list.toString();
+    }
+
+    private void commonRaw(CredentialConfig row, Map<String, Object> raw) {
+        raw.put("cryptographicBindingMethodsSupported", row.getCryptographicBindingMethodsSupported());
+        raw.put("credentialSigningAlgValuesSupported", row.getCredentialSigningAlgValuesSupported());
+        raw.put("proofTypesSupported", row.getProofTypesSupported());
+        raw.put("qrSettings", row.getQrSettings());
+        raw.put("qrSignatureAlgo", row.getQrSignatureAlgo());
+        raw.put("pluginConfigurations", row.getPluginConfigurations());
+        raw.values().removeIf(java.util.Objects::isNull); // unset optional columns; FormatConfig copies the map and refuses nulls
+    }
+
+    private TemplateRef template(CredentialConfig row) {
+        boolean templated = row.getVcTemplate() != null && !row.getVcTemplate().isBlank();
+        return templated
+                ? new TemplateRef(TEMPLATE_ENGINE_VELOCITY, row.getCredentialConfigKeyId(), null, TemplateRef.Mode.FULL_DOCUMENT, row.getVcTemplate(),
+                        Map.of(Constants.DID_URL, row.getDidUrl() == null ? "" : row.getDidUrl()))
+                : TemplateRef.NONE;
+    }
+
+    private DisplayConfig display(CredentialConfig row) {
+        return new DisplayConfig(convertList(row.getDisplay()), row.getOrder(), convert(row.getClaims()));
+    }
+
+    private CredentialConfiguration fromLegacyColumns(CredentialConfig row) {
         String format = row.getCredentialFormat();
         Map<String, Object> raw = new LinkedHashMap<>();
         String selector;
@@ -119,20 +238,9 @@ public class JpaConfigurationRegistry implements ConfigurationRegistry {
             }
             default -> selector = row.getCredentialConfigKeyId();
         }
-        raw.put("cryptographicBindingMethodsSupported", row.getCryptographicBindingMethodsSupported());
-        raw.put("credentialSigningAlgValuesSupported", row.getCredentialSigningAlgValuesSupported());
-        raw.put("proofTypesSupported", row.getProofTypesSupported());
-        raw.put("qrSettings", row.getQrSettings());
-        raw.put("qrSignatureAlgo", row.getQrSignatureAlgo());
-        raw.put("pluginConfigurations", row.getPluginConfigurations());
-        raw.values().removeIf(java.util.Objects::isNull); // unset optional columns; FormatConfig copies the map and refuses nulls
+        commonRaw(row, raw);
         FormatConfig formatConfig = new FormatConfig.Generic(raw, selector);
-
-        boolean templated = row.getVcTemplate() != null && !row.getVcTemplate().isBlank();
-        TemplateRef template = templated
-                ? new TemplateRef(TEMPLATE_ENGINE_VELOCITY, row.getCredentialConfigKeyId(), null, TemplateRef.Mode.FULL_DOCUMENT, row.getVcTemplate(),
-                        Map.of(Constants.DID_URL, row.getDidUrl() == null ? "" : row.getDidUrl()))
-                : TemplateRef.NONE;
+        TemplateRef template = template(row);
 
         String jose = row.getSignatureAlgo();
         if ((jose == null || jose.isBlank()) && row.getCredentialSigningAlgValuesSupported() != null && !row.getCredentialSigningAlgValuesSupported().isEmpty()) {
@@ -150,10 +258,8 @@ public class JpaConfigurationRegistry implements ConfigurationRegistry {
         IssuanceStrategy strategy = "DataProvider".equalsIgnoreCase(pluginMode) ? IssuanceStrategy.TEMPLATE : IssuanceStrategy.EXTERNAL;
         StatusConfig status = row.getCredentialStatusPurposes() == null || row.getCredentialStatusPurposes().isEmpty()
                 ? StatusConfig.NONE : new StatusConfig(STATUS_MECHANISM_BITSTRING, row.getCredentialStatusPurposes());
-        DisplayConfig display = new DisplayConfig(convertList(row.getDisplay()), row.getOrder(), convert(row.getClaims()));
-
         return new CredentialConfiguration(TenantContext.DEFAULT_TENANT_ID, row.getCredentialConfigKeyId(), row.getScope(), format, formatConfig,
-                template, signing, strategy, null, status, display, Map.of());
+                template, signing, strategy, null, status, display(row), Map.of());
     }
 
     private Map<String, Object> convert(Object value) {

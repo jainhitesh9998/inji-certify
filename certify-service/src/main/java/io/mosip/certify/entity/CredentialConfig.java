@@ -123,6 +123,42 @@ public class CredentialConfig {
     @Column(name = "qr_signature_algo")
     private String qrSignatureAlgo;
 
+    // ---- v2 model (1.1.0 migration, docs/design/08-database.md): beside the legacy columns until the 2.0.0 sunset.
+    // The v1 config API writes both shapes (ConfigV2Columns); the registry reads the JSONB shape when config_version >= 2.
+    @Column(name = "tenant_id", nullable = false)
+    private String tenantId = "default";
+
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "format_config", columnDefinition = "jsonb")
+    private Map<String, Object> formatConfig;
+
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "signing_config", columnDefinition = "jsonb")
+    private Map<String, Object> signingConfig;
+
+    @Column(name = "template_id")
+    private String templateId;
+
+    @Column(name = "template_version")
+    private Integer templateVersion;
+
+    @Column(name = "issuance_strategy", nullable = false)
+    private String issuanceStrategy = "TEMPLATE";
+
+    @Column(name = "data_source_id")
+    private String dataSourceId;
+
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "status_config", columnDefinition = "jsonb")
+    private Map<String, Object> statusConfig;
+
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "protocol_overrides", columnDefinition = "jsonb")
+    private Map<String, Object> protocolOverrides;
+
+    @Column(name = "config_version", nullable = false)
+    private Integer configVersion = 1;
+
     @NotNull
     @Column(name = "cr_dtimes")
     private LocalDateTime createdTimes;

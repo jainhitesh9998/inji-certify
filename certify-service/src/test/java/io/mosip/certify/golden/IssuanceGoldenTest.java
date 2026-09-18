@@ -189,6 +189,11 @@ class IssuanceGoldenTest {
         assertEquals(MDOC_ID, mdoc.id());
         assertTrue(configurationRegistry.all("default").size() >= 9, "all nine golden configurations are visible: " + configurationRegistry.all("default").size());
         assertTrue(configurationRegistry.all("acme").isEmpty(), "single tenant");
+        // rows written by the v1 config API carry the v2 model (P2-02), so every golden here reads through the JSONB path
+        io.mosip.certify.entity.CredentialConfig row = credentialConfigRepository.findByCredentialConfigKeyId(LDP_ID).orElseThrow();
+        assertEquals(2, row.getConfigVersion(), "the v1 API writes both shapes");
+        assertTrue(io.mosip.certify.registry.JpaConfigurationRegistry.isV2(row), "the registry reads the JSONB columns");
+        assertEquals("default", row.getTenantId());
         assertEquals("ldp_vc", ldpVcFormatter.formatId());
         // the row stores the types sorted alphabetically (finding: credential_definition.type order), the fragment reads them as stored
         assertEquals(java.util.List.of("GoldenCredential", "VerifiableCredential"), ((java.util.Map<?, ?>) ldpVcFormatter.metadataFragment(ldp, io.mosip.certify.spi.ProtocolVersion.OID4VCI_1_0).get("credential_definition")).get("type"));

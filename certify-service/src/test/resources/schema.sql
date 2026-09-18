@@ -108,6 +108,17 @@ CREATE TABLE IF NOT EXISTS credential_config (
     credential_status_purpose VARCHAR,
     qr_settings VARCHAR,
     qr_signature_algo VARCHAR,
+    -- 1.1.0 (V1_1_0_000__config_v2_and_tenancy.sql): the v2 model beside the legacy columns
+    tenant_id VARCHAR(64) NOT NULL DEFAULT 'default',
+    format_config VARCHAR,
+    signing_config VARCHAR,
+    template_id VARCHAR(128),
+    template_version INT,
+    issuance_strategy VARCHAR(16) NOT NULL DEFAULT 'TEMPLATE',
+    data_source_id VARCHAR(128),
+    status_config VARCHAR,
+    protocol_overrides VARCHAR,
+    config_version SMALLINT NOT NULL DEFAULT 1,
     cr_dtimes TIMESTAMP NOT NULL,
     upd_dtimes TIMESTAMP,
     CONSTRAINT pk_config_id PRIMARY KEY (config_id)
