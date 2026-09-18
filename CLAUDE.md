@@ -24,6 +24,7 @@ Every other rule below serves these three; when they conflict, this order decide
 6. Every deprecated surface gets `Deprecation`, `Sunset` and `Link` headers, a `certify.deprecated.calls` counter, a kill switch, an OpenAPI `deprecated` flag and a line in `docs/technical_docs/Releases.md`. Removal happens no earlier than two minor releases after the replacement and never in a patch.
 7. Old plugin interfaces (`certify-integration-api`), property names and the v1 config API keep working through adapters and aliases until 2.0.0.
 8. A decision not already in `docs/design/12-risks-and-decisions.md` is asked, not assumed; the answer is appended to the decision log before the PR opens.
+9. Configuration: new settings go into a typed `@ConfigurationProperties` record under `certify.<module>.*` (see `docs/design/14-configuration.md`); no new `@Value` lookups, no SpEL map literals, no new entries in the security URL lists; every renamed key gets an alias so existing deployments need no change.
 
 ## Repository map: today and target
 

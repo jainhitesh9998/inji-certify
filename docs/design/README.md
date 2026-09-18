@@ -18,6 +18,7 @@ Baseline: `inji/inji-certify` `develop` at commit `a1cfd63` (1.0.0-beta.1-SNAPSH
 | 11 | [Roadmap](./11-roadmap.md) | Planning or picking a phase |
 | 12 | [Risks and decisions](./12-risks-and-decisions.md) | Before taking a decision; append to the log after |
 | 13 | [Automated development](./13-automated-development.md) | Operating the agent-driven build-out |
+| 14 | [Configuration revamp](./14-configuration.md) | Any new property, `@Value`, profile or URL list |
 | wp/ | [Work packages](./wp/) | Picking up a task |
 
 Live review with comments: https://claude.ai/code/artifact/5cf478f6-018c-4079-8825-e4a837db3323
