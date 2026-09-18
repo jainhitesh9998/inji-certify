@@ -50,8 +50,8 @@ class JsonMapTemplateEngineTest {
                 """);
         assertEquals("did:web:issuer.example", doc.get("issuer"));
         assertEquals("did:jwk:abc", doc.get("holder"));
-        assertEquals("2026-09-18T10:00:00Z", doc.get("validFrom"));
-        assertEquals("2027-09-18T10:00:00Z", doc.get("validUntil"));
+        assertEquals("2026-09-18T10:00:00.000Z", doc.get("validFrom"));
+        assertEquals("2027-09-18T10:00:00.000Z", doc.get("validUntil"));
         assertEquals("Golden Farmer", doc.get("name"));
         assertEquals(34, doc.get("age"), "a lone placeholder keeps the number");
         assertEquals(true, doc.get("verified"));

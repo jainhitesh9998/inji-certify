@@ -51,8 +51,8 @@ class VelocityTemplateEngineTest {
         Map<String, Object> doc = engine.render(TemplateRef.inline("velocity", TEMPLATE, TemplateRef.Mode.FULL_DOCUMENT), model("Golden Farmer")).document();
 
         assertEquals("did:web:issuer.example", doc.get("issuer"));
-        assertEquals("2026-09-18T10:00:00Z", doc.get("issuanceDate"));
-        assertEquals("2027-09-18T10:00:00Z", doc.get("expirationDate"));
+        assertEquals("2026-09-18T10:00:00.000Z", doc.get("issuanceDate"));
+        assertEquals("2027-09-18T10:00:00.000Z", doc.get("expirationDate"));
         Map<?, ?> subject = (Map<?, ?>) doc.get("credentialSubject");
         assertEquals("did:jwk:abc", subject.get("id"));
         assertEquals("Golden Farmer", subject.get("fullName"));

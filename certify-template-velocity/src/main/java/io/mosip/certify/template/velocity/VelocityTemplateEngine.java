@@ -25,7 +25,7 @@ public class VelocityTemplateEngine implements TemplateEngine {
     public static final String ID = "velocity";
     public static final String ERROR_TEMPLATE_RENDER = "template_render_failed";
     /** The timestamp form Certify has always written into credentials. */
-    static final DateTimeFormatter TIMESTAMP = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'").withZone(ZoneOffset.UTC);
+    static final DateTimeFormatter TIMESTAMP = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC); // Constants.UTC_DATETIME_PATTERN, as the legacy issuance writes validFrom/validUntil
 
     private final VelocityRenderer renderer;
     private final ObjectMapper objectMapper;
