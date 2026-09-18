@@ -1,0 +1,7 @@
+{
+  "body" : {
+    "error" : "invalid_credential_request",
+    "error_description" : "No matching ldp_vc credential configuration found for scope: sample_vc_ldp"
+  },
+  "status" : 400
+}

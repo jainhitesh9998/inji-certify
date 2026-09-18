@@ -33,7 +33,9 @@ public final class Goldens {
             "publicKeyMultibase", "publicKeyJwk", "publicKeyPem", "x", "y", "n", "e",
             "qr", "statusListIndex", "statusListCredential",
             // the shared status list's bits depend on which credentials were revoked before the golden was taken
-            "encodedList");
+            "encodedList",
+            // the MOSIP error envelope stamps the response time
+            "responseTime");
 
     private static final ObjectMapper MAPPER = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT)
             .enable(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS);
@@ -84,7 +86,8 @@ public final class Goldens {
         }
         java.util.List<JsonNode> items = new java.util.ArrayList<>();
         array.forEach(items::add);
-        items.sort(java.util.Comparator.comparing(JsonNode::toString));
+        // compare the key-sorted form so that normalisation is idempotent (a recorded golden re-normalises to itself)
+        items.sort(java.util.Comparator.comparing(item -> sorted(item).toString()));
         array.removeAll();
         items.forEach(array::add);
     }

@@ -1,0 +1,9 @@
+{
+  "body" : {
+    "c_nonce" : "<c_nonce>",
+    "c_nonce_expires_in" : 300,
+    "error" : "invalid_proof",
+    "error_description" : "invalid_proof"
+  },
+  "status" : 400
+}
