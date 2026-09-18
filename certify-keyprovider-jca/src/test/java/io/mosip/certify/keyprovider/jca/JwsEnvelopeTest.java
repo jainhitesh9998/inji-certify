@@ -95,4 +95,24 @@ class JwsEnvelopeTest {
         assertNotNull(jws.getSignature());
         assertTrue(jws.verify(verifierFor(key)));
     }
+
+    @Test
+    void detachedUnencodedJwsOverBinaryPayloadVerifiesWithJca() throws Exception {
+        SigningKey key = PROVIDER.resolve(KeyRef.parse("jca:dev-rs256"));
+        byte[] hash = java.security.MessageDigest.getInstance("SHA-256").digest("canonical n-quads".getBytes(StandardCharsets.UTF_8));
+
+        String compact = JwsEnvelope.sign(hash, JwsHeaderPolicy.detachedUnencoded(), key, PROVIDER);
+
+        String[] parts = compact.split("\\.", -1);
+        assertEquals("", parts[1]);
+        com.nimbusds.jose.JWSHeader header = com.nimbusds.jose.JWSHeader.parse(new com.nimbusds.jose.util.Base64URL(parts[0]));
+        assertTrue(!header.isBase64URLEncodePayload() && header.getCriticalParams().contains("b64"));
+        byte[] prefix = (parts[0] + ".").getBytes(StandardCharsets.US_ASCII);
+        byte[] input = java.util.Arrays.copyOf(prefix, prefix.length + hash.length);
+        System.arraycopy(hash, 0, input, prefix.length, hash.length);
+        java.security.Signature verifier = java.security.Signature.getInstance("SHA256withRSA");
+        verifier.initVerify(key.descriptor().publicKey());
+        verifier.update(input);
+        assertTrue(verifier.verify(new com.nimbusds.jose.util.Base64URL(parts[2]).decode()), "binary payload bytes must be signed as-is");
+    }
 }

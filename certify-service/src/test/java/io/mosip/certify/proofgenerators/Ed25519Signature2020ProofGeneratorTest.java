@@ -1,107 +1,74 @@
 package io.mosip.certify.proofgenerators;
 
+import com.nimbusds.jose.JWSAlgorithm;
+import com.nimbusds.jose.JWSObject;
+import com.nimbusds.jose.Payload;
+import com.nimbusds.jose.crypto.RSASSAVerifier;
+import com.nimbusds.jose.jwk.RSAKey;
 import info.weboftrust.ldsignatures.LdProof;
-import info.weboftrust.ldsignatures.canonicalizer.Canonicalizer;
 import info.weboftrust.ldsignatures.canonicalizer.URDNA2015Canonicalizer;
 import io.mosip.certify.core.constants.Constants;
-import io.mosip.certify.core.constants.SignatureAlg;
-import io.mosip.kernel.signature.dto.SignRequestDtoV2;
-import io.mosip.kernel.signature.dto.SignResponseDto;
-import io.mosip.kernel.signature.exception.RequestException;
-import io.mosip.kernel.signature.service.SignatureServicev2;
+import io.mosip.certify.issuance.KeyProviderRegistry;
+import io.mosip.certify.signing.KeyRef;
+import io.mosip.certify.signing.SignatureAlgorithm;
+import io.mosip.certify.signing.SigningException;
+import io.mosip.certify.signing.SigningKey;
+import io.mosip.certify.signing.TestKeyProviders;
+import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.mockito.InjectMocks;
-import org.mockito.Mock;
-import org.mockito.MockitoAnnotations;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.test.util.ReflectionTestUtils;
 
-import java.util.HashMap;
+import java.security.MessageDigest;
+import java.security.Security;
+import java.security.Signature;
+import java.util.Base64;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.Mockito.*;
 
+/** The generator signs through the key provider; the proof is checked with plain JCA / Nimbus, not with Certify code. */
 class Ed25519Signature2020ProofGeneratorTest {
 
-    @InjectMocks
-    private Ed25519Signature2020ProofGenerator proofGenerator;
+    static { Security.addProvider(new BouncyCastleProvider()); }
 
-    @Mock
-    private SignatureServicev2 signatureService;
-
-    private Map<String, String> keyID;
+    final KeyProviderRegistry registry = TestKeyProviders.registry("app123/ref456", SignatureAlgorithm.EdDSA);
+    final Ed25519Signature2020ProofGenerator proofGenerator = new Ed25519Signature2020ProofGenerator();
+    final Map<String, String> keyID = Map.of(Constants.APPLICATION_ID, "app123", Constants.REFERENCE_ID, "ref456");
+    byte[] hash;
 
     @BeforeEach
-    void setUp() {
-        MockitoAnnotations.openMocks(this);
-        keyID = new HashMap<>();
-        keyID.put(Constants.APPLICATION_ID, "app123");
-        keyID.put(Constants.REFERENCE_ID, "ref456");
+    void setUp() throws Exception {
+        ReflectionTestUtils.setField(proofGenerator, "keyProviders", registry);
+        hash = MessageDigest.getInstance("SHA-256").digest("canonicalized document".getBytes());
+    }
+
+    static boolean verifyRaw(byte[] data, byte[] signature, SigningKey key, String jca) throws Exception {
+        Signature verifier = Signature.getInstance(jca, BouncyCastleProvider.PROVIDER_NAME);
+        verifier.initVerify(key.descriptor().publicKey());
+        verifier.update(data);
+        return verifier.verify(jca.equals("Ed25519") ? signature : com.nimbusds.jose.crypto.impl.ECDSA.transcodeSignatureToDER(signature));
     }
 
     @Test
-    void testGetName() {
+    void nameAndCanonicalizer() {
         assertEquals("Ed25519Signature2020", proofGenerator.getName());
+        assertInstanceOf(URDNA2015Canonicalizer.class, proofGenerator.getCanonicalizer());
     }
 
     @Test
-    void testGetCanonicalizer() {
-        Canonicalizer canonicalizer = proofGenerator.getCanonicalizer();
-        assertNotNull(canonicalizer);
-        assertTrue(canonicalizer instanceof URDNA2015Canonicalizer);
-    }
-
-    @Test
-    void testGenerateProofSuccess() {
-        LdProof baseProof = new LdProof();
-        String vcEncodedHash = "mockEncodedHash";
-        SignResponseDto responseDto = new SignResponseDto();
-        responseDto.setSignature("mockSignatureValue");
-
-        when(signatureService.signv2(any(SignRequestDtoV2.class))).thenReturn(responseDto);
-
-        LdProof result = proofGenerator.generateProof(baseProof, vcEncodedHash, keyID);
+    void proofVerifiesIndependently() throws Exception {
+        LdProof result = proofGenerator.generateProof(LdProof.builder().build(), Base64.getUrlEncoder().encodeToString(hash), keyID);
+        SigningKey key = TestKeyProviders.provider(registry).resolve(KeyRef.parse("keymanager:app123/ref456"));
 
         assertNotNull(result);
-        assertEquals("mockSignatureValue", result.getProofValue());
-        verify(signatureService).signv2(any(SignRequestDtoV2.class));
+        byte[] signature = io.ipfs.multibase.Multibase.decode(result.getProofValue());
+        assertTrue(verifyRaw(hash, signature, key, "Ed25519"), "proofValue must verify with plain JCA");
     }
 
     @Test
-    void testGenerateProof_NullProof() {
-        SignResponseDto responseDto = new SignResponseDto();
-        responseDto.setSignature("mockSignatureValue");
-        when(signatureService.signv2(any(SignRequestDtoV2.class))).thenReturn(responseDto);
-
-        LdProof result = proofGenerator.generateProof(null, "mockEncodedHash", keyID);
-
-        assertNotNull(result);
-        assertEquals("mockSignatureValue", result.getProofValue());
-    }
-
-    @Test
-    void testGenerateProof_EmptyKeyID() {
-        SignResponseDto responseDto = new SignResponseDto();
-        responseDto.setSignature("mockSignatureValue");
-        when(signatureService.signv2(any(SignRequestDtoV2.class))).thenReturn(responseDto);
-
-        Map<String, String> emptyKeyID = new HashMap<>();
-        LdProof result = proofGenerator.generateProof(new LdProof(), "mockEncodedHash", emptyKeyID);
-
-        assertNotNull(result);
-        assertEquals("mockSignatureValue", result.getProofValue());
-    }
-
-    @Test
-    void testGenerateProofSignature_ServiceFailure() {
-        when(signatureService.signv2(any(SignRequestDtoV2.class))).thenThrow(new RequestException("SIGNATURE_TEST_ERROR","Signature Failed"));
-
-        RequestException exception = assertThrows(RequestException.class, () -> {
-            proofGenerator.generateProof(new LdProof(), "mockEncodedHash", keyID);
-        });
-
-        assertEquals("SIGNATURE_TEST_ERROR", exception.getErrorCode());
-        assertEquals("SIGNATURE_TEST_ERROR --> Signature Failed", exception.getMessage());
+    void unknownKeyFails() {
+        assertThrows(SigningException.class, () -> proofGenerator.generateProof(LdProof.builder().build(),
+                Base64.getUrlEncoder().encodeToString(hash), Map.of(Constants.APPLICATION_ID, "nope", Constants.REFERENCE_ID, "")));
     }
 }

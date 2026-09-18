@@ -10,7 +10,6 @@ import io.mosip.certify.core.dto.CertificateResponseDTO;
 import io.mosip.certify.core.exception.CertifyException;
 import io.mosip.certify.proofgenerators.ProofGenerator;
 import io.mosip.certify.proofgenerators.ProofGeneratorFactory;
-import io.mosip.certify.proofgenerators.dataintegrity.KeymanagerByteSigner;
 import io.mosip.certify.utils.DIDDocumentUtil;
 import io.mosip.certify.vcformatters.VCFormatter;
 import io.mosip.kernel.signature.service.SignatureService;
@@ -68,6 +67,7 @@ public class W3CJsonLDTest {
         ReflectionTestUtils.setField(w3cJsonLd, "proofGeneratorFactory", proofGeneratorFactory);
         ReflectionTestUtils.setField(w3cJsonLd, "didDocumentUtil", didDocumentUtil);
         ReflectionTestUtils.setField(w3cJsonLd, "keyAliasMapper", keyAliasMapper);
+        ReflectionTestUtils.setField(w3cJsonLd, "keyProviders", io.mosip.certify.signing.TestKeyProviders.registry("appID/refID", io.mosip.certify.signing.SignatureAlgorithm.EdDSA));
         when(proofGeneratorFactory.getProofGenerator(any())).thenReturn(Optional.of(proofGenerator));
     }
 
