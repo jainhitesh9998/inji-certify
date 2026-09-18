@@ -20,9 +20,18 @@ Also: `JwsEnvelope` now assembles the RFC 7797 signing input as bytes (a binary 
 
 Tests replaced, not adapted: the previous generator and SD-JWT tests asserted that a mocked keymanager response was passed through; the new ones sign with a generated key and verify the proof with plain JCA or Nimbus (`TestKeyProviders`).
 
-## Slice 2 (open): paths without a golden yet
+## Slice 2 (branch `wp/p1-03-envelope-routing-2`): the JWS paths, after their goldens landed in P0-03 slice 2
 
-`Ed25519Signature2018`, `EcdsaSecp256k1Signature2019`, `EcdsaKoblitzSignature2016` (all `jwsSign` detached, ES256K/EdDSA), `MDocProcessor.signMSO` (`coseSign1`), `Credential.signQRData` (claim-169 `cwtSign`), `Credential.addProof` (`vc` format), `AccessTokenJwtUtil` (`jwsSign` RS256). Each gets a golden or vector with independent verification first (P0-03 remainder), then the same treatment. `JwksServiceImpl` and `DIDDocumentUtil` move to `KeyPublisher` in P1-04; `SystemInfoController` keeps `KeymanagerService` (certificate upload and CSR are keymanager administration).
+| Path | Before | After | Guard |
+| --- | --- | --- | --- |
+| `Ed25519Signature2018ProofGenerator` | `jwsSign` detached EdDSA | `LdLegacyEnvelope.detachedJws` | golden + danubetech `Ed25519Signature2018LdVerifier` |
+| `EcdsaSecp256k1Signature2019ProofGenerator` | `jwsSign` detached ES256K | same | golden + danubetech verifier over JCA |
+| `EcdsaKoblitzSignature2016ProofGenerator` | `jwsSign` detached ES256K | same | unit test verified with JCA (same code path; no golden, the suite has no registered context in the static loader) |
+| `AccessTokenJwtUtil` | `jwsSign` RS256 with `CERTIFY_SERVICE` | `JwsEnvelope.sign` compact (`alg`, `kid`) | pre-authorized-code golden: token verified with Nimbus against `jwks.json`; header golden `alg`+`kid` |
+
+## Slice 3 (open)
+
+`MDocProcessor.signMSO` (`coseSign1`), `Credential.signQRData` (claim-169 `cwtSign`), `Credential.addProof` (`vc` format): each needs a vector with independent verification first. `JwksServiceImpl` and `DIDDocumentUtil` move to `KeyPublisher` in P1-04; `SystemInfoController` keeps `KeymanagerService` (certificate upload and CSR are keymanager administration).
 
 ## Acceptance criteria (slice 1)
 
