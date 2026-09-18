@@ -71,7 +71,7 @@ public class Oid4vciCredentialController {
         ProofValidator.ProofPolicy policy = new ProofValidator.ProofPolicy(allowedProofAlgorithms(request.getCredentialConfigId()), issuerIdentifier, true,
                 authorization.clientId(), Map.of());
         IssuanceCommand command = IssuanceCommand.builder(request.getCredentialConfigId())
-                .tenant(TenantContext.DEFAULT).authorization(authorization).proofs(proofs).proofPolicy(policy).nonceCheck(nonceCheck)
+                .tenant(TenantContext.defaultTenant(issuerIdentifier, null)).authorization(authorization).proofs(proofs).proofPolicy(policy).nonceCheck(nonceCheck)
                 .protocol(ProtocolVersion.OID4VCI_1_0).correlationId(UUID.randomUUID().toString()).build();
 
         IssuanceResult result = issuanceService.issue(command);

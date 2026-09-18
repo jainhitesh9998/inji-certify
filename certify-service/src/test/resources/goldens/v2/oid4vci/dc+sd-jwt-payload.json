@@ -1,0 +1,10 @@
+{
+  "_sd" : "<_sd>",
+  "address" : {
+    "_sd" : "<_sd>"
+  },
+  "cnf" : "<cnf>",
+  "dateOfBirth" : "1990-01-01",
+  "iss" : "http://localhost:8090/v1/certify",
+  "vct" : "GoldenCredential"
+}

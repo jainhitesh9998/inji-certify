@@ -533,6 +533,28 @@ class IssuanceGoldenTest {
     }
 
     @Test
+    void oid4vciSdJwtIssuanceGoldenAndIndependentVerification() throws Exception {
+        MvcResult result = issueOid4vci(SDJWT_ID, proofJwt(nonce()));
+        JsonNode body = objectMapper.readTree(result.getResponse().getContentAsString());
+        assertEquals(200, result.getResponse().getStatus(), body.toString());
+        String sdJwt = body.get("credentials").get(0).get("credential").asText();
+        String[] parts = sdJwt.split("~");
+        assertTrue(parts.length >= 3, "issuer JWS plus two disclosures: " + parts.length);
+        JWSObject jws = JWSObject.parse(parts[0]);
+        assertEquals("dc+sd-jwt", jws.getHeader().getType().getType());
+        JsonNode payload = objectMapper.readTree(jws.getPayload().toString());
+        assertEquals("GoldenCredential", payload.get("vct").asText());
+        assertEquals(issuerIdentifier, payload.get("iss").asText());
+        assertTrue(payload.get("cnf").get("kid").asText().startsWith("did:jwk:"));
+        JWKSet jwks = JWKSet.parse(getJson("/.well-known/jwks.json").toString());
+        JWK key = jwks.getKeyByKeyId(jws.getHeader().getKeyID());
+        assertNotNull(key, "kid must be in jwks.json");
+        assertTrue(jws.verify(new ECDSAVerifier(key.toECKey())), "SD-JWT from the new surface must verify with Nimbus");
+        Goldens.assertGolden("v2/oid4vci/dc+sd-jwt-payload", payload);
+        Goldens.assertGolden("v2/oid4vci/dc+sd-jwt-header", objectMapper.readTree(jws.getHeader().toString()));
+    }
+
+    @Test
     void oid4vciErrorsFollowTheSpec() throws Exception {
         // the local profile's TestBearer filter authenticates every request, so the 401 path is covered by the controller unit only
         MvcResult unknown = issueOid4vci("NoSuchCredential", proofJwt(nonce()));
