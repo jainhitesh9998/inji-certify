@@ -60,25 +60,25 @@ public class JpaConfigurationRegistry implements ConfigurationRegistry {
 
     @Override
     public Optional<CredentialConfiguration> byId(String tenantId, String credentialConfigurationId) {
-        if (!TenantContext.DEFAULT_TENANT_ID.equals(tenantId)) {
+        if (tenantId == null || credentialConfigurationId == null) {
             return Optional.empty();
         }
-        return repository.findByCredentialConfigKeyId(credentialConfigurationId).filter(this::active).map(this::toConfiguration);
+        return repository.findByTenantIdAndCredentialConfigKeyId(tenantId, credentialConfigurationId).filter(this::active).map(this::toConfiguration);
     }
 
     @Override
     public Optional<CredentialConfiguration> bySelector(String tenantId, String format, String selectorKey) {
-        if (!TenantContext.DEFAULT_TENANT_ID.equals(tenantId) || format == null || selectorKey == null) {
+        if (tenantId == null || format == null || selectorKey == null) {
             return Optional.empty();
         }
         Optional<CredentialConfig> row = switch (format) {
             case VCFormats.LDP_VC -> {
                 int separator = selectorKey.indexOf(SELECTOR_SEPARATOR);
                 yield separator < 0 ? Optional.empty()
-                        : repository.findByCredentialFormatAndCredentialTypeAndContext(format, selectorKey.substring(separator + 1), selectorKey.substring(0, separator));
+                        : repository.findByTenantIdAndCredentialFormatAndCredentialTypeAndContext(tenantId, format, selectorKey.substring(separator + 1), selectorKey.substring(0, separator));
             }
-            case VCFormats.DC_SD_JWT, "vc+sd-jwt" -> repository.findByCredentialFormatAndSdJwtVct(format, selectorKey);
-            case VCFormats.MSO_MDOC -> repository.findByCredentialFormatAndDocType(format, selectorKey);
+            case VCFormats.DC_SD_JWT, "vc+sd-jwt" -> repository.findByTenantIdAndCredentialFormatAndSdJwtVct(tenantId, format, selectorKey);
+            case VCFormats.MSO_MDOC -> repository.findByTenantIdAndCredentialFormatAndDocType(tenantId, format, selectorKey);
             default -> Optional.empty();
         };
         return row.filter(this::active).map(this::toConfiguration);
@@ -86,10 +86,10 @@ public class JpaConfigurationRegistry implements ConfigurationRegistry {
 
     @Override
     public List<CredentialConfiguration> all(String tenantId) {
-        if (!TenantContext.DEFAULT_TENANT_ID.equals(tenantId)) {
+        if (tenantId == null) {
             return List.of();
         }
-        return repository.findAll().stream().filter(this::active).map(this::toConfiguration).toList();
+        return repository.findByTenantId(tenantId).stream().filter(this::active).map(this::toConfiguration).toList();
     }
 
     private boolean active(CredentialConfig row) {
@@ -258,7 +258,8 @@ public class JpaConfigurationRegistry implements ConfigurationRegistry {
         IssuanceStrategy strategy = "DataProvider".equalsIgnoreCase(pluginMode) ? IssuanceStrategy.TEMPLATE : IssuanceStrategy.EXTERNAL;
         StatusConfig status = row.getCredentialStatusPurposes() == null || row.getCredentialStatusPurposes().isEmpty()
                 ? StatusConfig.NONE : new StatusConfig(STATUS_MECHANISM_BITSTRING, row.getCredentialStatusPurposes());
-        return new CredentialConfiguration(TenantContext.DEFAULT_TENANT_ID, row.getCredentialConfigKeyId(), row.getScope(), format, formatConfig,
+        String tenantId = row.getTenantId() == null || row.getTenantId().isBlank() ? TenantContext.DEFAULT_TENANT_ID : row.getTenantId();
+        return new CredentialConfiguration(tenantId, row.getCredentialConfigKeyId(), row.getScope(), format, formatConfig,
                 template, signing, strategy, null, status, display(row), Map.of());
     }
 

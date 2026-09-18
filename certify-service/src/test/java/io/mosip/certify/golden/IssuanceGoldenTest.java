@@ -188,7 +188,7 @@ class IssuanceGoldenTest {
         io.mosip.certify.spi.CredentialConfiguration mdoc = configurationRegistry.bySelector("default", "mso_mdoc", "org.iso.18013.5.1.mDL").orElseThrow();
         assertEquals(MDOC_ID, mdoc.id());
         assertTrue(configurationRegistry.all("default").size() >= 9, "all nine golden configurations are visible: " + configurationRegistry.all("default").size());
-        assertTrue(configurationRegistry.all("acme").isEmpty(), "single tenant");
+        assertTrue(configurationRegistry.all("no-such-tenant").isEmpty(), "another tenant sees nothing (TenancyIssuanceTest owns the acme rows in this JVM)");
         // rows written by the v1 config API carry the v2 model (P2-02), so every golden here reads through the JSONB path
         io.mosip.certify.entity.CredentialConfig row = credentialConfigRepository.findByCredentialConfigKeyId(LDP_ID).orElseThrow();
         assertEquals(2, row.getConfigVersion(), "the v1 API writes both shapes");

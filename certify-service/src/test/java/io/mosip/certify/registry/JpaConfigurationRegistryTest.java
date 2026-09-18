@@ -49,7 +49,7 @@ class JpaConfigurationRegistryTest {
 
     @Test
     void ldpRowMapsToATemplatedKeymanagerSignedConfiguration() {
-        when(repository.findByCredentialConfigKeyId("FarmerCredential")).thenReturn(Optional.of(farmer()));
+        when(repository.findByTenantIdAndCredentialConfigKeyId("default", "FarmerCredential")).thenReturn(Optional.of(farmer()));
 
         CredentialConfiguration c = registry.byId("default", "FarmerCredential").orElseThrow();
 
@@ -118,6 +118,19 @@ class JpaConfigurationRegistryTest {
     }
 
     @Test
+    void lookupsAreScopedToTheTenant() {
+        CredentialConfig acme = farmer();
+        acme.setTenantId("acme");
+        when(repository.findByTenantIdAndCredentialConfigKeyId("acme", "FarmerCredential")).thenReturn(Optional.of(acme));
+        when(repository.findByTenantId("acme")).thenReturn(List.of(acme));
+        assertEquals("acme", registry.byId("acme", "FarmerCredential").orElseThrow().tenantId());
+        assertTrue(registry.byId("default", "FarmerCredential").isEmpty(), "another tenant's row is not visible");
+        assertEquals(1, registry.all("acme").size());
+        assertTrue(registry.all("default").isEmpty());
+        assertTrue(registry.byId(null, "FarmerCredential").isEmpty());
+    }
+
+    @Test
     void selectorsResolvePerFormat() {
         CredentialConfig sd = farmer();
         sd.setCredentialConfigKeyId("FarmerSdJwt");
@@ -134,9 +147,9 @@ class JpaConfigurationRegistryTest {
         mdl.setVcTemplate(null);
         mdl.setSignatureAlgo(null);
         mdl.setCredentialSigningAlgValuesSupported(List.of("ES256"));
-        when(repository.findByCredentialFormatAndCredentialTypeAndContext("ldp_vc", "FarmerCredential,VerifiableCredential", "https://www.w3.org/2018/credentials/v1")).thenReturn(Optional.of(farmer()));
-        when(repository.findByCredentialFormatAndSdJwtVct("dc+sd-jwt", "FarmerCredential")).thenReturn(Optional.of(sd));
-        when(repository.findByCredentialFormatAndDocType("mso_mdoc", "org.iso.18013.5.1.mDL")).thenReturn(Optional.of(mdl));
+        when(repository.findByTenantIdAndCredentialFormatAndCredentialTypeAndContext("default", "ldp_vc", "FarmerCredential,VerifiableCredential", "https://www.w3.org/2018/credentials/v1")).thenReturn(Optional.of(farmer()));
+        when(repository.findByTenantIdAndCredentialFormatAndSdJwtVct("default", "dc+sd-jwt", "FarmerCredential")).thenReturn(Optional.of(sd));
+        when(repository.findByTenantIdAndCredentialFormatAndDocType("default", "mso_mdoc", "org.iso.18013.5.1.mDL")).thenReturn(Optional.of(mdl));
 
         assertEquals("FarmerCredential", registry.bySelector("default", "ldp_vc", "https://www.w3.org/2018/credentials/v1|FarmerCredential,VerifiableCredential").orElseThrow().id());
         CredentialConfiguration sdJwt = registry.bySelector("default", "dc+sd-jwt", "FarmerCredential").orElseThrow();
@@ -153,8 +166,8 @@ class JpaConfigurationRegistryTest {
     void inactiveRowsOtherTenantsAndExternalModeAreHandled() {
         CredentialConfig inactive = farmer();
         inactive.setStatus("inactive");
-        when(repository.findByCredentialConfigKeyId("FarmerCredential")).thenReturn(Optional.of(inactive));
-        when(repository.findAll()).thenReturn(List.of(inactive, farmer()));
+        when(repository.findByTenantIdAndCredentialConfigKeyId("default", "FarmerCredential")).thenReturn(Optional.of(inactive));
+        when(repository.findByTenantId("default")).thenReturn(List.of(inactive, farmer()));
 
         assertTrue(registry.byId("default", "FarmerCredential").isEmpty());
         assertEquals(1, registry.all("default").size());

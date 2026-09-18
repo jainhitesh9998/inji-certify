@@ -12,6 +12,7 @@ import io.mosip.certify.spi.IssuedCredential;
 import io.mosip.certify.spi.ProofValidator;
 import io.mosip.certify.spi.ProtocolVersion;
 import io.mosip.certify.spi.TenantContext;
+import io.mosip.certify.tenancy.TenantContexts;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -44,8 +45,11 @@ public class Oid4vciCredentialController {
     private final ProofValidator.NonceCheck nonceCheck;
     private final String issuerIdentifier;
 
+    private final TenantContexts tenants;
+
     public Oid4vciCredentialController(IssuanceService oid4vciIssuanceService, ConfigurationRegistry configurations,
-                                       AuthorizationContext authorizationContext, CacheNonceCheck nonceCheck, Oid4vciIssuer issuer) {
+                                       AuthorizationContext authorizationContext, CacheNonceCheck nonceCheck, Oid4vciIssuer issuer, TenantContexts tenants) {
+        this.tenants = tenants;
         this.issuanceService = oid4vciIssuanceService;
         this.configurations = configurations;
         this.authorizationContext = authorizationContext;
@@ -66,10 +70,15 @@ public class Oid4vciCredentialController {
         if (request.getProofs() != null) {
             request.getProofs().forEach((type, values) -> values.forEach(value -> proofs.add(new ProofValidator.ProofInput(type.name().toLowerCase(), value))));
         }
-        ProofValidator.ProofPolicy policy = new ProofValidator.ProofPolicy(allowedProofAlgorithms(request.getCredentialConfigId()), issuerIdentifier, true,
+        // a tenant with its own issuer identifier gets this surface's suffix on it (Oid4vciIssuer); the default keeps the deployment's
+        TenantContext tenant = tenants.forRequest(authorizationContext.getTenantId(), issuerIdentifier, null);
+        if (!issuerIdentifier.equals(tenant.issuerIdentifier())) {
+            tenant = new TenantContext(tenant.tenantId(), Oid4vciIssuer.derive(tenant.issuerIdentifier(), null).identifier(), tenant.issuerDid(), tenant.keyNamespace());
+        }
+        ProofValidator.ProofPolicy policy = new ProofValidator.ProofPolicy(allowedProofAlgorithms(tenant.tenantId(), request.getCredentialConfigId()), tenant.issuerIdentifier(), true,
                 authorization.clientId(), Map.of());
         IssuanceCommand command = IssuanceCommand.builder(request.getCredentialConfigId())
-                .tenant(TenantContext.defaultTenant(issuerIdentifier, null)).authorization(authorization).proofs(proofs).proofPolicy(policy).nonceCheck(nonceCheck)
+                .tenant(tenant).authorization(authorization).proofs(proofs).proofPolicy(policy).nonceCheck(nonceCheck)
                 .protocol(ProtocolVersion.OID4VCI_1_0).correlationId(UUID.randomUUID().toString()).build();
 
         IssuanceResult result = issuanceService.issue(command);
@@ -89,8 +98,8 @@ public class Oid4vciCredentialController {
     }
 
     @SuppressWarnings("unchecked")
-    private List<String> allowedProofAlgorithms(String configurationId) {
-        return configurations.byId(TenantContext.DEFAULT_TENANT_ID, configurationId)
+    private List<String> allowedProofAlgorithms(String tenantId, String configurationId) {
+        return configurations.byId(tenantId, configurationId)
                 .map(c -> c.formatConfig() == null ? null : c.formatConfig().raw().get("proofTypesSupported"))
                 .filter(Map.class::isInstance)
                 .map(m -> ((Map<String, Object>) m).get("jwt"))
