@@ -124,6 +124,7 @@
 		<module>certify-template-jsonmap</module>
 		<module>certify-format-ldp-vc</module>
 		<module>certify-format-sd-jwt</module>
+		<module>certify-format-mdoc</module>
 	</modules>
 	
 	<dependencies>
