@@ -222,7 +222,7 @@ class StatusListPostgresTest {
             assertTrue(c.getMetaData().getURL().startsWith("jdbc:postgresql:"), c.getMetaData().getURL());
         }
         assertEquals(0, flyway.info().pending().length, "the service found nothing left to migrate");
-        assertEquals(List.of("1.0.0.000", "1.0.0.001", "1.0.0.002", "1.0.0.003"), // plus Flyway's own schema-creation row
+        assertEquals(List.of("1.0.0.000", "1.0.0.001", "1.0.0.002", "1.0.0.003", "1.1.0.000"), // plus Flyway's own schema-creation row
                 Arrays.stream(flyway.info().applied()).map(MigrationInfo::getVersion).filter(java.util.Objects::nonNull).map(Object::toString).toList());
     }
 
