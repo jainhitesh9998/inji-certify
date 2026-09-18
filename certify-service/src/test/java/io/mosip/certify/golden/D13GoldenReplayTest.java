@@ -68,6 +68,9 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @ActiveProfiles({"local", "test"})
 @TestPropertySource(properties = {
         "mosip.certify.issuer.ledger-enabled=false",
+        // the issuer-level display and authorization server list are deployment settings; 0.14.0 recorded these values
+        "mosip.certify.credential-config.issuer.display={{'name': 'Test Issuer', 'locale': 'en'}}",
+        "mosip.certify.authorization.url=http://localhost:8090",
         "mosip.certify.authn.filter-urls={'/issuance/credential','/issuance/vd11/credential','/issuance/vd12/credential'}",
         "spring.jpa.database-platform=org.hibernate.dialect.H2Dialect",
         "spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.H2Dialect",
@@ -240,7 +243,49 @@ class D13GoldenReplayTest {
         assertFalse(body.has("credential"));
     }
 
+    @Test
+    void versionedMetadataReplay() throws Exception {
+        MvcResult latest = mockMvc.perform(get("/.well-known/openid-credential-issuer?version=latest")).andReturn();
+        assertEquals(200, latest.getResponse().getStatus(), latest.getResponse().getContentAsString());
+        assertNotNull(latest.getResponse().getHeader("Deprecation"), "versioned metadata is deprecated from day one");
+        Goldens.assertGolden("d13/well-known/openid-credential-issuer-latest", onlyGoldenConfigurations(objectMapper.readTree(latest.getResponse().getContentAsString())));
+        Goldens.assertGolden("d13/well-known/openid-credential-issuer-vd12", onlyGoldenConfigurations(getJson("/.well-known/openid-credential-issuer?version=vd12")));
+        Goldens.assertGolden("d13/well-known/openid-credential-issuer-vd11", onlyGoldenConfigurations(getJson("/.well-known/openid-credential-issuer?version=vd11")));
+        Goldens.assertGolden("d13/well-known/issuance-openid-credential-issuer", onlyGoldenConfigurations(getJson("/issuance/.well-known/openid-credential-issuer")));
+        Goldens.assertGolden("d13/well-known/openid-credential-issuer-unknown-version",
+                statusAndBody(mockMvc.perform(get("/.well-known/openid-credential-issuer?version=vd10")).andReturn()));
+        // without a version the current (OpenID4VCI 1.0) document keeps answering
+        JsonNode current = getJson("/.well-known/openid-credential-issuer");
+        assertTrue(current.has("nonce_endpoint") && current.get("credential_configurations_supported").get(LDP_ID).has("credential_metadata"));
+        assertFalse(current.get("credential_configurations_supported").get(LDP_ID).has("order"));
+    }
+
+    @Test
+    void issuanceDidAliasServesTheCurrentDocument() throws Exception {
+        MvcResult alias = mockMvc.perform(get("/issuance/.well-known/did.json")).andReturn();
+        assertEquals(200, alias.getResponse().getStatus());
+        assertNotNull(alias.getResponse().getHeader("Deprecation"));
+        assertEquals(getJson("/.well-known/did.json"), objectMapper.readTree(alias.getResponse().getContentAsString()), "the alias and the root path publish the same DID document");
+    }
+
     // ---- helpers -------------------------------------------------------------------------------------
+
+    /** The golden tests share one H2 database per JVM; only the three configurations 0.14.0 recorded are compared. */
+    private JsonNode onlyGoldenConfigurations(JsonNode document) {
+        ObjectNode copy = document.deepCopy();
+        List<String> keep = List.of(LDP_ID, SDJWT_ID, MDOC_ID);
+        for (String field : List.of("credential_configurations_supported", "credentials_supported")) {
+            JsonNode configurations = copy.get(field);
+            if (configurations instanceof ObjectNode map) {
+                map.retain(keep);
+            } else if (configurations instanceof com.fasterxml.jackson.databind.node.ArrayNode list) {
+                com.fasterxml.jackson.databind.node.ArrayNode kept = objectMapper.createArrayNode();
+                list.forEach(item -> { if (item.hasNonNull("id") && keep.contains(item.get("id").asText())) kept.add(item); });
+                copy.set(field, kept);
+            }
+        }
+        return copy;
+    }
 
     private MvcResult issue(String path, Map<String, Object> request) throws Exception {
         return mockMvc.perform(post(path).header("Authorization", "TestBearer demo")

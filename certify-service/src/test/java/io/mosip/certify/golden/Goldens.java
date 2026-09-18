@@ -55,6 +55,8 @@ public final class Goldens {
                 Map.Entry<String, JsonNode> field = fields.next();
                 if (VOLATILE_KEYS.contains(field.getKey())) {
                     object.set(field.getKey(), MAPPER.getNodeFactory().textNode("<" + field.getKey() + ">"));
+                } else if (field.getValue().isTextual()) {
+                    object.set(field.getKey(), MAPPER.getNodeFactory().textNode(collapseBrackets(field.getValue().asText())));
                 } else {
                     normalizeInPlace(field.getValue());
                 }
@@ -70,9 +72,27 @@ public final class Goldens {
                 object.put("verificationMethod", hash > 0 ? vm.substring(0, hash) + "#<kid>" : vm);
             }
         } else if (node instanceof ArrayNode array) {
-            array.forEach(Goldens::normalizeInPlace);
+            for (int i = 0; i < array.size(); i++) {
+                if (array.get(i).isTextual()) {
+                    array.set(i, MAPPER.getNodeFactory().textNode(collapseBrackets(array.get(i).asText())));
+                } else {
+                    normalizeInPlace(array.get(i));
+                }
+            }
             sortObjectArray(array);
         }
+    }
+
+    private static final java.util.regex.Pattern NESTED_BRACKETS = java.util.regex.Pattern.compile("^\\[{2,}([^\\[\\]]*)\\]{2,}$");
+
+    /**
+     * H2 returns a {@code TEXT[]} column as one stringified element ({@code "[did:jwk, did:web]"}), and 0.14.0
+     * re-stringified the cached value on every metadata call ({@code "[[[cose_key]]]"}); the depth is an artefact of
+     * call order, so it is folded to one pair of brackets.
+     */
+    static String collapseBrackets(String text) {
+        java.util.regex.Matcher matcher = NESTED_BRACKETS.matcher(text);
+        return matcher.matches() ? "[" + matcher.group(1) + "]" : text;
     }
 
     /**
