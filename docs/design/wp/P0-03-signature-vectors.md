@@ -15,8 +15,9 @@ Lock the bytes keymanager produces on each signing path so Phase 1 can route the
 
 ## Acceptance criteria
 
-- [ ] All vectors recorded and the test passes on develop unchanged.
-- [ ] Each vector names the class and line that produced it.
+- [x] Vectors are the goldens of `IssuanceGoldenTest`, each verified by an independent library: Ed25519Signature2020, Ed25519Signature2018, RsaSignature2018, EcdsaSecp256k1Signature2019 (danubetech), eddsa-rdfc-2022 (danubetech Data Integrity), SD-JWT ES256 and the pre-authorized-code access token (Nimbus against `jwks.json`), EcdsaSecp256r1Signature2019 (danubetech canonicalization + JCA; no third-party verifier exists, see PROGRESS findings).
+- [ ] Remaining paths: mDoc `coseSign1` (JCA over the MSO with the `x5chain` certificate), claim-169 `cwtSign`, `Credential.addProof` (`vc`), the other Data Integrity cryptosuites (`ecdsa-rdfc-2019`, `ecdsa-jcs-2019`, `eddsa-jcs-2022`).
+- [x] Each golden names the test method that produced it (file name = test).
 
 ## Rules that apply
 

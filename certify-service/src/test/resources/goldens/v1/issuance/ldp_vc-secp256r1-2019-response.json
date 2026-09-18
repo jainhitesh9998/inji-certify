@@ -1,0 +1,29 @@
+{
+  "credentials" : [ {
+    "credential" : {
+      "@context" : [ "https://www.w3.org/2018/credentials/v1", "https://w3id.org/security/suites/ed25519-2020/v1", {
+        "GoldenEcR1Credential" : "https://example.org/golden#GoldenEcR1Credential",
+        "city" : "https://schema.org/addressLocality",
+        "dateOfBirth" : "https://schema.org/birthDate",
+        "fullName" : "https://schema.org/name"
+      } ],
+      "credentialSubject" : {
+        "city" : "Bengaluru",
+        "dateOfBirth" : "1990-01-01",
+        "fullName" : "Golden Farmer",
+        "id" : "<holder>"
+      },
+      "expirationDate" : "<expirationDate>",
+      "issuanceDate" : "<issuanceDate>",
+      "issuer" : "did:web:localhost:certify",
+      "proof" : {
+        "created" : "<created>",
+        "proofPurpose" : "assertionMethod",
+        "proofValue" : "<proofValue>",
+        "type" : "EcdsaSecp256r1Signature2019",
+        "verificationMethod" : "did:web:localhost:certify#<kid>"
+      },
+      "type" : [ "VerifiableCredential", "GoldenEcR1Credential" ]
+    }
+  } ]
+}

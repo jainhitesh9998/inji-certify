@@ -53,6 +53,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -80,8 +81,9 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
         "spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.H2Dialect",
         "mosip.certify.data-provider-plugin.did-url=did:web:localhost:certify",
         "mosip.certify.data-provider-plugin.vc-expiry-duration=P365D",
-        "mosip.certify.signature-algo.key-alias-mapper={'EdDSA': {{'CERTIFY_VC_SIGN_ED25519','ED25519_SIGN'}}, 'ES256': {{'CERTIFY_VC_SIGN_EC_R1','EC_SECP256R1_SIGN'}}, 'RS256': {{'CERTIFY_VC_SIGN_RSA',''}}}",
-        "mosip.certify.credential-config.credential-signing-alg-values-supported={'Ed25519Signature2020': {'EdDSA'}, 'EcdsaSecp256r1Signature2019': {'ES256'}, 'eddsa-rdfc-2022': {'EdDSA'}, 'ecdsa-rdfc-2019': {'ES256'}, 'RsaSignature2018': {'RS256'}}",
+        "mosip.certify.signature-algo.key-alias-mapper={'EdDSA': {{'CERTIFY_VC_SIGN_ED25519','ED25519_SIGN'}}, 'ES256': {{'CERTIFY_VC_SIGN_EC_R1','EC_SECP256R1_SIGN'}}, 'ES256K': {{'CERTIFY_VC_SIGN_EC_K1','EC_SECP256K1_SIGN'}}, 'RS256': {{'CERTIFY_VC_SIGN_RSA',''}}}",
+        "mosip.certify.credential-config.credential-signing-alg-values-supported={'Ed25519Signature2020': {'EdDSA'}, 'Ed25519Signature2018': {'EdDSA'}, 'EcdsaSecp256r1Signature2019': {'ES256'}, 'EcdsaSecp256k1Signature2019': {'ES256K'}, 'eddsa-rdfc-2022': {'EdDSA'}, 'ecdsa-rdfc-2019': {'ES256'}, 'RsaSignature2018': {'RS256'}}",
+        "mosip.certify.oauth.grant-types-supported=authorization_code,urn:ietf:params:oauth:grant-type:pre-authorized_code",
         "mosip.certify.credential-config.cryptographic-binding-methods-supported={'ldp_vc': {'did:jwk','did:web'}, 'dc+sd-jwt': {'did:jwk','did:web'}, 'mso_mdoc': {'cose_key'}}",
         "mosip.certify.credential-config.proof-types-supported={'jwt': {'proof_signing_alg_values_supported': {'ES256','EdDSA','RS256','PS256'}}}"
 })
@@ -91,6 +93,9 @@ class IssuanceGoldenTest {
     static final String SDJWT_ID = "GoldenSdJwtCredential";
     static final String DI_ID = "GoldenDataIntegrityCredential";
     static final String RSA_ID = "GoldenRsaCredential";
+    static final String EC_R1_ID = "GoldenEcR1Credential";
+    static final String EC_K1_ID = "GoldenEcK1Credential";
+    static final String ED_2018_ID = "GoldenEd2018Credential";
     static final String SCOPE = "sample_vc_ldp"; // the scope LocalAccessTokenValidationFilter injects
 
     @Autowired MockMvc mockMvc;
@@ -121,6 +126,17 @@ class IssuanceGoldenTest {
                     "https://www.w3.org/2018/credentials/v1", "CERTIFY_VC_SIGN_RSA", "", "RS256", "RsaSignature2018");
             rsa.setCredentialTypes(List.of("VerifiableCredential", "GoldenRsaCredential")); // ldp_vc configs are unique per (context, types)
             credentialConfigurationService.addCredentialConfiguration(rsa);
+        }
+        addLegacySuiteConfig(EC_R1_ID, "golden-ldp-ecr1.vm", "CERTIFY_VC_SIGN_EC_R1", "EC_SECP256R1_SIGN", "ES256", "EcdsaSecp256r1Signature2019");
+        addLegacySuiteConfig(EC_K1_ID, "golden-ldp-eck1.vm", "CERTIFY_VC_SIGN_EC_K1", "EC_SECP256K1_SIGN", "ES256K", "EcdsaSecp256k1Signature2019");
+        addLegacySuiteConfig(ED_2018_ID, "golden-ldp-ed2018.vm", "CERTIFY_VC_SIGN_ED25519", "ED25519_SIGN", "EdDSA", "Ed25519Signature2018");
+    }
+
+    private void addLegacySuiteConfig(String id, String templateFile, String appId, String refId, String algo, String suite) throws Exception {
+        if (credentialConfigRepository.findByCredentialConfigKeyId(id).isEmpty()) {
+            CredentialConfigurationDTO dto = ldpConfig(id, templateFile, "https://www.w3.org/2018/credentials/v1", appId, refId, algo, suite);
+            dto.setCredentialTypes(List.of("VerifiableCredential", id));
+            credentialConfigurationService.addCredentialConfiguration(dto);
         }
     }
 
@@ -218,6 +234,131 @@ class IssuanceGoldenTest {
     }
 
     @Test
+    void ed25519Signature2018GoldenAndIndependentVerification() throws Exception {
+        JsonNode body = issuedBody(ED_2018_ID);
+        JsonNode credential = body.get("credentials").get(0).get("credential");
+        assertEquals("Ed25519Signature2018", credential.get("proof").get("type").asText());
+        assertTrue(credential.get("proof").has("jws"), "2018 suites carry a detached jws");
+        byte[] publicKey = ed25519PublicKeyFromDidDocument(credential.get("proof").get("verificationMethod").asText());
+        JsonLDObject jsonLd = JsonLDObject.fromJson(credential.toString());
+        jsonLd.setDocumentLoader(staticContextLoader);
+        assertTrue(new info.weboftrust.ldsignatures.verifier.Ed25519Signature2018LdVerifier(publicKey).verify(jsonLd),
+                "Ed25519Signature2018 proof must verify with danubetech");
+        Goldens.assertGolden("v1/issuance/ldp_vc-ed25519-2018-response", body);
+    }
+
+    @Test
+    void ecdsaSecp256k1Signature2019GoldenAndIndependentVerification() throws Exception {
+        JsonNode body = issuedBody(EC_K1_ID);
+        JsonNode credential = body.get("credentials").get(0).get("credential");
+        assertEquals("EcdsaSecp256k1Signature2019", credential.get("proof").get("type").asText());
+        assertTrue(credential.get("proof").has("jws"));
+        JsonNode method = verificationMethod(credential.get("proof").get("verificationMethod").asText());
+        assertEquals("EcdsaSecp256k1VerificationKey2019", method.get("type").asText());
+        JWK jwk = JWK.parse(method.get("publicKeyJwk").toString());
+        java.security.PublicKey publicKey = jwk.toECKey().toECPublicKey(com.nimbusds.jose.crypto.bc.BouncyCastleProviderSingleton.getInstance());
+        // danubetech canonicalizes and parses the detached JWS; the ES256K signature itself is checked by plain JCA
+        com.danubetech.keyformats.crypto.ByteVerifier jca = new com.danubetech.keyformats.crypto.ByteVerifier(com.danubetech.keyformats.jose.JWSAlgorithm.ES256K) {
+            @Override
+            protected boolean verify(byte[] content, byte[] signature) throws java.security.GeneralSecurityException {
+                java.security.Signature verifier = java.security.Signature.getInstance("SHA256withECDSA", "BC");
+                verifier.initVerify(publicKey);
+                verifier.update(content);
+                try {
+                    return verifier.verify(com.nimbusds.jose.crypto.impl.ECDSA.transcodeSignatureToDER(signature));
+                } catch (com.nimbusds.jose.JOSEException e) {
+                    throw new java.security.SignatureException(e);
+                }
+            }
+        };
+        JsonLDObject jsonLd = JsonLDObject.fromJson(credential.toString());
+        jsonLd.setDocumentLoader(staticContextLoader);
+        assertTrue(new info.weboftrust.ldsignatures.verifier.EcdsaSecp256k1Signature2019LdVerifier(jca).verify(jsonLd),
+                "EcdsaSecp256k1Signature2019 proof must verify with danubetech + JCA");
+        Goldens.assertGolden("v1/issuance/ldp_vc-secp256k1-2019-response", body);
+    }
+
+    /**
+     * EcdsaSecp256r1Signature2019 is Certify's own suite name (no registered LD suite, no third-party verifier exists);
+     * verified here by canonicalizing with danubetech and checking the ECDSA signature with plain JCA against the
+     * P-256 key in did.json. Logged as a spec finding in PROGRESS.md; the registered equivalent is ecdsa-rdfc-2019.
+     */
+    @Test
+    void ecdsaSecp256r1Signature2019GoldenAndJcaVerification() throws Exception {
+        JsonNode body = issuedBody(EC_R1_ID);
+        JsonNode credential = body.get("credentials").get(0).get("credential");
+        assertEquals("EcdsaSecp256r1Signature2019", credential.get("proof").get("type").asText());
+        JsonNode method = verificationMethod(credential.get("proof").get("verificationMethod").asText());
+        assertEquals("EcdsaSecp256r1VerificationKey2019", method.get("type").asText());
+        byte[] multicodec = Multibase.decode(method.get("publicKeyMultibase").asText());
+        byte[] compressed = Arrays.copyOfRange(multicodec, 2, multicodec.length); // strip 0x8024 (p256-pub)
+        org.bouncycastle.jce.spec.ECNamedCurveParameterSpec spec = org.bouncycastle.jce.ECNamedCurveTable.getParameterSpec("secp256r1");
+        java.security.PublicKey publicKey = java.security.KeyFactory.getInstance("EC", "BC").generatePublic(
+                new org.bouncycastle.jce.spec.ECPublicKeySpec(spec.getCurve().decodePoint(compressed), spec));
+
+        JsonLDObject jsonLd = JsonLDObject.fromJson(credential.toString());
+        jsonLd.setDocumentLoader(staticContextLoader);
+        info.weboftrust.ldsignatures.LdProof proof = info.weboftrust.ldsignatures.LdProof.getFromJsonLDObject(jsonLd);
+        byte[] signature = Multibase.decode(proof.getProofValue());
+        info.weboftrust.ldsignatures.LdProof options = info.weboftrust.ldsignatures.LdProof.builder().base(proof).defaultContexts(false).build(); // as CredentialUtils.generateLdProof canonicalizes
+        info.weboftrust.ldsignatures.LdProof.removeLdProofValues(options);
+        info.weboftrust.ldsignatures.LdProof.removeFromJsonLdObject(jsonLd);
+        byte[] hash = new info.weboftrust.ldsignatures.canonicalizer.URDNA2015Canonicalizer().canonicalize(options, jsonLd);
+        java.security.Signature verifier = java.security.Signature.getInstance("SHA256withECDSA", "BC");
+        verifier.initVerify(publicKey);
+        verifier.update(hash);
+        assertTrue(verifier.verify(com.nimbusds.jose.crypto.impl.ECDSA.transcodeSignatureToDER(signature)),
+                "EcdsaSecp256r1Signature2019 proofValue must verify with JCA over the URDNA2015 hash");
+        Goldens.assertGolden("v1/issuance/ldp_vc-secp256r1-2019-response", body);
+    }
+
+    /** The flow docs/design/VALIDATE.md drives by hand: offer, offer fetch, token; the access token is verified against jwks.json. */
+    @Test
+    void preAuthorizedCodeFlowGoldenAndAccessTokenVerification() throws Exception {
+        MvcResult offerResult = mockMvc.perform(post("/pre-authorized-data").contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(Map.of("credential_configuration_id", LDP_ID, "claims", Map.of("fullName", "Golden Farmer", "dateOfBirth", "1990-01-01", "city", "Bengaluru"),
+                        "expires_in", 600, "tx_code", "1234")))).andReturn();
+        JsonNode offerBody = objectMapper.readTree(offerResult.getResponse().getContentAsString());
+        assertEquals(200, offerResult.getResponse().getStatus(), offerBody.toString());
+        assertTrue(offerBody.has("credential_offer_uri"), "offer response: " + offerBody);
+        String offerUri = offerBody.get("credential_offer_uri").asText();
+        assertTrue(offerUri.startsWith("openid-credential-offer://"), offerUri);
+        String offerUrl = java.net.URLDecoder.decode(offerUri.substring(offerUri.indexOf("credential_offer_uri=") + "credential_offer_uri=".length()), StandardCharsets.UTF_8);
+        String offerId = offerUrl.substring(offerUrl.lastIndexOf('/') + 1);
+        Goldens.assertGolden("v1/pre-authorized/offer-uri", offerBody);
+
+        JsonNode offer = getJson("/credential-offer-data/" + offerId);
+        // Finding (PROGRESS.md): the offer names the issuer as mosip.certify.identifier (with servlet path) while the
+        // issuer metadata's credential_issuer is mosip.certify.domain.url; OpenID4VCI requires the same identifier.
+        assertEquals(issuerIdentifier, offer.get("credential_issuer").asText());
+        assertNotEquals(domainUrl, offer.get("credential_issuer").asText(), "the two identity keys still differ (dual identity finding)");
+        assertEquals(LDP_ID, offer.get("credential_configuration_ids").get(0).asText());
+        JsonNode grant = offer.get("grants").get("urn:ietf:params:oauth:grant-type:pre-authorized_code");
+        String code = grant.get("pre-authorized_code").asText();
+        Goldens.assertGolden("v1/pre-authorized/credential-offer", offer);
+
+        MvcResult tokenResult = mockMvc.perform(post("/oauth/token").contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                .param("grant_type", "urn:ietf:params:oauth:grant-type:pre-authorized_code")
+                .param("pre-authorized_code", code).param("tx_code", "1234")).andReturn();
+        JsonNode token = objectMapper.readTree(tokenResult.getResponse().getContentAsString());
+        assertEquals(200, tokenResult.getResponse().getStatus(), token.toString());
+        assertEquals("Bearer", token.get("token_type").asText());
+        SignedJWT accessToken = SignedJWT.parse(token.get("access_token").asText());
+        JWKSet jwks = JWKSet.parse(getJson("/.well-known/jwks.json").toString());
+        JWK key = jwks.getKeyByKeyId(accessToken.getHeader().getKeyID());
+        assertNotNull(key, "access token kid " + accessToken.getHeader().getKeyID() + " must be in jwks.json");
+        assertTrue(accessToken.verify(new com.nimbusds.jose.crypto.RSASSAVerifier(key.toRSAKey())), "access token must verify with Nimbus");
+        assertEquals(SCOPE, accessToken.getJWTClaimsSet().getStringClaim("scope"));
+        Goldens.assertGolden("v1/pre-authorized/token-response", token);
+        // Finding (PROGRESS.md): sub carries the offer claims as a JSON string in map order (PII inside the access token,
+        // nondeterministic key order); parsed here so the golden is stable while the finding stands.
+        com.fasterxml.jackson.databind.node.ObjectNode claims = (com.fasterxml.jackson.databind.node.ObjectNode) objectMapper.readTree(accessToken.getJWTClaimsSet().toString());
+        claims.set("sub", objectMapper.readTree(claims.get("sub").asText()));
+        Goldens.assertGolden("v1/pre-authorized/access-token-claims", claims);
+        Goldens.assertGolden("v1/pre-authorized/access-token-header", objectMapper.readTree(accessToken.getHeader().toString()));
+    }
+
+    @Test
     void wrongNonceIsRejectedGolden() throws Exception {
         nonce();
         MvcResult result = issue(LDP_ID, proofJwt("not-the-nonce"));
@@ -244,6 +385,22 @@ class IssuanceGoldenTest {
     private String nonce() throws Exception {
         return objectMapper.readTree(mockMvc.perform(post("/nonce")).andExpect(status().isOk())
                 .andReturn().getResponse().getContentAsString()).get("c_nonce").asText();
+    }
+
+    private JsonNode issuedBody(String configurationId) throws Exception {
+        MvcResult result = issue(configurationId, proofJwt(nonce()));
+        JsonNode body = objectMapper.readTree(result.getResponse().getContentAsString());
+        assertEquals(200, result.getResponse().getStatus(), body.toString());
+        return body;
+    }
+
+    private JsonNode verificationMethod(String id) throws Exception {
+        for (JsonNode method : getJson("/.well-known/did.json").get("verificationMethod")) {
+            if (id.equals(method.get("id").asText())) {
+                return method;
+            }
+        }
+        throw new AssertionError("verification method " + id + " not in did.json");
     }
 
     private MvcResult issue(String configurationId, String proof) throws Exception {
