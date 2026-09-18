@@ -108,6 +108,7 @@ class IssuanceGoldenTest {
     @Autowired CredentialConfigRepository credentialConfigRepository;
     @Autowired StaticContextLoader staticContextLoader;
     @Autowired io.mosip.certify.issuance.ConfigurationRegistry configurationRegistry;
+    @Autowired io.mosip.certify.format.ldpvc.LdpVcFormatter ldpVcFormatter; // auto-configured over the service's StaticContextLoader
     @MockBean DataProviderPlugin dataProviderPlugin;
     @Value("${mosip.certify.identifier}") String issuerIdentifier;   // proof audience
     @Value("${mosip.certify.domain.url}") String domainUrl;           // metadata credential_issuer (a second identity key, see docs/design/14-configuration.md)
@@ -180,6 +181,9 @@ class IssuanceGoldenTest {
         assertEquals(MDOC_ID, mdoc.id());
         assertTrue(configurationRegistry.all("default").size() >= 9, "all nine golden configurations are visible: " + configurationRegistry.all("default").size());
         assertTrue(configurationRegistry.all("acme").isEmpty(), "single tenant");
+        assertEquals("ldp_vc", ldpVcFormatter.formatId());
+        // the row stores the types sorted alphabetically (finding: credential_definition.type order), the fragment reads them as stored
+        assertEquals(java.util.List.of("GoldenCredential", "VerifiableCredential"), ((java.util.Map<?, ?>) ldpVcFormatter.metadataFragment(ldp, io.mosip.certify.spi.ProtocolVersion.OID4VCI_1_0).get("credential_definition")).get("type"));
     }
 
     /** The published keys: one JWK per certificate of every mapped alias plus CERTIFY_SERVICE; key material masked. */
