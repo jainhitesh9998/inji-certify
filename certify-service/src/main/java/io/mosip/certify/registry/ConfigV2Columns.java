@@ -37,7 +37,7 @@ public final class ConfigV2Columns {
         row.setConfigVersion(VERSION_V2);
     }
 
-    static Map<String, Object> formatConfig(CredentialConfig row) {
+    public static Map<String, Object> formatConfig(CredentialConfig row) {
         Map<String, Object> out = new LinkedHashMap<>();
         put(out, "context", split(row.getContext()));
         put(out, "types", split(row.getCredentialType()));
@@ -50,7 +50,7 @@ public final class ConfigV2Columns {
         return out;
     }
 
-    static Map<String, Object> signingConfig(CredentialConfig row) {
+    public static Map<String, Object> signingConfig(CredentialConfig row) {
         Map<String, Object> out = new LinkedHashMap<>();
         String appId = row.getKeyManagerAppId();
         if (appId != null && appId.contains(":")) {
@@ -66,7 +66,7 @@ public final class ConfigV2Columns {
         return out;
     }
 
-    static Map<String, Object> statusConfig(CredentialConfig row) {
+    public static Map<String, Object> statusConfig(CredentialConfig row) {
         if (row.getCredentialStatusPurposes() == null || row.getCredentialStatusPurposes().isEmpty()) {
             return null;
         }

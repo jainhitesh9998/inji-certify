@@ -192,6 +192,14 @@ public class DefaultIssuanceService implements IssuanceService {
         return new Issued(formatter.sign(unsigned, signing, context), claims);
     }
 
+    @Override
+    public UnsignedCredential preview(CredentialConfiguration configuration, ClaimSet claims, IssuanceContext context, HolderBinding holder) {
+        CredentialFormatter formatter = formatters.require(configuration.format());
+        ClaimSet rendered = configuration.strategy() == io.mosip.certify.spi.IssuanceStrategy.TEMPLATE
+                ? render(claims, configuration, context, holder) : claims;
+        return formatter.build(rendered, configuration, context, holder);
+    }
+
     private ClaimSet render(ClaimSet fetched, CredentialConfiguration configuration, IssuanceContext context, HolderBinding holder) {
         TemplateRef template = configuration.template();
         if (template.mode() == TemplateRef.Mode.NONE) {

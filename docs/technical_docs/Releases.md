@@ -8,6 +8,10 @@ The OpenID4VCI draft-13 credential endpoints of release 0.14.0 are served again 
 
 `POST /oid4vci/credential` answers with a `notification_id` and the issuer metadata under `/oid4vci` advertises `notification_endpoint`: wallets report `credential_accepted`, `credential_failure` or `credential_deleted` to `POST /oid4vci/notification` (OpenID4VCI 1.0 section 10) with the access token of the issuance. Every issuance through the new surface is recorded in the `issuance_transaction` table created by the 1.1.0 migration and purged after `certify.protocol.oid4vci-v1.notification.retention` (default one day). The compatibility endpoints are unchanged.
 
+## v2 configuration API
+
+`POST`, `GET`, `PUT` and `DELETE /v2/credential-configurations` take and return the configuration model the rebuilt core reads (`formatConfig`, `signing`, `template`, `issuanceStrategy`, `status`, `display`, `protocol`), version templates in `credential_template`, and dry-run a body that carries `sampleClaims` through the template engine and formatter before saving it (`400 template_render_failed` otherwise). `POST /v2/credential-configurations/{id}/preview` renders a saved configuration against given claims without signing. Rows written through v2 carry every v1 column too, so `/credential-configurations` (v1), the compatibility endpoints and the issuer metadata see them unchanged. The v1 API is unchanged and not yet deprecated.
+
 # Changes in release 0.11.0
 
 ## Removal of  Artifactory dependency

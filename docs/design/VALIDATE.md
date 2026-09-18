@@ -73,6 +73,25 @@ The response is `{"credential_offer_uri":"openid-credential-offer://?credential_
 `IssuanceGoldenTest.preAuthorizedCodeFlowGoldenAndAccessTokenVerification`, which also verifies the access token
 against `jwks.json`.
 
+## 5b. Configure through the v2 API
+
+The same configuration can be written in the rebuilt model; `sampleClaims` makes the service render the template
+before it saves the row, and `preview` renders a saved one without signing:
+
+```bash
+curl -s -X POST http://localhost:8090/v1/certify/v2/credential-configurations -H 'Content-Type: application/json' -d '{
+  "id": "FarmerCredentialV2", "scope": "farmer_vc_ldp", "format": "ldp_vc",
+  "formatConfig": {"context": ["https://www.w3.org/2018/credentials/v1"], "types": ["VerifiableCredential", "FarmerCredential"],
+                   "claims": {"fullName": {"display": [{"name": "Full name", "locale": "en"}], "mandatory": true}}},
+  "signing": {"alias": "CERTIFY_VC_SIGN_ED25519/ED25519_SIGN", "alg": "EdDSA", "cryptosuite": "Ed25519Signature2020", "didUrl": "did:web:localhost:certify"},
+  "template": {"content": "<the Velocity template as text>"},
+  "display": {"display": [{"name": "Farmer credential", "locale": "en"}], "order": ["fullName"]},
+  "sampleClaims": {"fullName": "Sample Person"}
+}'
+curl -s -X POST http://localhost:8090/v1/certify/v2/credential-configurations/FarmerCredentialV2/preview \
+  -H 'Content-Type: application/json' -d '{"claims": {"fullName": "Preview Person"}}'
+```
+
 ## 6. Download with a wallet
 
 - Inji Web from the same compose (`inji-web` service) or the Inji mobile wallet: scan or open the offer, enter
