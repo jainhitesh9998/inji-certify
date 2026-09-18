@@ -1,0 +1,19 @@
+# Capability gaps and their root cause
+
+> Part of the Inji Certify extensibility design. Baseline: `develop` at `a1cfd63` (1.0.0-beta.1-SNAPSHOT). Index: [README.md](./README.md).
+
+The biggest gap is backwards, not forwards: draft-13 wallets have no endpoint. The remaining OpenID4VCI 1.0 features, HAIP, VC-API, alternate signers and offline signing all trace to the same four couplings (1, 3, 4, 5).
+
+| Capability | What it needs | Breaks on | Root cause |
+| --- | --- | --- | --- |
+| Draft-13 wallets on a develop deployment | The 0.14.0 request and response shapes, `?version=` metadata, `c_nonce` in the `invalid_proof` error, `acceptance_token`; all behind the same core | 5, 6 | The draft-13 code is not on develop; it exists in the 0.14.0 release at `e54539a` |
+| The rest of OpenID4VCI 1.0 | `credential_identifier` with `authorization_details`; `proofs.attestation` and `ldp_vp`; `key_attestation`; deferred issuance with `transaction_id` and `deferred_credential_endpoint`; `notification_endpoint`; `batch_credential_issuance`; request and response encryption; signed metadata | 1, 5, 6, 9 | No issuance transaction record beyond a cache entry; `proofs` typed as strings only; the request DTO lives in `certify-core` |
+| HAIP profile | Done: DPoP at the credential endpoint. Missing: `key_attestation` in proofs, PAR and wallet (client) attestation at the AS, encrypted credential responses, a non-mock `mso_mdoc` (AGENTS.md: "mock only"), `x5c` policy for SD-JWT issuer keys | 4, 6, 10 | Proof validation is one class; the AS half is entangled with the issuer; signing headers are hard-coded per format class |
+| VC-API issuer (`POST /credentials/issue`, `POST /credentials/status`) | Client-level auth, caller-supplied credential body, key selection by `options`, no holder binding | 1, 3, 4, 9 | No operation signs a supplied payload without a template name; `ParsedAccessToken` assumes a holder token; today's `POST /credentials/status` is Certify's revocation API |
+| Sign or issue from a CLI (batch pre-issuance, one-off signing, air-gapped keys) | A signing and formatting library that runs without Spring Web, JPA or a running service; key providers that work from a process with a file, a PKCS#11 token or a KMS credential | 3, 4, 9 | Signing code is `@Component`s with `@Value` properties, `CacheManager` and keymanager's own JPA repositories; nothing below the controllers can be instantiated standalone |
+| Alternate key stores (PKCS#11 direct, AWS/GCP/Azure KMS, HashiCorp Vault Transit, PKCS#12 for tests) and per-issuer keys | `KeyProvider` and `Signer` SPI; opaque `KeyRef` in configuration; one key registry feeding JWKS and DID documents | 4, 7 | Keymanager `appId`/`refId` are domain, API and DB vocabulary; seven signing paths |
+| New formats (`jwt_vc_json` back, `ecdsa-sd-2023`, BBS, full `mso_mdoc`) | One registration point per format: id, aliases, config schema, metadata fragment, build, sign | 2, 3, 7 | Format knowledge is spread over eight switches, three indexes and three validators |
+| New proof types and holder key forms (`cwt`, `ldp_vp`, `attestation`; `x5c`, `jwk` thumbprint, `did:web`) | `ProofValidator` per type returning a typed `HolderBinding`; `HolderKeyResolver` per key form | 6 | `getKeyMaterial` returns a DID string; resolver chosen by string prefix |
+| Status beyond Bitstring (IETF Token Status List for SD-JWT and mDoc) | `StatusProvider` SPI invoked per format after build, before sign | 11 | Status is inlined for `ldp_vc` + VC 2.0 and mutates the plugin JSON |
+| Templated and externally issued credentials in one deployment | Per-configuration issuance strategy | 1, 12 | Mode is a boot-time `@ConditionalOnProperty` on two service classes |
+| Second template engine, claims-only templates, or no template | `TemplateEngine` SPI with configuration lookup removed from it; envelope owned by the formatter | 3 | `VCFormatter` is the config accessor for the whole service |
