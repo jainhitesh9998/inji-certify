@@ -29,9 +29,15 @@ Tests replaced, not adapted: the previous generator and SD-JWT tests asserted th
 | `EcdsaKoblitzSignature2016ProofGenerator` | `jwsSign` detached ES256K | same | unit test verified with JCA (same code path; no golden, the suite has no registered context in the static loader) |
 | `AccessTokenJwtUtil` | `jwsSign` RS256 with `CERTIFY_SERVICE` | `JwsEnvelope.sign` compact (`alg`, `kid`) | pre-authorized-code golden: token verified with Nimbus against `jwks.json`; header golden `alg`+`kid` |
 
-## Slice 3 (open)
+## Slice 3 (branch `wp/p1-03-envelope-routing-3`): mDoc IssuerAuth
 
-`MDocProcessor.signMSO` (`coseSign1`), `Credential.signQRData` (claim-169 `cwtSign`), `Credential.addProof` (`vc` format): each needs a vector with independent verification first. `JwksServiceImpl` and `DIDDocumentUtil` move to `KeyPublisher` in P1-04; `SystemInfoController` keeps `KeymanagerService` (certificate upload and CSR are keymanager administration).
+| Path | Before | After | Guard |
+| --- | --- | --- | --- |
+| `MDocProcessor.signMSO` | keymanager `coseSign1` (alg protected, x5chain unprotected via `includeCertificate`, untagged, hex out) | `CoseEnvelope.sign1` with `CoseHeaderPolicy.mdocIssuerAuth()` | mDoc golden (IssuerAuth verified with JCA against the x5chain leaf; MSO summary golden records the header layout) plus JCA-verified unit tests |
+
+## Slice 4 (open)
+
+`Credential.signQRData` (claim-169 `cwtSign`) and `Credential.addProof` (`vc` format) need a vector with independent verification first. `JwksServiceImpl` and `DIDDocumentUtil` move to `KeyPublisher` in P1-04; `SystemInfoController` keeps `KeymanagerService` (certificate upload and CSR are keymanager administration).
 
 ## Acceptance criteria (slice 1)
 
