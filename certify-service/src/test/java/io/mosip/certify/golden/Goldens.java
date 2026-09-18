@@ -31,7 +31,9 @@ public final class Goldens {
             "pre-authorized_code", "access_token", "credential_offer_uri",
             // published key material regenerates with the test keystore on every run
             "publicKeyMultibase", "publicKeyJwk", "publicKeyPem", "x", "y", "n", "e",
-            "qr", "statusListIndex", "statusListCredential");
+            "qr", "statusListIndex", "statusListCredential",
+            // the shared status list's bits depend on which credentials were revoked before the golden was taken
+            "encodedList");
 
     private static final ObjectMapper MAPPER = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT)
             .enable(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS);

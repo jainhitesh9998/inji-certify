@@ -603,8 +603,8 @@ class IssuanceGoldenTest {
         Goldens.assertGolden("v2/oid4vci/mso_mdoc-summary", summary);
     }
 
-    // Status attachment on the new surface is exercised by StatusAndLedgerTest (mocked status-list service): the real
-    // service initialises list indices with PostgreSQL's generate_series, which H2 cannot run (finding in PROGRESS.md).
+    // Status attachment with the real status-list service needs PostgreSQL (generate_series): StatusListPostgresTest
+    // (Testcontainers) covers both surfaces end to end; StatusAndLedgerTest covers the provider over a mocked service.
 
     @Test
     void oid4vciIssuerMetadataGolden() throws Exception {
@@ -818,8 +818,8 @@ class IssuanceGoldenTest {
                 "CERTIFY_VC_SIGN_ED25519", "ED25519_SIGN", "EdDSA", "Ed25519Signature2020");
     }
 
-    private static CredentialConfigurationDTO ldpConfig(String id, String templateFile, String context, String appId,
-                                                        String refId, String algo, String suite) throws Exception {
+    static CredentialConfigurationDTO ldpConfig(String id, String templateFile, String context, String appId,
+                                                 String refId, String algo, String suite) throws Exception {
         CredentialConfigurationDTO dto = new CredentialConfigurationDTO();
         dto.setCredentialConfigKeyId(id);
         dto.setCredentialFormat("ldp_vc");
