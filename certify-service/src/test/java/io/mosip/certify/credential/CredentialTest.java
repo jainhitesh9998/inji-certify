@@ -2,11 +2,8 @@ package io.mosip.certify.credential;
 
 import io.mosip.certify.api.dto.VCResult;
 import io.mosip.certify.credential.Credential;
-import io.mosip.kernel.signature.dto.CWTSignRequestDto;
-import io.mosip.kernel.signature.dto.CoseSignResponseDto;
 import io.mosip.kernel.signature.dto.JWTSignatureResponseDto;
 import io.mosip.kernel.signature.dto.JWSSignatureRequestDto;
-import io.mosip.kernel.signature.service.CoseSignatureService;
 import io.mosip.kernel.signature.service.SignatureService;
 import io.mosip.certify.vcformatters.VCFormatter;
 import org.junit.Before;
@@ -21,14 +18,12 @@ public class CredentialTest {
 
     private VCFormatter mockFormatter;
     private SignatureService mockSignatureService;
-    private CoseSignatureService mockCoseSignatureService;
     private Credential credential;
 
     @Before
     public void setUp() {
         mockFormatter = mock(VCFormatter.class);
         mockSignatureService = mock(SignatureService.class);
-        mockCoseSignatureService = mock(CoseSignatureService.class);
 
         // Minimal subclass of Credential to allow testing
         credential = new Credential(mockFormatter, mockSignatureService) {
@@ -37,7 +32,8 @@ public class CredentialTest {
                 return false;
             }
         };
-        ReflectionTestUtils.setField(credential, "coseSignatureService", mockCoseSignatureService);
+        ReflectionTestUtils.setField(credential, "keyProviders", io.mosip.certify.signing.TestKeyProviders.registry("app-1/ref-1", io.mosip.certify.signing.SignatureAlgorithm.ES256));
+        ReflectionTestUtils.setField(credential, "cwtSigning", new io.mosip.certify.signing.CwtSigningProperties(180, 0));
     }
 
     @Test
@@ -64,43 +60,43 @@ public class CredentialTest {
     }
 
     @Test
-    public void testSignQRData_ReturnsSignedDataAndSendsCorrectRequest() {
-        String payload = "payload-to-sign";
-        String algorithm = "ES256";
-        String appId = "app-1";
-        String refId = "ref-1";
-        String didUrl = "did:example:123";
+    public void testSignQRData_ProducesAVerifiableClaim169Cwt() throws Exception {
+        String result = credential.signQRData("{\"4\":\"Golden Farmer\",\"8\":\"1990-01-01\"}", "ES256", "app-1", "ref-1", "did:example:123");
 
-        CoseSignResponseDto response = new CoseSignResponseDto();
-        response.setSignedData("signed.cwt.data");
+        com.upokecenter.cbor.CBORObject outer = com.upokecenter.cbor.CBORObject.DecodeFromBytes(java.util.HexFormat.of().parseHex(result));
+        assertTrue(outer.HasMostOuterTag(61));
+        com.upokecenter.cbor.CBORObject sign1 = outer.UntagOne();
+        assertTrue(sign1.HasMostOuterTag(18));
+        sign1 = sign1.UntagOne();
+        byte[] protectedBytes = sign1.get(0).GetByteString();
+        com.upokecenter.cbor.CBORObject protectedHeader = com.upokecenter.cbor.CBORObject.DecodeFromBytes(protectedBytes);
+        assertEquals(-7, protectedHeader.get(com.upokecenter.cbor.CBORObject.FromObject(1)).AsInt32());
+        assertEquals("app-1/ref-1", new String(protectedHeader.get(com.upokecenter.cbor.CBORObject.FromObject(4)).GetByteString()));
+        assertEquals(0, sign1.get(1).size());
+        com.upokecenter.cbor.CBORObject claims = com.upokecenter.cbor.CBORObject.DecodeFromBytes(sign1.get(2).GetByteString());
+        assertEquals("[1, 4, 5, 6, 169]", claims.getKeys().toString());
+        assertEquals("did:example:123", claims.get(com.upokecenter.cbor.CBORObject.FromObject(1)).AsString());
+        long iat = claims.get(com.upokecenter.cbor.CBORObject.FromObject(6)).AsInt64Value();
+        assertEquals(iat + 180L * 86400, claims.get(com.upokecenter.cbor.CBORObject.FromObject(4)).AsInt64Value());
+        assertEquals(iat, claims.get(com.upokecenter.cbor.CBORObject.FromObject(5)).AsInt64Value());
+        com.upokecenter.cbor.CBORObject claim169 = com.upokecenter.cbor.CBORObject.DecodeFromBytes(claims.get(com.upokecenter.cbor.CBORObject.FromObject(169)).GetByteString());
+        assertEquals("Golden Farmer", claim169.get(com.upokecenter.cbor.CBORObject.FromObject(4)).AsString());
+        byte[] sigStructure = com.upokecenter.cbor.CBORObject.NewArray().Add("Signature1").Add(protectedBytes).Add(new byte[0]).Add(sign1.get(2).GetByteString()).EncodeToBytes();
+        java.security.PublicKey publicKey = ((io.mosip.certify.issuance.KeyProviderRegistry) ReflectionTestUtils.getField(credential, "keyProviders"))
+                .provider("keymanager").resolve(io.mosip.certify.signing.KeyRef.parse("keymanager:app-1/ref-1")).descriptor().publicKey();
+        java.security.Signature verifier = java.security.Signature.getInstance("SHA256withECDSA");
+        verifier.initVerify(publicKey);
+        verifier.update(sigStructure);
+        assertTrue(verifier.verify(com.nimbusds.jose.crypto.impl.ECDSA.transcodeSignatureToDER(sign1.get(3).GetByteString())));
+    }
 
-        when(mockCoseSignatureService.cwtSign(any(CWTSignRequestDto.class))).thenReturn(response);
-
-        String result = credential.signQRData(payload, algorithm, appId, refId, didUrl);
-
-        assertEquals("signed.cwt.data", result);
-
-        ArgumentCaptor<CWTSignRequestDto> captor = ArgumentCaptor.forClass(CWTSignRequestDto.class);
-        verify(mockCoseSignatureService, times(1)).cwtSign(captor.capture());
-        CWTSignRequestDto sent = captor.getValue();
-
-        assertNotNull(sent);
-        assertEquals(payload, sent.getClaim169Payload());
-        assertEquals(algorithm, sent.getAlgorithm());
-        assertEquals(appId, sent.getApplicationId());
-        assertEquals(refId, sent.getReferenceId());
-        assertEquals(didUrl, sent.getIssuer());
-
-        assertNotNull(sent.getProtectedHeader());
-        assertTrue(Boolean.TRUE.equals(sent.getProtectedHeader().get("x5c")));
+    @Test(expected = io.mosip.certify.core.exception.CertifyException.class)
+    public void testSignQRData_UnknownAlgorithmIsRejected() {
+        credential.signQRData("{}", "HS256", "app-1", "ref-1", "did");
     }
 
     @Test(expected = RuntimeException.class)
-    public void testSignQRData_ServiceThrowsRuntimeException_IsPropagated() {
-        when(mockCoseSignatureService.cwtSign(any(CWTSignRequestDto.class)))
-                .thenThrow(new RuntimeException("cwt service failure"));
-
-        credential.signQRData("p", "alg", "app", "ref", "did");
+    public void testSignQRData_MissingKeyIsPropagated() {
+        credential.signQRData("{}", "ES256", "nope", "ref", "did");
     }
-
 }

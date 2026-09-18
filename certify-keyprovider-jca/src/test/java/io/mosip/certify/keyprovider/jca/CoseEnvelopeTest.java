@@ -90,7 +90,9 @@ class CoseEnvelopeTest {
         CBORObject claims = CBORObject.DecodeFromBytes(sign1.get(2).GetByteString());
         assertEquals("https://issuer.example", claims.get(CBORObject.FromObject(1)).AsString());
         assertEquals("claim-169-payload", claims.get(CBORObject.FromObject(169)).AsString());
-        assertEquals(key.kid(), new String(sign1.get(1).get(CBORObject.FromObject(4)).GetByteString()));
+        CBORObject protectedHeader = CBORObject.DecodeFromBytes(sign1.get(0).GetByteString());
+        assertEquals(key.kid(), new String(protectedHeader.get(CBORObject.FromObject(4)).GetByteString()), "kid travels in the protected header");
+        assertEquals(0, sign1.get(1).size(), "no unprotected header entries: the chain is not included on the compatibility surface");
         assertTrue(verify(sign1, key, SignatureAlgorithm.ES256));
     }
 }

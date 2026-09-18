@@ -29,6 +29,10 @@ public final class CoseEnvelope {
     static byte[] sign1Locally(byte[] payload, byte[] externalAad, CoseHeaderPolicy policy, SigningKey key, Signer signer) {
         CBORObject protectedHeader = CBORObject.NewMap();
         protectedHeader.Add(CBORObject.FromObject(LABEL_ALG), CBORObject.FromObject(key.algorithm().coseId()));
+        String kid = policy.kid() == null ? null : policy.kid().kidFor(key);
+        if (kid != null && policy.kidInProtected()) {
+            protectedHeader.Add(CBORObject.FromObject(LABEL_KID), CBORObject.FromObject(kid.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        }
         byte[] protectedBytes = protectedHeader.EncodeToBytes();
 
         CBORObject unprotectedHeader = CBORObject.NewMap();
@@ -43,11 +47,8 @@ public final class CoseEnvelope {
                 unprotectedHeader.Add(CBORObject.FromObject(LABEL_X5CHAIN), array);
             }
         }
-        if (policy.kid() != null) {
-            String kid = policy.kid().kidFor(key);
-            if (kid != null) {
-                unprotectedHeader.Add(CBORObject.FromObject(LABEL_KID), CBORObject.FromObject(kid.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
-            }
+        if (kid != null && !policy.kidInProtected()) {
+            unprotectedHeader.Add(CBORObject.FromObject(LABEL_KID), CBORObject.FromObject(kid.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
         }
 
         byte[] toBeSigned = sigStructure(protectedBytes, externalAad, payload);

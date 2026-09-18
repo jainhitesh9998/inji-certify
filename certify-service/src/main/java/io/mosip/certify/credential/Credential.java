@@ -12,13 +12,25 @@ import java.util.Map;
 import io.mosip.certify.api.dto.VCResult;
 import io.mosip.certify.core.constants.Constants;
 import io.mosip.certify.vcformatters.VCFormatter;
-import io.mosip.kernel.signature.dto.CWTSignRequestDto;
-import io.mosip.kernel.signature.dto.CoseSignResponseDto;
 import io.mosip.kernel.signature.dto.JWSSignatureRequestDto;
 import io.mosip.kernel.signature.dto.JWTSignatureResponseDto;
-import io.mosip.kernel.signature.service.CoseSignatureService;
 import io.mosip.kernel.signature.service.SignatureService;
-import io.mosip.kernel.signature.service.impl.CoseSignatureServiceImpl;
+import com.upokecenter.cbor.CBORObject;
+import io.mosip.certify.core.constants.ErrorConstants;
+import io.mosip.certify.core.exception.CertifyException;
+import io.mosip.certify.issuance.KeyProviderRegistry;
+import io.mosip.certify.signing.CoseHeaderPolicy;
+import io.mosip.certify.signing.CwtEnvelope;
+import io.mosip.certify.signing.CwtSigningProperties;
+import io.mosip.certify.signing.KeyProvider;
+import io.mosip.certify.signing.KeyRef;
+import io.mosip.certify.signing.LegacyKeyRefs;
+import io.mosip.certify.signing.SignatureAlgorithm;
+import io.mosip.certify.signing.SigningKey;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import lombok.extern.slf4j.Slf4j;
 import org.json.JSONArray;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -32,7 +44,10 @@ public abstract class Credential{
     protected SignatureService signatureService;
 
     @Autowired
-    private CoseSignatureService coseSignatureService;
+    private KeyProviderRegistry keyProviders;
+
+    @Autowired
+    private CwtSigningProperties cwtSigning;
 
     /**
      * Constructor for credentials
@@ -123,22 +138,45 @@ public abstract class Credential{
     * @param didUrl DID URL of the issuer
     */
     public String signQRData(String payload, String qrSignAlgorithm, String appID, String refID, String didUrl) {
-        CWTSignRequestDto cwtSignRequestDto = new CWTSignRequestDto();
-        cwtSignRequestDto.setClaim169Payload(payload);
-        cwtSignRequestDto.setApplicationId(appID);
-        cwtSignRequestDto.setReferenceId(refID);
-        cwtSignRequestDto.setAlgorithm(qrSignAlgorithm);
-        cwtSignRequestDto.setIssuer(didUrl);
+        KeyRef ref = LegacyKeyRefs.keymanager(appID, refID);
+        KeyProvider provider = keyProviders.provider(ref.provider());
+        SignatureAlgorithm algorithm = SignatureAlgorithm.fromJose(qrSignAlgorithm)
+                .orElseThrow(() -> new CertifyException(ErrorConstants.VC_SIGNING_ERROR, "Unsupported QR signature algorithm " + qrSignAlgorithm));
+        SigningKey key = provider.resolve(ref).withAlgorithm(algorithm);
+        // Registered claims in the order keymanager wrote them (iss, exp, nbf, iat), then claim 169 as bstr .cbor
+        Instant now = Instant.now();
+        Map<Integer, Object> claims = new LinkedHashMap<>();
+        claims.put(1, didUrl);
+        claims.put(4, now.plus(Duration.ofDays(cwtSigning.expDays())).getEpochSecond());
+        claims.put(5, now.plus(Duration.ofDays(cwtSigning.nbfDays())).getEpochSecond());
+        claims.put(6, now.getEpochSecond());
+        claims.put(169, claim169(payload));
+        byte[] cwt = CwtEnvelope.sign(claims, CoseHeaderPolicy.cwt(), key, provider, true);
+        log.info("CWT signed for claim 169");
+        return HexFormat.of().formatHex(cwt);
+    }
 
-        Map<String, Object> protectedHeaders = new HashMap<>();
-        protectedHeaders.put("x5c", true);
-        protectedHeaders.put("kid", true);
-
-        cwtSignRequestDto.setProtectedHeader(protectedHeaders);
-        log.info("CWT sign request DTO built successfully");
-        CoseSignResponseDto coseSignResponseDto = coseSignatureService.cwtSign(cwtSignRequestDto);
-
-        return coseSignResponseDto.getSignedData();
+    /**
+     * Claim 169 is {@code bstr .cbor}: PixelPass hands over the mapped data as CBOR hex (what keymanager wrapped as the
+     * byte string); a JSON object is accepted too and encoded as a CBOR map with integer labels where the key is numeric.
+     */
+    static byte[] claim169(String mappedData) {
+        if (mappedData.matches("(?:[0-9a-fA-F]{2})+")) {
+            return HexFormat.of().parseHex(mappedData);
+        }
+        CBORObject json;
+        try {
+            json = CBORObject.FromJSONString(mappedData);
+        } catch (RuntimeException e) {
+            throw new CertifyException(ErrorConstants.VC_SIGNING_ERROR, "claim 169 payload is neither CBOR hex nor a JSON object: " + e.getMessage());
+        }
+        CBORObject map = CBORObject.NewMap();
+        for (CBORObject k : json.getKeys()) {
+            String name = k.AsString();
+            CBORObject label = name.matches("-?\\d+") ? CBORObject.FromObject(Long.parseLong(name)) : k;
+            map.Add(label, json.get(k));
+        }
+        return map.EncodeToBytes();
     }
 
 }
