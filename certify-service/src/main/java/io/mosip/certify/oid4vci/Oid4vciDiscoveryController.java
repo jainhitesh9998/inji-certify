@@ -52,6 +52,7 @@ public class Oid4vciDiscoveryController {
         metadata.setAuthorizationServers(legacy.getAuthorizationServers());
         metadata.setCredentialEndpoint(issuer.credentialEndpoint());
         metadata.setNonceEndpoint(issuer.nonceEndpoint());
+        metadata.setNotificationEndpoint(issuer.notificationEndpoint());
         metadata.setCredentialConfigurationSupportedDTO(legacy.getCredentialConfigurationSupportedDTO());
         return metadata;
     }

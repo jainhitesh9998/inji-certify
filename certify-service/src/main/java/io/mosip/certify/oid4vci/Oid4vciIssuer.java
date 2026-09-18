@@ -22,4 +22,8 @@ public record Oid4vciIssuer(String identifier) {
     public String nonceEndpoint() {
         return identifier + "/nonce";
     }
+
+    public String notificationEndpoint() {
+        return identifier + "/notification";
+    }
 }

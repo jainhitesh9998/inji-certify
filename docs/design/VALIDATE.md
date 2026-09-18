@@ -100,6 +100,16 @@ through `GET /v1/certify/oid4vci/.well-known/openid-credential-issuer` (its own 
 same pre-authorized flow on the new surface (the token comes from the same `/oauth/token`; the proof's `aud` must be
 the new `credential_issuer`). The wallet flow above still uses the compatibility path `/issuance/credential`.
 
+The credential response on this surface carries a `notification_id`; a wallet that implements the OpenID4VCI 1.0
+notification endpoint reports back to `POST /v1/certify/oid4vci/notification` and the matching
+`issuance_transaction` row (`select state from issuance_transaction`) moves from `ISSUED` to `NOTIFIED`. By hand:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8090/v1/certify/oid4vci/notification \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"notification_id":"<id from the credential response>","event":"credential_accepted"}'   # 204
+```
+
 ## 6c. Draft-13 wallets and the compatibility path through the core
 
 A wallet that still speaks OpenID4VCI draft 13 (release 0.14.0) posts the 0.14.0 body to the same

@@ -34,5 +34,6 @@
       "validFrom" : "<validFrom>",
       "validUntil" : "<validUntil>"
     }
-  } ]
+  } ],
+  "notification_id" : "<notification_id>"
 }
