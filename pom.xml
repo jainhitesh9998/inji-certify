@@ -117,6 +117,7 @@
 		<module>certify-signing</module>
 		<module>certify-keyprovider-jca</module>
 		<module>certify-keyprovider-keymanager</module>
+		<module>certify-keyprovider-x509-file</module>
 		<module>certify-spi</module>
 		<module>certify-issuance</module>
 		<module>certify-cli</module>

@@ -69,17 +69,26 @@ public class JcaKeyProvider implements KeyProvider {
 
     /** Loads every key entry of a PKCS#12 keystore; the purpose of each key is {@code vc-signing}. */
     public static JcaKeyProvider fromPkcs12(Path path, char[] password) {
+        return fromPkcs12(ID, path, password);
+    }
+
+    /** The same keystore published under another provider id (an {@code x509-file} provider next to keymanager). */
+    public static JcaKeyProvider fromPkcs12(String id, Path path, char[] password) {
         try (InputStream in = Files.newInputStream(path)) {
             KeyStore keyStore = KeyStore.getInstance("PKCS12");
             keyStore.load(in, password);
-            return fromKeyStore(keyStore, password);
+            return fromKeyStore(id, keyStore, password);
         } catch (IOException | GeneralSecurityException e) {
             throw new SigningException("Cannot load PKCS#12 keystore " + path, e);
         }
     }
 
     public static JcaKeyProvider fromKeyStore(KeyStore keyStore, char[] password) {
-        JcaKeyProvider provider = new JcaKeyProvider();
+        return fromKeyStore(ID, keyStore, password);
+    }
+
+    public static JcaKeyProvider fromKeyStore(String id, KeyStore keyStore, char[] password) {
+        JcaKeyProvider provider = new JcaKeyProvider(id);
         try {
             Enumeration<String> aliases = keyStore.aliases();
             while (aliases.hasMoreElements()) {

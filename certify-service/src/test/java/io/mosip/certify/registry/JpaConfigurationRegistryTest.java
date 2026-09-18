@@ -122,6 +122,18 @@ class JpaConfigurationRegistryTest {
     }
 
     @Test
+    void providerPrefixedKeyColumnSelectsAnotherProvider() {
+        CredentialConfig row = farmer();
+        row.setKeyManagerAppId("x509-file:issuer-es256@abc");
+        row.setKeyManagerRefId(null);
+        row.setSignatureAlgo("ES256");
+        CredentialConfiguration c = registry.toConfiguration(row);
+        assertEquals("x509-file", c.signing().keyRef().provider());
+        assertEquals("issuer-es256", c.signing().keyRef().alias());
+        assertEquals("abc", c.signing().keyRef().version());
+    }
+
+    @Test
     void rowWithoutAnyAlgorithmIsAConfigurationError() {
         CredentialConfig broken = farmer();
         broken.setSignatureAlgo(null);
