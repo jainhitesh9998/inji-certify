@@ -66,25 +66,46 @@ final class PostgresSupport {
 
     /** Runs the DDL files in the order ddl.sql lists them, skipping psql meta-commands, as a deployment does today. */
     void applyDdlScripts(String database) throws IOException, SQLException {
+        applyDdlScripts(database, DDL_DIR, DDL_FILES);
+    }
+
+    /** The same for another release's DDL directory (a vendored copy under src/test/resources/db). */
+    void applyDdlScripts(String database, Path ddlDir, int expectedFiles) throws IOException, SQLException {
         List<String> order = new ArrayList<>();
-        for (String line : Files.readAllLines(DDL_DIR.resolve("ddl.sql"))) {
+        for (String line : Files.readAllLines(ddlDir.resolve("ddl.sql"))) {
             if (line.startsWith("\\ir ")) {
                 order.add(line.substring(4).trim());
             }
         }
-        assertEquals(DDL_FILES, order.size(), "ddl.sql lists every table file");
+        assertEquals(expectedFiles, order.size(), "ddl.sql lists every table file");
         try (Connection c = dataSource(database).getConnection(); Statement s = c.createStatement()) {
             s.execute("SET search_path TO " + SCHEMA);
             for (String file : order) {
-                StringBuilder sql = new StringBuilder();
-                for (String line : Files.readAllLines(DDL_DIR.resolve(file), StandardCharsets.UTF_8)) {
-                    if (!line.startsWith("\\")) {
-                        sql.append(line).append('\n');
-                    }
-                }
-                s.execute(sql.toString());
+                s.execute(withoutMetaCommands(ddlDir.resolve(file)));
             }
         }
+    }
+
+    /** Runs one SQL script (an upgrade or rollback script under db_upgrade_script) against the database. */
+    void applySqlFile(String database, Path file) throws IOException, SQLException {
+        execute(database, withoutMetaCommands(file));
+    }
+
+    void execute(String database, String sql) throws SQLException {
+        try (Connection c = dataSource(database).getConnection(); Statement s = c.createStatement()) {
+            s.execute("SET search_path TO " + SCHEMA);
+            s.execute(sql);
+        }
+    }
+
+    private static String withoutMetaCommands(Path file) throws IOException {
+        StringBuilder sql = new StringBuilder();
+        for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
+            if (!line.startsWith("\\")) {
+                sql.append(line).append('\n');
+            }
+        }
+        return sql.toString();
     }
 
     Set<String> tables(String database) throws SQLException {
