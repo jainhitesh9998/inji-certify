@@ -32,6 +32,10 @@ public record JwsHeaderPolicy(String typ, KidStrategy kid, ChainInclusion x5c, b
         return new JwsHeaderPolicy(null, KidStrategy.NONE, ChainInclusion.NONE, false, false, true, Map.of());
     }
 
+    public JwsHeaderPolicy withTyp(String type) {
+        return new JwsHeaderPolicy(type, kid, x5c, x5tS256, b64, detached, extraHeaders);
+    }
+
     public JwsHeaderPolicy withKid(KidStrategy strategy) {
         return new JwsHeaderPolicy(typ, strategy, x5c, x5tS256, b64, detached, extraHeaders);
     }
