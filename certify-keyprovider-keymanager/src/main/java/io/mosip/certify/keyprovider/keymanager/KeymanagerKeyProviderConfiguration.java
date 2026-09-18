@@ -55,6 +55,12 @@ public class KeymanagerKeyProviderConfiguration {
 
     // The three mosip.certify.* keys below are today's settings read where they were read before (AppConfig,
     // JwksServiceImpl); they keep their SpEL map form until the alias layer of 14-configuration.md replaces them.
+    /** Today's {@code mosip.certify.signature-algo.key-alias-mapper} (JOSE name to {@code [appId, refId]} pairs) for the legacy listeners that still pick keys by it. */
+    @Bean("legacyKeyAliasMapper")
+    public Map<String, List<List<String>>> legacyKeyAliasMapper(@Value("#{${mosip.certify.signature-algo.key-alias-mapper:{}}}") Map<String, List<List<String>>> keyAliasMapper) {
+        return keyAliasMapper == null ? Map.of() : keyAliasMapper;
+    }
+
     @Bean
     public KeymanagerKeyProvider keymanagerKeyProvider(KeymanagerService keymanagerService, SignatureServicev2 signatureService,
                                                        KeymanagerProviderProperties properties,

@@ -204,9 +204,13 @@ public class DefaultIssuanceService implements IssuanceService {
         }
         Instant validFrom = context.now();
         TemplateEngine.Validity validity = new TemplateEngine.Validity(validFrom, validFrom.plus(defaultValidity));
+        ClaimSet model = fetched;
+        for (IssuanceListener listener : listeners) {
+            model = listener.beforeRender(model, configuration, context, holder);
+        }
         TemplateEngine.RenderedDocument rendered = engine.render(template,
-                new TemplateEngine.TemplateModel(fetched, context.tenant(), holder, validity, configuration, template.params()));
-        Map<String, Object> provenance = new HashMap<>(fetched.provenance());
+                new TemplateEngine.TemplateModel(model, context.tenant(), holder, validity, configuration, template.params()));
+        Map<String, Object> provenance = new HashMap<>(model.provenance());
         provenance.put(PROVENANCE_TEMPLATE_MODE, template.mode().name());
         return new ClaimSet(rendered.document(), provenance);
     }
