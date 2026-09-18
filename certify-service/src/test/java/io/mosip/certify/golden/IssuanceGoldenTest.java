@@ -100,6 +100,7 @@ class IssuanceGoldenTest {
     static final String ED_2018_ID = "GoldenEd2018Credential";
     static final String MDOC_ID = "GoldenMdlCredential";
     static final String QR_ID = "GoldenQrCredential";
+    static final String STATUS_ID = "GoldenStatusCredential";
     static final String SCOPE = "sample_vc_ldp"; // the scope LocalAccessTokenValidationFilter injects
 
     @Autowired MockMvc mockMvc;
@@ -138,6 +139,13 @@ class IssuanceGoldenTest {
         addLegacySuiteConfig(ED_2018_ID, "golden-ldp-ed2018.vm", "CERTIFY_VC_SIGN_ED25519", "ED25519_SIGN", "EdDSA", "Ed25519Signature2018");
         if (credentialConfigRepository.findByCredentialConfigKeyId(MDOC_ID).isEmpty()) {
             credentialConfigurationService.addCredentialConfiguration(mdocConfig());
+        }
+        if (credentialConfigRepository.findByCredentialConfigKeyId(STATUS_ID).isEmpty()) {
+            CredentialConfigurationDTO status = ldpConfig(STATUS_ID, "golden-ldp-status.vm", "https://www.w3.org/ns/credentials/v2",
+                    "CERTIFY_VC_SIGN_ED25519", "ED25519_SIGN", "EdDSA", "eddsa-rdfc-2022");
+            status.setCredentialTypes(List.of("VerifiableCredential", STATUS_ID));
+            status.setCredentialStatusPurposes(List.of("revocation"));
+            credentialConfigurationService.addCredentialConfiguration(status);
         }
         if (credentialConfigRepository.findByCredentialConfigKeyId(QR_ID).isEmpty()) {
             CredentialConfigurationDTO qr = ldpConfig(QR_ID, "golden-ldp-qr.vm", "https://www.w3.org/2018/credentials/v1",
@@ -594,6 +602,9 @@ class IssuanceGoldenTest {
         summary.put("validityInfoKeys", mso.get("validityInfo").getKeys().toString());
         Goldens.assertGolden("v2/oid4vci/mso_mdoc-summary", summary);
     }
+
+    // Status attachment on the new surface is exercised by StatusAndLedgerTest (mocked status-list service): the real
+    // service initialises list indices with PostgreSQL's generate_series, which H2 cannot run (finding in PROGRESS.md).
 
     @Test
     void oid4vciIssuerMetadataGolden() throws Exception {
