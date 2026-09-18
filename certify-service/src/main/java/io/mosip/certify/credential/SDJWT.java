@@ -9,12 +9,20 @@ package io.mosip.certify.credential;
 import java.text.ParseException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Base64;
 import java.util.Map;
 
 import io.mosip.certify.core.constants.ErrorConstants;
 import io.mosip.certify.core.constants.VCFormats;
 import io.mosip.certify.core.exception.CertifyException;
-import io.mosip.kernel.signature.dto.JWSSignatureRequestDtoV2;
+import io.mosip.certify.issuance.KeyProviderRegistry;
+import io.mosip.certify.signing.JwsEnvelope;
+import io.mosip.certify.signing.JwsHeaderPolicy;
+import io.mosip.certify.signing.KeyProvider;
+import io.mosip.certify.signing.KeyRef;
+import io.mosip.certify.signing.LegacyKeyRefs;
+import io.mosip.certify.signing.SignatureAlgorithm;
+import io.mosip.certify.signing.SigningKey;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
@@ -30,7 +38,6 @@ import com.nimbusds.jwt.PlainJWT;
 import io.mosip.certify.api.dto.VCResult;
 import io.mosip.certify.utils.SDJsonUtils;
 import io.mosip.certify.vcformatters.VCFormatter;
-import io.mosip.kernel.signature.dto.JWTSignatureResponseDto;
 import io.mosip.kernel.signature.service.SignatureService;
 import lombok.extern.slf4j.Slf4j;
 
@@ -46,6 +53,9 @@ public class SDJWT extends Credential{
 
     @Autowired
     private ObjectMapper objectMapper;
+
+    @Autowired
+    private KeyProviderRegistry keyProviders;
 
     /**
      * This method returns true when a format can be handled.
@@ -121,24 +131,15 @@ public class SDJWT extends Credential{
         VCResult<String> vcResult = new VCResult<>();
         String[] jwt = vcToSign.split("~");
         String[] jwtPayload = jwt[0].split("\\.");
-        //TODO: Request DTO should add options for header.
-        JWSSignatureRequestDtoV2 payload = new JWSSignatureRequestDtoV2();
-        payload.setDataToSign(jwtPayload.length > 1?jwtPayload[1]:jwtPayload[0]);
-        payload.setApplicationId(appID);
-        payload.setReferenceId(refID);
-        payload.setAdditionalHeaders(Map.of("typ", VCFormats.DC_SD_JWT));
-        //TODO: Wait for keymanager fix here.
-        payload.setSignAlgorithm(signAlgorithm);
-        payload.setIncludePayload(true);
-        payload.setIncludeCertificateChain(true);
-        payload.setIncludeCertHash(true);
-        payload.setValidateJson(false);
-        payload.setB64JWSHeaderParam(true);
-        payload.setCertificateUrl("");
-        //payload.setSignAlgorithm(signAlgorithm); // RSSignature2018 --> RS256, PS256, ES256
-
-        JWTSignatureResponseDto jwsSignedData = signatureService.jwsSignV2(payload);
-        vcResult.setCredential(vcToSign.replaceAll("^[^~]*", jwsSignedData.getJwtSignedData()));
+        KeyRef ref = LegacyKeyRefs.keymanager(appID, refID);
+        KeyProvider provider = keyProviders.provider(ref.provider());
+        SignatureAlgorithm algorithm = SignatureAlgorithm.fromJose(signAlgorithm)
+                .orElseThrow(() -> new CertifyException(ErrorConstants.VC_SIGNING_ERROR, "Unsupported signature algorithm " + signAlgorithm));
+        SigningKey key = provider.resolve(ref).withAlgorithm(algorithm);
+        byte[] payloadBytes = Base64.getUrlDecoder().decode(jwtPayload.length > 1 ? jwtPayload[1] : jwtPayload[0]);
+        // header: alg, typ dc+sd-jwt, kid, x5c, x5t#S256 (what keymanager's jwsSignV2 emitted for this request)
+        String issuerJws = JwsEnvelope.sign(payloadBytes, JwsHeaderPolicy.sdJwtVc(), key, provider);
+        vcResult.setCredential(vcToSign.replaceAll("^[^~]*", java.util.regex.Matcher.quoteReplacement(issuerJws)));
         return vcResult;
     }
 

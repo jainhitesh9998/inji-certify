@@ -38,11 +38,16 @@ public final class JwsEnvelope {
     static String signLocally(byte[] payload, JwsHeaderPolicy policy, SigningKey key, Signer signer) {
         JWSHeader header = header(policy, key);
         String encodedHeader = header.toBase64URL().toString();
-        String payloadPart = policy.b64() ? Base64URL.encode(payload).toString() : new String(payload, StandardCharsets.UTF_8);
-        byte[] signingInput = (encodedHeader + "." + payloadPart).getBytes(StandardCharsets.UTF_8);
+        // RFC 7797: with b64=false the payload bytes themselves follow the dot, so the input is assembled as bytes
+        byte[] payloadPart = policy.b64() ? Base64URL.encode(payload).toString().getBytes(StandardCharsets.US_ASCII) : payload;
+        byte[] headerPart = (encodedHeader + ".").getBytes(StandardCharsets.US_ASCII);
+        byte[] signingInput = new byte[headerPart.length + payloadPart.length];
+        System.arraycopy(headerPart, 0, signingInput, 0, headerPart.length);
+        System.arraycopy(payloadPart, 0, signingInput, headerPart.length, payloadPart.length);
         byte[] signature = signer.signRaw(signingInput, key, key.algorithm());
         String encodedSignature = Base64URL.encode(signature).toString();
-        return encodedHeader + "." + (policy.detached() ? "" : payloadPart) + "." + encodedSignature;
+        String payloadSegment = policy.detached() ? "" : new String(payloadPart, StandardCharsets.UTF_8);
+        return encodedHeader + "." + payloadSegment + "." + encodedSignature;
     }
 
     public static JWSHeader header(JwsHeaderPolicy policy, SigningKey key) {

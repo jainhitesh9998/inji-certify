@@ -1,24 +1,29 @@
 package io.mosip.certify.proofgenerators;
 
-import com.danubetech.keyformats.jose.JWSAlgorithm;
 import info.weboftrust.ldsignatures.LdProof;
 import info.weboftrust.ldsignatures.canonicalizer.Canonicalizer;
 import info.weboftrust.ldsignatures.canonicalizer.URDNA2015Canonicalizer;
 import io.mosip.certify.core.constants.Constants;
 import io.mosip.certify.core.constants.SignatureAlg;
-import io.mosip.kernel.signature.dto.JWSSignatureRequestDto;
-import io.mosip.kernel.signature.dto.JWTSignatureResponseDto;
-import io.mosip.kernel.signature.service.SignatureService;
+import io.mosip.certify.issuance.KeyProviderRegistry;
+import io.mosip.certify.signing.KeyProvider;
+import io.mosip.certify.signing.KeyRef;
+import io.mosip.certify.signing.LdLegacyEnvelope;
+import io.mosip.certify.signing.LegacyKeyRefs;
+import io.mosip.certify.signing.SignatureAlgorithm;
+import io.mosip.certify.signing.SigningKey;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
+import java.util.Base64;
 import java.util.Map;
 
+/** RSA_SIGNATURE_SUITE_2018: signs the URDNA2015 hash through the key provider the configuration's key columns name (P1-03). */
 @Component
 public class RSASignature2018ProofGenerator implements ProofGenerator {
+
     @Autowired
-    SignatureService signatureService;
+    KeyProviderRegistry keyProviders;
 
     Canonicalizer canonicalizer = new URDNA2015Canonicalizer();
 
@@ -34,19 +39,11 @@ public class RSASignature2018ProofGenerator implements ProofGenerator {
 
     @Override
     public LdProof generateProof(LdProof vcLdProof, String vcEncodedHash, Map<String, String> keyID) {
-        JWSSignatureRequestDto payload = new JWSSignatureRequestDto();
-        payload.setDataToSign(vcEncodedHash);
-        payload.setApplicationId(keyID.get(Constants.APPLICATION_ID));
-        payload.setReferenceId(keyID.get(Constants.REFERENCE_ID)); // alg, empty = RSA
-        payload.setIncludePayload(false);
-        payload.setIncludeCertificate(false);
-        payload.setIncludeCertHash(true);
-        payload.setValidateJson(false);
-        payload.setB64JWSHeaderParam(false);
-        payload.setCertificateUrl("");
-        payload.setSignAlgorithm(JWSAlgorithm.RS256); // RSSignature2018 --> RS256, PS256, ES256
-        JWTSignatureResponseDto jwsSignedData = signatureService.jwsSign(payload);
-        return LdProof.builder().base(vcLdProof).defaultContexts(false)
-                .jws(jwsSignedData.getJwtSignedData()).build();
+        KeyRef ref = LegacyKeyRefs.keymanager(keyID.get(Constants.APPLICATION_ID), keyID.get(Constants.REFERENCE_ID));
+        KeyProvider provider = keyProviders.provider(ref.provider());
+        SigningKey key = provider.resolve(ref).withAlgorithm(SignatureAlgorithm.RS256);
+        byte[] hash = Base64.getUrlDecoder().decode(vcEncodedHash);
+        String jws = LdLegacyEnvelope.detachedJws(hash, key, provider);
+        return LdProof.builder().base(vcLdProof).defaultContexts(false).jws(jws).build();
     }
 }

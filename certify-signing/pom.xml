@@ -13,6 +13,32 @@
 
     <dependencies>
         <dependency>
+            <!-- Linked Data proof envelopes (legacy suites and Data Integrity) share danubetech's canonicalizers and proof types -->
+            <groupId>info.weboftrust</groupId>
+            <artifactId>ld-signatures-java</artifactId>
+            <version>1.0.0</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>com.danubetech</groupId>
+                    <artifactId>key-formats-java</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>decentralized-identity</groupId>
+                    <artifactId>jsonld-common-java</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>com.danubetech</groupId>
+            <artifactId>data-integrity-java</artifactId>
+            <version>1.17.0</version>
+        </dependency>
+        <dependency>
+            <groupId>com.github.multiformats</groupId>
+            <artifactId>java-multibase</artifactId>
+            <version>v1.1.1</version>
+        </dependency>
+        <dependency>
             <groupId>com.nimbusds</groupId>
             <artifactId>nimbus-jose-jwt</artifactId>
             <version>10.0.2</version>

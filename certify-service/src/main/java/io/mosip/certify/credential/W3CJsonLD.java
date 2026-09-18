@@ -23,8 +23,13 @@ import io.mosip.certify.config.contextloader.StaticContextLoader;
 import io.mosip.certify.core.constants.*;
 import io.mosip.certify.core.dto.CertificateResponseDTO;
 import io.mosip.certify.proofgenerators.ProofGeneratorFactory;
-import io.mosip.certify.proofgenerators.dataintegrity.KeymanagerByteSigner;
-import io.mosip.certify.proofgenerators.dataintegrity.KeymanagerByteSignerFactory;
+import io.mosip.certify.issuance.KeyProviderRegistry;
+import io.mosip.certify.signing.KeyProvider;
+import io.mosip.certify.signing.KeyRef;
+import io.mosip.certify.signing.LegacyKeyRefs;
+import io.mosip.certify.signing.SignatureAlgorithm;
+import io.mosip.certify.signing.SignerByteSigner;
+import io.mosip.certify.signing.SigningKey;
 import io.mosip.certify.services.CertifyIssuanceServiceImpl;
 import io.mosip.certify.utils.CredentialUtils;
 import io.mosip.certify.utils.DIDDocumentUtil;
@@ -58,6 +63,9 @@ public class W3CJsonLD extends Credential{
 
     @Autowired
     private StaticContextLoader staticContextLoader;
+
+    @Autowired
+    private KeyProviderRegistry keyProviders;
 
 
     /**
@@ -130,8 +138,12 @@ public class W3CJsonLD extends Credential{
             ldProofWithJWS.addToJsonLDObject(jsonLDObject);
         } else {
             LdSigner signer = LdSignerRegistry.getLdSignerByDataIntegritySuiteTerm(SignatureAlg.DATA_INTEGRITY);
-            KeymanagerByteSigner keymanagerByteSigner = KeymanagerByteSignerFactory.getInstance(appID, refID, signatureService, signAlgorithm);
-            signer.setSigner(keymanagerByteSigner);
+            KeyRef ref = LegacyKeyRefs.keymanager(appID, refID);
+            KeyProvider provider = keyProviders.provider(ref.provider());
+            SignatureAlgorithm algorithm = SignatureAlgorithm.fromJose(signAlgorithm)
+                    .orElseThrow(() -> new CertifyException("Unsupported signature algorithm " + signAlgorithm));
+            SigningKey key = provider.resolve(ref).withAlgorithm(algorithm);
+            signer.setSigner(new SignerByteSigner(provider, key, algorithm));
             signer.setCryptosuite(signatureCryptoSuite);
 
             DataIntegrityProof dataIntegrityProof = DataIntegrityProof.builder()

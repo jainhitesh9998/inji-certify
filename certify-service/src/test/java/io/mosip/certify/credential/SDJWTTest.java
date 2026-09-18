@@ -107,38 +107,33 @@ public class SDJWTTest {
     }
 
     @Test
-    public void testAddProof_ShouldReplaceUnsignedHeaderWithSignedJWT() {
-        String unsignedVC = "header.payload~disclosure";
-        String signedJwt = "signed.header.payload";
+    public void testAddProof_SignsIssuerJwsThroughTheKeyProvider() throws Exception {
+        io.mosip.certify.issuance.KeyProviderRegistry registry = io.mosip.certify.signing.TestKeyProviders.registry("appID/refID", io.mosip.certify.signing.SignatureAlgorithm.ES256);
+        ReflectionTestUtils.setField(sdjwt, "keyProviders", registry);
+        String payload = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString("{\"vct\":\"Farmer\"}".getBytes());
+        String unsignedVC = "eyJhbGciOiJub25lIn0." + payload + "~disclosure";
 
-        JWTSignatureResponseDto signedResponse = new JWTSignatureResponseDto();
-        signedResponse.setJwtSignedData(signedJwt);
+        VCResult<?> result = sdjwt.addProof(unsignedVC, null, "ES256", "appID", "refID", "url", null);
 
-        when(mockSignatureService.jwsSignV2(any(JWSSignatureRequestDtoV2.class))).thenReturn(signedResponse);
-
-        VCResult<?> result = sdjwt.addProof(unsignedVC, null, "RS256", "appID", "refID", "url", "Ed25519Signature2020");
-
-        assertNotNull(result);
-        assertTrue(((String) result.getCredential()).startsWith("signed.header.payload"));
+        String credential = (String) result.getCredential();
+        assertTrue(credential.endsWith("~disclosure"));
+        com.nimbusds.jose.JWSObject jws = com.nimbusds.jose.JWSObject.parse(credential.substring(0, credential.indexOf('~')));
+        assertEquals("dc+sd-jwt", jws.getHeader().getType().getType());
+        assertEquals("ES256", jws.getHeader().getAlgorithm().getName());
+        assertNotNull(jws.getHeader().getKeyID());
+        assertNotNull("x5c as keymanager's jwsSignV2 emitted", jws.getHeader().getX509CertChain());
+        assertNotNull(jws.getHeader().getX509CertSHA256Thumbprint());
+        assertEquals("{\"vct\":\"Farmer\"}", jws.getPayload().toString());
+        com.nimbusds.jose.jwk.ECKey ec = (com.nimbusds.jose.jwk.ECKey) registry.provider("keymanager").resolve(io.mosip.certify.signing.KeyRef.parse("keymanager:appID/refID")).descriptor().toJwk();
+        com.nimbusds.jose.crypto.ECDSAVerifier verifier = new com.nimbusds.jose.crypto.ECDSAVerifier(ec);
+        verifier.getJCAContext().setProvider(com.nimbusds.jose.crypto.bc.BouncyCastleProviderSingleton.getInstance());
+        assertTrue("issuer JWS must verify with Nimbus", jws.verify(verifier));
     }
 
     @Test
-    public void testAddProof_ShouldSendCorrectSignatureRequest() {
-        String unsignedVC = "header.payload~disclosure";
-
-        JWTSignatureResponseDto response = new JWTSignatureResponseDto();
-        response.setJwtSignedData("signed.jwt");
-        when(mockSignatureService.jwsSignV2(any(JWSSignatureRequestDtoV2.class))).thenReturn(response);
-
-        sdjwt.addProof(unsignedVC, null, "PS256", "myApp", "myRef", "https://example.com", "Ed25519Signature2020");
-
-        verify(mockSignatureService).jwsSignV2(argThat(dto ->
-                "myApp".equals(dto.getApplicationId()) &&
-                        "myRef".equals(dto.getReferenceId()) &&
-                        "PS256".equals(dto.getSignAlgorithm()) &&
-                        dto.getIncludePayload() &&
-                        dto.getIncludeCertificateChain() &&
-                        "".equals(dto.getCertificateUrl())
-        ));
+    public void testAddProof_RejectsUnknownAlgorithm() {
+        ReflectionTestUtils.setField(sdjwt, "keyProviders", io.mosip.certify.signing.TestKeyProviders.registry("appID/refID", io.mosip.certify.signing.SignatureAlgorithm.ES256));
+        CertifyException e = assertThrows(CertifyException.class, () -> sdjwt.addProof("h.p~d", null, "HS256", "appID", "refID", "url", null));
+        assertEquals(ErrorConstants.VC_SIGNING_ERROR, e.getErrorCode());
     }
 }
