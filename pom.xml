@@ -122,6 +122,7 @@
 		<module>certify-cli</module>
 		<module>certify-template-velocity</module>
 		<module>certify-template-jsonmap</module>
+		<module>certify-format-ldp-vc</module>
 	</modules>
 	
 	<dependencies>
