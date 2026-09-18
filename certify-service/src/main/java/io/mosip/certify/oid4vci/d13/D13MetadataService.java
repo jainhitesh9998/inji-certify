@@ -60,7 +60,8 @@ public class D13MetadataService {
             throw new CertifyException(ERROR_UNSUPPORTED_VERSION, "Unsupported version: " + version);
         }
         CredentialIssuerMetadataDTO current = registry.issuerMetadata();
-        List<CredentialConfig> rows = repository.findAll().stream().filter(row -> Constants.ACTIVE.equals(row.getStatus())).toList();
+        List<CredentialConfig> rows = repository.findAll().stream().filter(row -> Constants.ACTIVE.equals(row.getStatus()))
+                .filter(row -> row.getTenantId() == null || row.getTenantId().isBlank() || "default".equals(row.getTenantId())).toList(); // draft-13 is the default tenant's surface
         Map<String, Object> document = new LinkedHashMap<>();
         document.put("credential_issuer", credentialIssuer);
         document.put("authorization_servers", current.getAuthorizationServers());

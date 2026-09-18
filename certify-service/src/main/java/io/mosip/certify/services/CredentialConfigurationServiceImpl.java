@@ -352,9 +352,11 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
 
     @Override
     public CredentialIssuerMetadataDTO fetchCredentialIssuerMetadata() {
+        // the compatibility surface and the v1 config API are the default tenant's; other tenants' rows stay out of this document
         List<CredentialConfig> credentialConfigList = credentialConfigRepository.findAll()
                 .stream()
                 .filter(config -> Constants.ACTIVE.equals(config.getStatus()))
+                .filter(config -> config.getTenantId() == null || config.getTenantId().isBlank() || "default".equals(config.getTenantId()))
                 .toList();
 
         return buildMetadata(credentialConfigList);

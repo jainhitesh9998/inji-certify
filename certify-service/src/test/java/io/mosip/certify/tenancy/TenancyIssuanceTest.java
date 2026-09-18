@@ -81,6 +81,7 @@ class TenancyIssuanceTest {
     @Autowired ObjectMapper objectMapper;
     @Autowired CredentialConfigurationService credentialConfigurationService;
     @Autowired CredentialConfigRepository credentialConfigRepository;
+    @Autowired io.mosip.certify.core.spi.CredentialRegistry credentialRegistry;
     @MockBean DataProviderPlugin dataProviderPlugin;
     @Value("${mosip.certify.identifier}") String issuerIdentifier;
 
@@ -95,6 +96,7 @@ class TenancyIssuanceTest {
             CredentialConfig row = credentialConfigRepository.findByCredentialConfigKeyId(ACME_ID).orElseThrow();
             row.setTenantId("acme"); // the v1 API writes the default tenant; a tenant's row is placed by hand until the v2 API
             credentialConfigRepository.save(row);
+            credentialRegistry.evict(); // the default document is cached; the row changed tenant behind the v1 API's back
         }
     }
 
@@ -120,6 +122,30 @@ class TenancyIssuanceTest {
         JsonNode defaultBody = objectMapper.readTree(dflt.getResponse().getContentAsString());
         assertEquals(200, dflt.getResponse().getStatus(), defaultBody.toString());
         assertEquals("did:web:localhost:certify", defaultBody.get("credentials").get(0).get("credential").get("issuer").asText(), "the default tenant keeps the deployment's DID");
+    }
+
+    @Test
+    void theHostSelectsTheIssuerMetadataDocument() throws Exception {
+        JsonNode acme = objectMapper.readTree(mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get("/oid4vci/.well-known/openid-credential-issuer")
+                .header("Host", ACME_HOST)).andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
+        assertEquals("http://acme.localhost/v1/certify/oid4vci", acme.get("credential_issuer").asText());
+        assertEquals("http://acme.localhost/v1/certify/oid4vci/credential", acme.get("credential_endpoint").asText());
+        assertEquals("http://acme.localhost/v1/certify/oid4vci/nonce", acme.get("nonce_endpoint").asText());
+        JsonNode acmeConfigs = acme.get("credential_configurations_supported");
+        assertEquals(1, acmeConfigs.size(), "only acme's configurations: " + acmeConfigs);
+        JsonNode entry = acmeConfigs.get(ACME_ID);
+        assertEquals("ldp_vc", entry.get("format").asText());
+        assertEquals("sample_vc_ldp", entry.get("scope").asText());
+        org.junit.jupiter.api.Assertions.assertTrue(entry.get("credential_definition").get("type").toString().contains("AcmeCredential"), entry.toString());
+        assertEquals("AcmeCredential", entry.get("credential_metadata").get("display").get(0).get("name").asText());
+        assertEquals("fullName", entry.get("credential_metadata").get("claims").get(0).get("path").get(0).asText());
+        assertEquals("EdDSA", entry.get("credential_signing_alg_values_supported").get(0).asText());
+
+        JsonNode dflt = objectMapper.readTree(mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get("/oid4vci/.well-known/openid-credential-issuer"))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
+        assertEquals(issuerIdentifier + "/oid4vci", dflt.get("credential_issuer").asText(), "the default tenant keeps the deployment's document");
+        org.junit.jupiter.api.Assertions.assertTrue(dflt.get("credential_configurations_supported").has(DEFAULT_ID));
+        org.junit.jupiter.api.Assertions.assertFalse(dflt.get("credential_configurations_supported").has(ACME_ID), "acme's configuration is not in the default document");
     }
 
     private MvcResult issue(String configurationId, String host, String proof) throws Exception {
