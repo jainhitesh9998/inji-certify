@@ -21,22 +21,20 @@ The two largest risks are shipping develop to a deployment whose wallets still s
 | CI has no Docker for Testcontainers | Database tests cannot run per PR | Confirm the `kattu` workflows' runners; fall back to a PostgreSQL service container |
 | A CLI run with the keymanager provider needs the keymanager database and HSM | Offline signing is not possible with keymanager keys | Documented; offline runs use the PKCS#11 or PKCS#12 provider |
 
-Decisions needed from the team before P2:
+Decisions taken on 2026-09-18 (details in the log below):
 
-- [x] Draft-13 wallets: decided 2026-09-18, `oid4vci-d13` is built in P1 and on by default, deprecated from day one.
-- [x] Issuer surface: decided 2026-09-18, a new spec-clean surface under `{domain}{servletPath}/oid4vci` with today's paths kept as a deprecated compatibility surface.
-- [x] Keymanager: decided 2026-09-18, kernel-keymanager stays the embedded default provider; other key managers plug in above it; no remote keymanager.
-- [ ] Where do agent work packages land: PRs straight to `develop` behind the gates, an integration branch, or the fork only for now?
-- [ ] Flyway run mode: Helm pre-upgrade Job plus startup in compose (recommended), startup everywhere, or baseline only for now? Is Docker available on the CI runners for Testcontainers?
-- [ ] HAIP: is the embedded `certify-as` or eSignet the authorization server for PAR and wallet attestation?
-- [ ] Which additional key provider comes first: a cloud KMS, Vault, or the file provider only for tests and the CLI?
-- [ ] Tenant isolation to prepare for: shared schema with `tenant_id` (recommended default), schema per tenant, or database per tenant?
-- [ ] Should the nonce endpoint be advertised by default on the compatibility surface too (`allow-c-nonce=true`)?
-- [ ] Keep Velocity as the default engine and add `jsonmap`, or move the shipped samples to `jsonmap` and keep Velocity for compatibility only?
-- [ ] Status for SD-JWT and mDoc: IETF Token Status List, or Bitstring referenced from a `status` claim?
-- [ ] Do the `verify-core` tables stay in the `certify` schema with a `verify_` prefix, or move to their own schema?
-- [ ] Is presentation during issuance a product commitment or an experiment?
-
+- [x] Draft-13 wallets: `oid4vci-d13` is built in P1 and on by default, deprecated from day one.
+- [x] Issuer surface: a new spec-clean surface under `{domain}{servletPath}/oid4vci`; today's paths kept as a deprecated compatibility surface.
+- [x] Keymanager: kernel-keymanager stays the embedded default provider; other key managers plug in above it; no remote keymanager.
+- [x] Where work lands: branches on `jainhitesh9998/inji-certify` only, integration branch `design/extensibility`; no pull requests to `inji/inji-certify`.
+- [x] Flyway and CI: Helm pre-upgrade Job in Kubernetes, startup migration in docker-compose; GitHub Actions on the fork runs the gates with Docker.
+- [x] HAIP: both halves; Certify as a HAIP resource server behind any HAIP-capable authorization server, and `certify-as` implementing PAR, PKCE, DPoP-bound tokens and wallet attestation itself.
+- [x] First non-keymanager provider: `x509-file` (PKCS#12 or PEM) with a dev mode that generates a key and a test chain at startup.
+- [x] Tenant isolation: shared schema with a defaulted `tenant_id` column.
+- [x] Templating: Velocity stays the default for existing whole-document templates; SD-JWT and mDoc use a standard claims mapping with format libraries building the envelope; a JSON mapping engine and a no-template path are provided; output validated by JSON Schema per format plus format-specific checks.
+- [x] Status for SD-JWT and mDoc: IETF Token Status List; Bitstring stays for W3C credentials.
+- [x] `verify-core` tables: stay in the `certify` schema unrenamed, created only by the `certify-as` Flyway location.
+- [x] Presentation during issuance (IAE): a supported feature kept in `certify-as` behind a feature flag; the core never depends on it.
 
 ## Decision log
 
@@ -44,6 +42,15 @@ Record every decision taken while building, newest first. A work package that ne
 
 | Date | Decision | Options considered | Chosen | By | Affects |
 | --- | --- | --- | --- | --- | --- |
+| 2026-09-18 | Work lands on branches of `jainhitesh9998/inji-certify` only; integration branch `design/extensibility`; no PRs to upstream | upstream PRs; integration branch; fork only | fork only | project owner | automation, CI |
+| 2026-09-18 | Flyway runs from a Helm pre-upgrade Job in Kubernetes and at startup in docker-compose; the application only validates at boot; CI is GitHub Actions on the fork with Docker for Testcontainers | Job; startup everywhere; manual | Job + compose startup | project owner (judgement delegated) | P0-04, P0-05, CI |
+| 2026-09-18 | HAIP on both sides: resource-server behaviour works behind any HAIP-capable AS (eSignet is one of several), and `certify-as` implements PAR, PKCE, DPoP-bound access tokens and wallet attestation | issuer half only; both | both | project owner | P4, certify-as, certify-authz |
+| 2026-09-18 | First non-keymanager provider is `x509-file` (PKCS#12 or PEM) with a dev mode generating a key and a test IACA-to-DSC chain at startup | KMS; Vault; file | file with dev mode | project owner | P3, tests, CLI |
+| 2026-09-18 | Tenant isolation: shared schema with a defaulted `tenant_id` column; schema- or database-per-tenant stays reachable through Hibernate multi-tenancy later | shared schema; schema per tenant; database per tenant | shared schema | project owner | P2 migration, entities |
+| 2026-09-18 | Templating: Velocity remains the default engine for existing whole-document (`FULL_DOCUMENT`) templates; SD-JWT and mDoc use a standard claims mapping (`CLAIMS_ONLY`) with the format libraries building the envelope; a `jsonmap` engine and a no-template build path exist; output validated by JSON Schema per format plus format checks (SD path validity, mDoc namespace shape) | Velocity only; replace Velocity; both | both, standard mapping for SD-JWT and mDoc | project owner (validation by judgement) | P1-08, P5 |
+| 2026-09-18 | Status mechanism: IETF Token Status List for SD-JWT and mDoc; Bitstring Status List stays for W3C credentials | Bitstring everywhere; Token Status List | Token Status List for SD-JWT and mDoc | judgement | P5 StatusProvider |
+| 2026-09-18 | `verify-core` tables stay in the `certify` schema unrenamed, created only by the `certify-as` Flyway location | rename with prefix; own schema; leave | leave, owned by certify-as | judgement | P0-04 |
+| 2026-09-18 | Presentation during issuance (IAE) is a supported feature kept in `certify-as` behind a feature flag; the core does not depend on it | drop; experiment; supported | supported behind a flag | project owner | certify-as |
 | 2026-09-18 | Draft-13 support: `oid4vci-d13` adapter built in P1, on by default, deprecated from day one | not supported; built but off; on by default | on by default | project owner | P0-02, P1-12, deprecation counters |
 | 2026-09-18 | Protocol surface: new spec-clean OpenID4VCI 1.0 surface under `{domain}{servletPath}/oid4vci` with its own issuer identifier; today's paths kept as a deprecated compatibility surface over the same core | same path only; second issuer URL only; both | new surface plus deprecated old surface | project owner | `oid4vci-v1`, API compatibility, metadata, tenancy prefix |
 | 2026-09-18 | Keymanager: MOSIP kernel-keymanager stays an embedded library and the default key provider; no HTTP or remote keymanager option; keymanager already covers HSM backends (PKCS#11, PKCS#12, offline), so Certify's `KeyProvider` SPI is for other key managers (cloud KMS, Vault, file, X.509 providers, other libraries) | embedded library; remote keymanager service | embedded, wrapped as `certify-keyprovider-keymanager` | project owner | signing, database, CLI |

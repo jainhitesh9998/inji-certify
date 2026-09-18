@@ -37,7 +37,9 @@ Inji Certify (`develop`, 1.0.0-beta.1) is an OpenID4VCI 1.0 credential issuer wh
 
 ## Working on a work package
 
-- Specs live in `docs/design/wp/`; pick one whose dependencies are merged. Branch `wp/<id>-<slug>` from `develop`; PR to `develop`; keep a PR under roughly 800 changed lines excluding recorded goldens and generated SQL.
+- All work is pushed to branches on `jainhitesh9998/inji-certify`; never open a pull request against `inji/inji-certify`. The integration branch is `design/extensibility`.
+- Specs live in `docs/design/wp/`; pick one whose dependencies are merged. Branch `wp/<id>-<slug>` from `design/extensibility`; merge back after the gates pass (a PR inside the fork is optional, for review); keep a change under roughly 800 lines excluding recorded goldens and generated SQL.
+- CI is `.github/workflows/rebuild-ci.yml` (GitHub Actions on the fork, Docker available, so Testcontainers runs).
 - Before code: read the spec, the design section that owns it, and the classes it names. Record goldens or vectors before touching the code they protect.
 - Stay inside the files the spec names; list anything else under "Outside scope" in the PR.
 - Copy the spec's acceptance checklist into the PR and tick each item with evidence.
@@ -58,7 +60,7 @@ Java 21 and Maven 3.9 are required; Docker is required for Testcontainers and th
 
 ## Where things are decided
 
-`docs/design/12-risks-and-decisions.md` holds the open questions and the decision log. `docs/design/11-roadmap.md` holds phases, exit criteria and order. `docs/design/13-automated-development.md` holds the operating model for agents and reviewers.
+`docs/design/12-risks-and-decisions.md` holds the decision log; decisions already taken include: draft-13 adapter on by default; new `/oid4vci` surface with today's paths deprecated; keymanager embedded default; `x509-file` first extra provider with dev-mode generation; shared-schema tenancy; Velocity default with standard claims mapping for SD-JWT and mDoc; Token Status List for SD-JWT and mDoc; HAIP on both the resource-server and `certify-as` sides; IAE supported behind a flag in `certify-as`. `docs/design/11-roadmap.md` holds phases, exit criteria and order. `docs/design/13-automated-development.md` holds the operating model for agents and reviewers.
 
 ## Glossary
 

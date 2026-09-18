@@ -2,6 +2,8 @@
 
 > Part of the Inji Certify extensibility design. Baseline: `develop` at `a1cfd63` (1.0.0-beta.1-SNAPSHOT). Index: [README.md](./README.md).
 
+Decided 2026-09-18: Velocity stays the default engine for existing whole-document templates; SD-JWT and mDoc move to a standard claims mapping in which the format library builds the envelope (`CLAIMS_ONLY`), a JSON mapping engine and a no-template path are provided, and rendered output is validated by a JSON Schema per format plus format checks before signing.
+
 One Velocity string template per configuration produces the whole credential document, the engine that renders it is also the only path to configuration, and the template author is responsible for format correctness. The design below splits envelope from claims, makes the engine a plugin, validates output, and stores templates as versioned rows instead of base64 blobs.
 
 How templating works on develop, step by step:

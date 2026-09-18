@@ -8,8 +8,8 @@ The rebuild is executed as a stream of small, independently mergeable work packa
 
 ```mermaid
 flowchart LR
-  Spec[WP spec in docs/design/wp] --> Branch[wp/&lt;id&gt;-&lt;slug&gt; off develop]
-  Branch --> PR[PR to develop]
+  Spec[WP spec in docs/design/wp] --> Branch[wp/&lt;id&gt;-&lt;slug&gt; off design/extensibility]
+  Branch --> PR[PR inside the fork to design/extensibility]
   PR --> CI[CI: unit, goldens, vectors, ArchUnit, Testcontainers, api-test]
   CI --> Review[Human review against the acceptance list]
   Review --> Merge[Squash-merge, WP closed]
@@ -17,7 +17,7 @@ flowchart LR
 ```
 
 - One agent per WP, one WP per branch, one PR per WP. A WP that grows past roughly 800 changed lines (excluding recorded goldens and generated SQL) is split, not merged.
-- PRs target `develop` directly. Phase 1 is safe to land incrementally because every PR must keep both golden sets and the signature vectors green; if a WP cannot keep them green it is wrong, not the tests.
+- All branches live on `jainhitesh9998/inji-certify`; nothing is opened against `inji/inji-certify`. The integration branch is `design/extensibility` (develop plus the design and the rebuild); WP branches merge into it after the gates pass. Phase 1 is safe to land incrementally because every merge must keep both golden sets and the signature vectors green; if a WP cannot keep them green it is wrong, not the tests.
 - Agents run independently only on WPs whose dependencies are merged. The dependency field in each spec is authoritative.
 - Every WP that takes a decision not already in `12-risks-and-decisions.md` stops and asks; the answer is appended to the decision log before the PR is opened.
 
@@ -25,7 +25,7 @@ flowchart LR
 
 | Gate | What it runs | Introduced by |
 | --- | --- | --- |
-| Unit and component tests | `mvn -B test` across modules | today |
+| Unit and component tests | `mvn -B verify` across modules, run by `.github/workflows/rebuild-ci.yml` on the fork (Docker available for Testcontainers) | today |
 | Golden wire tests | `GoldenReplayTest` for v1 (and d13 once WP1-10 lands) | P0-01, P0-02 |
 | Signature vectors | `SignatureVectorTest` | P0-03 |
 | Architecture rules | ArchUnit with a frozen violation list that may only shrink | P0-06 |
@@ -39,7 +39,7 @@ flowchart LR
 Every WP spec contains: goal, scope (in and out), acceptance criteria as a checklist, dependencies, size (S under 2 days, M under 5, L split it). An agent working a WP:
 
 1. Reads `CLAUDE.md`, `docs/design/05-target-architecture.md`, the design section that owns the WP, and the spec.
-2. Creates `wp/<id>-<slug>` from the current `develop`.
+2. Creates `wp/<id>-<slug>` from the current `design/extensibility` on the fork.
 3. Writes or extends tests first when the WP changes behaviour-adjacent code; records goldens or vectors before touching the code they protect.
 4. Keeps changes inside the files the spec names; anything else is listed in the PR description under "Outside scope".
 5. Runs the full gate list locally (`mvn -B verify -Pgoldens,archunit,testcontainers`) before opening the PR.
