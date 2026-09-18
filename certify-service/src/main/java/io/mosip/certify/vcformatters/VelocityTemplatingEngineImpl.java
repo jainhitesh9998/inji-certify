@@ -5,7 +5,6 @@
  */
 package io.mosip.certify.vcformatters;
 
-import java.io.StringWriter;
 import java.util.*;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -13,9 +12,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.mosip.certify.config.VelocityEnvConfig;
 import io.mosip.certify.core.constants.*;
 import org.apache.commons.codec.binary.Base64;
-import org.apache.velocity.VelocityContext;
-import org.apache.velocity.app.VelocityEngine;
-import org.apache.velocity.runtime.RuntimeConstants;
+import io.mosip.certify.template.velocity.VelocityRenderer;
 import org.apache.velocity.tools.generic.DateTool;
 import org.apache.velocity.tools.generic.EscapeTool;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -43,7 +40,9 @@ import static io.mosip.certify.core.constants.Constants.*;
 @Slf4j
 @Service
 public class VelocityTemplatingEngineImpl implements VCFormatter {
-    VelocityEngine engine;
+    /** The shared Velocity renderer from certify-template-velocity; created locally when no bean is injected (unit tests). */
+    @Autowired(required = false)
+    VelocityRenderer renderer;
 
     @Autowired
     CredentialConfigRepository credentialConfigRepository;
@@ -61,10 +60,9 @@ public class VelocityTemplatingEngineImpl implements VCFormatter {
 
     @PostConstruct
     public void initialize() {
-        engine = new VelocityEngine();
-        engine.setProperty(RuntimeConstants.INPUT_ENCODING, "UTF-8");
-        engine.setProperty(RuntimeConstants.OUTPUT_ENCODING, "UTF-8");
-        engine.init();
+        if (renderer == null) {
+            renderer = new VelocityRenderer();
+        }
         log.info("VelocityTemplatingEngineImpl initialized. Using Spring Cache for CredentialConfig.");
     }
 
@@ -220,7 +218,6 @@ public class VelocityTemplatingEngineImpl implements VCFormatter {
         String issuer = updatedTemplateParams.get(DID_URL).toString();
         String vcTemplateString = getCachedCredentialConfig(templateName).getVcTemplate(); // NEW
         vcTemplateString = new String(Base64.decodeBase64(vcTemplateString));
-        StringWriter writer = new StringWriter();
         // TODO: Eventually, the credentialSubject from the plugin will be templated as-is
         // Date: https://velocity.apache.org/tools/3.1/apidocs/org/apache/velocity/tools/generic/DateTool.html
         updatedTemplateParams.put("_dateTool", new DateTool());
@@ -237,9 +234,7 @@ public class VelocityTemplatingEngineImpl implements VCFormatter {
                 log.error("Template: " + updatedTemplateParams.get(Constants.RENDERING_TEMPLATE_ID) + " not available in DB", e);
             }
         }
-        VelocityContext context = new VelocityContext(updatedTemplateParams);
-        engine.evaluate(context, writer, /*logTag */ templateName, vcTemplateString); // use vcTemplateString
-        JSONObject jsonObject = new JSONObject(writer.toString());
+        JSONObject jsonObject = new JSONObject(renderer.evaluate(vcTemplateString, updatedTemplateParams, templateName));
         if (updatedTemplateParams.containsKey(VCDMConstants.CREDENTIAL_ID)) {
             jsonObject.put(VCDMConstants.ID, updatedTemplateParams.get(VCDMConstants.CREDENTIAL_ID));
         }
@@ -276,10 +271,7 @@ public class VelocityTemplatingEngineImpl implements VCFormatter {
             log.error(e.getMessage(), e);
             throw new CertifyException(ErrorConstants.JSON_PROCESSING_ERROR, "Error processing JSON data for QR code generation.");
         }
-        StringWriter writer = new StringWriter();
         updatedTemplateParams.put("_esc", new EscapeTool());
-        VelocityContext context = new VelocityContext(updatedTemplateParams);
-        engine.evaluate(context, writer, /*logTag */ templateName, qrTemplateString); // use qrTemplateString
-        return new JSONArray(writer.toString());
+        return new JSONArray(renderer.evaluate(qrTemplateString, updatedTemplateParams, templateName));
     }
 }
