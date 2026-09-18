@@ -18,7 +18,7 @@ import java.util.Map;
  * The OpenID4VCI 1.0 issuer metadata of a tenant other than {@code default}, built from the core's view of its
  * configurations (formatter fragments, the configuration's scope, binding methods, signing algorithms, proof types
  * and display) under the tenant's own issuer identifier. The default tenant keeps the document develop builds, so
- * the goldens stay untouched; tenants share the deployment's authorization servers and issuer display for now.
+ * the goldens stay untouched; a tenant's `display` and `authorization-servers` settings replace the deployment's in its document.
  */
 @Component
 public class TenantIssuerMetadata {
@@ -29,9 +29,12 @@ public class TenantIssuerMetadata {
     private final ConfigurationRegistry configurations;
     private final List<CredentialFormatter> formatters;
     private final Oid4vciV1Properties properties;
+    private final io.mosip.certify.tenancy.TenancyProperties tenancy;
 
-    public TenantIssuerMetadata(ConfigurationRegistry configurations, List<CredentialFormatter> formatters, Oid4vciV1Properties properties) {
+    public TenantIssuerMetadata(ConfigurationRegistry configurations, List<CredentialFormatter> formatters, Oid4vciV1Properties properties,
+                                io.mosip.certify.tenancy.TenancyProperties tenancy) {
         this.properties = properties;
+        this.tenancy = tenancy;
         this.configurations = configurations;
         this.formatters = formatters;
     }
@@ -39,14 +42,19 @@ public class TenantIssuerMetadata {
     public Map<String, Object> document(TenantContext tenant, Oid4vciIssuer issuer, CredentialIssuerMetadataDTO deployment) {
         Map<String, Object> document = new LinkedHashMap<>();
         document.put("credential_issuer", issuer.identifier());
-        document.put("authorization_servers", deployment.getAuthorizationServers());
+        io.mosip.certify.tenancy.TenancyProperties.Tenant overrides = tenancy.tenant(tenant.tenantId());
+        boolean ownAuthorizationServers = overrides != null && overrides.authorizationServers() != null && !overrides.authorizationServers().isEmpty();
+        document.put("authorization_servers", ownAuthorizationServers ? overrides.authorizationServers() : deployment.getAuthorizationServers());
         document.put("credential_endpoint", issuer.credentialEndpoint());
         document.put("nonce_endpoint", issuer.nonceEndpoint());
         document.put("notification_endpoint", issuer.notificationEndpoint());
         if (properties.batch().size() > 1) {
             document.put("batch_credential_issuance", Map.of("batch_size", properties.batch().size()));
         }
-        if (deployment.getDisplay() != null) {
+        boolean ownDisplay = overrides != null && overrides.display() != null && !overrides.display().isEmpty();
+        if (ownDisplay) {
+            document.put("display", overrides.display());
+        } else if (deployment.getDisplay() != null) {
             document.put("display", deployment.getDisplay());
         }
         Map<String, Object> supported = new LinkedHashMap<>();

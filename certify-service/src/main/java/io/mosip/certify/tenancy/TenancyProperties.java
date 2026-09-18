@@ -20,7 +20,13 @@ public record TenancyProperties(@DefaultValue("false") boolean enabled, @Default
     public static final String RESOLVER_HOST = "host";
     public static final String RESOLVER_PATH = "path";
 
-    public record Tenant(@DefaultValue List<String> hosts, String issuerIdentifier, String issuerDid, String keyNamespace) {}
+    /**
+     * A tenant's overrides of the deployment's issuer settings (docs/design/14-configuration.md): hosts for the host
+     * resolver, its own issuer identifier, DID and key namespace, and the issuer {@code display} and
+     * {@code authorization_servers} of its metadata document (the deployment's when absent).
+     */
+    public record Tenant(@DefaultValue List<String> hosts, String issuerIdentifier, String issuerDid, String keyNamespace,
+                         @DefaultValue List<Map<String, Object>> display, @DefaultValue List<String> authorizationServers) {}
 
     public Tenant tenant(String tenantId) {
         return tenants == null || tenantId == null ? null : tenants.get(tenantId);

@@ -12,7 +12,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 class PathTenantResolverTest {
 
     static final TenancyProperties PROPERTIES = new TenancyProperties(true, "path",
-            Map.of("acme", new TenancyProperties.Tenant(List.of(), null, "did:web:acme.example", null)));
+            Map.of("acme", new TenancyProperties.Tenant(List.of(), null, "did:web:acme.example", null, List.of(), List.of())));
 
     @Test
     void theSegmentAfterTIsTheTenant() {

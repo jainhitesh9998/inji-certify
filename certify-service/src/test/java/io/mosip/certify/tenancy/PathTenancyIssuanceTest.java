@@ -58,6 +58,9 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
         "certify.tenancy.enabled=true",
         "certify.tenancy.resolver=path",
         "certify.tenancy.tenants.beta.issuer-did=did:web:beta.example",
+        "certify.tenancy.tenants.beta.display[0].name=Beta Issuer",
+        "certify.tenancy.tenants.beta.display[0].locale=en",
+        "certify.tenancy.tenants.beta.authorization-servers[0]=http://beta.example/as",
         "mosip.certify.issuer.ledger-enabled=false",
         "mosip.certify.authn.filter-urls={'/issuance/credential'}",
         "spring.jpa.database-platform=org.hibernate.dialect.H2Dialect",
@@ -107,6 +110,8 @@ class PathTenancyIssuanceTest {
         assertEquals(acmeIdentifier + "/notification", acme.get("notification_endpoint").asText());
         assertTrue(acme.get("credential_configurations_supported").has(ACME_ID));
         assertFalse(acme.get("credential_configurations_supported").has(DEFAULT_ID));
+        assertEquals("Beta Issuer", acme.get("display").get(0).get("name").asText(), "the tenant's own issuer display");
+        assertEquals("http://beta.example/as", acme.get("authorization_servers").get(0).asText(), "the tenant's own authorization server");
 
         String nonce = objectMapper.readTree(mockMvc.perform(post("/t/beta/oid4vci/nonce")).andExpect(status().isOk()).andReturn().getResponse().getContentAsString()).get("c_nonce").asText();
         MvcResult issued = mockMvc.perform(post("/t/beta/oid4vci/credential").header("Authorization", "TestBearer demo").contentType(MediaType.APPLICATION_JSON)
@@ -124,6 +129,7 @@ class PathTenancyIssuanceTest {
         // the default surface is untouched and does not see acme's configuration; an unknown path tenant is the default
         JsonNode dflt = objectMapper.readTree(mockMvc.perform(get("/oid4vci/.well-known/openid-credential-issuer")).andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
         assertEquals(issuerIdentifier + "/oid4vci", dflt.get("credential_issuer").asText());
+        assertFalse(dflt.has("display") && "Beta Issuer".equals(dflt.get("display").get(0).get("name").asText()), "the default document keeps the deployment's display");
         assertTrue(dflt.get("credential_configurations_supported").has(DEFAULT_ID));
         assertFalse(dflt.get("credential_configurations_supported").has(ACME_ID));
         JsonNode nobody = objectMapper.readTree(mockMvc.perform(get("/t/nobody/oid4vci/.well-known/openid-credential-issuer")).andExpect(status().isOk()).andReturn().getResponse().getContentAsString());
