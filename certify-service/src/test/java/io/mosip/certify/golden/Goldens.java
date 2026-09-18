@@ -27,7 +27,8 @@ public final class Goldens {
 
     static final Set<String> VOLATILE_KEYS = Set.of(
             "id", "issuanceDate", "expirationDate", "validFrom", "validUntil", "created", "proofValue", "jws",
-            "iat", "exp", "nbf", "jti", "c_nonce", "nonce", "_sd", "sd_alg", "cnf", "signature", "x5c", "x5t#S256", "kid");
+            "iat", "exp", "nbf", "jti", "c_nonce", "nonce", "_sd", "sd_alg", "cnf", "signature", "x5c", "x5t#S256", "kid",
+            "pre-authorized_code", "access_token", "credential_offer_uri");
 
     private static final ObjectMapper MAPPER = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT)
             .enable(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS);

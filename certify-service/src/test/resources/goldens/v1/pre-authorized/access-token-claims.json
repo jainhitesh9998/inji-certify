@@ -1,0 +1,13 @@
+{
+  "aud" : "http://localhost:8090/v1/certify/v1/certify/issuance/credential",
+  "client_id" : "",
+  "exp" : "<exp>",
+  "iat" : "<iat>",
+  "iss" : "http://localhost:8090",
+  "scope" : "sample_vc_ldp",
+  "sub" : {
+    "city" : "Bengaluru",
+    "dateOfBirth" : "1990-01-01",
+    "fullName" : "Golden Farmer"
+  }
+}

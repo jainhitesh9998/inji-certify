@@ -114,6 +114,20 @@
             <scope>test</scope>
         </dependency>
         <dependency>
+            <!-- danubetech's EcdsaSecp256k1Signature2019LdVerifier has a bitcoinj constructor overload; javac needs the class to resolve any constructor -->
+            <groupId>org.bitcoinj</groupId>
+            <artifactId>bitcoinj-core</artifactId>
+            <version>0.16.2</version>
+            <scope>test</scope>
+            <exclusions>
+                <!-- only the class definitions are needed; its BouncyCastle and Guava versions must not leak in -->
+                <exclusion>
+                    <groupId>*</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
             <groupId>io.mosip.kernel</groupId>
             <artifactId>kernel-keymanager-service</artifactId>
             <version>${kernel.keymanager.version}</version>

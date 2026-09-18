@@ -62,8 +62,8 @@ class RSASignature2018ProofGeneratorTest {
         SigningKey key = TestKeyProviders.provider(registry).resolve(KeyRef.parse("keymanager:app123/ref456"));
 
         assertNotNull(result);
-        // RFC 7797 detached JWS over binary bytes: rebuild the signing input (ASCII header + '.' + raw hash) and verify with JCA;
-        // Nimbus' detached-payload parse goes through a UTF-8 String and cannot represent arbitrary bytes.
+        // RFC 7797 detached JWS over binary bytes: rebuild the signing input (ASCII header + '.' + raw hash) and verify with
+        // JCA, independent of any JOSE library's handling of the critical b64 header.
         String[] parts = result.getJws().split("\\.", -1);
         assertEquals(3, parts.length);
         assertEquals("", parts[1], "payload segment is detached");

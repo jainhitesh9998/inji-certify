@@ -57,16 +57,21 @@ Expected: `["FarmerCredential", ...]` and a token endpoint under Certify's own U
 ## 5. Create a credential offer
 
 `/pre-authorized-data` is unauthenticated in the stack configuration (`mosip.certify.security.ignore-auth-urls`).
-The claims must name a row of `config/farmer_identity_data.csv` through its identifier column `id`:
+Claim keys must be among the configuration's `claims` metadata (last path segment); anything else is refused with
+`unknown_claims`, and note the refusal comes back as HTTP 200 with an `errors` array (legacy envelope, logged as a
+finding). For `FarmerCredential` the seed lists `fullName`, `phone`, `dateOfBirth`, ... — the mock CSV plugin then
+resolves the row it serves:
 
 ```bash
 curl -s http://localhost:8090/v1/certify/pre-authorized-data \
   -H 'Content-Type: application/json' \
-  -d '{"credential_configuration_id":"FarmerCredential","claims":{"id":"2154189532"},"expires_in":600,"tx_code":"1234"}'
+  -d '{"credential_configuration_id":"FarmerCredential","claims":{"fullName":"Gorge Cooper"},"expires_in":600,"tx_code":"1234"}'
 ```
 
 The response is `{"credential_offer_uri":"openid-credential-offer://?credential_offer_uri=..."}`. Show it as a QR
-(`qrencode -t ansiutf8 '<uri>'`) or paste it into the wallet.
+(`qrencode -t ansiutf8 '<uri>'`) or paste it into the wallet. The same three steps run in-JVM in
+`IssuanceGoldenTest.preAuthorizedCodeFlowGoldenAndAccessTokenVerification`, which also verifies the access token
+against `jwks.json`.
 
 ## 6. Download with a wallet
 
