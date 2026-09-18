@@ -36,7 +36,7 @@ jobs:
       - name: Build and verify
         # Runs unit tests today; golden replay, signature vectors, ArchUnit and
         # Testcontainers suites join this step as their work packages land.
-        run: mvn -B -ntp -U verify
+        run: mvn -B -ntp -U -Dgpg.skip=true verify
 
       - name: Upload test reports
         if: always()
