@@ -6,6 +6,7 @@ import io.mosip.certify.core.dto.AuthorizationContext;
 import io.mosip.certify.core.dto.CredentialRequest;
 import io.mosip.certify.core.dto.CredentialResponse;
 import io.mosip.certify.core.exception.CertifyException;
+import io.mosip.certify.core.exception.InvalidRequestException;
 import io.mosip.certify.core.exception.NotAuthenticatedException;
 import io.mosip.certify.core.spi.VCIssuanceService;
 import io.mosip.certify.issuance.ConfigurationRegistry;
@@ -23,7 +24,7 @@ import io.mosip.certify.spi.TenantContext;
 import io.mosip.certify.utils.DIDDocumentUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Primary;
 import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Service;
@@ -38,15 +39,17 @@ import java.util.UUID;
  * The compatibility path {@code POST /issuance/credential} (OpenID4VCI 1.0 body) served by the new core when
  * {@code certify.protocol.oid4vci-v1.compat-core.enabled=true}: the same command the new surface builds, with today's
  * issuer identifier as tenant identifier and proof audience, the shared nonce store, and the legacy error codes and
- * messages so that the v1 goldens hold byte for byte. Replaces {@code CertifyIssuanceServiceImpl} for the controller
- * ({@code @Primary}); the legacy service stays until the default flips.
+ * messages so that the v1 goldens hold byte for byte. Replaces {@code CertifyIssuanceServiceImpl} (DataProvider mode)
+ * and {@code VCIssuanceServiceImpl} (VCIssuance mode, through {@code LegacyExternalIssuer}) for the controller
+ * ({@code @Primary}); the legacy services stay until the default flips.
  */
 @Slf4j
 @Service
 @Primary
-// the VCIssuance plugin mode has no ExternalIssuer adapter yet, so the flag only applies to DataProvider deployments
-@ConditionalOnExpression("${" + Oid4vciV1Properties.COMPAT_CORE_PREFIX + ".enabled:false} and '${mosip.certify.plugin-mode:}' == 'DataProvider'")
+@ConditionalOnProperty(prefix = Oid4vciV1Properties.COMPAT_CORE_PREFIX, name = "enabled", havingValue = "true")
 public class CoreBackedVCIssuanceService implements VCIssuanceService {
+
+    static final String PLUGIN_MODE_VC_ISSUANCE = "VCIssuance";
 
     static final List<String> DEFAULT_PROOF_ALGORITHMS = List.of("ES256", "EdDSA", "RS256", "PS256", "ES256K");
     static final String PARAM_SURFACE = "surface";
@@ -59,6 +62,7 @@ public class CoreBackedVCIssuanceService implements VCIssuanceService {
     private final DIDDocumentUtil didDocumentUtil;
     private final String issuerIdentifier;
     private final String didUrl;
+    private final String pluginMode;
 
     public CoreBackedVCIssuanceService(@Qualifier("oid4vciIssuanceService") IssuanceService issuanceService, ConfigurationRegistry configurations,
                                        AuthorizationContext authorizationContext, CacheNonceCheck nonceCheck, DIDDocumentUtil didDocumentUtil,
@@ -70,6 +74,7 @@ public class CoreBackedVCIssuanceService implements VCIssuanceService {
         this.didDocumentUtil = didDocumentUtil;
         this.issuerIdentifier = environment.getRequiredProperty("mosip.certify.identifier").replaceAll("/+$", "");
         this.didUrl = environment.getProperty("mosip.certify.data-provider-plugin.did-url", "");
+        this.pluginMode = environment.getProperty("mosip.certify.plugin-mode", "DataProvider");
     }
 
     @Override
@@ -111,6 +116,9 @@ public class CoreBackedVCIssuanceService implements VCIssuanceService {
 
     @Override
     public Map<String, Object> getDIDDocument() {
+        if (PLUGIN_MODE_VC_ISSUANCE.equalsIgnoreCase(pluginMode)) {
+            throw new InvalidRequestException(ErrorConstants.UNSUPPORTED_IN_CURRENT_PLUGIN_MODE); // as VCIssuanceServiceImpl answers
+        }
         return didDocumentUtil.generateDIDDocument(didUrl);
     }
 

@@ -1,0 +1,7 @@
+{
+  "body" : {
+    "error" : "unsupported_credential_format",
+    "error_description" : "Invalid or unsupported VC format requested."
+  },
+  "status" : 400
+}

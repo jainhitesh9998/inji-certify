@@ -1,0 +1,7 @@
+{
+  "body" : {
+    "error" : "vci_exchange_failed",
+    "error_description" : "vci_exchange_failed"
+  },
+  "status" : 400
+}
