@@ -1,0 +1,21 @@
+{
+    "@context": [
+        "https://www.w3.org/ns/credentials/v2",
+        {
+            "GoldenStatusCredential": "https://example.org/golden#GoldenStatusCredential",
+            "fullName": "https://schema.org/name",
+            "dateOfBirth": "https://schema.org/birthDate",
+            "city": "https://schema.org/addressLocality"
+        }
+    ],
+    "issuer": "${_issuer}",
+    "type": ["VerifiableCredential", "GoldenStatusCredential"],
+    "validFrom": "${validFrom}",
+    "validUntil": "${validUntil}",
+    "credentialSubject": {
+        "id": "${_holderId}",
+        "fullName": "${fullName}",
+        "dateOfBirth": "${dateOfBirth}",
+        "city": "${city}"
+    }
+}

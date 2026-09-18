@@ -20,6 +20,8 @@ public class DataProviderPluginDataSource implements CredentialDataSource {
 
     public static final String ID = "data-provider-plugin";
     public static final String ERROR_UNAVAILABLE = "data_provider_unavailable";
+    /** Provenance key under which the plugin's data travels to the listeners (ledger indexing). */
+    public static final String PROVENANCE_DATA = "data";
 
     private final ObjectProvider<DataProviderPlugin> plugin;
 
@@ -42,7 +44,8 @@ public class DataProviderPluginDataSource implements CredentialDataSource {
         identityDetails.put("accessTokenHash", context.authorization().tokenHash());
         try {
             JSONObject data = dataProviderPlugin.fetchData(identityDetails);
-            return new ClaimSet(data.toMap(), Map.of("source", ID));
+            Map<String, Object> claims = data.toMap();
+            return new ClaimSet(claims, Map.of("source", ID, PROVENANCE_DATA, claims));
         } catch (DataProviderExchangeException e) {
             throw new DataSourceException(e.getErrorCode() == null ? "data_provider_error" : e.getErrorCode(), e.getMessage(), e);
         }
