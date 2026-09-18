@@ -21,4 +21,4 @@ Branch: `wp/p1-06-sd-jwt-formatter` off `design/extensibility`. Phase 1. Size: M
 - [x] `SdJwtFormatterTest`: issuer JWS verified with Nimbus, header fields, every disclosure's digest present in `_sd`, non-SD claims in clear, alias, metadata, SD path validation.
 - [x] `IssuanceGoldenTest.oid4vciSdJwtIssuanceGoldenAndIndependentVerification`: the golden SD-JWT configuration through the new surface, Nimbus-verified against `jwks.json`; goldens `v2/oid4vci/dc+sd-jwt-*`.
 - [x] Legacy goldens unchanged; ArchUnit unchanged.
-- [x] Full `certify-service` suite green:  tests.
+- [x] Full `certify-service` suite: 892 tests, one pre-existing flaky failure (`StaticContextLoaderTest`, fixed in the follow-up branch `wp/fix-context-loader-flake`); green on rerun.
