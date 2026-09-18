@@ -16,9 +16,15 @@ Wallets that still speak OpenID4VCI draft 13 (release 0.14.0) get their credenti
 - Deprecated from day one: `@DeprecatedEndpoint` on every handler (`oid4vci-d13-credential`, `oid4vci-d13-versioned-credential`; `since` 2026-09-19, replacement `/oid4vci/credential`): `Deprecation` and `Link` headers, `certify.deprecated.calls` counter, `mosip.certify.deprecated.<name>.enabled=false` kill switch, OpenAPI `deprecated`. Adapter kill switch: `certify.protocol.oid4vci-d13.enabled=false` removes every bean (`D13Properties`, typed).
 - `D13GoldenReplayTest`: the P0-02 goldens replayed through MockMvc (`ldp_vc`, vd12, vd11, `vc+sd-jwt` header/payload/response, mDoc response and summary with the two deviations folded back, the four error answers, the fresh nonce from the error accepted next); every credential verified with danubetech, Nimbus or JCA; the 1.0 body on the same path still answered by the 1.0 controller without deprecation headers. Unit tests for the nonce rules, the body filter, the mDoc wrapper and the SD-JWT typ.
 
-## Not in this slice
+## Second slice (branch `wp/p1-12-oid4vci-d13-metadata`): discovery
 
-Versioned issuer metadata (`?version=latest|vd12|vd11`), the `/issuance/.well-known/*` aliases (slice 2), `c_nonce` in the token response of `certify-as`, `acceptance_token`, docs (`VALIDATE.md` draft-13 walk-through), the P1-13 move into `certify-protocol-oid4vci-d13`.
+- `D13MetadataService` + `D13DiscoveryController`: `GET /.well-known/openid-credential-issuer?version=latest|vd12|vd11` next to the current document (which keeps answering when no `version` is given, so 1.0 wallets see no change), `GET /issuance/.well-known/openid-credential-issuer` (version optional, `latest` by default) and `GET /issuance/.well-known/did.json`, all `@DeprecatedEndpoint(oid4vci-d13-metadata)`. Built from the same rows and the same issuer-level values (`credential_issuer` = `mosip.certify.domain.url`, `authorization_servers`, `display`) as the current document: `latest` is the draft-13 shape (per configuration `display`, `order`, `credential_definition.credentialSubject` or `claims`, JOSE names in `credential_signing_alg_values_supported`, mDoc COSE identifiers mapped back), SD-JWT configurations presented as `vc+sd-jwt` whatever the row stores), `vd12` keys `credentials_supported` by id with `cryptographic_suites_supported`, `vd11` lists them with `id`; `credential_endpoint` names the versioned path. An unknown version raises `UNSUPPORTED_METADATA_VERSION`, answered by the service's advice as 0.14.0 did (HTTP 200 envelope; decision recorded).
+- `Goldens.collapseBrackets`: H2 returns `TEXT[]` columns as one stringified element and 0.14.0 deepened the brackets on every metadata call (`"[[[cose_key]]]"`), so the normaliser folds any nesting to one pair; the four affected d13 goldens were re-normalised.
+- `D13GoldenReplayTest`: the five metadata goldens replayed (issuer display and authorization server list set to the values 0.14.0 recorded, both deployment settings), the unversioned document unchanged, the DID alias equal to the root document.
+
+## Not in these slices
+
+`c_nonce` in the token response of `certify-as`, `acceptance_token`, docs (`VALIDATE.md` draft-13 walk-through), the P1-13 move into `certify-protocol-oid4vci-d13`.
 
 ## Acceptance criteria
 
@@ -26,6 +32,8 @@ Versioned issuer metadata (`?version=latest|vd12|vd11`), the `/issuance/.well-kn
 - [x] `IssuanceGoldenTest` (21) and the v1/v2 goldens unchanged; ArchUnit unchanged.
 - [x] Unit tests: `D13NonceCheckTest`, `D13BodyBufferFilterTest`, `D13MdocTest`, `SdJwtHeaderPolicyTest`.
 - [x] Full `certify-service` suite green (915 tests, 0 failures).
+- [x] Second slice: the five metadata goldens replayed (`versionedMetadataReplay`, `issuanceDidAliasServesTheCurrentDocument`).
+- [x] Full `certify-service` suite green after the second slice (917 tests, 0 failures).
 - [ ] CI green on the fork.
 
 ## Rules that apply
