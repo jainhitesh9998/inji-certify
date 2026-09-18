@@ -47,16 +47,19 @@ Inji Certify (`develop`, 1.0.0-beta.1) is an OpenID4VCI 1.0 credential issuer wh
 ## Commands
 
 ```bash
-mvn -B -q -DskipTests install                     # build all modules
+mvn -B -q -DskipTests -Dgpg.skip=true install     # build all modules (JAVA_HOME on JDK 21)
 mvn -B -pl certify-service test                   # unit tests
 mvn -B -pl certify-service test -Dtest=GoldenReplayTest,SignatureVectorTest   # wire and signature guards (after P0-01, P0-03)
 mvn -B -pl certify-service test -Dtest='*ArchitectureTest'                     # ArchUnit (after P0-06)
-mvn -B verify -Ptestcontainers                    # repository and migration tests on PostgreSQL (after P0-05)
+mvn -B -Dgpg.skip=true verify -Ptestcontainers    # repository and migration tests on PostgreSQL (after P0-05)
 mvn -B -pl certify-service spring-boot:run -Dspring-boot.run.profiles=local    # run with TestBearer tokens and the mock CSV data provider
 docker compose -f docker-compose/docker-compose-injistack/docker-compose.yml up   # full local stack, see its README
 ```
 
-Java 21 and Maven 3.9 are required; Docker is required for Testcontainers and the conformance jobs.
+Java 21 and Maven 3.9 are required; Docker is required for Testcontainers and the conformance jobs. Two local-build facts that are not obvious:
+
+- Maven must itself run on JDK 21, not just have a JDK 21 on `PATH`: JDK 23 and later disable implicit annotation processing, so Lombok never runs and `certify-integration-api` fails with `cannot find symbol setClientId`. On macOS: `export JAVA_HOME=$(/usr/libexec/java_home -v 21)` before any `mvn` command.
+- The parent pom binds `maven-gpg-plugin:sign` to `verify` for Maven Central publishing; add `-Dgpg.skip=true` to every `verify` or `install` locally and in CI.
 
 ## Where things are decided
 
