@@ -1,0 +1,7 @@
+{
+  "body" : {
+    "error" : "vc_issuance_failed",
+    "error_description" : "vc_issuance_failed"
+  },
+  "status" : 400
+}

@@ -16,7 +16,7 @@ Branch: `wp/p1-11c-compat-core` off `design/extensibility`. Phase 1. Size: M. De
 
 ## Outside scope
 
-`JwsHeaderPolicy`-style module edits: none. `CredentialIdListener` unchanged. The legacy `CertifyIssuanceServiceImpl` stays until the flag's default flips (follow-up WP after CI has run both modes): proof-validation and nonce audit entries (`PROOF_VALIDATION`, `NONCE_VALIDATION`) have no core hook yet and are not written on the core path; `VCIssuanceServiceImpl` (VCIssuance plugin mode) needs the `ExternalIssuer` adapter first.
+`JwsHeaderPolicy`-style module edits: none. `CredentialIdListener` unchanged. The legacy `CertifyIssuanceServiceImpl` stays until the flag's default flips (follow-up WP after CI has run both modes): proof-validation and nonce audit entries (`PROOF_VALIDATION`, `NONCE_VALIDATION`) have no core hook yet and are not written on the core path; `VCIssuanceServiceImpl` (VCIssuance plugin mode) is covered since P1-15 (`LegacyExternalIssuer`).
 
 ## Acceptance criteria
 

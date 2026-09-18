@@ -173,7 +173,7 @@ class IssuanceGoldenTest {
         JsonNode metadata = getJson("/.well-known/openid-credential-issuer");
         assertEquals(domainUrl, metadata.get("credential_issuer").asText());
         assertTrue(metadata.get("credential_configurations_supported").has(LDP_ID));
-        Goldens.assertGolden("v1/well-known/openid-credential-issuer", metadata);
+        Goldens.assertGolden("v1/well-known/openid-credential-issuer", onlyGoldenConfigurations(metadata));
     }
 
     /** The new core's view of the same rows: every golden configuration maps, with the key the legacy columns name. */
@@ -614,7 +614,7 @@ class IssuanceGoldenTest {
         assertEquals(issuerIdentifier + "/oid4vci/nonce", metadata.get("nonce_endpoint").asText());
         assertTrue(metadata.get("credential_configurations_supported").has(LDP_ID));
         assertTrue(metadata.get("credential_configurations_supported").has(MDOC_ID));
-        Goldens.assertGolden("v2/oid4vci/openid-credential-issuer", metadata);
+        Goldens.assertGolden("v2/oid4vci/openid-credential-issuer", onlyGoldenConfigurations(metadata));
     }
 
     @Test
@@ -711,6 +711,18 @@ class IssuanceGoldenTest {
     }
 
     // ---- helpers -------------------------------------------------------------------------------------
+
+    static final List<String> GOLDEN_IDS = List.of(LDP_ID, SDJWT_ID, DI_ID, RSA_ID, EC_R1_ID, EC_K1_ID, ED_2018_ID, MDOC_ID, QR_ID, STATUS_ID);
+
+    /** The golden tests share one H2 database per JVM; issuer metadata is compared for this test's configurations only. */
+    private JsonNode onlyGoldenConfigurations(JsonNode metadata) {
+        com.fasterxml.jackson.databind.node.ObjectNode copy = metadata.deepCopy();
+        JsonNode configurations = copy.get("credential_configurations_supported");
+        if (configurations instanceof com.fasterxml.jackson.databind.node.ObjectNode map) {
+            map.retain(GOLDEN_IDS);
+        }
+        return copy;
+    }
 
     private JsonNode getJson(String path) throws Exception {
         return objectMapper.readTree(mockMvc.perform(get(path)).andExpect(status().isOk())

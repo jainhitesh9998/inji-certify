@@ -1,0 +1,22 @@
+{
+  "credentials" : [ {
+    "credential" : {
+      "@context" : [ "https://www.w3.org/2018/credentials/v1" ],
+      "credentialSubject" : {
+        "fullName" : "Plugin Farmer",
+        "id" : "<holder>"
+      },
+      "id" : "<id>",
+      "issuanceDate" : "<issuanceDate>",
+      "issuer" : "did:web:plugin",
+      "proof" : {
+        "created" : "<created>",
+        "proofPurpose" : "assertionMethod",
+        "proofValue" : "<proofValue>",
+        "type" : "Ed25519Signature2020",
+        "verificationMethod" : "did:web:plugin#<kid>"
+      },
+      "type" : [ "PluginCredential", "VerifiableCredential" ]
+    }
+  } ]
+}
