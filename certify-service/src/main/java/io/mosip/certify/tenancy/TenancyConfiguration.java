@@ -18,8 +18,11 @@ public class TenancyConfiguration {
         if (properties.enabled() && TenancyProperties.RESOLVER_HOST.equalsIgnoreCase(properties.resolver())) {
             return new HostTenantResolver(properties);
         }
+        if (properties.enabled() && TenancyProperties.RESOLVER_PATH.equalsIgnoreCase(properties.resolver())) {
+            return new PathTenantResolver(properties);
+        }
         if (properties.enabled() && !TenancyProperties.RESOLVER_FIXED.equalsIgnoreCase(properties.resolver())) {
-            throw new IllegalStateException("certify.tenancy.resolver must be 'fixed' or 'host': " + properties.resolver());
+            throw new IllegalStateException("certify.tenancy.resolver must be 'fixed', 'host' or 'path': " + properties.resolver());
         }
         return TenantResolver.fixed(TenantContext.DEFAULT);
     }

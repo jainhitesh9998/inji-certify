@@ -16,7 +16,7 @@ import org.springframework.web.bind.annotation.RestController;
  * either endpoint is valid on either surface).
  */
 @RestController
-@RequestMapping("/oid4vci")
+@RequestMapping({"/oid4vci", "/t/{tenant}/oid4vci"}) // the second form serves path-resolved tenants (certify.tenancy.resolver=path)
 public class Oid4vciDiscoveryController {
 
     private final CredentialRegistry registry;

@@ -25,7 +25,7 @@ import java.util.Set;
  */
 @Slf4j
 @RestController
-@RequestMapping("/oid4vci")
+@RequestMapping({"/oid4vci", "/t/{tenant}/oid4vci"}) // the second form serves path-resolved tenants (certify.tenancy.resolver=path)
 public class Oid4vciNotificationController {
 
     public static final Set<String> EVENTS = Set.of("credential_accepted", "credential_failure", "credential_deleted");
