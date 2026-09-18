@@ -30,7 +30,8 @@ public final class Goldens {
             "iat", "exp", "nbf", "jti", "c_nonce", "nonce", "_sd", "sd_alg", "cnf", "signature", "x5c", "x5t#S256", "kid",
             "pre-authorized_code", "access_token", "credential_offer_uri",
             // published key material regenerates with the test keystore on every run
-            "publicKeyMultibase", "publicKeyJwk", "publicKeyPem", "x", "y", "n", "e");
+            "publicKeyMultibase", "publicKeyJwk", "publicKeyPem", "x", "y", "n", "e",
+            "qr");
 
     private static final ObjectMapper MAPPER = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT)
             .enable(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS);

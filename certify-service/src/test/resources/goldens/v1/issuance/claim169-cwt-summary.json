@@ -1,0 +1,8 @@
+{
+  "claim169Keys" : "[4, 8]",
+  "claimLabels" : "[1, 4, 5, 6, 169]",
+  "innerTag" : 18,
+  "outerTag" : 61,
+  "protectedLabels" : "[1, 4]",
+  "unprotectedLabels" : "[]"
+}
