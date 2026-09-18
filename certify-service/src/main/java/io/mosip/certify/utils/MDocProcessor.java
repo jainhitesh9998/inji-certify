@@ -17,8 +17,15 @@ import io.mosip.certify.core.constants.Constants;
 import io.mosip.certify.core.constants.ErrorConstants;
 import io.mosip.certify.core.constants.VCDM2Constants;
 import io.mosip.certify.core.exception.CertifyException;
-import io.mosip.kernel.signature.dto.CoseSignRequestDto;
-import io.mosip.kernel.signature.service.CoseSignatureService;
+import io.mosip.certify.issuance.KeyProviderRegistry;
+import io.mosip.certify.signing.CoseEnvelope;
+import io.mosip.certify.signing.CoseHeaderPolicy;
+import io.mosip.certify.signing.KeyProvider;
+import io.mosip.certify.signing.KeyRef;
+import io.mosip.certify.signing.LegacyKeyRefs;
+import io.mosip.certify.signing.SignatureAlgorithm;
+import io.mosip.certify.signing.SigningException;
+import io.mosip.certify.signing.SigningKey;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
@@ -52,7 +59,7 @@ public class MDocProcessor {
     private MDocConfig mDocConfig;
 
     @Autowired
-    private CoseSignatureService coseSignatureService;
+    private KeyProviderRegistry keyProviders;
 
     /**
      * Process templated JSON to create final mDoc structure
@@ -497,24 +504,17 @@ public class MDocProcessor {
     public byte[] signMSO(Map<String, Object> mso, String appID, String refID, String signAlgorithm) throws Exception {
         try {
             byte[] msoCbor = encodeToTaggedCBOR(mso);
-
-            CoseSignRequestDto signRequest = new CoseSignRequestDto();
-
-            String base64UrlPayload = Base64.getUrlEncoder().withoutPadding().encodeToString(msoCbor);
-
-            signRequest.setPayload(base64UrlPayload);
-            signRequest.setApplicationId(appID);
-            signRequest.setReferenceId(refID);
-            signRequest.setAlgorithm(signAlgorithm);
-            signRequest.setIncludeCOSETag(false);
-
-            // Set unprotected header in request
-            signRequest.setUnprotectedHeader(Map.of("includeCertificate", true));
-
-            String hexSignedData = coseSignatureService.coseSign1(signRequest).getSignedData();
-            return hexStringToByteArray(hexSignedData);
-
+            KeyRef ref = LegacyKeyRefs.keymanager(appID, refID);
+            KeyProvider provider = keyProviders.provider(ref.provider());
+            SignatureAlgorithm algorithm = SignatureAlgorithm.fromJose(signAlgorithm)
+                    .orElseThrow(() -> new CertifyException(ErrorConstants.VC_SIGNING_ERROR, "Unsupported signature algorithm " + signAlgorithm));
+            SigningKey key = provider.resolve(ref).withAlgorithm(algorithm);
+            // ISO/IEC 18013-5 IssuerAuth: alg in the protected header, x5chain unprotected, untagged COSE_Sign1
+            return CoseEnvelope.sign1(msoCbor, CoseHeaderPolicy.mdocIssuerAuth(), key, provider);
         } catch (CertifyException e) {
+            log.error("Error during COSE signing: {}", e.getMessage(), e);
+            throw new CertifyException(ErrorConstants.VC_SIGNING_ERROR, "COSE signing failed: " + e.getMessage());
+        } catch (SigningException e) {
             log.error("Error during COSE signing: {}", e.getMessage(), e);
             throw new CertifyException(ErrorConstants.VC_SIGNING_ERROR, "COSE signing failed: " + e.getMessage());
         }

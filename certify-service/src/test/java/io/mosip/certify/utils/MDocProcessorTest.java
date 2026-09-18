@@ -8,9 +8,6 @@ import io.mosip.certify.config.MDocConfig;
 import io.mosip.certify.core.constants.Constants;
 import io.mosip.certify.core.constants.VCDM2Constants;
 import io.mosip.certify.core.exception.CertifyException;
-import io.mosip.kernel.signature.dto.CoseSignRequestDto;
-import io.mosip.kernel.signature.dto.CoseSignResponseDto;
-import io.mosip.kernel.signature.service.CoseSignatureService;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.AfterClass;
@@ -85,8 +82,6 @@ public class MDocProcessorTest {
     @Mock
     private MDocConfig mDocConfig;
 
-    @Mock
-    private CoseSignatureService coseSignatureService;
 
     @InjectMocks
     private MDocProcessor mDocProcessor;
@@ -748,59 +743,45 @@ public class MDocProcessorTest {
     // ==================== COSE Signing Tests ====================
 
     @Test
-    public void should_returnSignedBytes_when_validInputProvided() throws Exception {
+    public void should_returnVerifiableIssuerAuth_when_validInputProvided() throws Exception {
+        io.mosip.certify.issuance.KeyProviderRegistry registry = io.mosip.certify.signing.TestKeyProviders.registry("testApp/testRef", io.mosip.certify.signing.SignatureAlgorithm.ES256);
+        ReflectionTestUtils.setField(mDocProcessor, "keyProviders", registry);
         Map<String, Object> mso = new HashMap<>();
         mso.put("version", "1.0");
         mso.put("digestAlgorithm", "SHA-256");
 
-        // Mock the COSE signature service response
-        String mockHexSignedData = "d2844341a10126404c504143204f50454e4141";
-
-        CoseSignResponseDto mockResponse = new CoseSignResponseDto();
-        mockResponse.setSignedData(mockHexSignedData);
-
-        when(coseSignatureService.coseSign1(any(CoseSignRequestDto.class)))
-                .thenReturn(mockResponse);
-
         byte[] result = mDocProcessor.signMSO(mso, "testApp", "testRef", "ES256");
 
-        assertNotNull("Result should not be null", result);
-        assertTrue("Result should have data", result.length > 0);
-
-        // Verify service was called with correct parameters
-        ArgumentCaptor<CoseSignRequestDto> captor = ArgumentCaptor.forClass(CoseSignRequestDto.class);
-        verify(coseSignatureService).coseSign1(captor.capture());
-        CoseSignRequestDto requestDto = captor.getValue();
-        assertEquals("Application ID should match", "testApp", requestDto.getApplicationId());
-        assertEquals("Reference ID should match", "testRef", requestDto.getReferenceId());
-        assertEquals("Algorithm should match", "ES256", requestDto.getAlgorithm());
-        assertEquals("Include COSE Tag should match", false, requestDto.getIncludeCOSETag());
-
-        // Assert the request dto payload is B64 encoded - tagged mso #6.24(bstr .cbor mso)
-        String payload = requestDto.getPayload();
-        try {
-            byte[] decodedPayload = Base64.getUrlDecoder().decode(payload);
-            assertTrue("Decoded payload should contain data", decodedPayload.length > 0);
-            // Verify the decoded payload is a CBOR-encoded tag-24 wrapped ByteString (bstr .cbor mso)
-            List<DataItem> cborItems = new CborDecoder(new ByteArrayInputStream(decodedPayload)).decode();
-            assertFalse("Should decode to CBOR items", cborItems.isEmpty());
-            DataItem item = cborItems.get(0);
-            assertTrue("Payload should be a ByteString", item instanceof ByteString);
-            assertEquals("Payload should have CBOR tag 24", 24, item.getTag().getValue());
-        } catch (IllegalArgumentException e) {
-            fail("Payload should be valid Base64 encoded: " + e.getMessage());
-        }
+        com.upokecenter.cbor.CBORObject sign1 = com.upokecenter.cbor.CBORObject.DecodeFromBytes(result);
+        assertFalse("IssuerAuth is untagged", sign1.isTagged());
+        assertEquals("COSE_Sign1 has four elements", 4, sign1.size());
+        byte[] protectedBytes = sign1.get(0).GetByteString();
+        assertEquals("alg ES256 in the protected header", -7, com.upokecenter.cbor.CBORObject.DecodeFromBytes(protectedBytes).get(com.upokecenter.cbor.CBORObject.FromObject(1)).AsInt32());
+        assertTrue("x5chain in the unprotected header", sign1.get(1).ContainsKey(com.upokecenter.cbor.CBORObject.FromObject(33)));
+        byte[] payload = sign1.get(2).GetByteString();
+        com.upokecenter.cbor.CBORObject tagged = com.upokecenter.cbor.CBORObject.DecodeFromBytes(payload);
+        assertTrue("payload is #6.24(bstr .cbor mso)", tagged.HasMostOuterTag(24));
+        assertEquals("1.0", com.upokecenter.cbor.CBORObject.DecodeFromBytes(tagged.Untag().GetByteString()).get("version").AsString());
+        byte[] sigStructure = com.upokecenter.cbor.CBORObject.NewArray().Add("Signature1").Add(protectedBytes).Add(new byte[0]).Add(payload).EncodeToBytes();
+        java.security.PublicKey publicKey = registry.provider("keymanager").resolve(io.mosip.certify.signing.KeyRef.parse("keymanager:testApp/testRef")).descriptor().publicKey();
+        java.security.Signature verifier = java.security.Signature.getInstance("SHA256withECDSA");
+        verifier.initVerify(publicKey);
+        verifier.update(sigStructure);
+        assertTrue("IssuerAuth must verify with JCA", verifier.verify(com.nimbusds.jose.crypto.impl.ECDSA.transcodeSignatureToDER(sign1.get(3).GetByteString())));
     }
 
     @Test(expected = CertifyException.class)
-    public void should_throwException_when_signingFails() throws Exception {
+    public void should_throwException_when_signingKeyIsMissing() throws Exception {
+        ReflectionTestUtils.setField(mDocProcessor, "keyProviders", io.mosip.certify.signing.TestKeyProviders.registry("other/key", io.mosip.certify.signing.SignatureAlgorithm.ES256));
         Map<String, Object> mso = new HashMap<>();
         mso.put("version", "1.0");
-
-        when(coseSignatureService.coseSign1(any(CoseSignRequestDto.class)))
-                .thenThrow(new CertifyException("Signing failed"));
-
         mDocProcessor.signMSO(mso, "app", "ref", "ES256");
+    }
+
+    @Test(expected = CertifyException.class)
+    public void should_throwException_when_algorithmIsUnknown() throws Exception {
+        ReflectionTestUtils.setField(mDocProcessor, "keyProviders", io.mosip.certify.signing.TestKeyProviders.registry("app/ref", io.mosip.certify.signing.SignatureAlgorithm.ES256));
+        mDocProcessor.signMSO(Map.of("version", "1.0"), "app", "ref", "HS256");
     }
 
     // ==================== IssuerSigned Structure Tests ====================
