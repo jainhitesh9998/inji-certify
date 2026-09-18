@@ -30,6 +30,11 @@ import java.util.List;
 public class Oid4vciIssuanceConfiguration {
 
     @Bean
+    public Oid4vciIssuer oid4vciIssuer(Environment environment) {
+        return Oid4vciIssuer.derive(environment.getRequiredProperty("mosip.certify.identifier"), environment.getProperty("certify.oid4vci.issuer-identifier"));
+    }
+
+    @Bean
     public IssuanceService oid4vciIssuanceService(ConfigurationRegistry configurations, List<CredentialFormatter> formatters,
                                                   KeyProviderRegistry keyProviders, List<CredentialDataSource> dataSources,
                                                   List<ExternalIssuer> externalIssuers, List<ProofValidator> proofValidators,

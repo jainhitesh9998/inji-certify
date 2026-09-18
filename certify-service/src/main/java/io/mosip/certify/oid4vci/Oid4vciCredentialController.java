@@ -13,7 +13,6 @@ import io.mosip.certify.spi.ProofValidator;
 import io.mosip.certify.spi.ProtocolVersion;
 import io.mosip.certify.spi.TenantContext;
 import jakarta.validation.Valid;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -46,13 +45,12 @@ public class Oid4vciCredentialController {
     private final String issuerIdentifier;
 
     public Oid4vciCredentialController(IssuanceService oid4vciIssuanceService, ConfigurationRegistry configurations,
-                                       AuthorizationContext authorizationContext, CacheNonceCheck nonceCheck,
-                                       @Value("${mosip.certify.identifier}") String issuerIdentifier) {
+                                       AuthorizationContext authorizationContext, CacheNonceCheck nonceCheck, Oid4vciIssuer issuer) {
         this.issuanceService = oid4vciIssuanceService;
         this.configurations = configurations;
         this.authorizationContext = authorizationContext;
         this.nonceCheck = nonceCheck;
-        this.issuerIdentifier = issuerIdentifier;
+        this.issuerIdentifier = issuer.identifier();
     }
 
     @PostMapping(value = "/credential", produces = "application/json")

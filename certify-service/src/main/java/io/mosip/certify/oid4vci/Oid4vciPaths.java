@@ -9,8 +9,12 @@ final class Oid4vciPaths {
 
     private Oid4vciPaths() {}
 
+    static final String WELL_KNOWN = PREFIX + ".well-known/";
+    static final String NONCE = PREFIX + "nonce";
+
+    /** Every /oid4vci/ request except the public discovery and nonce endpoints carries an access token. */
     static boolean isOid4vci(HttpServletRequest request) {
         String uri = request.getRequestURI();
-        return uri != null && uri.contains(PREFIX);
+        return uri != null && uri.contains(PREFIX) && !uri.contains(WELL_KNOWN) && !uri.endsWith(NONCE);
     }
 }

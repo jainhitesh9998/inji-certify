@@ -5,6 +5,6 @@
   },
   "cnf" : "<cnf>",
   "dateOfBirth" : "1990-01-01",
-  "iss" : "http://localhost:8090/v1/certify",
+  "iss" : "http://localhost:8090/v1/certify/oid4vci",
   "vct" : "GoldenCredential"
 }

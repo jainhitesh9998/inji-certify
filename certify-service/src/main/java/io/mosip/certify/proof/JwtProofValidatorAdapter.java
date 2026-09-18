@@ -72,7 +72,7 @@ public class JwtProofValidatorAdapter implements ProofValidator {
         Map<String, Object> configuration = Map.of("jwt", Map.of("proof_signing_alg_values_supported", algorithms));
         boolean valid;
         try {
-            valid = legacy.validate(policy == null ? null : policy.clientId(), nonceClaim, jwt, configuration);
+            valid = legacy.validate(policy == null ? null : policy.clientId(), nonceClaim, jwt, configuration, policy == null ? null : policy.audience());
         } catch (InvalidRequestException e) {
             throw new ProofValidationException(e.getErrorCode(), "Proof rejected: " + e.getErrorCode());
         }
