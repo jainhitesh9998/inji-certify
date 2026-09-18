@@ -1,0 +1,36 @@
+-- The 0.14.0 H2 test schema predates its own CredentialConfig entity; recorder runs use the entity's column set
+-- (JSONB and TEXT[] as VARCHAR on H2, as develop's schema.sql does).
+DROP TABLE IF EXISTS credential_config;
+CREATE TABLE credential_config (
+    config_id VARCHAR(255) NOT NULL,
+    status VARCHAR(255),
+    vc_template VARCHAR,
+    credential_config_key_id VARCHAR(2048) NOT NULL UNIQUE,
+    context VARCHAR,
+    credential_type VARCHAR,
+    credential_format VARCHAR(255) NOT NULL,
+    did_url VARCHAR,
+    key_manager_app_id VARCHAR(36),
+    key_manager_ref_id VARCHAR(128),
+    signature_algo VARCHAR(36),
+    signature_crypto_suite VARCHAR(128),
+    sd_claim VARCHAR,
+    display VARCHAR NOT NULL,
+    display_order VARCHAR NOT NULL,
+    scope VARCHAR(255) NOT NULL,
+    cryptographic_binding_methods_supported VARCHAR NOT NULL,
+    credential_signing_alg_values_supported VARCHAR NOT NULL,
+    proof_types_supported VARCHAR NOT NULL,
+    doctype VARCHAR,
+    credential_subject VARCHAR,
+    mso_mdoc_claims VARCHAR,
+    sd_jwt_claims VARCHAR,
+    sd_jwt_vct VARCHAR,
+    plugin_configurations VARCHAR,
+    credential_status_purpose VARCHAR,
+    qr_settings VARCHAR,
+    qr_signature_algo VARCHAR,
+    cr_dtimes TIMESTAMP NOT NULL,
+    upd_dtimes TIMESTAMP,
+    CONSTRAINT pk_config_id PRIMARY KEY (config_id)
+);

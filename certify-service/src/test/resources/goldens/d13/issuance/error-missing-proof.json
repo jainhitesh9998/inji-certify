@@ -1,0 +1,7 @@
+{
+  "body" : {
+    "error" : "invalid_proof",
+    "error_description" : "invalid_proof"
+  },
+  "status" : 400
+}
