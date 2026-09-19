@@ -178,6 +178,13 @@ public class CredentialConfigurationV2Service {
         if (signing.getAlg() == null || SignatureAlgorithm.fromJose(signing.getAlg()).isEmpty()) {
             throw new ConfigV2Exception(400, ConfigV2Exception.UNSUPPORTED_SIGNATURE_ALGORITHM, "Unknown signature algorithm " + signing.getAlg());
         }
+        if (signing.getX5c() != null && !signing.getX5c().isBlank()) {
+            try {
+                io.mosip.certify.registry.JpaConfigurationRegistry.chainInclusion(signing.getX5c());
+            } catch (IllegalStateException e) {
+                throw ConfigV2Exception.invalid(e.getMessage());
+            }
+        }
         Map<String, Object> formatConfig = body.getFormatConfig() == null ? Map.of() : body.getFormatConfig();
         String exclude = existing == null ? null : existing.getConfigId();
         switch (format) {

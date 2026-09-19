@@ -134,6 +134,11 @@
             <scope>test</scope>
         </dependency>
         <dependency>
+            <groupId>io.inji.certify</groupId>
+            <artifactId>certify-keyprovider-x509-file</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
             <!-- danubetech's EcdsaSecp256k1Signature2019LdVerifier has a bitcoinj constructor overload; javac needs the class to resolve any constructor -->
             <groupId>org.bitcoinj</groupId>
             <artifactId>bitcoinj-core</artifactId>

@@ -52,6 +52,16 @@ public record CertificateChain(List<X509Certificate> leafFirst) {
     }
 
     /** DER certificates base64 (not base64url) encoded, leaf first: the {@code x5c} header value. */
+    /** The chain without a self-signed root (the trust anchor), when it has more than one certificate; a lone self-signed certificate stays. */
+    public CertificateChain withoutAnchor() {
+        if (leafFirst.size() < 2) {
+            return this;
+        }
+        X509Certificate root = leafFirst.get(leafFirst.size() - 1);
+        boolean selfSigned = root.getSubjectX500Principal().equals(root.getIssuerX500Principal());
+        return selfSigned ? new CertificateChain(leafFirst.subList(0, leafFirst.size() - 1)) : this;
+    }
+
     public List<String> toX5c() {
         List<String> out = new ArrayList<>(leafFirst.size());
         for (X509Certificate cert : leafFirst) {

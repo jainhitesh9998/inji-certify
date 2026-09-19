@@ -88,7 +88,14 @@ public class MdocFormatter implements CredentialFormatter {
     public IssuedCredential sign(UnsignedCredential credential, SigningContext signing, IssuanceContext context) {
         try {
             byte[] msoCbor = MdocProcessor.encodeToTaggedCBOR(credential.asMap());
-            byte[] issuerAuth = CoseEnvelope.sign1(msoCbor, CoseHeaderPolicy.mdocIssuerAuth(), signing.key(), signing.signer());
+            CoseHeaderPolicy policy = signing.config().coseHeaders() == null ? CoseHeaderPolicy.mdocIssuerAuth()
+                    : new CoseHeaderPolicy(signing.config().coseHeaders().x5chain(), null, false); // the configuration's x5chain choice
+            try {
+                io.mosip.certify.signing.CertificateChainPolicy.check(signing.key().chain(), context == null ? java.time.Instant.now() : context.now());
+            } catch (io.mosip.certify.signing.SigningException e) {
+                throw new FormatException("certificate_chain_invalid", e.getMessage(), e);
+            }
+            byte[] issuerAuth = CoseEnvelope.sign1(msoCbor, policy, signing.key(), signing.signer());
             Map<String, Object> namespaces = (Map<String, Object>) credential.attributes().getOrDefault(ATTRIBUTE_NAMESPACES, Map.of());
             Map<String, Object> issuerSigned = MdocProcessor.createIssuerSignedStructure(namespaces, issuerAuth);
             String encoded = Base64.getUrlEncoder().withoutPadding().encodeToString(MdocProcessor.encodeToCBOR(issuerSigned));

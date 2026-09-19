@@ -136,6 +136,25 @@ public class JcaKeyProvider implements KeyProvider {
         return resolve(new KeyRef(id, alias));
     }
 
+    /** Generates a CA key under the alias (self-signed, CA basic constraints); dev chains hang under it. */
+    public SigningKey generateCa(String alias, SignatureAlgorithm algorithm, String subjectDn, String purpose) {
+        DevKeys.Generated generated = DevKeys.generateCa(algorithm, subjectDn);
+        add(alias, generated.privateKey(), CertificateChain.of(generated.certificate()), algorithm, purpose);
+        return resolve(new KeyRef(id, alias));
+    }
+
+    /** Generates a key whose certificate is signed by the CA held under {@code caAlias}; the chain is [leaf, ca]. */
+    public SigningKey generateSignedBy(String alias, SignatureAlgorithm algorithm, String subjectDn, String purpose, String caAlias) {
+        Entry ca = entries.get(caAlias);
+        if (ca == null) {
+            throw new SigningException("No CA under alias " + caAlias);
+        }
+        X509Certificate caCertificate = ca.descriptor().chain().leaf().orElseThrow(() -> new SigningException("CA " + caAlias + " has no certificate"));
+        DevKeys.Generated generated = DevKeys.generateSignedBy(algorithm, subjectDn, ca.privateKey(), caCertificate, ca.descriptor().algorithm());
+        add(alias, generated.privateKey(), CertificateChain.of(generated.certificate(), caCertificate), algorithm, purpose);
+        return resolve(new KeyRef(id, alias));
+    }
+
     /**
      * Adds a key with its chain. The algorithm is derived from the key when {@code algorithm} is null:
      * RSA keys default to RS256, EC keys to the curve's ES algorithm, Ed25519 keys to EdDSA.

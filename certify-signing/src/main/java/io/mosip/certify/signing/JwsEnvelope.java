@@ -61,7 +61,11 @@ public final class JwsEnvelope {
         }
         CertificateChain chain = key.chain();
         if (policy.x5c() != JwsHeaderPolicy.ChainInclusion.NONE && !chain.isEmpty()) {
-            List<String> x5c = policy.x5c() == JwsHeaderPolicy.ChainInclusion.LEAF ? chain.toX5c().subList(0, 1) : chain.toX5c();
+            List<String> x5c = switch (policy.x5c()) {
+                case LEAF -> chain.toX5c().subList(0, 1);
+                case WITHOUT_ANCHOR -> chain.withoutAnchor().toX5c();
+                default -> chain.toX5c();
+            };
             builder.x509CertChain(x5c.stream().map(Base64::new).toList());
         }
         if (policy.x5tS256()) {
