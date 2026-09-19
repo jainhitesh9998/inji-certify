@@ -20,6 +20,9 @@ import java.util.List;
 @Service
 public class OAuthAuthorizationServerMetadataService {
 
+    @org.springframework.beans.factory.annotation.Autowired
+    private org.springframework.beans.factory.ObjectProvider<io.mosip.certify.as.AsProperties> asProperties;
+
     @Value("${mosip.certify.oauth.issuer:}")
     private String issuer;
 
@@ -61,6 +64,15 @@ public class OAuthAuthorizationServerMetadataService {
         metadata.setCodeChallengeMethodsSupported(parseCommaSeparatedValues(codeChallengeMethodsSupported));
         metadata.setInteractiveAuthorizationEndpoint(interactiveAuthorizationEndpoint);
         metadata.setRequireInteractiveAuthorizationRequest(requireInteractiveAuthorizationRequest);
+        // the authorization code flow is advertised once a client is registered (certify.as.clients); the endpoints
+        // hang next to the token endpoint, so an unchanged deployment's document is unchanged
+        io.mosip.certify.as.AsProperties as = asProperties == null ? null : asProperties.getIfAvailable(); // null when built outside Spring (unit tests)
+        if (as != null && as.enabled() && tokenEndpoint != null && tokenEndpoint.endsWith("/oauth/token")) {
+            String base = tokenEndpoint.substring(0, tokenEndpoint.length() - "/oauth/token".length());
+            metadata.setAuthorizationEndpoint(base + "/oauth/authorize");
+            metadata.setPushedAuthorizationRequestEndpoint(base + "/oauth/par");
+            metadata.setRequirePushedAuthorizationRequests(Boolean.TRUE);
+        }
 
         log.debug("OAuth Authorization Server metadata built successfully for issuer: {}", issuer);
         return metadata;

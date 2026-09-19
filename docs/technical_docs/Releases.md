@@ -32,6 +32,10 @@ With `certify.tenancy` enabled, a tenant configured with `issuer-did` issues und
 
 `POST /pre-authorized-data` accepts an optional `subject` next to `claims`: the identifier the data provider resolves (for the CSV plugin, the row id). It becomes the access token's `sub`, so plugins that look the record up by `sub` work in the pre-authorized code flow without eSignet. Offers with `claims` behave as before.
 
+## Authorization code flow in Certify's own authorization server
+
+Once a client is registered under `certify.as.clients.<client-id>.redirect-uris`, the authorization server metadata advertises `authorization_endpoint`, `pushed_authorization_request_endpoint` and `require_pushed_authorization_requests`, and wallets run the authorization code flow with pushed requests and PKCE (`S256`) against `POST /oauth/par`, `GET /oauth/authorize` and `POST /oauth/token`. The subject of an authorization comes from `certify.as.authorization.subject-mode`: `none` (default) refuses, `fixed` approves every request for `certify.as.authorization.fixed-subject` without user interaction, which is meant for conformance runs and demos only. Deployments without registered clients see no change.
+
 # Changes in release 0.11.0
 
 ## Removal of  Artifactory dependency
