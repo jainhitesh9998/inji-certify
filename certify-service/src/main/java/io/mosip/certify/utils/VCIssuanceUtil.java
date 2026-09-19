@@ -10,7 +10,6 @@ import io.mosip.certify.api.dto.VCResult;
 import io.mosip.certify.services.VCICacheService;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
-import org.slf4j.Logger;
 
 import java.text.ParseException;
 import java.time.LocalDateTime;
@@ -24,8 +23,7 @@ public class VCIssuanceUtil {
         // Private constructor to prevent instantiation
     }
 
-    public static String validateAndGetClientNonce(VCICacheService vciCacheService,
-                                                   String proof, Logger log, String nonceEndpoint) {
+    public static String validateAndGetClientNonce(VCICacheService vciCacheService, String proof, String nonceEndpoint) {
         boolean hasNonceEndpoint = nonceEndpoint != null && !nonceEndpoint.isEmpty();
         String proofJwtNonce = null;
         boolean proofJwtHasNonceClaim;

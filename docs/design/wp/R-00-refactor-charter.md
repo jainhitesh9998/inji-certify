@@ -21,4 +21,4 @@ Owner's request of 2026-09-19: the develop-era code under `certify-service` shou
 
 Slices are taken in the order of the table, smallest first within an area, and each is recorded in `PROGRESS.md` as `R-nn`.
 
-Done: R-01 golden set names; R-02 `CertifyApplicationTests` no longer boots a second application.
+Done: R-01 golden set names; R-02 `CertifyApplicationTests` no longer boots a second application; R-03 one `CredentialUtils`, helpers next to their only caller (area 1).
