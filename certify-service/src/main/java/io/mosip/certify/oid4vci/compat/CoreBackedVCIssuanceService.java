@@ -15,7 +15,7 @@ import io.mosip.certify.issuance.IssuanceException;
 import io.mosip.certify.issuance.IssuanceResult;
 import io.mosip.certify.issuance.IssuanceService;
 import io.mosip.certify.oid4vci.CacheNonceCheck;
-import io.mosip.certify.oid4vci.Oid4vciV1Properties;
+import io.mosip.certify.oid4vci.Oid4vciProperties;
 import io.mosip.certify.spi.Authorization;
 import io.mosip.certify.spi.IssuedCredential;
 import io.mosip.certify.spi.ProofValidator;
@@ -47,7 +47,7 @@ import java.util.UUID;
 @Slf4j
 @Service
 @Primary
-@ConditionalOnProperty(prefix = Oid4vciV1Properties.COMPAT_CORE_PREFIX, name = "enabled", havingValue = "true")
+@ConditionalOnProperty(prefix = Oid4vciProperties.COMPAT_CORE_PREFIX, name = "enabled", havingValue = "true")
 public class CoreBackedVCIssuanceService implements VCIssuanceService {
 
     static final String PLUGIN_MODE_VC_ISSUANCE = "VCIssuance";

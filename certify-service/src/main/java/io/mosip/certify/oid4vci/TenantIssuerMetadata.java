@@ -28,10 +28,10 @@ public class TenantIssuerMetadata {
 
     private final ConfigurationRegistry configurations;
     private final List<CredentialFormatter> formatters;
-    private final Oid4vciV1Properties properties;
+    private final Oid4vciProperties properties;
     private final io.mosip.certify.tenancy.TenancyProperties tenancy;
 
-    public TenantIssuerMetadata(ConfigurationRegistry configurations, List<CredentialFormatter> formatters, Oid4vciV1Properties properties,
+    public TenantIssuerMetadata(ConfigurationRegistry configurations, List<CredentialFormatter> formatters, Oid4vciProperties properties,
                                 io.mosip.certify.tenancy.TenancyProperties tenancy) {
         this.properties = properties;
         this.tenancy = tenancy;

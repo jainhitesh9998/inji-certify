@@ -11,6 +11,14 @@ public interface ProofValidator {
     HolderBinding validate(ProofInput proof, ProofPolicy policy, NonceCheck nonce, IssuanceContext context) throws ProofValidationException;
 
     /**
+     * Every holder one proof binds: one for a {@code jwt} proof, one per attested key for an {@code attestation} proof
+     * or a {@code jwt} proof carrying a key attestation (OpenID4VCI 1.0 Appendix F). The default is the single binding.
+     */
+    default List<HolderBinding> validateAll(ProofInput proof, ProofPolicy policy, NonceCheck nonce, IssuanceContext context) throws ProofValidationException {
+        return List.of(validate(proof, policy, nonce, context));
+    }
+
+    /**
      * One proof as received: a compact string for {@code jwt} and {@code cwt}, a JSON object for {@code ldp_vp}.
      */
     record ProofInput(String type, Object value) {}

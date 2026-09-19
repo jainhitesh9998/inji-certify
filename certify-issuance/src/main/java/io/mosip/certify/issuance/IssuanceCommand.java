@@ -27,11 +27,12 @@ import java.util.Optional;
  * @param protocol                  the protocol the request arrived through
  * @param protocolParams            protocol-specific parameters forwarded to formatters and listeners
  * @param correlationId             request id for logs and the ledger
+ * @param maxCredentials            the most credentials one request may yield (a proof may bind several holders), 0 for no cap
  */
 public record IssuanceCommand(TenantContext tenant, String credentialConfigurationId, ConfigurationSelector selector,
                               Authorization authorization, List<ProofInput> proofs, ProofPolicy proofPolicy, NonceCheck nonceCheck,
                               Optional<Map<String, Object>> suppliedCredential, ProtocolVersion protocol,
-                              Map<String, Object> protocolParams, String correlationId) {
+                              Map<String, Object> protocolParams, String correlationId, int maxCredentials) {
 
     public IssuanceCommand {
         tenant = tenant == null ? TenantContext.DEFAULT : tenant;
@@ -70,6 +71,7 @@ public record IssuanceCommand(TenantContext tenant, String credentialConfigurati
         private ProtocolVersion protocol = ProtocolVersion.NONE;
         private Map<String, Object> protocolParams = Map.of();
         private String correlationId;
+        private int maxCredentials;
 
         public Builder tenant(TenantContext v) { tenant = v; return this; }
         public Builder credentialConfigurationId(String v) { credentialConfigurationId = v; return this; }
@@ -82,10 +84,11 @@ public record IssuanceCommand(TenantContext tenant, String credentialConfigurati
         public Builder protocol(ProtocolVersion v) { protocol = v; return this; }
         public Builder protocolParams(Map<String, Object> v) { protocolParams = v; return this; }
         public Builder correlationId(String v) { correlationId = v; return this; }
+        public Builder maxCredentials(int v) { maxCredentials = v; return this; }
 
         public IssuanceCommand build() {
             return new IssuanceCommand(tenant, credentialConfigurationId, selector, authorization, proofs, proofPolicy, nonceCheck,
-                    suppliedCredential, protocol, protocolParams, correlationId);
+                    suppliedCredential, protocol, protocolParams, correlationId, maxCredentials);
         }
     }
 }

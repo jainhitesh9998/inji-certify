@@ -35,7 +35,7 @@ One namespace, `certify.*`, one typed record per module, validated at startup, d
 | Namespace | Owner module | Holds | Replaces |
 | --- | --- | --- | --- |
 | `certify.issuer` | core | `identifier` (the one issuer URL), `did`, `display[]`, `tenant-default` | `domain.url`, `identifier`, `discovery.issuer-id`, `data-provider-plugin.did-url`, `credential-config.issuer.display` |
-| `certify.protocol.oid4vci-v1` | oid4vci-v1 adapter | `enabled`, `base-path` (`/oid4vci`), `compat-paths.enabled`, `nonce-endpoint.enabled`, `encryption.*`, `profile` (`none`/`haip`), `deferred.enabled`, `notification.enabled` | `allow-c-nonce`, `cnonce-expire-seconds`, `supported.jwt-proof-alg` |
+| `certify.protocol.oid4vci-v1` | oid4vci-v1 adapter | `enabled`, `base-path` (`/oid4vci`), `compat-paths.enabled`, `nonce-endpoint.enabled`, `encryption.*`, `profile` (`none`/`haip`), `deferred.enabled`, `notification.enabled`, `key-attestation.attesters.<id>.jwks|trust-anchor`, `key-attestation.clock-skew` (P3-10) | `allow-c-nonce`, `cnonce-expire-seconds`, `supported.jwt-proof-alg` |
 | `certify.protocol.oid4vci-d13` | oid4vci-d13 adapter | `enabled` (default true), `versioned-paths.enabled` | new |
 | `certify.protocol.vc-api` | vc-api adapter | `enabled`, `base-path`, `client-auth.*` | new |
 | `certify.authz` | authz | `issuer-uri`, `jwk-set-uri`, `audiences[]`, `jws-algorithms[]`, `dpop.*` (allowed algorithms, max age, skew, jti ttl), `local-test-tokens.enabled` | `authn.*`, `dpop.*`, `security.*`, profile `local` |

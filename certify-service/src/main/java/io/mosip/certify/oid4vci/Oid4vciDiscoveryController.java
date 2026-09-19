@@ -25,11 +25,11 @@ public class Oid4vciDiscoveryController {
     private final io.mosip.certify.core.dto.AuthorizationContext authorizationContext;
     private final io.mosip.certify.tenancy.TenantContexts tenants;
     private final TenantIssuerMetadata tenantMetadata;
-    private final Oid4vciV1Properties properties;
+    private final Oid4vciProperties properties;
 
     public Oid4vciDiscoveryController(CredentialRegistry registry, NonceService nonceService, Oid4vciIssuer issuer,
                                       io.mosip.certify.core.dto.AuthorizationContext authorizationContext,
-                                      io.mosip.certify.tenancy.TenantContexts tenants, TenantIssuerMetadata tenantMetadata, Oid4vciV1Properties properties) {
+                                      io.mosip.certify.tenancy.TenantContexts tenants, TenantIssuerMetadata tenantMetadata, Oid4vciProperties properties) {
         this.registry = registry;
         this.nonceService = nonceService;
         this.issuer = issuer;

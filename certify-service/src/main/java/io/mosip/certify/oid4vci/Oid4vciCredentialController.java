@@ -9,6 +9,7 @@ import io.mosip.certify.issuance.IssuanceResult;
 import io.mosip.certify.issuance.IssuanceService;
 import io.mosip.certify.spi.Authorization;
 import io.mosip.certify.spi.IssuedCredential;
+import io.mosip.certify.proof.KeyAttestationProofValidator;
 import io.mosip.certify.spi.ProofValidator;
 import io.mosip.certify.spi.ProtocolVersion;
 import io.mosip.certify.spi.TenantContext;
@@ -44,13 +45,13 @@ public class Oid4vciCredentialController {
     private final AuthorizationContext authorizationContext;
     private final CacheNonceCheck nonceCheck;
     private final String issuerIdentifier;
-    private final Oid4vciV1Properties properties;
+    private final Oid4vciProperties properties;
 
     private final TenantContexts tenants;
 
     public Oid4vciCredentialController(IssuanceService oid4vciIssuanceService, ConfigurationRegistry configurations,
                                        AuthorizationContext authorizationContext, CacheNonceCheck nonceCheck, Oid4vciIssuer issuer, TenantContexts tenants,
-                                       Oid4vciV1Properties properties) {
+                                       Oid4vciProperties properties) {
         this.tenants = tenants;
         this.properties = properties;
         this.issuanceService = oid4vciIssuanceService;
@@ -82,12 +83,13 @@ public class Oid4vciCredentialController {
         if (!issuerIdentifier.equals(tenant.issuerIdentifier())) {
             tenant = new TenantContext(tenant.tenantId(), Oid4vciIssuer.derive(tenant.issuerIdentifier(), null).identifier(), tenant.issuerDid(), tenant.keyNamespace());
         }
-        ProofValidator.ProofPolicy policy = new ProofValidator.ProofPolicy(allowedProofAlgorithms(tenant.tenantId(), request.getCredentialConfigId()), tenant.issuerIdentifier(), true,
-                authorization.clientId(), Map.of());
+        Map<String, Object> proofTypes = proofTypesSupported(tenant.tenantId(), request.getCredentialConfigId());
+        ProofValidator.ProofPolicy policy = new ProofValidator.ProofPolicy(allowedProofAlgorithms(proofTypes), tenant.issuerIdentifier(), true,
+                authorization.clientId(), Map.of(KeyAttestationProofValidator.POLICY_PROOF_TYPES, proofTypes));
         RecordingNonceCheck recording = new RecordingNonceCheck(nonceCheck);
         IssuanceCommand command = IssuanceCommand.builder(request.getCredentialConfigId())
                 .tenant(tenant).authorization(authorization).proofs(proofs).proofPolicy(policy).nonceCheck(recording)
-                .protocol(ProtocolVersion.OID4VCI_1_0).correlationId(UUID.randomUUID().toString()).build();
+                .protocol(ProtocolVersion.OID4VCI_1_0).correlationId(UUID.randomUUID().toString()).maxCredentials(batchSize).build();
 
         IssuanceResult result = issuanceService.issue(command);
         if (result instanceof IssuanceResult.Issued && properties.nonce().singleUse()) {
@@ -111,12 +113,19 @@ public class Oid4vciCredentialController {
         return ResponseEntity.ok(body);
     }
 
+    /** The configuration's {@code proof_types_supported} object (raw, as the metadata publishes it), or an empty map. */
     @SuppressWarnings("unchecked")
-    private List<String> allowedProofAlgorithms(String tenantId, String configurationId) {
+    private Map<String, Object> proofTypesSupported(String tenantId, String configurationId) {
         return configurations.byId(tenantId, configurationId)
                 .map(c -> c.formatConfig() == null ? null : c.formatConfig().raw().get("proofTypesSupported"))
                 .filter(Map.class::isInstance)
-                .map(m -> ((Map<String, Object>) m).get("jwt"))
+                .map(m -> (Map<String, Object>) m)
+                .orElse(Map.of());
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<String> allowedProofAlgorithms(Map<String, Object> proofTypes) {
+        return java.util.Optional.ofNullable(proofTypes.get("jwt"))
                 .filter(Map.class::isInstance)
                 .map(m -> ((Map<String, Object>) m).get("proof_signing_alg_values_supported"))
                 .filter(List.class::isInstance)

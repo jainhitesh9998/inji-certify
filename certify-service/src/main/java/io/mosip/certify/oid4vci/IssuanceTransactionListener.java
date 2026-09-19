@@ -24,9 +24,9 @@ import java.util.UUID;
 public class IssuanceTransactionListener implements IssuanceListener {
 
     private final IssuanceTransactionRepository repository;
-    private final Oid4vciV1Properties properties;
+    private final Oid4vciProperties properties;
 
-    public IssuanceTransactionListener(IssuanceTransactionRepository repository, Oid4vciV1Properties properties) {
+    public IssuanceTransactionListener(IssuanceTransactionRepository repository, Oid4vciProperties properties) {
         this.repository = repository;
         this.properties = properties;
     }
