@@ -188,3 +188,24 @@ CREATE TABLE IF NOT EXISTS issuance_transaction (
     expires_at TIMESTAMP,
     CONSTRAINT pk_issuance_transaction PRIMARY KEY (id)
 );
+
+-- presentation during issuance and the authorization code flow keep their sessions and codes here (mirrors db_scripts/inji_certify/ddl/certify-iar_session.sql)
+CREATE TABLE IF NOT EXISTS iar_session (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    auth_session VARCHAR(128) NOT NULL UNIQUE,
+    transaction_id VARCHAR(64) NOT NULL,
+    request_id VARCHAR(64),
+    verify_nonce VARCHAR(64),
+    expires_at TIMESTAMP,
+    client_id VARCHAR(128),
+    scope VARCHAR(128),
+    authorization_code VARCHAR(128),
+    response_uri VARCHAR(512),
+    code_challenge VARCHAR(128),
+    code_challenge_method VARCHAR(10),
+    code_issued_at TIMESTAMP,
+    is_code_used BOOLEAN NOT NULL DEFAULT FALSE,
+    code_used_at TIMESTAMP,
+    cr_dtimes TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    identity_data VARCHAR
+);

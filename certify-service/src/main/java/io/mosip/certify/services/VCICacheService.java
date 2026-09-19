@@ -30,6 +30,7 @@ public class VCICacheService {
     private static final String VCISSUANCE_CACHE = "vcissuance";
     private static final String PRE_AUTH_TXN_CACHE = "preAuthCacheTxn";
     private static final String NONCE_CACHE = "nonce";
+    private static final String PAR_PREFIX = "par:";
 
     @PostConstruct
     public void validateCacheConfiguration() {
@@ -103,6 +104,20 @@ public class VCICacheService {
     public void setPreAuthCodeData(String code, PreAuthCodeData data) {
         String key = Constants.PRE_AUTH_CODE_PREFIX + code;
         cacheManager.getCache("preAuthCodeCache").put(key, data);
+    }
+
+    /** Pushed authorization requests (RFC 9126) share the pre-authorized code cache under their own prefix. */
+    public void setPushedAuthorizationRequest(String id, io.mosip.certify.as.PushedAuthorizationRequest request) {
+        cacheManager.getCache("preAuthCodeCache").put(PAR_PREFIX + id, request);
+    }
+
+    public io.mosip.certify.as.PushedAuthorizationRequest getPushedAuthorizationRequest(String id) {
+        Cache.ValueWrapper wrapper = cacheManager.getCache("preAuthCodeCache").get(PAR_PREFIX + id);
+        return wrapper != null ? (io.mosip.certify.as.PushedAuthorizationRequest) wrapper.get() : null;
+    }
+
+    public void evictPushedAuthorizationRequest(String id) {
+        cacheManager.getCache("preAuthCodeCache").evict(PAR_PREFIX + id);
     }
 
     public PreAuthCodeData getPreAuthCodeData(String code) {
