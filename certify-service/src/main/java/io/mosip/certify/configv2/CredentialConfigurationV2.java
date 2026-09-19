@@ -48,6 +48,8 @@ public class CredentialConfigurationV2 {
         private String alg;
         private String cryptosuite;
         private String didUrl;
+        /** How much of the key's chain the SD-JWT {@code x5c} and mDoc {@code x5chain} carry: {@code full}, {@code leaf}, {@code without-anchor} (HAIP) or {@code none}; the formatter's default when absent. */
+        private String x5c;
     }
 
     /** Template text as stored in {@code credential_template}; a changed content saves the next version. */

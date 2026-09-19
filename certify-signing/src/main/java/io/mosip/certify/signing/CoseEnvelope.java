@@ -38,7 +38,7 @@ public final class CoseEnvelope {
         CBORObject unprotectedHeader = CBORObject.NewMap();
         CertificateChain chain = key.chain();
         if (policy.x5chain() != JwsHeaderPolicy.ChainInclusion.NONE && !chain.isEmpty()) {
-            List<byte[]> der = chain.toDer();
+            List<byte[]> der = (policy.x5chain() == JwsHeaderPolicy.ChainInclusion.WITHOUT_ANCHOR ? chain.withoutAnchor() : chain).toDer();
             if (policy.x5chain() == JwsHeaderPolicy.ChainInclusion.LEAF || der.size() == 1) {
                 unprotectedHeader.Add(CBORObject.FromObject(LABEL_X5CHAIN), CBORObject.FromObject(der.get(0)));
             } else {

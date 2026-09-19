@@ -153,6 +153,13 @@ public class JpaConfigurationRegistry implements ConfigurationRegistry {
         String cryptosuite = signingModel.get("cryptosuite") == null ? null : blankToNull(signingModel.get("cryptosuite").toString());
         String didUrl = signingModel.get("didUrl") == null ? row.getDidUrl() : signingModel.get("didUrl").toString();
         SigningConfig signing = new SigningConfig(keyRef, algorithm, cryptosuite, null, null, didUrl);
+        String x5c = signingModel.get("x5c") == null ? null : blankToNull(signingModel.get("x5c").toString());
+        if (x5c != null) {
+            // how much of the key's certificate chain the SD-JWT x5c and mDoc x5chain carry (HAIP: without the anchor)
+            io.mosip.certify.signing.JwsHeaderPolicy.ChainInclusion inclusion = chainInclusion(x5c);
+            signing = new SigningConfig(keyRef, algorithm, cryptosuite, io.mosip.certify.signing.JwsHeaderPolicy.sdJwtVc().withX5c(inclusion),
+                    new io.mosip.certify.signing.CoseHeaderPolicy(inclusion, null, false), didUrl);
+        }
 
         StatusConfig status = StatusConfig.NONE;
         if (row.getStatusConfig() != null && row.getStatusConfig().get("purposes") instanceof List<?> purposes && !purposes.isEmpty()) {
@@ -292,6 +299,16 @@ public class JpaConfigurationRegistry implements ConfigurationRegistry {
 
     private List<Map<String, Object>> convertList(Object value) {
         return value == null ? List.of() : objectMapper.convertValue(value, new TypeReference<List<Map<String, Object>>>() {});
+    }
+
+    public static io.mosip.certify.signing.JwsHeaderPolicy.ChainInclusion chainInclusion(String value) {
+        return switch (value.trim().toLowerCase().replace('-', '_')) {
+            case "full" -> io.mosip.certify.signing.JwsHeaderPolicy.ChainInclusion.FULL;
+            case "leaf" -> io.mosip.certify.signing.JwsHeaderPolicy.ChainInclusion.LEAF;
+            case "without_anchor" -> io.mosip.certify.signing.JwsHeaderPolicy.ChainInclusion.WITHOUT_ANCHOR;
+            case "none" -> io.mosip.certify.signing.JwsHeaderPolicy.ChainInclusion.NONE;
+            default -> throw new IllegalStateException("signing_config.x5c must be full, leaf, without-anchor or none: " + value);
+        };
     }
 
     private static String blankToNull(String value) {

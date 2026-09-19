@@ -100,6 +100,8 @@ public class SdJwtFormatter implements CredentialFormatter {
     }
 
     /** {@code typ dc+sd-jwt}, except for a draft-13 request that named {@code vc+sd-jwt}: 0.14.0 answered with that typ and its wallets check it. */
+    static final String ERROR_CERTIFICATE_CHAIN = "certificate_chain_invalid";
+
     static JwsHeaderPolicy headerPolicy(IssuanceContext context) {
         JwsHeaderPolicy policy = JwsHeaderPolicy.sdJwtVc();
         if (context != null && context.protocol() == ProtocolVersion.OID4VCI_D13
@@ -117,7 +119,16 @@ public class SdJwtFormatter implements CredentialFormatter {
         } catch (Exception e) {
             throw new FormatException(ERROR_SD_CLAIMS, "SD-JWT payload is not serializable: " + e.getMessage(), e);
         }
-        String jws = JwsEnvelope.sign(payload, headerPolicy(context), signing.key(), signing.signer());
+        JwsHeaderPolicy policy = headerPolicy(context);
+        if (signing.config().jwsHeaders() != null) {
+            policy = policy.withX5c(signing.config().jwsHeaders().x5c()); // the configuration's x5c choice; typ and kid stay the format's
+        }
+        try {
+            io.mosip.certify.signing.CertificateChainPolicy.check(signing.key().chain(), context == null ? java.time.Instant.now() : context.now());
+        } catch (io.mosip.certify.signing.SigningException e) {
+            throw new FormatException(ERROR_CERTIFICATE_CHAIN, e.getMessage(), e);
+        }
+        String jws = JwsEnvelope.sign(payload, policy, signing.key(), signing.signer());
         @SuppressWarnings("unchecked")
         List<String> disclosures = (List<String>) credential.attributes().getOrDefault(ATTRIBUTE_DISCLOSURES, List.of());
         StringBuilder out = new StringBuilder(jws).append('~');

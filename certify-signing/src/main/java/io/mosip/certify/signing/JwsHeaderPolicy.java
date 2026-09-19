@@ -9,7 +9,8 @@ import java.util.Map;
 public record JwsHeaderPolicy(String typ, KidStrategy kid, ChainInclusion x5c, boolean x5tS256,
                               boolean b64, boolean detached, Map<String, Object> extraHeaders) {
 
-    public enum ChainInclusion { FULL, LEAF, NONE }
+    /** {@code WITHOUT_ANCHOR}: every certificate but a self-signed root, as HAIP requires of {@code x5c} and {@code x5chain}. */
+    public enum ChainInclusion { FULL, LEAF, WITHOUT_ANCHOR, NONE }
 
     public JwsHeaderPolicy {
         kid = kid == null ? KidStrategy.PROVIDER : kid;

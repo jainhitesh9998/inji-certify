@@ -29,6 +29,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.Date;
 
 /** Key-pair and self-signed certificate generation for dev mode; never for production keys. */
+/** Dev keys and certificates. Certificates begin two days in the past so that fixed-clock tests and hosts with a skewed clock see them as valid. */
 final class DevKeys {
 
     record Generated(PrivateKey privateKey, X509Certificate certificate) {}
@@ -41,7 +42,7 @@ final class DevKeys {
             Instant now = Instant.now();
             X509v3CertificateBuilder builder = new JcaX509v3CertificateBuilder(
                     new X500Name(subjectDn), BigInteger.valueOf(now.toEpochMilli()),
-                    Date.from(now.minus(1, ChronoUnit.MINUTES)), Date.from(now.plus(365, ChronoUnit.DAYS)),
+                    Date.from(now.minus(2, ChronoUnit.DAYS)), Date.from(now.plus(365, ChronoUnit.DAYS)),
                     new X500Name(subjectDn), keyPair.getPublic())
                     .addExtension(Extension.basicConstraints, true, new BasicConstraints(false))
                     .addExtension(Extension.keyUsage, true, new KeyUsage(KeyUsage.digitalSignature));
@@ -53,6 +54,51 @@ final class DevKeys {
         } catch (GeneralSecurityException | org.bouncycastle.operator.OperatorCreationException
                  | org.bouncycastle.cert.CertIOException e) {
             throw new SigningException("Cannot generate dev key for " + algorithm.joseName(), e);
+        }
+    }
+
+    /** A CA certificate: self-signed, {@code basicConstraints CA:true}, {@code keyCertSign}. */
+    static Generated generateCa(SignatureAlgorithm algorithm, String subjectDn) {
+        try {
+            KeyPair keyPair = keyPair(algorithm);
+            Instant now = Instant.now();
+            X509v3CertificateBuilder builder = new JcaX509v3CertificateBuilder(
+                    new X500Name(subjectDn), BigInteger.valueOf(now.toEpochMilli()),
+                    Date.from(now.minus(2, ChronoUnit.DAYS)), Date.from(now.plus(10 * 365, ChronoUnit.DAYS)),
+                    new X500Name(subjectDn), keyPair.getPublic())
+                    .addExtension(Extension.basicConstraints, true, new BasicConstraints(true))
+                    .addExtension(Extension.keyUsage, true, new KeyUsage(KeyUsage.keyCertSign | KeyUsage.cRLSign));
+            ContentSigner signer = new JcaContentSignerBuilder(certSigningAlgorithm(algorithm))
+                    .setProvider(BouncyCastleProvider.PROVIDER_NAME).build(keyPair.getPrivate());
+            X509Certificate certificate = new JcaX509CertificateConverter()
+                    .setProvider(BouncyCastleProvider.PROVIDER_NAME).getCertificate(builder.build(signer));
+            return new Generated(keyPair.getPrivate(), certificate);
+        } catch (GeneralSecurityException | org.bouncycastle.operator.OperatorCreationException
+                 | org.bouncycastle.cert.CertIOException e) {
+            throw new SigningException("Cannot generate dev CA for " + algorithm.joseName(), e);
+        }
+    }
+
+    /** A leaf certificate for a new key, signed by the CA key: {@code basicConstraints CA:false}, {@code digitalSignature}. */
+    static Generated generateSignedBy(SignatureAlgorithm algorithm, String subjectDn, PrivateKey caKey, X509Certificate caCertificate,
+                                      SignatureAlgorithm caAlgorithm) {
+        try {
+            KeyPair keyPair = keyPair(algorithm);
+            Instant now = Instant.now();
+            X509v3CertificateBuilder builder = new JcaX509v3CertificateBuilder(
+                    caCertificate, BigInteger.valueOf(now.toEpochMilli()),
+                    Date.from(now.minus(2, ChronoUnit.DAYS)), Date.from(now.plus(365, ChronoUnit.DAYS)),
+                    new X500Name(subjectDn), keyPair.getPublic())
+                    .addExtension(Extension.basicConstraints, true, new BasicConstraints(false))
+                    .addExtension(Extension.keyUsage, true, new KeyUsage(KeyUsage.digitalSignature));
+            ContentSigner signer = new JcaContentSignerBuilder(certSigningAlgorithm(caAlgorithm))
+                    .setProvider(BouncyCastleProvider.PROVIDER_NAME).build(caKey);
+            X509Certificate certificate = new JcaX509CertificateConverter()
+                    .setProvider(BouncyCastleProvider.PROVIDER_NAME).getCertificate(builder.build(signer));
+            return new Generated(keyPair.getPrivate(), certificate);
+        } catch (GeneralSecurityException | org.bouncycastle.operator.OperatorCreationException
+                 | org.bouncycastle.cert.CertIOException e) {
+            throw new SigningException("Cannot generate a dev key signed by " + caCertificate.getSubjectX500Principal(), e);
         }
     }
 

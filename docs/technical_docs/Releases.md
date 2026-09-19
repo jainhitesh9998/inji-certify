@@ -32,6 +32,10 @@ With `certify.tenancy` enabled, a tenant configured with `issuer-did` issues und
 
 `POST /pre-authorized-data` accepts an optional `subject` next to `claims`: the identifier the data provider resolves (for the CSV plugin, the row id). It becomes the access token's `sub`, so plugins that look the record up by `sub` work in the pre-authorized code flow without eSignet. Offers with `claims` behave as before.
 
+## X.509 chains for SD-JWT VC and mDoc
+
+The `x509-file` provider's dev mode now signs generated keys with a dev CA (`certify.keyprovider.x509-file.ca-alias`, default `dev-ca`) instead of self-signing them, a configuration may choose how much of the chain its SD-JWT `x5c` and mDoc `x5chain` carry (`signing.x5c` in the v2 configuration API: `full`, `leaf`, `without-anchor`, `none`), and the chain is checked (validity, links) before an SD-JWT VC or mDoc is signed. Configurations without the setting are unchanged.
+
 ## DPoP-bound access tokens
 
 `POST /oauth/token` accepts a `DPoP` proof (RFC 9449) on every grant and then issues a sender-constrained token (`cnf.jkt`, `token_type: DPoP`) that the credential endpoints already enforce; the authorization server metadata advertises `dpop_signing_alg_values_supported`. Without a proof the token is a Bearer token, as before.

@@ -17,11 +17,13 @@ import java.util.List;
  *                 missing; never on in production
  * @param keys     the keys the provider must hold (alias, algorithm, subject DN); in dev mode they are generated,
  *                 otherwise they must exist in the file
+ * @param caAlias  alias of the dev CA that signs generated keys (dev mode); {@code caSubject} its subject
  * @param purpose  purpose recorded on generated keys
  */
 @ConfigurationProperties(prefix = "certify.keyprovider.x509-file")
 public record X509FileProperties(@DefaultValue("false") boolean enabled, @DefaultValue("x509-file") String id, Path path, String password,
-                                 @DefaultValue("false") boolean devMode, List<KeySpec> keys, @DefaultValue("vc-signing") String purpose) {
+                                 @DefaultValue("false") boolean devMode, List<KeySpec> keys, @DefaultValue("vc-signing") String purpose,
+                                 @DefaultValue("dev-ca") String caAlias, @DefaultValue("CN=Inji Certify Dev CA") String caSubject) {
 
     /** One required key. */
     public record KeySpec(String alias, String algorithm, String subject) {}

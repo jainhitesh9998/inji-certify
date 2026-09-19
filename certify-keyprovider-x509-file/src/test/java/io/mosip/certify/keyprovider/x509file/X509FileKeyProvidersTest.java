@@ -22,7 +22,7 @@ class X509FileKeyProvidersTest {
     @TempDir Path dir;
 
     X509FileProperties props(Path file, boolean devMode, List<X509FileProperties.KeySpec> keys) {
-        return new X509FileProperties(true, "x509-file", file, "pw", devMode, keys, "vc-signing");
+        return new X509FileProperties(true, "x509-file", file, "pw", devMode, keys, "vc-signing", "dev-ca", "CN=Inji Certify Dev CA");
     }
 
     @Test
@@ -41,7 +41,10 @@ class X509FileKeyProvidersTest {
         JcaKeyProvider second = X509FileKeyProviders.open(props(file, false, keys));
         assertEquals(first.resolve(KeyRef.parse("x509-file:issuer-eddsa")).descriptor().publicKey(),
                 second.resolve(KeyRef.parse("x509-file:issuer-eddsa")).descriptor().publicKey(), "the second start loads the same keys");
-        assertEquals(2, second.publicKeys(KeyFilter.validNow()).size());
+        assertEquals(3, second.publicKeys(KeyFilter.validNow()).size(), "the two keys and the dev CA that signed them");
+        assertEquals(2, es256.chain().leafFirst().size(), "generated keys chain to the dev CA");
+        assertEquals("CN=Inji Certify Dev CA", es256.chain().root().orElseThrow().getSubjectX500Principal().getName());
+        assertTrue(second.aliases().contains("dev-ca"));
         byte[] signature = second.signRaw("data".getBytes(), es256, SignatureAlgorithm.ES256);
         assertEquals(64, signature.length, "ES256 concatenated R||S");
     }
@@ -54,7 +57,7 @@ class X509FileKeyProvidersTest {
         SigningException e = assertThrows(SigningException.class, () -> X509FileKeyProviders.open(props(file, false,
                 List.of(new X509FileProperties.KeySpec("a", "ES256", "CN=a"), new X509FileProperties.KeySpec("b", "RS256", "CN=b")))));
         assertTrue(e.getMessage().contains("[b]"));
-        assertThrows(SigningException.class, () -> X509FileKeyProviders.open(new X509FileProperties(true, "x509-file", null, "pw", true, List.of(), "p")));
+        assertThrows(SigningException.class, () -> X509FileKeyProviders.open(new X509FileProperties(true, "x509-file", null, "pw", true, List.of(), "p", "dev-ca", "CN=Inji Certify Dev CA")));
         assertThrows(SigningException.class, () -> X509FileKeyProviders.open(props(dir.resolve("x.p12"), true, List.of(new X509FileProperties.KeySpec("z", "HS256", "CN=z")))));
     }
 }

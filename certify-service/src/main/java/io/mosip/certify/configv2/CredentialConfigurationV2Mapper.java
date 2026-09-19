@@ -55,6 +55,7 @@ final class CredentialConfigurationV2Mapper {
         put(signingConfig, "alg", signing.getAlg());
         put(signingConfig, "cryptosuite", signing.getCryptosuite());
         put(signingConfig, "didUrl", signing.getDidUrl());
+        put(signingConfig, "x5c", signing.getX5c());
         row.setSigningConfig(signingConfig);
         if (ConfigV2Columns.PROVIDER_KEYMANAGER.equals(provider)) {
             int slash = signing.getAlias().indexOf('/');
@@ -116,6 +117,7 @@ final class CredentialConfigurationV2Mapper {
         signing.setAlg(str(signingConfig.get("alg")));
         signing.setCryptosuite(str(signingConfig.get("cryptosuite")));
         signing.setDidUrl(str(signingConfig.get("didUrl")));
+        signing.setX5c(str(signingConfig.get("x5c")));
         dto.setSigning(signing);
         if (template != null) {
             CredentialConfigurationV2.Template t = new CredentialConfigurationV2.Template();

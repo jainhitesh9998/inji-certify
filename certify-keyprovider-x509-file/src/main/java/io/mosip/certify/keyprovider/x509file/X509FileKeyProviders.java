@@ -35,9 +35,13 @@ public final class X509FileKeyProviders {
             if (!properties.devMode()) {
                 throw new SigningException("Keystore " + properties.path() + " lacks the required keys " + missing.stream().map(X509FileProperties.KeySpec::alias).toList());
             }
+            // HAIP forbids a self-signed signing certificate: generated keys chain to a dev CA held in the same keystore
+            if (!provider.aliases().contains(properties.caAlias())) {
+                provider.generateCa(properties.caAlias(), SignatureAlgorithm.ES256, properties.caSubject(), "dev-ca");
+            }
             for (X509FileProperties.KeySpec key : missing) {
                 String subject = key.subject() == null || key.subject().isBlank() ? "CN=Inji Certify " + key.alias() : key.subject();
-                provider.generate(key.alias(), SignatureAlgorithm.fromJose(key.algorithm()).orElseThrow(), subject, properties.purpose());
+                provider.generateSignedBy(key.alias(), SignatureAlgorithm.fromJose(key.algorithm()).orElseThrow(), subject, properties.purpose(), properties.caAlias());
             }
             try {
                 if (properties.path().getParent() != null) {
