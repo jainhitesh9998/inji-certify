@@ -32,6 +32,10 @@ With `certify.tenancy` enabled, a tenant configured with `issuer-did` issues und
 
 `POST /pre-authorized-data` accepts an optional `subject` next to `claims`: the identifier the data provider resolves (for the CSV plugin, the row id). It becomes the access token's `sub`, so plugins that look the record up by `sub` work in the pre-authorized code flow without eSignet. Offers with `claims` behave as before.
 
+## Token Status List
+
+A configuration whose `status.mechanism` is `TokenStatusList` gives its SD-JWT VC payload or mDoc MSO a `status.status_list` entry (draft-ietf-oauth-status-list); the lists are signed JWTs (`typ statuslist+jwt`) under `certify.status.token-status-list.key-ref`, served at `GET /credentials/token-status-list/{id}` as `application/statuslist+jwt`, and re-signed by the status-list batch job on revocation. Bitstring Status List for `ldp_vc` is unchanged.
+
 ## X.509 chains for SD-JWT VC and mDoc
 
 The `x509-file` provider's dev mode now signs generated keys with a dev CA (`certify.keyprovider.x509-file.ca-alias`, default `dev-ca`) instead of self-signing them, a configuration may choose how much of the chain its SD-JWT `x5c` and mDoc `x5chain` carry (`signing.x5c` in the v2 configuration API: `full`, `leaf`, `without-anchor`, `none`), and the chain is checked (validity, links) before an SD-JWT VC or mDoc is signed. Configurations without the setting are unchanged.

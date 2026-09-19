@@ -18,6 +18,9 @@ public interface StatusListCredentialRepository extends JpaRepository<StatusList
      * @param statusPurpose The purpose of the status list (e.g., "revocation", "suspension")
      * @return An optional containing the first available status list credential, or empty if none found
      */
+    Optional<StatusListCredential> findFirstByCredentialTypeAndStatusPurposeAndCredentialStatusOrderByCreatedDtimesDesc(
+            String credentialType, String statusPurpose, StatusListCredential.CredentialStatus credentialStatus);
+
     Optional<StatusListCredential> findFirstByStatusPurposeAndCredentialStatusOrderByCreatedDtimesDesc(
             String statusPurpose,
             StatusListCredential.CredentialStatus credentialStatus
