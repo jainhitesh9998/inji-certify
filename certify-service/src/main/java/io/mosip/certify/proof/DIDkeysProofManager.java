@@ -87,8 +87,9 @@ public class DIDkeysProofManager implements JwtProofKeyManager {
     private static JWK ecKey(String curveName, Curve curve, byte[] b) {
         ECCurve ecCurve = ECNamedCurveTable.getParameterSpec(curveName).getCurve();
         ECPoint point = ecCurve.decodePoint(Arrays.copyOfRange(b, 2, b.length));
-        byte[] x = BigIntegers.asUnsignedByteArray(point.getAffineXCoord().toBigInteger());
-        byte[] y = BigIntegers.asUnsignedByteArray(point.getAffineYCoord().toBigInteger());
+        // JWK coordinates are fixed-width (RFC 7518 6.2.1.2): a minimal-length coordinate would change the thumbprint
+        byte[] x = BigIntegers.asUnsignedByteArray(32, point.getAffineXCoord().toBigInteger());
+        byte[] y = BigIntegers.asUnsignedByteArray(32, point.getAffineYCoord().toBigInteger());
         return new ECKey.Builder(curve, Base64URL.encode(x), Base64URL.encode(y)).build();
     }
 

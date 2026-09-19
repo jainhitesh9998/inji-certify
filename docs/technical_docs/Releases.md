@@ -63,6 +63,10 @@ A proof whose `kid` is an RSA `did:key` (multicodec `0x1205`) was decoded by 1.0
 ## `did:web` holder keys, and `did:key` in the advertised default
 
 A proof whose `kid` is a `did:web` DID URL is resolved by fetching the DID document over HTTPS when `certify.protocol.oid4vci-v1.did-web-holders.enabled=true` (`timeout` per fetch, default 5 s); the verification method named by the `kid` supplies the key as `publicKeyJwk` or `publicKeyMultibase`, and the credential is bound to the `kid`. Off by default, so nothing changes for deployments that do not set it. The local profile's `cryptographic-binding-methods-supported` default now lists `did:jwk` and `did:key` for `ldp_vc` and `dc+sd-jwt`, the methods the issuer resolves without configuration (the compose profile already did); a deployment that enables `did:web` holders adds `did:web` to its own default or per configuration.
+
+## P-256 keys with a leading zero byte
+
+The DID document encoded the P-256 `publicKeyMultibase` from a minimal-length X coordinate, so for about one key in 256 (an X starting with a zero byte) `did.json` published a wrong point and no verifier could check credentials signed with that key; the `did:key` holder resolver built JWK coordinates the same way, changing the thumbprint of such holder keys. Both are fixed-width now. A deployment whose P-256 signing key is affected publishes the right key after upgrading, without a key change.
 # Changes in release 0.11.0
 
 ## Removal of  Artifactory dependency

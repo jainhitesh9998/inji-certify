@@ -1,5 +1,9 @@
 package io.mosip.certify.proof;
 
+import org.bouncycastle.util.BigIntegers;
+import java.security.interfaces.ECPublicKey;
+import java.security.spec.ECGenParameterSpec;
+import java.security.KeyPairGenerator;
 import com.nimbusds.jose.JOSEException;
 import com.nimbusds.jose.JWSAlgorithm;
 import com.nimbusds.jose.JWSHeader;
@@ -257,5 +261,36 @@ public class DIDkeysProofManagerTest {
 
         assertFalse(result.isPresent());
     }
-}
 
+    /** JWK coordinates are fixed-width (RFC 7518): a P-256 did:key whose X or Y starts with a zero byte must still yield 32-byte coordinates and the right thumbprint. */
+    @Test
+    void p256DidKeyWithShortCoordinateYieldsFixedWidthJwk() throws Exception {
+        KeyPairGenerator generator = KeyPairGenerator.getInstance("EC");
+        generator.initialize(new ECGenParameterSpec("secp256r1"));
+        ECPublicKey shortCoordinate = null;
+        for (int i = 0; i < 20000 && shortCoordinate == null; i++) {
+            ECPublicKey candidate = (ECPublicKey) generator.generateKeyPair().getPublic();
+            if (BigIntegers.asUnsignedByteArray(candidate.getW().getAffineX()).length < 32 || BigIntegers.asUnsignedByteArray(candidate.getW().getAffineY()).length < 32) {
+                shortCoordinate = candidate;
+            }
+        }
+        assertNotNull(shortCoordinate, "no P-256 key with a short coordinate found in 20000 tries");
+        org.bouncycastle.jce.spec.ECNamedCurveParameterSpec spec = org.bouncycastle.jce.ECNamedCurveTable.getParameterSpec("secp256r1");
+        byte[] compressed = spec.getCurve().createPoint(shortCoordinate.getW().getAffineX(), shortCoordinate.getW().getAffineY()).getEncoded(true);
+        byte[] bytes = new byte[2 + compressed.length];
+        bytes[0] = (byte) 0x80; bytes[1] = 0x24;
+        System.arraycopy(compressed, 0, bytes, 2, compressed.length);
+        String didKey = "did:key:" + Multibase.encode(Multibase.Base.Base58BTC, bytes);
+        JWSHeader header = Mockito.mock(JWSHeader.class);
+        when(header.getKeyID()).thenReturn(didKey);
+        when(header.getJWK()).thenReturn(null);
+
+        Optional<JWK> resolved = new DIDkeysProofManager().getKeyFromHeader(header);
+
+        assertTrue(resolved.isPresent());
+        ECKey ec = (ECKey) resolved.get();
+        assertEquals(32, ec.getX().decode().length);
+        assertEquals(32, ec.getY().decode().length);
+        assertEquals(new ECKey.Builder(Curve.P_256, shortCoordinate).build().computeThumbprint(), ec.computeThumbprint());
+    }
+}
