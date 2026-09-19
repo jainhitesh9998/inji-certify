@@ -45,6 +45,8 @@ public class CredentialConfigurationSupportedServiceImplTest {
     @InjectMocks
     private CredentialConfigurationServiceImpl credentialConfigurationService;
 
+    private CredentialIssuerMetadataBuilder metadataBuilder;
+
     @Mock
     private CredentialConfigurationDTO credentialConfigurationDTO;
 
@@ -65,6 +67,9 @@ public class CredentialConfigurationSupportedServiceImplTest {
 //        keyAliasMapper.put("RS256", List.of());
 
         MockitoAnnotations.openMocks(this);
+        metadataBuilder = new CredentialIssuerMetadataBuilder();
+        ReflectionTestUtils.setField(metadataBuilder, "credentialConfigMapper", credentialConfigMapper);
+        ReflectionTestUtils.setField(credentialConfigurationService, "metadataBuilder", metadataBuilder);
         logo = new MetaDataDisplayDTO.Logo();
         logo.setUri("https://logo2.mosip.io");
         metaDataDisplayDTO = new MetaDataDisplayDTO();
@@ -100,22 +105,23 @@ public class CredentialConfigurationSupportedServiceImplTest {
         credentialConfigurationDTO.setKeyManagerRefId("TEST2019-REF");
         credentialConfigurationDTO.setClaims(Map.of("name", new ClaimsDTO(List.of(new ClaimsDTO.Display("Full Name", "en")))));
 
-        ReflectionTestUtils.setField(credentialConfigurationService, "credentialIssuer", "http://example.com/");
-        ReflectionTestUtils.setField(credentialConfigurationService, "authUrl", "http://auth.com");
-        ReflectionTestUtils.setField(credentialConfigurationService, "servletPath", "v1/test");
+        ReflectionTestUtils.setField(metadataBuilder, "credentialIssuer", "http://example.com/");
+        ReflectionTestUtils.setField(metadataBuilder, "authUrl", "http://auth.com");
+        ReflectionTestUtils.setField(metadataBuilder, "servletPath", "v1/test");
         ReflectionTestUtils.setField(credentialConfigurationService, "pluginMode", "DataProvider");
-        ReflectionTestUtils.setField(credentialConfigurationService, "issuerDisplay", List.of(Map.of()));
+        ReflectionTestUtils.setField(metadataBuilder, "issuerDisplay", List.of(Map.of()));
         Map<String, List<String>> credentialSigningMap = new LinkedHashMap<>();
         credentialSigningMap.put("Ed25519Signature2020", List.of("EdDSA"));
         credentialSigningMap.put("RsaSignature2018", List.of("RS256"));
         credentialSigningMap.put("EcdsaSecp256r1Signature2019", List.of("ES256"));
         ReflectionTestUtils.setField(credentialConfigurationService, "cryptographicBindingMethodsSupportedMap", new LinkedHashMap<>());
         ReflectionTestUtils.setField(credentialConfigurationService, "credentialSigningAlgValuesSupportedMap", credentialSigningMap);
+        ReflectionTestUtils.setField(metadataBuilder, "credentialSigningAlgValuesSupportedMap", credentialSigningMap);
         ReflectionTestUtils.setField(credentialConfigurationService, "proofTypesSupported", new LinkedHashMap<>());
         ReflectionTestUtils.setField(credentialConfigurationService, "keyAliasMapper", keyAliasMapper);
         Map<String, String> authServerMapping = new HashMap<>();
         authServerMapping.put("default", "http://auth.com");
-        ReflectionTestUtils.setField(credentialConfigurationService, "authorizationServerMapping", authServerMapping);
+        ReflectionTestUtils.setField(metadataBuilder, "authorizationServerMapping", authServerMapping);
 
     }
 
@@ -408,10 +414,8 @@ public class CredentialConfigurationSupportedServiceImplTest {
 
         LinkedHashMap<String, List<String>> unsupportedAlgorithms = new LinkedHashMap<>();
         unsupportedAlgorithms.put("EcdsaSecp256r1Signature2019", List.of("UNSUPPORTED_ALG"));
-        ReflectionTestUtils.setField(
-                credentialConfigurationService,
-                "credentialSigningAlgValuesSupportedMap",
-                unsupportedAlgorithms);
+        ReflectionTestUtils.setField(credentialConfigurationService, "credentialSigningAlgValuesSupportedMap", unsupportedAlgorithms);
+        ReflectionTestUtils.setField(metadataBuilder, "credentialSigningAlgValuesSupportedMap", unsupportedAlgorithms);
 
         when(credentialConfigRepository.findAll()).thenReturn(List.of(config));
         CredentialConfigurationDTO dto = new CredentialConfigurationDTO();
@@ -800,13 +804,13 @@ public class CredentialConfigurationSupportedServiceImplTest {
     @Test
     public void resolveAuthorizationServers_MultipleServers_Success() {
         // Setup multiple servers in authUrl
-        ReflectionTestUtils.setField(credentialConfigurationService, "authUrl", "http://auth1.com, http://auth2.com ");
+        ReflectionTestUtils.setField(metadataBuilder, "authUrl", "http://auth1.com, http://auth2.com ");
 
         // Setup mappings
         Map<String, String> authServerMapping = new HashMap<>();
         authServerMapping.put("Farmer", "http://farmer-as.com");
         authServerMapping.put("Default", "http://auth1.com"); // Duplicate
-        ReflectionTestUtils.setField(credentialConfigurationService, "authorizationServerMapping", authServerMapping);
+        ReflectionTestUtils.setField(metadataBuilder, "authorizationServerMapping", authServerMapping);
 
         when(credentialConfigRepository.findAll()).thenReturn(Collections.emptyList());
 
@@ -827,11 +831,11 @@ public class CredentialConfigurationSupportedServiceImplTest {
     @Test
     public void resolveAuthorizationServers_AuthUrlIsNull_ReturnsOnlyMappingServers() {
         // authUrl is null
-        ReflectionTestUtils.setField(credentialConfigurationService, "authUrl", null);
+        ReflectionTestUtils.setField(metadataBuilder, "authUrl", null);
 
         Map<String, String> authServerMapping = new HashMap<>();
         authServerMapping.put("default", "http://mapping-server.com");
-        ReflectionTestUtils.setField(credentialConfigurationService, "authorizationServerMapping", authServerMapping);
+        ReflectionTestUtils.setField(metadataBuilder, "authorizationServerMapping", authServerMapping);
 
         when(credentialConfigRepository.findAll()).thenReturn(Collections.emptyList());
 
@@ -846,11 +850,11 @@ public class CredentialConfigurationSupportedServiceImplTest {
     @Test
     public void resolveAuthorizationServers_SingleAuthUrl_NoSplitRequired_ReturnsAllServers() {
         // authUrl has only 1 value — comma-split won't produce multiple entries
-        ReflectionTestUtils.setField(credentialConfigurationService, "authUrl", "http://single-auth.com");
+        ReflectionTestUtils.setField(metadataBuilder, "authUrl", "http://single-auth.com");
 
         Map<String, String> authServerMapping = new HashMap<>();
         authServerMapping.put("extra", "http://extra-server.com");
-        ReflectionTestUtils.setField(credentialConfigurationService, "authorizationServerMapping", authServerMapping);
+        ReflectionTestUtils.setField(metadataBuilder, "authorizationServerMapping", authServerMapping);
 
         when(credentialConfigRepository.findAll()).thenReturn(Collections.emptyList());
 
@@ -868,8 +872,8 @@ public class CredentialConfigurationSupportedServiceImplTest {
     @Test
     public void resolveAuthorizationServers_MappingIsNull_ReturnsOnlyAuthUrlServers() {
         // authorizationServerMapping is null
-        ReflectionTestUtils.setField(credentialConfigurationService, "authUrl", "http://auth1.com, http://auth2.com");
-        ReflectionTestUtils.setField(credentialConfigurationService, "authorizationServerMapping", null);
+        ReflectionTestUtils.setField(metadataBuilder, "authUrl", "http://auth1.com, http://auth2.com");
+        ReflectionTestUtils.setField(metadataBuilder, "authorizationServerMapping", null);
 
         when(credentialConfigRepository.findAll()).thenReturn(Collections.emptyList());
 
@@ -885,8 +889,8 @@ public class CredentialConfigurationSupportedServiceImplTest {
     @Test
     public void resolveAuthorizationServers_MappingIsEmpty_ReturnsOnlyAuthUrlServers() {
         // authorizationServerMapping is an empty map
-        ReflectionTestUtils.setField(credentialConfigurationService, "authUrl", "http://auth1.com, http://auth2.com");
-        ReflectionTestUtils.setField(credentialConfigurationService, "authorizationServerMapping", new HashMap<>());
+        ReflectionTestUtils.setField(metadataBuilder, "authUrl", "http://auth1.com, http://auth2.com");
+        ReflectionTestUtils.setField(metadataBuilder, "authorizationServerMapping", new HashMap<>());
 
         when(credentialConfigRepository.findAll()).thenReturn(Collections.emptyList());
 
@@ -916,7 +920,7 @@ public class CredentialConfigurationSupportedServiceImplTest {
         
         when(credentialConfigMapper.toDto(config)).thenReturn(dto);
 
-        CredentialConfigurationSupportedDTO result = ReflectionTestUtils.invokeMethod(credentialConfigurationService, "mapToSupportedDTO", config);
+        CredentialConfigurationSupportedDTO result = ReflectionTestUtils.invokeMethod(metadataBuilder, "toSupportedDTO", config);
 
         Assert.assertNotNull(result);
         Assert.assertEquals(VCFormats.LDP_VC, result.getFormat());
@@ -940,7 +944,7 @@ public class CredentialConfigurationSupportedServiceImplTest {
         
         when(credentialConfigMapper.toDto(config)).thenReturn(dtoV2);
 
-        CredentialConfigurationSupportedDTO result = ReflectionTestUtils.invokeMethod(credentialConfigurationService, "mapToSupportedDTO", config);
+        CredentialConfigurationSupportedDTO result = ReflectionTestUtils.invokeMethod(metadataBuilder, "toSupportedDTO", config);
 
         Assert.assertNotNull(result);
         Assert.assertEquals("org.iso.18013.5.1.mDL", result.getDocType());
@@ -963,7 +967,7 @@ public class CredentialConfigurationSupportedServiceImplTest {
         
         when(credentialConfigMapper.toDto(config)).thenReturn(dtoV2);
 
-        CredentialConfigurationSupportedDTO result = ReflectionTestUtils.invokeMethod(credentialConfigurationService, "mapToSupportedDTO", config);
+        CredentialConfigurationSupportedDTO result = ReflectionTestUtils.invokeMethod(metadataBuilder, "toSupportedDTO", config);
 
         Assert.assertNotNull(result);
         Assert.assertEquals("https://example.com/vct", result.getVct());
