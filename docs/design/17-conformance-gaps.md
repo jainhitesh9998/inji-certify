@@ -25,7 +25,7 @@ Written on 2026-09-19 from the OpenID Foundation certification page ("OpenID for
 5. **Token Status List** for SD-JWT VC and mDoc: a `StatusProvider` that allocates indices, the status list JWT (and CWT for mDoc) signed under the same chain, a status list URI, and the revocation path already used by Bitstring.
 6. **Key attestation** in `jwt` proofs: parse and validate the `key_attestation` JWT when present, refuse when the configuration requires it. Done in P3-10 (`docs/design/wp/P3-10-key-attestation.md`).
 7. **Credential response encryption** (`credential_response_encryption` in metadata, JWE credential responses) and **signed metadata**: optional for the suite, part of the 1.0 feature set.
-8. **Deployment for the run**: HTTPS issuer identifier on a public host reachable from the suite's IP, a registered redirect URI, the trust anchors and client attestation material exported for the tester.
+8. **Deployment for the run**: HTTPS issuer identifier on a public host reachable from the suite's IP, a registered redirect URI, the trust anchors and client attestation material exported for the tester. Runbook: `19-conformance-run.md`; the run itself needs the owner's public host.
 
 Rough effort at the pace of this branch: 1 to 3 together about two to three days, 4 and 5 about two days, 6 and 7 about half a day each, 8 an afternoon.
 
