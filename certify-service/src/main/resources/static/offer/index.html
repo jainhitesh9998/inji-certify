@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Credential offer</title>
+<style>
+  :root { color-scheme: light; --ink: #1c1c1c; --muted: #6b6b6b; --line: #ddd; --accent: #1a5fb4; --ok: #2e7d32; --bad: #b3261e; --bg: #fafaf8; --card: #fff; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px 16px 48px; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 18px; }
+  section h2 { font-size: 1.05rem; margin: 0 0 12px; }
+  label { display: block; font-size: 0.85rem; color: var(--muted); margin: 10px 0 4px; }
+  input, select, textarea { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; font: inherit; background: #fff; }
+  textarea { min-height: 84px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; }
+  button { margin-top: 14px; padding: 9px 16px; border: 0; border-radius: 6px; background: var(--accent); color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+  button.secondary { background: #fff; color: var(--accent); border: 1px solid var(--accent); }
+  button[disabled] { opacity: 0.5; cursor: default; }
+  #qr { display: flex; justify-content: center; align-items: center; min-height: 260px; background: #fff; border: 1px dashed var(--line); border-radius: 8px; }
+  #qr img, #qr canvas { image-rendering: pixelated; }
+  .uri { word-break: break-all; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; background: #f4f4f2; padding: 8px 10px; border-radius: 6px; margin-top: 10px; }
+  pre { white-space: pre-wrap; word-break: break-word; background: #f4f4f2; border-radius: 6px; padding: 10px; font-size: 0.78rem; max-height: 360px; overflow: auto; margin: 10px 0 0; }
+  .status { margin-top: 10px; font-size: 0.9rem; }
+  .status.ok { color: var(--ok); } .status.bad { color: var(--bad); }
+  ol.steps { padding-left: 20px; margin: 0; color: var(--muted); font-size: 0.9rem; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .hint { font-size: 0.8rem; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Credential offer</h1>
+  <p class="sub">Create a pre-authorized credential offer on this issuer, scan its QR code with a wallet, or let this page play the wallet.</p>
+
+  <div class="grid">
+    <section>
+      <h2>1. Offer</h2>
+      <label for="configuration">Credential configuration</label>
+      <select id="configuration"></select>
+      <label for="subject">Subject (the record id the data provider resolves, e.g. the CSV row id)</label>
+      <input id="subject" placeholder="2154189532">
+      <label for="claims">Or claims as JSON (used when the subject is empty)</label>
+      <textarea id="claims" placeholder='{"fullName": "Gorge Cooper", "dateOfBirth": "1990-05-25"}'></textarea>
+      <div class="row">
+        <div style="flex:1"><label for="txCode">Transaction code (optional)</label><input id="txCode" placeholder="1234"></div>
+        <div style="flex:1"><label for="expires">Expires in (seconds)</label><input id="expires" value="600"></div>
+      </div>
+      <button id="create">Create offer</button>
+      <div id="offerStatus" class="status"></div>
+      <div id="offerUri" class="uri" hidden></div>
+      <pre id="offerDoc" hidden></pre>
+    </section>
+
+    <section>
+      <h2>2. Scan</h2>
+      <div id="qr"><span class="hint">The QR code appears here</span></div>
+      <p class="hint">The QR carries the <code>openid-credential-offer://</code> deep link. Inji Wallet and other OpenID4VCI wallets scan it, fetch the offer, exchange the pre-authorized code for a token and download the credential.</p>
+      <div class="row">
+        <button id="copy" class="secondary" disabled>Copy link</button>
+        <a id="open" class="hint" hidden>Open the deep link on this device</a>
+      </div>
+    </section>
+  </div>
+
+  <section style="margin-top:20px">
+    <h2>3. Or let this page be the wallet</h2>
+    <ol class="steps">
+      <li>Exchange the pre-authorized code (and transaction code) for an access token at the token endpoint.</li>
+      <li>Fetch a <code>c_nonce</code> from the nonce endpoint of the <code>/oid4vci</code> surface.</li>
+      <li>Sign a <code>jwt</code> proof of possession with a fresh P-256 key in this browser and request the credential.</li>
+    </ol>
+    <button id="wallet" disabled>Run the pre-authorized code flow here</button>
+    <div id="walletStatus" class="status"></div>
+    <pre id="credential" hidden></pre>
+  </section>
+</main>
+
+<script src="qrcode.min.js"></script>
+<script>
+(function () {
+  // Same origin as the issuer: the servlet path is everything before /offer/
+  const BASE = location.pathname.replace(/\/offer\/.*$/, "");
+  const el = (id) => document.getElementById(id);
+  let metadata = null, newMetadata = null, offer = null, offerDocument = null, tokenEndpoint = null;
+
+  async function api(method, path, body, headers, form) {
+    const h = Object.assign({}, headers || {});
+    let data;
+    if (form) { data = new URLSearchParams(form); h["Content-Type"] = "application/x-www-form-urlencoded"; }
+    else if (body !== undefined) { data = JSON.stringify(body); h["Content-Type"] = "application/json"; }
+    const r = await fetch(path.startsWith("http") ? path : BASE + path, { method, headers: h, body: data });
+    const text = await r.text();
+    let parsed = text;
+    try { parsed = JSON.parse(text); } catch (e) { /* plain text */ }
+    return { status: r.status, body: parsed };
+  }
+
+  function status(id, message, ok) {
+    const node = el(id); node.textContent = message; node.className = "status " + (ok === undefined ? "" : ok ? "ok" : "bad");
+  }
+
+  async function load() {
+    const [legacy, fresh] = await Promise.all([api("GET", "/.well-known/openid-credential-issuer"), api("GET", "/oid4vci/.well-known/openid-credential-issuer")]);
+    metadata = legacy.body; newMetadata = fresh.body;
+    const as = await api("GET", "/.well-known/oauth-authorization-server");
+    tokenEndpoint = as.body && as.body.token_endpoint;
+    const configurations = (metadata && metadata.credential_configurations_supported) || {};
+    const select = el("configuration");
+    select.innerHTML = "";
+    Object.keys(configurations).sort().forEach((id) => {
+      const option = document.createElement("option");
+      const display = (configurations[id].credential_metadata && configurations[id].credential_metadata.display || configurations[id].display || [])[0];
+      option.value = id; option.textContent = id + (display && display.name && display.name !== id ? " (" + display.name + ")" : "") + " · " + configurations[id].format;
+      select.appendChild(option);
+    });
+    if (!Object.keys(configurations).length) status("offerStatus", "No credential configuration is advertised by " + BASE, false);
+  }
+
+  el("create").addEventListener("click", async () => {
+    const request = { credential_configuration_id: el("configuration").value, expires_in: Number(el("expires").value) || 600 };
+    if (el("txCode").value.trim()) request.tx_code = el("txCode").value.trim();
+    if (el("subject").value.trim()) request.subject = el("subject").value.trim();
+    else if (el("claims").value.trim()) {
+      try { request.claims = JSON.parse(el("claims").value); } catch (e) { status("offerStatus", "Claims are not valid JSON: " + e.message, false); return; }
+    } else { status("offerStatus", "Give a subject or claims", false); return; }
+    status("offerStatus", "Creating the offer…");
+    el("create").disabled = true;
+    try {
+      const r = await api("POST", "/pre-authorized-data", request);
+      if (r.status !== 200 || !r.body || !r.body.credential_offer_uri) {
+        status("offerStatus", "The issuer refused the offer (" + r.status + "): " + (typeof r.body === "string" ? r.body : JSON.stringify(r.body)), false); return;
+      }
+      offer = r.body;
+      const deepLink = offer.credential_offer_uri;
+      el("offerUri").textContent = deepLink; el("offerUri").hidden = false;
+      el("qr").innerHTML = "";
+      new QRCode(el("qr"), { text: deepLink, width: 256, height: 256, correctLevel: QRCode.CorrectLevel.M });
+      el("copy").disabled = false;
+      el("open").href = deepLink; el("open").hidden = false;
+      const offerUrl = new URL(deepLink.replace(/^[a-z-]+:\/\//, "https://x/")).searchParams.get("credential_offer_uri");
+      offerDocument = offerUrl ? (await api("GET", offerUrl)).body : null;
+      el("offerDoc").textContent = JSON.stringify(offerDocument, null, 2); el("offerDoc").hidden = !offerDocument;
+      const grant = offerDocument && offerDocument.grants && offerDocument.grants["urn:ietf:params:oauth:grant-type:pre-authorized_code"];
+      status("offerStatus", grant ? "Offer created; the pre-authorized code is in the offer document below." : "Offer created (the offer document could not be fetched).", true);
+      el("wallet").disabled = !grant;
+      el("credential").hidden = true; status("walletStatus", "");
+    } catch (e) {
+      status("offerStatus", "Request failed: " + e.message, false);
+    } finally {
+      el("create").disabled = false;
+    }
+  });
+
+  el("copy").addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(el("offerUri").textContent); el("copy").textContent = "Copied"; setTimeout(() => el("copy").textContent = "Copy link", 1500); }
+    catch (e) { el("copy").textContent = "Select and copy the link above"; }
+  });
+
+  // ---- the in-page wallet: token, nonce, proof, credential
+  const b64url = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const b64urlText = (text) => b64url(new TextEncoder().encode(text));
+
+  async function proofJwt(audience, nonce) {
+    const key = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign"]);
+    const jwk = await crypto.subtle.exportKey("jwk", key.publicKey);
+    const header = { alg: "ES256", typ: "openid4vci-proof+jwt", jwk: { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y } };
+    const claims = { aud: audience, iat: Math.floor(Date.now() / 1000), nonce };
+    const signingInput = b64urlText(JSON.stringify(header)) + "." + b64urlText(JSON.stringify(claims));
+    const signature = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key.privateKey, new TextEncoder().encode(signingInput));
+    return signingInput + "." + b64url(signature); // WebCrypto's ECDSA signature is already the JOSE R||S form
+  }
+
+  el("wallet").addEventListener("click", async () => {
+    const grant = offerDocument.grants["urn:ietf:params:oauth:grant-type:pre-authorized_code"];
+    el("wallet").disabled = true;
+    try {
+      status("walletStatus", "1/3 exchanging the pre-authorized code for a token…");
+      const form = { grant_type: "urn:ietf:params:oauth:grant-type:pre-authorized_code", "pre-authorized_code": grant["pre-authorized_code"] };
+      if (el("txCode").value.trim()) form.tx_code = el("txCode").value.trim();
+      const token = await api("POST", tokenEndpoint, undefined, undefined, form);
+      if (token.status !== 200 || !token.body.access_token) { status("walletStatus", "Token request refused (" + token.status + "): " + JSON.stringify(token.body), false); return; }
+      status("walletStatus", "2/3 fetching a c_nonce…");
+      const nonce = await api("POST", "/oid4vci/nonce");
+      if (nonce.status !== 200) { status("walletStatus", "Nonce request refused (" + nonce.status + ")", false); return; }
+      status("walletStatus", "3/3 signing the proof and requesting the credential…");
+      const proof = await proofJwt(newMetadata.credential_issuer, nonce.body.c_nonce);
+      const credential = await api("POST", "/oid4vci/credential", { credential_configuration_id: el("configuration").value, proofs: { jwt: [proof] } },
+        { Authorization: (token.body.token_type || "Bearer") + " " + token.body.access_token });
+      el("credential").textContent = JSON.stringify(credential.body, null, 2); el("credential").hidden = false;
+      const issued = credential.status === 200 && credential.body.credentials && credential.body.credentials.length;
+      status("walletStatus", issued ? "Credential issued (" + credential.body.credentials.length + "); notification id " + credential.body.notification_id : "Credential request refused (" + credential.status + ")", !!issued);
+    } catch (e) {
+      status("walletStatus", "The flow failed: " + e.message, false);
+    } finally {
+      el("wallet").disabled = false;
+    }
+  });
+
+  load().catch((e) => status("offerStatus", "Could not load the issuer metadata: " + e.message, false));
+})();
+</script>
+</body>
+</html>

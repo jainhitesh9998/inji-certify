@@ -75,6 +75,10 @@ With `certify.protocol.vc-api.enabled=true`, `POST /vc-api/credentials/issue` (W
 ## Four defects found by the workflow run
 
 The v1 and v2 configuration APIs evicted the `issuerMetadataCache` through `@CacheEvict`, which fails with "Cannot find cache" on a deployment whose `mosip.certify.cache.names` does not list that name (every deployment upgrading with its own list); the eviction is programmatic and tolerant now, and the name is still worth adding to the list so metadata is cached. The service jar lacked `certify-keyprovider-jca`, which the x509-file provider needs, because the service declared it with test scope; enabling `certify.keyprovider.x509-file` failed at startup with `ClassNotFoundException`. The compose stack's `certify_init.sql` created `status_list_credential.capacity` where the DDL and the entity say `capacity_in_kb` (renamed in 0.13.0), so status lists failed on a fresh compose stack. And once a Token Status List existed, a Bitstring credential issued afterwards was given an index on that JWT list because the Bitstring lookup ignored the list type; the lookup is type-aware now. All four fixed.
+
+## Offer page
+
+With `certify.offer-page.enabled=true`, `{servletPath}/offer/` serves a page that creates a pre-authorized credential offer for a chosen configuration and subject, shows the `openid-credential-offer://` deep link as a QR code for a wallet, and can run the pre-authorized code flow itself (token, `c_nonce`, a proof signed in the browser, the credential). Off by default.
 # Changes in release 0.11.0
 
 ## Removal of  Artifactory dependency

@@ -102,6 +102,17 @@ curl -s -X POST http://localhost:8090/v1/certify/v2/credential-configurations/Fa
   -H 'Content-Type: application/json' -d '{"claims": {"fullName": "Preview Person"}}'
 ```
 
+## 5c. The offer page
+
+With `certify.offer-page.enabled=true` (on in the local profile and the compose rebuild profile) Certify serves a
+page at `{domain}{servletPath}/offer/` (for the compose stack `http://localhost:8090/v1/certify/offer/`): pick a
+credential configuration, give the subject the data provider resolves (the CSV row id) or claims as JSON, and
+"Create offer" posts to `/pre-authorized-data` and shows the `openid-credential-offer://` deep link as a QR code for
+a wallet to scan, with the offer document underneath. "Run the pre-authorized code flow here" lets the page play the
+wallet: token, `c_nonce`, a P-256 proof signed in the browser, and the credential from `/oid4vci/credential`. The
+page is a static file (`certify-service/src/main/resources/static/offer/`) opened by its own security chain, so
+nothing changes in the URL lists; keep it off in production unless the offer endpoint should be reachable that way.
+
 ## 6. Download with a wallet
 
 - Inji Web from the same compose (`inji-web` service) or the Inji mobile wallet: scan or open the offer, enter
