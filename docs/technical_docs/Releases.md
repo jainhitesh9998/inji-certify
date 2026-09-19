@@ -55,6 +55,10 @@ Once a client is registered under `certify.as.clients.<client-id>.redirect-uris`
 ## Holder keys as `did:key` with RSA
 
 A proof whose `kid` is an RSA `did:key` (multicodec `0x1205`) was decoded by 1.0.0-beta.1 but never verified: the resolver built the key without its `kid`, so signature verification found no matching key and the request failed with `invalid_proof`. It verifies now on both surfaces. Every other holder key form (`jwk` header with P-256, Ed25519 or RSA; `kid` as `did:jwk` or `did:key` with Ed25519, P-256 or secp256k1) is unchanged and covered by `HolderDidMethodsTest`; see `docs/design/18-compatibility-validation.md`.
+
+## Key attestations on the new surface
+
+`POST /oid4vci/credential` validates a `key_attestation` JOSE header on `jwt` proofs and accepts the `attestation` proof type (OpenID4VCI 1.0 Appendix D and F): the attestation must be typed `key-attestation+jwt`, signed by an attester configured under `certify.protocol.oid4vci-v1.key-attestation.attesters.<id>` (`jwks`, or `trust-anchor` for an `x5c` chain), unexpired, and carry the proof key in `attested_keys`; a configuration that lists `key_attestations_required` under `proof_types_supported.jwt` refuses proofs without one and checks the accepted `key_storage` and `user_authentication` values. One credential is issued per attested key, within `batch_size`. Compatibility surfaces are unchanged (`attestation` proofs answer `unsupported_proof_type` there, as any unknown type did).
 # Changes in release 0.11.0
 
 ## Removal of  Artifactory dependency

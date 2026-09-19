@@ -8,7 +8,7 @@ Two OpenID4VCI 1.0 behaviours the roadmap lists for Phase 3 (docs/design/11-road
 
 ## Scope
 
-- `certify.protocol.oid4vci-v1.nonce.single-use` (default true) and `certify.protocol.oid4vci-v1.batch.size` (default 10) in `Oid4vciV1Properties`.
+- `certify.protocol.oid4vci-v1.nonce.single-use` (default true) and `certify.protocol.oid4vci-v1.batch.size` (default 10) in `Oid4vciProperties`.
 - `RecordingNonceCheck` wraps the request's `CacheNonceCheck` and remembers every nonce the proofs presented; once the core answers with issued credentials, `Oid4vciCredentialController` consumes them (`CacheNonceCheck.consume`, `VCICacheService.evictNonceTransaction`). All proofs of a batch share one nonce, so consumption waits for the whole request; a refused request leaves the nonce valid.
 - `proofs` longer than `batch.size` answer `400 invalid_credential_request` before any proof is validated.
 - `batch_credential_issuance: {batch_size}` in the default (`CredentialIssuerMetadataDTO`) and per-tenant (`TenantIssuerMetadata`) documents of the new surface when the size is above 1. The v2 metadata golden is re-recorded for the new field; v1 and d13 goldens are untouched.

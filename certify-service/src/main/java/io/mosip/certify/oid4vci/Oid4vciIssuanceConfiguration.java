@@ -27,7 +27,7 @@ import java.util.List;
  * plugin, the jwt proof adapter. Listeners and status providers arrive with P1-10.
  */
 @Configuration
-@org.springframework.boot.context.properties.EnableConfigurationProperties(Oid4vciV1Properties.class)
+@org.springframework.boot.context.properties.EnableConfigurationProperties(Oid4vciProperties.class)
 public class Oid4vciIssuanceConfiguration {
 
     @Bean

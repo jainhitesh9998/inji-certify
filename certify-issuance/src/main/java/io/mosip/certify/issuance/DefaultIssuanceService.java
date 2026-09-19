@@ -135,7 +135,7 @@ public class DefaultIssuanceService implements IssuanceService {
                 throw new IssuanceException(IssuanceException.INVALID_PROOF, "Unsupported proof type " + proof.type());
             }
             try {
-                holders.add(validator.validate(proof, command.proofPolicy(), command.nonceCheck(), context));
+                holders.addAll(validator.validateAll(proof, command.proofPolicy(), command.nonceCheck(), context));
             } catch (ProofValidationException e) {
                 if (IssuanceException.INVALID_NONCE.equals(e.getErrorCode())) {
                     throw new IssuanceException(e.getErrorCode(), e.getMessage(), e);
@@ -146,6 +146,10 @@ public class DefaultIssuanceService implements IssuanceService {
         if (holders.isEmpty()) {
             throw new IssuanceException(IssuanceException.INVALID_PROOF,
                     lastFailure != null ? lastFailure.getMessage() : "None of the submitted proofs passed validation", lastFailure);
+        }
+        if (command.maxCredentials() > 0 && holders.size() > command.maxCredentials()) {
+            throw new IssuanceException(IssuanceException.INVALID_CREDENTIAL_REQUEST,
+                    "The proofs bind " + holders.size() + " keys; batch_size is " + command.maxCredentials());
         }
         return holders;
     }
