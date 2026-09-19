@@ -62,6 +62,9 @@ public class OAuthAuthorizationServerMetadataDTO {
     /**
      * Interactive authorization endpoint for OAuth 2.0 flows
      */
+    @JsonProperty("token_endpoint_auth_methods_supported")
+    private List<String> tokenEndpointAuthMethodsSupported;
+
     @JsonProperty("authorization_endpoint")
     private String authorizationEndpoint;
 

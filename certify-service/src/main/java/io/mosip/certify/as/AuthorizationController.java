@@ -21,13 +21,16 @@ import java.util.Map;
 public class AuthorizationController {
 
     private final AuthorizationCodeService service;
+    private final ClientAttestationValidator clientAttestation;
 
-    public AuthorizationController(AuthorizationCodeService service) {
+    public AuthorizationController(AuthorizationCodeService service, ClientAttestationValidator clientAttestation) {
         this.service = service;
+        this.clientAttestation = clientAttestation;
     }
 
     @PostMapping(value = "/oauth/par", consumes = MediaType.APPLICATION_FORM_URLENCODED_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<Map<String, Object>> par(@RequestParam Map<String, String> params) {
+    public ResponseEntity<Map<String, Object>> par(@RequestParam Map<String, String> params, jakarta.servlet.http.HttpServletRequest http) {
+        clientAttestation.validate(http, params.get("client_id"));
         PushedAuthorizationRequest request = service.push(params);
         long expiresIn = Math.max(1, request.expiresAtEpochSeconds() - Instant.now().getEpochSecond());
         return ResponseEntity.status(HttpStatus.CREATED)

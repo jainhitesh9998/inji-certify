@@ -116,6 +116,12 @@ public class VCICacheService {
         return wrapper != null ? (io.mosip.certify.as.PushedAuthorizationRequest) wrapper.get() : null;
     }
 
+    /** Records a client attestation PoP jti; false when it was seen before (replay). The entry lives as long as the cache does. */
+    public boolean claimClientAttestationJti(String jti, long windowSeconds) {
+        Cache c = cacheManager.getCache("preAuthCodeCache");
+        return c.putIfAbsent("capop:" + jti, Long.valueOf(windowSeconds)) == null;
+    }
+
     public void evictPushedAuthorizationRequest(String id) {
         cacheManager.getCache("preAuthCodeCache").evict(PAR_PREFIX + id);
     }

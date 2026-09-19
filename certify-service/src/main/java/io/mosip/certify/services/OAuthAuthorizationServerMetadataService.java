@@ -72,6 +72,9 @@ public class OAuthAuthorizationServerMetadataService {
             metadata.setAuthorizationEndpoint(base + "/oauth/authorize");
             metadata.setPushedAuthorizationRequestEndpoint(base + "/oauth/par");
             metadata.setRequirePushedAuthorizationRequests(Boolean.TRUE);
+            if (as.clientAttestation() != null && as.clientAttestation().attesters() != null && !as.clientAttestation().attesters().isEmpty()) {
+                metadata.setTokenEndpointAuthMethodsSupported(java.util.List.of(io.mosip.certify.as.ClientAttestationValidator.AUTH_METHOD));
+            }
         }
 
         log.debug("OAuth Authorization Server metadata built successfully for issuer: {}", issuer);

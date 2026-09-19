@@ -38,6 +38,9 @@ public class OAuthController {
     private final PreAuthorizedCodeService preAuthorizedCodeService;
 
     @Autowired
+    private org.springframework.beans.factory.ObjectProvider<io.mosip.certify.as.ClientAttestationValidator> clientAttestationValidator;
+
+    @Autowired
     public OAuthController(IarService iarService,
                            OAuthAuthorizationServerMetadataService oAuthAuthorizationServerMetadataService,
                            PreAuthorizedCodeService preAuthorizedCodeService) {
@@ -105,9 +108,17 @@ public class OAuthController {
     @PostMapping(value = "/oauth/token",
                  consumes = MediaType.APPLICATION_FORM_URLENCODED_VALUE,
                  produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<OAuthTokenResponse> processTokenRequest(@RequestParam Map<String, String> params)
+    public ResponseEntity<OAuthTokenResponse> processTokenRequest(@RequestParam Map<String, String> params, jakarta.servlet.http.HttpServletRequest http)
             throws CertifyException {
         log.info("Received OAuth token request");
+        io.mosip.certify.as.ClientAttestationValidator attestation = clientAttestationValidator.getIfAvailable();
+        if (attestation != null) {
+            try {
+                attestation.validate(http, params.get("client_id")); // HAIP: client authentication at every OAuth endpoint
+            } catch (io.mosip.certify.as.AsException e) {
+                throw new CertifyException(e.error(), e.getMessage());
+            }
+        }
         try {
             OAuthTokenResponse response;
             String grantType = params.get("grant_type");
