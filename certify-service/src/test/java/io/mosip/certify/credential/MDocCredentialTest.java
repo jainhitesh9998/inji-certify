@@ -6,7 +6,6 @@ import io.mosip.certify.core.constants.VCFormats;
 import io.mosip.certify.core.exception.CertifyException;
 import io.mosip.certify.utils.MDocProcessor;
 import io.mosip.certify.vcformatters.VCFormatter;
-import io.mosip.kernel.signature.service.SignatureService;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -38,8 +37,6 @@ public class MDocCredentialTest {
     @Mock
     private VCFormatter vcFormatter;
 
-    @Mock
-    private SignatureService signatureService;
 
     @Mock
     private ObjectMapper objectMapper;
@@ -49,7 +46,7 @@ public class MDocCredentialTest {
 
     @Before
     public void setUp() {
-        mDocCredential = new MDocCredential(vcFormatter, signatureService);
+        mDocCredential = new MDocCredential(vcFormatter);
         // Inject the mocked dependencies using ReflectionTestUtils
         ReflectionTestUtils.setField(mDocCredential, "objectMapper", objectMapper);
         ReflectionTestUtils.setField(mDocCredential, "mDocProcessor", mDocProcessor);
@@ -197,7 +194,7 @@ public class MDocCredentialTest {
                     .thenReturn(cborIssuerSigned);
 
             VCResult<?> result = mDocCredential.addProof(
-                    vcToSign, null, signAlgorithm, appID, refID, didUrl, "Ed25519Signature2020"
+                    vcToSign, signAlgorithm, appID, refID, didUrl, "Ed25519Signature2020"
             );
 
             assertNotNull("Result should not be null", result);
@@ -238,7 +235,7 @@ public class MDocCredentialTest {
             mockedStatic.when(() -> MDocProcessor.encodeToCBOR(any())).thenReturn(cborIssuerSigned);
 
             VCResult<?> result = mDocCredential.addProof(
-                    vcToSign, null, "ES256", "appID", "refID", "https://example.com/did", "Ed25519Signature2020"
+                    vcToSign, "ES256", "appID", "refID", "https://example.com/did", "Ed25519Signature2020"
             );
 
             assertNotNull("Credential should not be null", result.getCredential());
@@ -278,7 +275,7 @@ public class MDocCredentialTest {
                 mockedStatic.when(() -> MDocProcessor.encodeToCBOR(any())).thenReturn(cborIssuerSigned);
 
                 VCResult<?> result = mDocCredential.addProof(
-                        vcToSign, null, algorithm, "appID", "refID", "https://example.com/did", "Ed25519Signature2020"
+                        vcToSign, algorithm, "appID", "refID", "https://example.com/did", "Ed25519Signature2020"
                 );
 
                 assertNotNull("Result should not be null for " + algorithm, result);
@@ -311,7 +308,7 @@ public class MDocCredentialTest {
             mockedStatic.when(() -> MDocProcessor.encodeToCBOR(any())).thenReturn(cborIssuerSigned);
 
             VCResult<?> result = mDocCredential.addProof(
-                    vcToSign, null, "ES256", "appID", "refID", "https://example.com/did", "Ed25519Signature2020"
+                    vcToSign, "ES256", "appID", "refID", "https://example.com/did", "Ed25519Signature2020"
             );
 
             assertNotNull("Result should not be null", result);
@@ -331,7 +328,7 @@ public class MDocCredentialTest {
                 .thenThrow(new RuntimeException("JSON parsing failed"));
 
         mDocCredential.addProof(
-                vcToSign, null, "ES256", appID, refID, "https://example.com/did", "Ed25519Signature2020"
+                vcToSign, "ES256", appID, refID, "https://example.com/did", "Ed25519Signature2020"
         );
     }
 
@@ -346,7 +343,7 @@ public class MDocCredentialTest {
                     .thenThrow(new RuntimeException("Salting failed"));
 
             mDocCredential.addProof(
-                    vcToSign, null, "ES256", "appID", "refID", "https://example.com/did", "Ed25519Signature2020"
+                    vcToSign, "ES256", "appID", "refID", "https://example.com/did", "Ed25519Signature2020"
             );
         }
     }
@@ -364,7 +361,7 @@ public class MDocCredentialTest {
                     .thenThrow(new RuntimeException("Digest calculation failed"));
 
             mDocCredential.addProof(
-                    vcToSign, null, "ES256", "appID", "refID", "https://example.com/did", "Ed25519Signature2020"
+                    vcToSign, "ES256", "appID", "refID", "https://example.com/did", "Ed25519Signature2020"
             );
         }
     }
@@ -385,7 +382,7 @@ public class MDocCredentialTest {
                     .thenThrow(new RuntimeException("MSO creation failed"));
 
             mDocCredential.addProof(
-                    vcToSign, null, "ES256", "appID", "refID", "https://example.com/did", "Ed25519Signature2020"
+                    vcToSign, "ES256", "appID", "refID", "https://example.com/did", "Ed25519Signature2020"
             );
         }
     }
@@ -408,7 +405,7 @@ public class MDocCredentialTest {
                     .thenThrow(new RuntimeException("MSO signing failed"));
 
             mDocCredential.addProof(
-                    vcToSign, null, "ES256", "appID", "refID", "https://example.com/did", "Ed25519Signature2020"
+                    vcToSign, "ES256", "appID", "refID", "https://example.com/did", "Ed25519Signature2020"
             );
         }
     }
@@ -437,7 +434,7 @@ public class MDocCredentialTest {
                     .thenThrow(new RuntimeException("CBOR encoding failed"));
 
             mDocCredential.addProof(
-                    vcToSign, null, "ES256", "appID", "refID", "https://example.com/did", "Ed25519Signature2020"
+                    vcToSign, "ES256", "appID", "refID", "https://example.com/did", "Ed25519Signature2020"
             );
         }
     }
@@ -463,7 +460,7 @@ public class MDocCredentialTest {
                     .thenThrow(new RuntimeException("IssuerSigned structure creation failed"));
 
             mDocCredential.addProof(
-                    vcToSign, null, "ES256", "appID", "refID", "https://example.com/did", "Ed25519Signature2020"
+                    vcToSign, "ES256", "appID", "refID", "https://example.com/did", "Ed25519Signature2020"
             );
         }
     }

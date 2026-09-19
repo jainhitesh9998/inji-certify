@@ -38,7 +38,6 @@ import com.nimbusds.jwt.PlainJWT;
 import io.mosip.certify.api.dto.VCResult;
 import io.mosip.certify.utils.SDJsonUtils;
 import io.mosip.certify.vcformatters.VCFormatter;
-import io.mosip.kernel.signature.service.SignatureService;
 import lombok.extern.slf4j.Slf4j;
 
 
@@ -47,15 +46,13 @@ import lombok.extern.slf4j.Slf4j;
 public class SDJWT extends Credential{
 
     @Autowired
-    public SDJWT(VCFormatter vcFormatter, SignatureService signatureService){
-        super(vcFormatter, signatureService);
+    public SDJWT(VCFormatter vcFormatter) {
+        super(vcFormatter);
     }
 
     @Autowired
     private ObjectMapper objectMapper;
 
-    @Autowired
-    private KeyProviderRegistry keyProviders;
 
     /**
      * This method returns true when a format can be handled.
@@ -127,7 +124,7 @@ public class SDJWT extends Credential{
      * @param didUrl url where the public key is accesible.
      */
     @Override
-    public VCResult<?> addProof(String vcToSign, String headers, String signAlgorithm, String appID, String refID, String didUrl, String signatureCryptoSuite) {
+    public VCResult<?> addProof(String vcToSign, String signAlgorithm, String appID, String refID, String didUrl, String signatureCryptoSuite) {
         VCResult<String> vcResult = new VCResult<>();
         String[] jwt = vcToSign.split("~");
         String[] jwtPayload = jwt[0].split("\\.");

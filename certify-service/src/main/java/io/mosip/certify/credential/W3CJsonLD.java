@@ -35,8 +35,6 @@ import io.mosip.certify.signing.SigningKey;
 import io.mosip.certify.services.CertifyIssuanceServiceImpl;
 import io.mosip.certify.utils.DIDDocumentUtil;
 import io.mosip.certify.vcformatters.VCFormatter;
-import io.mosip.kernel.signature.service.SignatureService;
-import io.mosip.kernel.signature.service.SignatureServicev2;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
@@ -59,8 +57,6 @@ public class W3CJsonLD extends Credential{
     @Autowired
     ProofGeneratorFactory proofGeneratorFactory;
     @Autowired
-    SignatureServicev2 signatureService;
-    @Autowired
     DIDDocumentUtil didDocumentUtil;
 
     @Value("#{${mosip.certify.signature-algo.key-alias-mapper}}")
@@ -69,8 +65,6 @@ public class W3CJsonLD extends Credential{
     @Autowired
     private StaticContextLoader staticContextLoader;
 
-    @Autowired
-    private KeyProviderRegistry keyProviders;
 
 
     /**
@@ -79,8 +73,8 @@ public class W3CJsonLD extends Credential{
      * @param vcFormatter
      * @param signatureService
      */
-    public W3CJsonLD(VCFormatter vcFormatter, SignatureService signatureService) {
-        super(vcFormatter, signatureService);
+    public W3CJsonLD(VCFormatter vcFormatter) {
+        super(vcFormatter);
     }
 
 
@@ -102,7 +96,7 @@ public class W3CJsonLD extends Credential{
      * @param headers headers to be added. Can be null.
      */
     @Override
-    public VCResult<?> addProof(String vcToSign, String headers, String signAlgorithm, String appID, String refID, String didUrl, String signatureCryptoSuite){
+    public VCResult<?> addProof(String vcToSign, String signAlgorithm, String appID, String refID, String didUrl, String signatureCryptoSuite){
         VCResult<JsonLDObject> vcResult = new VCResult<>();
         Map<String,String> keyReferenceDetails = Map.of(Constants.APPLICATION_ID, appID, Constants.REFERENCE_ID, refID);
         JsonLDObject jsonLDObject = JsonLDObject.fromJson(vcToSign);

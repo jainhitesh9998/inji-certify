@@ -19,7 +19,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import io.mosip.certify.api.dto.VCResult;
 import io.mosip.certify.vcformatters.VCFormatter;
-import io.mosip.kernel.signature.service.SignatureService;
 import lombok.extern.slf4j.Slf4j;
 
 /**
@@ -36,8 +35,8 @@ public class MDocCredential extends Credential {
     @Autowired
     private MDocProcessor mDocProcessor;
 
-    public MDocCredential(VCFormatter vcFormatter, SignatureService signatureService) {
-        super(vcFormatter, signatureService);
+    public MDocCredential(VCFormatter vcFormatter) {
+        super(vcFormatter);
     }
 
     @Override
@@ -59,7 +58,7 @@ public class MDocCredential extends Credential {
     }
 
     @Override
-    public VCResult<?> addProof(String vcToSign, String headers, String signAlgorithm, String appID, String refID, String didUrl, String signatureCryptoSuite) {
+    public VCResult<?> addProof(String vcToSign, String signAlgorithm, String appID, String refID, String didUrl, String signatureCryptoSuite) {
         try {
             VCResult<String> vcResult = new VCResult<>();
 

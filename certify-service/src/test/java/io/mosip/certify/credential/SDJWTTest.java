@@ -7,9 +7,6 @@ import io.mosip.certify.core.constants.ErrorConstants;
 import io.mosip.certify.core.constants.VCFormats;
 import io.mosip.certify.core.exception.CertifyException;
 import io.mosip.certify.vcformatters.VCFormatter;
-import io.mosip.kernel.signature.dto.JWSSignatureRequestDtoV2;
-import io.mosip.kernel.signature.dto.JWTSignatureResponseDto;
-import io.mosip.kernel.signature.service.SignatureService;
 
 import org.junit.Before;
 import org.junit.Test;
@@ -32,8 +29,6 @@ public class SDJWTTest {
     @Mock
     private VCFormatter mockFormatter;
 
-    @Mock
-    private SignatureService mockSignatureService;
 
     private ObjectMapper objectMapper = new ObjectMapper();
 
@@ -113,7 +108,7 @@ public class SDJWTTest {
         String payload = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString("{\"vct\":\"Farmer\"}".getBytes());
         String unsignedVC = "eyJhbGciOiJub25lIn0." + payload + "~disclosure";
 
-        VCResult<?> result = sdjwt.addProof(unsignedVC, null, "ES256", "appID", "refID", "url", null);
+        VCResult<?> result = sdjwt.addProof(unsignedVC, "ES256", "appID", "refID", "url", null);
 
         String credential = (String) result.getCredential();
         assertTrue(credential.endsWith("~disclosure"));
@@ -133,7 +128,7 @@ public class SDJWTTest {
     @Test
     public void testAddProof_RejectsUnknownAlgorithm() {
         ReflectionTestUtils.setField(sdjwt, "keyProviders", io.mosip.certify.signing.TestKeyProviders.registry("appID/refID", io.mosip.certify.signing.SignatureAlgorithm.ES256));
-        CertifyException e = assertThrows(CertifyException.class, () -> sdjwt.addProof("h.p~d", null, "HS256", "appID", "refID", "url", null));
+        CertifyException e = assertThrows(CertifyException.class, () -> sdjwt.addProof("h.p~d", "HS256", "appID", "refID", "url", null));
         assertEquals(ErrorConstants.VC_SIGNING_ERROR, e.getErrorCode());
     }
 }
