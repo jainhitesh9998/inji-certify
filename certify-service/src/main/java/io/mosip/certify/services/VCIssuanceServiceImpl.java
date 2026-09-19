@@ -104,7 +104,7 @@ public class VCIssuanceServiceImpl implements VCIssuanceService {
             ProofValidator proofValidator = proofValidatorFactory.getProofValidator(proofType);
             for (String proofValue : entry.getValue()) {
                 try {
-                    String validCNonce = VCIssuanceUtil.validateAndGetClientNonce(vciCacheService, proofValue, log, nonceEndpoint);
+                    String validCNonce = VCIssuanceUtil.validateAndGetClientNonce(vciCacheService, proofValue, nonceEndpoint);
 
                     boolean isValid = proofValidator.validate(clientId, validCNonce, proofValue, supportedProofTypes);
                     if (!isValid) {

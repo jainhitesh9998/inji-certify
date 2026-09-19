@@ -29,7 +29,7 @@ import io.mosip.certify.core.exception.RenderingTemplateException;
 import io.mosip.certify.entity.CredentialConfig;
 import io.mosip.certify.repository.CredentialConfigRepository;
 import io.mosip.certify.core.spi.RenderingTemplateService;
-import io.mosip.certify.services.CredentialUtils;
+import io.mosip.certify.utils.CredentialUtils;
 import jakarta.annotation.PostConstruct;
 import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;

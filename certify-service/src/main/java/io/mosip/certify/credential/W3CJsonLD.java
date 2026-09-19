@@ -12,6 +12,8 @@ import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
+import java.io.IOException;
+import java.security.GeneralSecurityException;
 import java.util.*;
 
 import com.danubetech.dataintegrity.DataIntegrityProof;
@@ -31,7 +33,6 @@ import io.mosip.certify.signing.SignatureAlgorithm;
 import io.mosip.certify.signing.SignerByteSigner;
 import io.mosip.certify.signing.SigningKey;
 import io.mosip.certify.services.CertifyIssuanceServiceImpl;
-import io.mosip.certify.utils.CredentialUtils;
 import io.mosip.certify.utils.DIDDocumentUtil;
 import io.mosip.certify.vcformatters.VCFormatter;
 import io.mosip.kernel.signature.service.SignatureService;
@@ -40,7 +41,11 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
+import com.apicatalog.jsonld.lang.Keywords;
+import foundation.identity.jsonld.JsonLDException;
 import foundation.identity.jsonld.JsonLDObject;
+import foundation.identity.jsonld.JsonLDUtils;
+import info.weboftrust.ldsignatures.canonicalizer.Canonicalizer;
 import info.weboftrust.ldsignatures.LdProof;
 import io.mosip.certify.api.dto.VCResult;
 import io.mosip.certify.core.exception.CertifyException;
@@ -133,7 +138,7 @@ public class W3CJsonLD extends Credential{
                     .created(createDate).proofPurpose(VCDMConstants.ASSERTION_METHOD)
                     .verificationMethod(URI.create(didUrl + "#" + kid))
                     .build();
-            LdProof ldProofWithJWS = CredentialUtils.generateLdProof(vcLdProof, jsonLDObject,
+            LdProof ldProofWithJWS = generateLdProof(vcLdProof, jsonLDObject,
                     keyReferenceDetails, proofGenerator);
             ldProofWithJWS.addToJsonLDObject(jsonLDObject);
         } else {
@@ -153,7 +158,7 @@ public class W3CJsonLD extends Credential{
                     .verificationMethod(URI.create(didUrl + "#" + kid))
                     .type(SignatureAlg.DATA_INTEGRITY).build();
 
-            dataIntegrityProof = CredentialUtils.generateDataIntegrityProof(dataIntegrityProof, jsonLDObject, signer);
+            dataIntegrityProof = generateDataIntegrityProof(dataIntegrityProof, jsonLDObject, signer);
             dataIntegrityProof.addToJsonLDObject(jsonLDObject);
         }
         vcResult.setCredential(jsonLDObject);
@@ -161,4 +166,51 @@ public class W3CJsonLD extends Credential{
         return vcResult;
     }
 
+
+    /** Legacy suites (Ed25519Signature2018/2020, RsaSignature2018, ...): canonicalise, then let the proof generator sign the hash. */
+    private static LdProof generateLdProof(LdProof vcLdProof, JsonLDObject jsonLDObject, Map<String, String> keyReferenceDetails,
+                                           ProofGenerator proofGenerator) {
+        Canonicalizer canonicalizer = proofGenerator.getCanonicalizer();
+        byte[] vcHashBytes;
+        try {
+            vcHashBytes = canonicalizer.canonicalize(vcLdProof, jsonLDObject);
+        } catch (IOException | GeneralSecurityException | JsonLDException e) {
+            log.error("Error occurred during canonicalization.", e);
+            throw new CertifyException(ErrorConstants.CANONICALIZATION_ERROR, "Error occurred during canonicalization.");
+        }
+        String vcEncodedHash = Base64.getUrlEncoder().encodeToString(vcHashBytes);
+        return proofGenerator.generateProof(vcLdProof, vcEncodedHash, keyReferenceDetails);
+    }
+
+    /** Data Integrity cryptosuites (eddsa-rdfc-2022, ecdsa-jcs-2019, ...): the danubetech signer canonicalises and signs. */
+    private static DataIntegrityProof generateDataIntegrityProof(DataIntegrityProof dataIntegrityProof, JsonLDObject jsonLDObject, LdSigner signer) {
+        DataIntegrityProof.Builder<? extends DataIntegrityProof.Builder<?>> ldProofBuilder = DataIntegrityProof.builder()
+                .base(dataIntegrityProof)
+                .defaultContexts(false);
+        try {
+            signer.initialize(ldProofBuilder);
+        } catch (GeneralSecurityException e) {
+            log.error("Error during cryptosuite initialization", e);
+            throw new CertifyException(ErrorConstants.CRYPTOSUITE_INITIALIZATION_ERROR, "Error occurred during crypto suite initialization.");
+        }
+        DataIntegrityProof ldProofOptions = DataIntegrityProof.fromJson(dataIntegrityProof.toJson());
+        if (ldProofOptions.getContexts() == null || ldProofOptions.getContexts().isEmpty()) {
+            JsonLDUtils.jsonLdAdd(ldProofOptions, Keywords.CONTEXT, jsonLDObject.getContexts().stream().map(JsonLDUtils::uriToString).filter(Objects::nonNull).toList());
+        }
+        com.danubetech.dataintegrity.canonicalizer.Canonicalizer canonicalizer = signer.getCanonicalizer(ldProofOptions);
+        byte[] canonicalizationResult;
+        try {
+            canonicalizationResult = canonicalizer.canonicalize(ldProofOptions, jsonLDObject);
+        } catch (IOException | GeneralSecurityException | JsonLDException e) {
+            log.error("Error occurred during canonicalization.", e);
+            throw new CertifyException(ErrorConstants.CANONICALIZATION_ERROR, "Error occurred during canonicalization.");
+        }
+        try {
+            signer.sign(ldProofBuilder, canonicalizationResult);
+        } catch (GeneralSecurityException e) {
+            log.error("Error occurred while signing the Verifiable Credential.", e);
+            throw new CertifyException(ErrorConstants.VC_SIGNING_ERROR, "Error occurred while signing the Verifiable Credential.");
+        }
+        return ldProofBuilder.build();
+    }
 }

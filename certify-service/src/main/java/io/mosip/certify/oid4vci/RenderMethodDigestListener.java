@@ -11,7 +11,7 @@ import io.mosip.certify.spi.HolderBinding;
 import io.mosip.certify.spi.IssuanceContext;
 import io.mosip.certify.spi.IssuanceListener;
 import io.mosip.certify.spi.TemplateRef;
-import io.mosip.certify.services.CredentialUtils;
+import io.mosip.certify.utils.CredentialUtils;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.annotation.Order;
 import org.springframework.core.env.Environment;

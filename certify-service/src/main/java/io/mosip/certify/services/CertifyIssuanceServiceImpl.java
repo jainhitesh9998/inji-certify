@@ -53,7 +53,6 @@ import java.time.format.DateTimeParseException;
 import java.util.*;
 import java.util.stream.Collectors;
 
-import static io.mosip.certify.utils.CredentialUtils.toJsonMap;
 import static io.mosip.certify.utils.VCIssuanceUtil.getScopeCredentialMapping;
 
 @Slf4j
@@ -176,7 +175,7 @@ public class CertifyIssuanceServiceImpl implements VCIssuanceService {
             ProofValidator proofValidator = proofValidatorFactory.getProofValidator(proofType);
             for (String proofValue : entry.getValue()) {
                 try {
-                    String validCNonce = VCIssuanceUtil.validateAndGetClientNonce(vcICacheService, proofValue, log, nonceEndpoint);
+                    String validCNonce = VCIssuanceUtil.validateAndGetClientNonce(vcICacheService, proofValue, nonceEndpoint);
 
                     boolean isValid = proofValidator.validate(clientId, validCNonce, proofValue, supportedProofTypes);
                     if (!isValid) {
@@ -432,5 +431,27 @@ public class CertifyIssuanceServiceImpl implements VCIssuanceService {
         }
         log.info("Signed QR codes generated successfully for template");
         return signedQrCodes;
+    }
+
+    /** The template model with lists and maps wrapped as org.json values so Velocity renders them as JSON. */
+    private static Map<String, Object> toJsonMap(Map<String, Object> valueMap) {
+        Map<String, Object> wrapped = new HashMap<>();
+        for (Map.Entry<String, Object> entry : valueMap.entrySet()) {
+            String key = entry.getKey();
+            Object value = entry.getValue();
+            if (key == null || value == null) {
+                continue;
+            }
+            if (value instanceof List) {
+                wrapped.put(key, new JSONArray((List<Object>) value));
+            } else if (value.getClass().isArray()) {
+                wrapped.put(key, new JSONArray(List.of(value)));
+            } else if (value instanceof String || value instanceof Map<?, ?>) {
+                wrapped.put(key, JSONObject.wrap(value));
+            } else {
+                wrapped.put(key, value); // numbers and other scalars render as they are
+            }
+        }
+        return wrapped;
     }
 }
