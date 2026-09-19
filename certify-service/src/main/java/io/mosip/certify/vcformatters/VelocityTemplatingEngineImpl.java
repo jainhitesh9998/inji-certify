@@ -18,7 +18,6 @@ import org.apache.velocity.tools.generic.EscapeTool;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
-import org.springframework.cache.annotation.Cacheable;
 
 
 import org.json.JSONArray;
@@ -67,12 +66,11 @@ public class VelocityTemplatingEngineImpl implements VCFormatter {
     }
 
     /**
-     * Internal method to fetch CredentialConfig, leveraging Spring Cache.
+     * The active row for a template key; called within this class, so it was never served by the Spring cache it declared.
      * The key is expected to be "credentialType:context:credentialFormat".
      */
-    @Cacheable(cacheNames = "credentialConfig", key = "#templateKey")
-    protected CredentialConfig getCachedCredentialConfig(String templateKey) {
-        log.debug("Cache miss for credentialConfig with key: {}. Fetching from DB.", templateKey);
+    private CredentialConfig getCachedCredentialConfig(String templateKey) {
+        log.debug("Fetching credentialConfig for key: {}", templateKey);
         if (templateKey == null || !templateKey.contains(DELIMITER)) {
             log.error("Invalid templateKey format for getCachedCredentialConfig: {}", templateKey);
             throw new CertifyException(ErrorConstants.EXPECTED_TEMPLATE_NOT_FOUND, "Invalid template key format: " + templateKey);

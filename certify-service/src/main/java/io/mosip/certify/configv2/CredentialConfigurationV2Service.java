@@ -29,7 +29,6 @@ import io.mosip.certify.spi.UnsignedCredential;
 import io.mosip.certify.tenancy.TenantContexts;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.annotation.CacheEvict;
-import org.springframework.cache.annotation.Caching;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.DigestUtils;
@@ -53,7 +52,6 @@ import java.util.stream.Collectors;
 @Service
 public class CredentialConfigurationV2Service {
 
-    static final String LEGACY_CONFIG_CACHE = "credentialConfig";
     static final HolderBinding PREVIEW_HOLDER = HolderBinding.did("did:example:preview-holder", "jwt");
 
     private final CredentialConfigRepository configurations;
@@ -89,8 +87,7 @@ public class CredentialConfigurationV2Service {
     }
 
     @Transactional
-    @Caching(evict = {@CacheEvict(cacheNames = CredentialRegistry.CACHE_NAME, allEntries = true),
-            @CacheEvict(cacheNames = LEGACY_CONFIG_CACHE, allEntries = true)})
+    @CacheEvict(cacheNames = CredentialRegistry.CACHE_NAME, allEntries = true)
     public CredentialConfigurationV2 create(CredentialConfigurationV2 body) {
         String tenant = tenant();
         if (body.getId() == null || body.getId().isBlank()) {
@@ -128,8 +125,7 @@ public class CredentialConfigurationV2Service {
     }
 
     @Transactional
-    @Caching(evict = {@CacheEvict(cacheNames = CredentialRegistry.CACHE_NAME, allEntries = true),
-            @CacheEvict(cacheNames = LEGACY_CONFIG_CACHE, allEntries = true)})
+    @CacheEvict(cacheNames = CredentialRegistry.CACHE_NAME, allEntries = true)
     public CredentialConfigurationV2 update(String id, CredentialConfigurationV2 body) {
         String tenant = tenant();
         CredentialConfig row = find(tenant, id);
@@ -148,8 +144,7 @@ public class CredentialConfigurationV2Service {
     }
 
     @Transactional
-    @Caching(evict = {@CacheEvict(cacheNames = CredentialRegistry.CACHE_NAME, allEntries = true),
-            @CacheEvict(cacheNames = LEGACY_CONFIG_CACHE, allEntries = true)})
+    @CacheEvict(cacheNames = CredentialRegistry.CACHE_NAME, allEntries = true)
     public void delete(String id) {
         CredentialConfig row = find(tenant(), id);
         configurations.delete(row); // template versions stay: the row can be recreated against them
