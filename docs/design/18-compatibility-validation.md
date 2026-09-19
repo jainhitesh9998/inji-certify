@@ -21,18 +21,14 @@ that proves each item still works on the new surface (`POST /oid4vci/credential`
 | `kid: did:key:zDna...` (`0x1200`, sent as `0x80 0x24`) | P-256, ES256 | the `kid` as sent | yes | yes |
 | `kid: did:key:zQ3s...` (`0xe701`) | secp256k1, ES256K | the `kid` as sent | yes, when `ES256K` is in `proof_signing_alg_values_supported` (the shipped defaults list RS256, PS256, ES256, EdDSA) | same |
 | `kid: did:key:z4MX...` (`0x1205`, sent as `0x85 0x24`) | RSA 2048, RS256 | the `kid` as sent | decoded but never verified: the resolver built the JWK without its `kid`, so the JWS key selector answered "no matching key(s) found" and the request failed with `invalid_proof` | fixed: the RSA branch now sets `kid` like the P-256 branch; both surfaces issue |
+| `kid: did:web:wallet.example#key-1` | any key the DID document publishes (`publicKeyJwk` or `publicKeyMultibase`) | the `kid` as sent | rejected (`invalid_proof`) | resolved when `certify.protocol.oid4vci-v1.did-web-holders.enabled` is set (P3-11); rejected as before otherwise |
 
 Proof claim checks (`typ openid4vci-proof+jwt`, allowed `alg`, exactly one of `kid` or `jwk`, `aud`, `iat`,
 `nonce`, optional `exp`, `iss` equal to the client id when present) are the `develop` code and stay covered by
 `JwtProofValidatorTest`; the new surface adds names for the failures (`invalid_proof`, `invalid_nonce`) that the
 compatibility surface reports as a plain `invalid_proof`.
 
-Not supported on `develop` and not supported here: holders identified by `did:web`, by an `x5c` chain or by a
-bare JWK thumbprint `kid`. Note that the shipped local profile advertises
-`cryptographic_binding_methods_supported: [did:jwk, did:web]` for `ldp_vc` and `dc+sd-jwt` although no resolver
-honours `did:web` holders; a proof with `kid: did:web:...` is rejected. Either the default should drop `did:web`
-or a `did:web` `HolderKeyResolver` should be added (capability gap 6 in `04-capability-gaps.md`). Owner's call,
-recorded in `12-risks-and-decisions.md`.
+Not supported on `develop`: holders identified by `did:web`, by an `x5c` chain or by a bare JWK thumbprint `kid`. The shipped local profile nevertheless advertised `did:web` for `ldp_vc` and `dc+sd-jwt`. Decided by the owner on 2026-09-19: the default advertises `did:jwk` and `did:key`, and `did:web` holders resolve when `certify.protocol.oid4vci-v1.did-web-holders.enabled` is set (P3-11, `DIDwebProofManager`: the DID document is fetched over HTTPS and the verification method named by the `kid` supplies the key). `x5c` and thumbprint holders remain unsupported.
 
 ## Issuer identity
 

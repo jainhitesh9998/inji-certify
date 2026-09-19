@@ -80,7 +80,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
         "mosip.certify.data-provider-plugin.id-field-prefix-uri=urn:uuid:",
         "mosip.certify.signature-algo.key-alias-mapper={'EdDSA': {{'CERTIFY_VC_SIGN_ED25519','ED25519_SIGN'}}}",
         "mosip.certify.credential-config.credential-signing-alg-values-supported={'Ed25519Signature2020': {'EdDSA'}}",
-        "mosip.certify.credential-config.cryptographic-binding-methods-supported={'ldp_vc': {'did:jwk','did:key'}}",
+        "mosip.certify.credential-config.cryptographic-binding-methods-supported={'ldp_vc': {'did:jwk','did:key','did:web'}}",
+        "certify.protocol.oid4vci-v1.did-web-holders.enabled=true",
         "mosip.certify.credential-config.proof-types-supported={'jwt': {'proof_signing_alg_values_supported': {'RS256','PS256','ES256','ES256K','EdDSA'}}}"
 })
 class HolderDidMethodsTest {
@@ -93,6 +94,7 @@ class HolderDidMethodsTest {
     @Autowired CredentialConfigurationService credentialConfigurationService;
     @Autowired CredentialConfigRepository credentialConfigRepository;
     @MockBean DataProviderPlugin dataProviderPlugin;
+    @MockBean io.mosip.certify.proof.DidDocumentFetcher didDocuments;
     @Value("${mosip.certify.identifier}") String issuerIdentifier;
 
     /** A holder key as a wallet presents it: {@code kid == null} puts the public JWK in the header. */
@@ -102,6 +104,9 @@ class HolderDidMethodsTest {
             return label;
         }
     }
+
+    /** The key behind did:web:wallet.example#key-1; the stubbed fetcher serves its DID document. */
+    static final ECKey DID_WEB_KEY = generateP256();
 
     static Stream<Holder> holders() throws Exception {
         ECKey p256 = new ECKeyGenerator(Curve.P_256).generate();
@@ -118,12 +123,28 @@ class HolderDidMethodsTest {
                 new Holder("kid did:key P-256", p256, JWSAlgorithm.ES256, didKey(new byte[]{(byte) 0x80, 0x24}, compressed("secp256r1", p256))),
                 new Holder("kid did:key secp256k1", k256, JWSAlgorithm.ES256K, didKey(new byte[]{(byte) 0xe7, 0x01}, compressed("secp256k1", k256))),
                 new Holder("kid did:key RSA", rsa, JWSAlgorithm.RS256, didKey(new byte[]{(byte) 0x85, 0x24},
-                        new RSAPublicKey(rsa.getModulus().decodeToBigInteger(), rsa.getPublicExponent().decodeToBigInteger()).getEncoded("DER"))));
+                        new RSAPublicKey(rsa.getModulus().decodeToBigInteger(), rsa.getPublicExponent().decodeToBigInteger()).getEncoded("DER"))),
+                new Holder("kid did:web P-256 (did-web-holders.enabled)", DID_WEB_KEY, JWSAlgorithm.ES256, "did:web:wallet.example#key-1"));
+    }
+
+    static ECKey generateP256() {
+        try {
+            return new ECKeyGenerator(Curve.P_256).generate();
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
     }
 
     @BeforeEach
     void setUp() throws Exception {
         when(dataProviderPlugin.fetchData(any())).thenAnswer(inv -> new JSONObject(Map.of("fullName", "Bound Farmer", "dateOfBirth", "1990-01-01", "city", "Pune")));
+        when(didDocuments.fetch(any())).thenAnswer(inv -> {
+            if (!"https://wallet.example/.well-known/did.json".equals(inv.getArgument(0).toString())) {
+                throw new java.io.IOException("404 " + inv.getArgument(0));
+            }
+            return "{\"@context\":[\"https://www.w3.org/ns/did/v1\"],\"id\":\"did:web:wallet.example\",\"verificationMethod\":[{\"id\":\"did:web:wallet.example#key-1\","
+                    + "\"type\":\"JsonWebKey2020\",\"controller\":\"did:web:wallet.example\",\"publicKeyJwk\":" + DID_WEB_KEY.toPublicJWK().toJSONString() + "}]}";
+        });
         if (credentialConfigRepository.findByCredentialConfigKeyId(CONFIG_ID).isEmpty()) {
             credentialConfigurationService.addCredentialConfiguration(config());
         }
@@ -162,7 +183,7 @@ class HolderDidMethodsTest {
         // H2 stores TEXT[] as VARCHAR and reads the list back as one bracketed element; PostgreSQL keeps the array
         List<String> raw = objectMapper.convertValue(entry.get("cryptographic_binding_methods_supported"), objectMapper.getTypeFactory().constructCollectionType(List.class, String.class));
         String bindingMethods = String.join(",", raw);
-        assertTrue(bindingMethods.contains("did:jwk") && bindingMethods.contains("did:key"), path + ": " + bindingMethods);
+        assertTrue(bindingMethods.contains("did:jwk") && bindingMethods.contains("did:key") && bindingMethods.contains("did:web"), path + ": " + bindingMethods);
         assertEquals(List.of("RS256", "PS256", "ES256", "ES256K", "EdDSA"),
                 objectMapper.convertValue(entry.get("proof_types_supported").get("jwt").get("proof_signing_alg_values_supported"), List.class), path);
     }

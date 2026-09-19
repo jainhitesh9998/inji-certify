@@ -29,6 +29,7 @@ import io.mosip.certify.core.constants.ErrorConstants;
 import io.mosip.certify.core.exception.InvalidRequestException;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -47,6 +48,10 @@ public class JwtProofValidator implements ProofValidator {
 
     @Value("${mosip.certify.identifier}")
     private String credentialIdentifier;
+
+    /** Present only when did:web holders are enabled (DidWebHolderConfiguration). */
+    @Autowired(required = false)
+    private DIDwebProofManager didWebProofManager;
 
     @Override
     public String getProofType() {
@@ -179,7 +184,8 @@ public class JwtProofValidator implements ProofValidator {
         if ((Objects.isNull(jwsHeader.getKeyID()) && Objects.isNull(jwsHeader.getJWK()))
                 ||
                 (Objects.isNull(jwsHeader.getJWK()) && Objects.nonNull(jwsHeader.getKeyID()) &&
-                        !(jwsHeader.getKeyID().startsWith(DID_KEY_PREFIX) || jwsHeader.getKeyID().startsWith(DID_JWK_PREFIX))))
+                        !(jwsHeader.getKeyID().startsWith(DID_KEY_PREFIX) || jwsHeader.getKeyID().startsWith(DID_JWK_PREFIX)
+                                || (didWebProofManager != null && jwsHeader.getKeyID().startsWith(DIDwebProofManager.DID_WEB_PREFIX)))))
             throw new InvalidRequestException(ErrorConstants.PROOF_HEADER_INVALID_KEY);
 
         // both cannot be present, either one of them is only allowed
@@ -194,6 +200,8 @@ public class JwtProofValidator implements ProofValidator {
             return new DIDjwkProofManager();
         } else if (kid.startsWith("did:key:")) {
             return new DIDkeysProofManager();
+        } else if (kid.startsWith(DIDwebProofManager.DID_WEB_PREFIX) && didWebProofManager != null) {
+            return didWebProofManager; // certify.protocol.oid4vci-v1.did-web-holders.enabled
         } else {
             return new DIDjwkProofManager();
         }
