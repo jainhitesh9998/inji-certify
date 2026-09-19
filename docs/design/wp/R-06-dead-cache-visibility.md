@@ -22,5 +22,5 @@ No behaviour change: the metadata cache evictions stay; the `credentialConfig` c
 
 ## Acceptance criteria
 
-- [ ] `VelocityTemplatingEngineImplTest`, `CredentialConfigurationSupportedServiceImplTest`, `CredentialConfigurationV2Test`, `StatusListCredentialServiceTest`, `IssuanceGoldenTest` green; no golden changed.
-- [ ] Full `certify-service` suite green (reverse order); CI green after merge.
+- [x] `VelocityTemplatingEngineImplTest`, `CredentialConfigurationSupportedServiceImplTest`, `CredentialConfigurationV2Test`, `StatusListCredentialServiceTest`, `IssuanceGoldenTest` green; no golden changed.
+- [x] Full `certify-service` suite green (1034, reverse order, after F-01); CI: the integration-branch run after merge.
