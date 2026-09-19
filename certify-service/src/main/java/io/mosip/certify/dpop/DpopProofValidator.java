@@ -146,6 +146,28 @@ public class DpopProofValidator {
      * @throws InvalidDpopHeaderException on any failure; returns normally when the proof
      *         satisfies every rule in RFC 9449 section 4.3
      */
+    /**
+     * RFC 9449 section 5: a proof presented at the token endpoint has no access token to bind to yet; it proves
+     * possession of the key the issued token is then bound to. Answers the key thumbprint for {@code cnf.jkt}.
+     */
+    public String validateForTokenEndpoint(String dpopToken, HttpServletRequest request) {
+        SignedJWT jwt = parseDpopToken(dpopToken);
+        JWK jwk = validateDpopHeader(jwt);
+        verifySignature(jwt, jwk);
+        JWTClaimsSet claims = getClaims(jwt);
+        verifyHtmHtuClaims(claims, request);
+        verifyFreshness(claims);
+        String jkt = computeThumbprint(jwk);
+        String jti = claims.getJWTID();
+        if (jti == null || jti.isBlank()) {
+            throw new InvalidDpopHeaderException("DPoP proof is missing the jti claim");
+        }
+        if (checkAndMarkJti(jkt, jti)) {
+            throw new InvalidDpopHeaderException("DPoP proof has already been used");
+        }
+        return jkt;
+    }
+
     public void validate(String dpopToken, String accessToken,
                                    Map<String, Object> accessTokenClaims, HttpServletRequest request) {
         SignedJWT jwt = parseDpopToken(dpopToken);

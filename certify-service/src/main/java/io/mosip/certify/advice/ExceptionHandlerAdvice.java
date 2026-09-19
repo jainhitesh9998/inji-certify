@@ -347,6 +347,7 @@ public class ExceptionHandlerAdvice extends ResponseEntityExceptionHandler imple
         switch (certifyErrorCode.toLowerCase()) {
             case "invalid_request":
             case "invalid_grant":
+            case "invalid_dpop_proof": // RFC 9449 section 5.2
             case "invalid_client":
             case "unauthorized_client":
             case "unsupported_grant_type":

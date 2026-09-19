@@ -56,6 +56,10 @@ public class AccessTokenJwtUtil {
      * @return Signed JWT string
      */
     public String generateSignedJwt(IarSession session, String issuer, String audience, int expirySeconds) {
+        return generateSignedJwt(session, issuer, audience, expirySeconds, null);
+    }
+
+    public String generateSignedJwt(IarSession session, String issuer, String audience, int expirySeconds, String dpopJkt) {
         String identityData = session.getIdentityData();
         if (!StringUtils.hasText(identityData)) {
             log.warn("Identity data is null or empty for session: {}, transaction_id: {}",
@@ -70,7 +74,7 @@ public class AccessTokenJwtUtil {
             throw new CertifyException(ErrorConstants.INVALID_REQUEST, "Scope is required but not found in session");
         }
 
-        return generateSignedJwt(identityData, scope, session.getClientId(), issuer, audience, expirySeconds);
+        return generateSignedJwt(identityData, scope, session.getClientId(), issuer, audience, expirySeconds, dpopJkt);
     }
 
     /**
@@ -87,6 +91,12 @@ public class AccessTokenJwtUtil {
      */
     public String generateSignedJwt(String identityData, String scope, String clientId,
                                      String issuer, String audience, int expirySeconds) {
+        return generateSignedJwt(identityData, scope, clientId, issuer, audience, expirySeconds, null);
+    }
+
+    /** The same token, sender-constrained to the DPoP key thumbprint when one is given ({@code cnf.jkt}, RFC 9449 section 6.1). */
+    public String generateSignedJwt(String identityData, String scope, String clientId,
+                                     String issuer, String audience, int expirySeconds, String dpopJkt) {
         try {
             if (!StringUtils.hasText(identityData)) {
                 throw new CertifyException(ErrorConstants.INVALID_REQUEST, "Identity data is required");
@@ -109,6 +119,9 @@ public class AccessTokenJwtUtil {
             payload.put("exp", expiresAt);
             payload.put("client_id", clientId);
             payload.put("scope", scope);
+            if (dpopJkt != null && !dpopJkt.isBlank()) {
+                payload.put("cnf", Map.of("jkt", dpopJkt));
+            }
             log.debug("Added scope '{}' to JWT", scope);
 
             // Convert payload to JSON string

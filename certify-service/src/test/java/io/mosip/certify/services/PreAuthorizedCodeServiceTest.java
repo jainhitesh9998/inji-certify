@@ -172,13 +172,13 @@ public class PreAuthorizedCodeServiceTest {
         when(vciCacheService.getPreAuthCodeData(preAuthCode)).thenReturn(codeData);
         when(vciCacheService.claimPreAuthCode(preAuthCode)).thenReturn(true);
         when(vciCacheService.setPreAuthTransaction(anyString(), any(PreAuthTransaction.class))).thenReturn(null);
-        when(accessTokenJwtUtil.generateSignedJwt(anyString(), anyString(), anyString(), anyString(), anyString(), anyInt()))
+        when(accessTokenJwtUtil.generateSignedJwt(anyString(), anyString(), anyString(), anyString(), anyString(), anyInt(), org.mockito.ArgumentMatchers.isNull()))
                 .thenReturn("test.jwt.token");
 
         OAuthTokenResponse response = preAuthorizedCodeService.exchangePreAuthorizedCode(tokenRequest);
 
         Assert.assertEquals("test.jwt.token", response.getAccessToken());
-        verify(accessTokenJwtUtil).generateSignedJwt(org.mockito.ArgumentMatchers.eq("2154189532"), anyString(), anyString(), anyString(), anyString(), anyInt());
+        verify(accessTokenJwtUtil).generateSignedJwt(org.mockito.ArgumentMatchers.eq("2154189532"), anyString(), anyString(), anyString(), anyString(), anyInt(), org.mockito.ArgumentMatchers.isNull());
     }
 
     @Test
@@ -362,7 +362,7 @@ public class PreAuthorizedCodeServiceTest {
         when(vciCacheService.getPreAuthCodeData(preAuthCode)).thenReturn(codeData);
         when(vciCacheService.claimPreAuthCode(preAuthCode)).thenReturn(true);
         when(vciCacheService.setPreAuthTransaction(anyString(), any(PreAuthTransaction.class))).thenReturn(null);
-        when(accessTokenJwtUtil.generateSignedJwt(anyString(), anyString(), anyString(), anyString(), anyString(), anyInt()))
+        when(accessTokenJwtUtil.generateSignedJwt(anyString(), anyString(), anyString(), anyString(), anyString(), anyInt(), org.mockito.ArgumentMatchers.isNull()))
                 .thenReturn("test.jwt.token");
 
         OAuthTokenResponse response = preAuthorizedCodeService.exchangePreAuthorizedCode(tokenRequest);
@@ -401,7 +401,7 @@ public class PreAuthorizedCodeServiceTest {
         when(vciCacheService.getPreAuthCodeData(preAuthCode)).thenReturn(codeData);
         when(vciCacheService.claimPreAuthCode(preAuthCode)).thenReturn(true);
         when(vciCacheService.setPreAuthTransaction(anyString(), any(PreAuthTransaction.class))).thenReturn(null);
-        when(accessTokenJwtUtil.generateSignedJwt(anyString(), anyString(), anyString(), anyString(), anyString(), anyInt()))
+        when(accessTokenJwtUtil.generateSignedJwt(anyString(), anyString(), anyString(), anyString(), anyString(), anyInt(), org.mockito.ArgumentMatchers.isNull()))
                 .thenReturn("test.jwt.token");
 
         OAuthTokenResponse response = preAuthorizedCodeService.exchangePreAuthorizedCode(tokenRequest);

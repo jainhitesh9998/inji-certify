@@ -62,6 +62,9 @@ public class OAuthAuthorizationServerMetadataDTO {
     /**
      * Interactive authorization endpoint for OAuth 2.0 flows
      */
+    @JsonProperty("dpop_signing_alg_values_supported")
+    private List<String> dpopSigningAlgValuesSupported;
+
     @JsonProperty("token_endpoint_auth_methods_supported")
     private List<String> tokenEndpointAuthMethodsSupported;
 

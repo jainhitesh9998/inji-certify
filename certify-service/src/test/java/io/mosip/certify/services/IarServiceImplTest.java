@@ -258,7 +258,7 @@ public class IarServiceImplTest {
         when(iarSessionRepository.findByAuthorizationCode("iar_auth_abc123"))
                 .thenReturn(Optional.of(sessionForToken()));
         when(iarSessionRepository.markAuthorizationCodeAsUsed(anyString(), any())).thenReturn(1);
-        when(accessTokenJwtUtil.generateSignedJwt(any(IarSession.class), anyString(), anyString(), anyInt()))
+        when(accessTokenJwtUtil.generateSignedJwt(any(IarSession.class), anyString(), anyString(), anyInt(), org.mockito.ArgumentMatchers.isNull()))
                 .thenReturn("signed.jwt");
 
         OAuthTokenResponse response = iarService.processTokenRequest(validTokenRequest());
@@ -369,7 +369,7 @@ public class IarServiceImplTest {
         when(validator.validate(any())).thenReturn(Collections.emptySet());
         when(iarSessionRepository.findByAuthorizationCode(anyString())).thenReturn(Optional.of(sessionForToken()));
         when(iarSessionRepository.markAuthorizationCodeAsUsed(anyString(), any())).thenReturn(1);
-        when(accessTokenJwtUtil.generateSignedJwt(any(IarSession.class), anyString(), anyString(), anyInt()))
+        when(accessTokenJwtUtil.generateSignedJwt(any(IarSession.class), anyString(), anyString(), anyInt(), org.mockito.ArgumentMatchers.isNull()))
                 .thenThrow(new RuntimeException("kms down"));
         assertThrows(CertifyException.class, () -> iarService.processTokenRequest(validTokenRequest()));
     }

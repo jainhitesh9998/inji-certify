@@ -299,7 +299,7 @@ public class PreAuthorizedCodeService {
         validateTokenRequest(request, codeData);
 
         // Generate access token
-        String accessToken = generateAccessToken(codeData);
+        String accessToken = generateAccessToken(codeData, request.getDpopJkt());
 
         long currentTime = System.currentTimeMillis();
 
@@ -314,7 +314,7 @@ public class PreAuthorizedCodeService {
 
         OAuthTokenResponse response = new OAuthTokenResponse();
         response.setAccessToken(accessToken);
-        response.setTokenType("Bearer");
+        response.setTokenType(request.getDpopJkt() != null ? io.mosip.certify.core.constants.Constants.DPOP : "Bearer");
         response.setExpiresIn(accessTokenExpirySeconds);
         return response;
     }
@@ -357,7 +357,7 @@ public class PreAuthorizedCodeService {
      * Generate a signed JWT access token for pre-authorized code flow.
      * Calls AccessTokenJwtUtil.generateSignedJwt directly with raw parameters.
      */
-    private String generateAccessToken(PreAuthCodeData codeData) {
+    private String generateAccessToken(PreAuthCodeData codeData, String dpopJkt) {
         try {
             // the token subject: the record the offer named, else the offer's claims as JSON (PreAuthDataProviderPlugin reads them from the cache)
             String claimsJson = codeData.getSubject() != null ? codeData.getSubject()
@@ -393,7 +393,8 @@ public class PreAuthorizedCodeService {
                     "",
                     oauthIssuer,
                     oauthAudience,
-                    accessTokenExpirySeconds
+                    accessTokenExpirySeconds,
+                    dpopJkt
             );
         } catch (Exception e) {
             log.error("Failed to generate access token for pre-authorized code flow", e);

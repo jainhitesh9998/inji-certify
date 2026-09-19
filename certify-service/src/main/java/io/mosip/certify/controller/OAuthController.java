@@ -41,6 +41,9 @@ public class OAuthController {
     private org.springframework.beans.factory.ObjectProvider<io.mosip.certify.as.ClientAttestationValidator> clientAttestationValidator;
 
     @Autowired
+    private org.springframework.beans.factory.ObjectProvider<io.mosip.certify.dpop.DpopProofValidator> dpopProofValidator;
+
+    @Autowired
     public OAuthController(IarService iarService,
                            OAuthAuthorizationServerMetadataService oAuthAuthorizationServerMetadataService,
                            PreAuthorizedCodeService preAuthorizedCodeService) {
@@ -111,6 +114,20 @@ public class OAuthController {
     public ResponseEntity<OAuthTokenResponse> processTokenRequest(@RequestParam Map<String, String> params, jakarta.servlet.http.HttpServletRequest http)
             throws CertifyException {
         log.info("Received OAuth token request");
+        // RFC 9449 section 5: a DPoP proof at the token endpoint binds the issued token to the wallet's key
+        String dpopJkt = null;
+        String dpopProof = http.getHeader(io.mosip.certify.core.constants.Constants.DPOP);
+        if (dpopProof != null && !dpopProof.isBlank()) {
+            try {
+                io.mosip.certify.dpop.DpopProofValidator validator = dpopProofValidator.getIfAvailable();
+                if (validator == null) {
+                    throw new CertifyException("invalid_dpop_proof", "DPoP is not available");
+                }
+                dpopJkt = validator.validateForTokenEndpoint(dpopProof, http);
+            } catch (io.mosip.certify.core.exception.InvalidDpopHeaderException e) {
+                throw new CertifyException("invalid_dpop_proof", e.getMessage());
+            }
+        }
         io.mosip.certify.as.ClientAttestationValidator attestation = clientAttestationValidator.getIfAvailable();
         if (attestation != null) {
             try {
@@ -130,6 +147,7 @@ public class OAuthController {
             // Check if this is a pre-authorized code grant
             if (Constants.PRE_AUTHORIZED_CODE_GRANT_TYPE.equals(grantType)) {
                 OAuthTokenRequest tokenRequest = new OAuthTokenRequest();
+                tokenRequest.setDpopJkt(dpopJkt);
                 tokenRequest.setGrant_type(grantType);
                 tokenRequest.setPre_authorized_code(params.get("pre-authorized_code"));
                 tokenRequest.setTx_code(params.get("tx_code"));
@@ -143,6 +161,7 @@ public class OAuthController {
                 }
                 // Handle authorization_code grant type via IarService
                 OAuthTokenRequest tokenRequest = new OAuthTokenRequest();
+                tokenRequest.setDpopJkt(dpopJkt);
                 tokenRequest.setGrant_type(grantType);
                 tokenRequest.setCode(params.get("code"));
                 tokenRequest.setCode_verifier(params.get("code_verifier"));

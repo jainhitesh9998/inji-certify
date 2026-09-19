@@ -45,4 +45,8 @@ public class OAuthTokenRequest {
      * OPTIONAL (for pre-authorized_code grant). The transaction code if required by the credential offer.
      */
     private String tx_code;
+
+    /** Thumbprint of the DPoP proof key presented at the token endpoint (RFC 9449); null for a Bearer token. Set by the controller, never bound from the form. */
+    @com.fasterxml.jackson.annotation.JsonIgnore
+    private String dpopJkt;
 }

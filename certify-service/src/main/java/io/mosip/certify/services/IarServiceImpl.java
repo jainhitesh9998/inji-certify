@@ -174,8 +174,8 @@ public class IarServiceImpl implements IarService {
             IarSession session = validateAndMarkAuthorizationCodeUsed(tokenRequest);
 
             OAuthTokenResponse response = new OAuthTokenResponse();
-            response.setAccessToken(generateAccessToken(session));
-            response.setTokenType(tokenType);
+            response.setAccessToken(generateAccessToken(session, tokenRequest.getDpopJkt()));
+            response.setTokenType(tokenRequest.getDpopJkt() != null ? io.mosip.certify.core.constants.Constants.DPOP : tokenType);
             response.setExpiresIn(tokenExpiresInSeconds);
             
             // Set scope from the session
@@ -410,14 +410,14 @@ public class IarServiceImpl implements IarService {
      * @param session The IAR session containing client and transaction information
      * @return Signed JWT access token string
      */
-    private String generateAccessToken(IarSession session) {
+    private String generateAccessToken(IarSession session, String dpopJkt) {
         try {
             String jwtToken = accessTokenJwtUtil.generateSignedJwt(
                 session, 
                 issuer,
                 audience,
                 tokenExpiresInSeconds
-            );
+            , dpopJkt);
             log.debug("Generated JWT access token for client_id: {}, transaction_id: {}", 
                      session.getClientId(), session.getTransactionId());
             return jwtToken;
