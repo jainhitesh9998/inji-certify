@@ -172,6 +172,53 @@ script reaches, for example an override file setting `mosip_certify_domain_url=h
 `certify` service. On 2026-09-19 the run passed every check except the deprecation header on
 `/issuance/credential`, which waits for the owner's decision (P1-11f).
 
+## 6e. Every workflow in one run
+
+`docs/design/tools/workflows.py` drives every issuance workflow against a running stack and prints one `PASS`/`FAIL`
+line per step (52 steps on 2026-09-19): discovery on all surfaces; the pre-authorized code flow on the compatibility,
+draft-13 and `/oid4vci` surfaces with notification, batch and nonce replay; the authorization code flow of Certify's
+own AS with PAR, PKCE, client attestation and a DPoP-bound token (and the refusals of a replayed attestation PoP, a
+Bearer presentation of a DPoP token and a foreign DPoP key); key attestations on `jwt` proofs and the `attestation`
+proof type; SD-JWT VC under the x509-file dev CA with a Token Status List and its revocation by the batch job; mDoc;
+VC-API issuance, its refusals and a status update resolved through the ledger; the v2 configuration API.
+
+The stack needs a `workflows` profile next to `rebuild` (the driver creates the extra configurations itself):
+
+```properties
+certify.as.clients.wallet.redirect-uris=https://wallet.example/cb
+certify.as.authorization.subject-mode=fixed
+certify.as.authorization.fixed-subject=2154189532
+certify.as.client-attestation.attesters.test.jwks={"keys":[<the attester's public JWK, kid wallet-provider-1>]}
+certify.protocol.oid4vci-v1.key-attestation.attesters.test.jwks={"keys":[<the same JWK>]}
+certify.protocol.vc-api.enabled=true
+certify.protocol.vc-api.clients.coordinator.secret=s3cret
+certify.protocol.vc-api.clients.other.secret=other-secret
+certify.protocol.vc-api.clients.other.credential-configurations=SomeOtherConfiguration
+certify.keyprovider.x509-file.enabled=true
+certify.keyprovider.x509-file.dev-mode=true
+certify.keyprovider.x509-file.path=/tmp/workflows-pki.p12
+certify.keyprovider.x509-file.password=pki-test
+certify.keyprovider.x509-file.keys[0].alias=sdjwt-es256
+certify.keyprovider.x509-file.keys[0].algorithm=ES256
+certify.keyprovider.x509-file.keys[1].alias=mdoc-es256
+certify.keyprovider.x509-file.keys[1].algorithm=ES256
+certify.status.token-status-list.key-ref=x509-file:sdjwt-es256
+mosip.certify.batch.status-list-update.cron-expression=*/10 * * * * *
+mosip.certify.batch.status-list-update.lock-at-least-for=5s
+```
+
+Mount it as `/home/mosip/config/certify-workflows.properties`, set `active_profile_env=default, csvdp-farmer, rebuild, workflows`,
+and point `mosip_certify_domain_url` at the host the run uses (a Cloudflare tunnel in front of port 8090 works; the
+driver pins IPv4 and sets a user agent because Cloudflare stalls Python's defaults). Then:
+
+```bash
+.venv/bin/pip install pyjwt cryptography cbor2
+.venv/bin/python docs/design/tools/workflows.py https://<host>/v1/certify FarmerCredential 2154189532 attester.pem
+```
+
+`attester.pem` is the private key of the JWK in the two `attesters` properties. The run of 2026-09-19 found four
+defects that the unit suite could not see (F-02 to F-05 in `docs/design/wp/PROGRESS.md`); all are fixed.
+
 ## 7. Verify the credential independently
 
 The wallet shows the credential; to check it with a third-party verifier, paste the `ldp_vc` JSON into any

@@ -131,7 +131,7 @@
             <groupId>io.inji.certify</groupId>
             <artifactId>certify-keyprovider-jca</artifactId>
             <version>${project.version}</version>
-            <scope>test</scope>
+            <!-- compile scope: the x509-file provider needs it at runtime; a test scope here overrides that transitive dependency and drops it from the jar -->
         </dependency>
         <dependency>
             <groupId>io.inji.certify</groupId>

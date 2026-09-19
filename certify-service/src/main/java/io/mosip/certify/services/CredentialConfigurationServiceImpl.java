@@ -26,7 +26,6 @@ import io.mosip.certify.validators.credentialconfigvalidators.SdJwtCredentialCon
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.cache.annotation.CacheEvict;
 import io.mosip.certify.core.spi.CredentialRegistry;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
@@ -48,6 +47,9 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
 
     @Autowired
     private CredentialIssuerMetadataBuilder metadataBuilder;
+
+    @Autowired
+    private IssuerMetadataCache issuerMetadataCache;
 
     @Value("${mosip.certify.plugin-mode}")
     private String pluginMode;
@@ -79,12 +81,13 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
                                    List<String> allowedStatusPurposes) {}
 
     @Override
-    @CacheEvict(cacheNames = CredentialRegistry.CACHE_NAME, allEntries = true)
     public CredentialConfigResponse addCredentialConfiguration(CredentialConfigurationDTO credentialConfigurationDTO) {
         validateCredentialConfiguration(credentialConfigurationDTO, true);
 
         CredentialConfig credentialConfig = credentialConfigMapper.toEntity(credentialConfigurationDTO);
-        return saveCredentialConfiguration(credentialConfig);
+        CredentialConfigResponse response = saveCredentialConfiguration(credentialConfig);
+        issuerMetadataCache.evict();
+        return response;
     }
 
     /**
@@ -138,6 +141,7 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
         credentialConfigResponse.setId(savedConfig.getCredentialConfigKeyId());
         credentialConfigResponse.setStatus(savedConfig.getStatus());
 
+        issuerMetadataCache.evict();
         return credentialConfigResponse;
     }
 
@@ -267,7 +271,6 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
     }
 
     @Override
-    @CacheEvict(cacheNames = CredentialRegistry.CACHE_NAME, allEntries = true)
     public CredentialConfigResponse updateCredentialConfiguration(String credentialConfigKeyId, CredentialConfigurationDTO credentialConfigurationDTO){
         Optional<CredentialConfig> optional = credentialConfigRepository.findByCredentialConfigKeyId(credentialConfigKeyId);
 
@@ -297,7 +300,6 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
 
     @Override
     @Transactional
-    @CacheEvict(cacheNames = CredentialRegistry.CACHE_NAME, allEntries = true)
     public String deleteCredentialConfigurationById(String credentialConfigKeyId) {
         Optional<CredentialConfig> optional = credentialConfigRepository.findByCredentialConfigKeyId(credentialConfigKeyId) ;
 
@@ -308,6 +310,7 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
 
         credentialConfigRepository.delete(optional.get());
         log.info("Deleted credential configuration: {}", credentialConfigKeyId);
+        issuerMetadataCache.evict();
         return credentialConfigKeyId;
     }
 

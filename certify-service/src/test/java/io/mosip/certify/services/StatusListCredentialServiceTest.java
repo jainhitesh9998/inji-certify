@@ -170,14 +170,14 @@ public class StatusListCredentialServiceTest {
     public void findOrCreateStatusList_FindsExisting() {
         StatusListCredential slc = new StatusListCredential();
         slc.setId("id6");
-        when(statusListCredentialRepository.findFirstByStatusPurposeAndCredentialStatusOrderByCreatedDtimesDesc(anyString(), any())).thenReturn(Optional.of(slc));
+        when(statusListCredentialRepository.findFirstByCredentialTypeAndStatusPurposeAndCredentialStatusOrderByCreatedDtimesDesc(eq(StatusListCredentialService.BITSTRING_CREDENTIAL_TYPE), anyString(), any())).thenReturn(Optional.of(slc));
         StatusListCredential result = service.findOrCreateStatusList("revocation");
         assertEquals("id6", result.getId());
     }
 
     @Test
     public void findOrCreateStatusList_CreatesNew() {
-        when(statusListCredentialRepository.findFirstByStatusPurposeAndCredentialStatusOrderByCreatedDtimesDesc(anyString(), any())).thenReturn(Optional.empty());
+        when(statusListCredentialRepository.findFirstByCredentialTypeAndStatusPurposeAndCredentialStatusOrderByCreatedDtimesDesc(eq(StatusListCredentialService.BITSTRING_CREDENTIAL_TYPE), anyString(), any())).thenReturn(Optional.empty());
         W3CJsonLD w3CJsonLD = mock(W3CJsonLD.class);
         when(credentialFactory.getCredential(VCFormats.LDP_VC)).thenReturn(Optional.of(w3CJsonLD));
         VCResult mockVcResultLdp = new VCResult<JsonLDObject>();
@@ -260,7 +260,7 @@ public class StatusListCredentialServiceTest {
         StatusListCredential slc = new StatusListCredential();
         slc.setId("slid");
         slc.setStatusPurpose("revocation");
-        when(statusListCredentialRepository.findFirstByStatusPurposeAndCredentialStatusOrderByCreatedDtimesDesc(anyString(), any())).thenReturn(Optional.of(slc));
+        when(statusListCredentialRepository.findFirstByCredentialTypeAndStatusPurposeAndCredentialStatusOrderByCreatedDtimesDesc(eq(StatusListCredentialService.BITSTRING_CREDENTIAL_TYPE), anyString(), any())).thenReturn(Optional.of(slc));
         when(indexProvider.acquireIndex(anyString(), anyMap())).thenReturn(Optional.of(1L));
         JSONObject json = new JSONObject();
         service.addCredentialStatus(json, "revocation");
@@ -272,7 +272,7 @@ public class StatusListCredentialServiceTest {
         StatusListCredential slc = new StatusListCredential();
         slc.setId("slid");
         slc.setStatusPurpose("revocation");
-        when(statusListCredentialRepository.findFirstByStatusPurposeAndCredentialStatusOrderByCreatedDtimesDesc(anyString(), any())).thenReturn(Optional.of(slc));
+        when(statusListCredentialRepository.findFirstByCredentialTypeAndStatusPurposeAndCredentialStatusOrderByCreatedDtimesDesc(eq(StatusListCredentialService.BITSTRING_CREDENTIAL_TYPE), anyString(), any())).thenReturn(Optional.of(slc));
         when(indexProvider.acquireIndex(anyString(), anyMap())).thenReturn(Optional.of(-1L)).thenReturn(Optional.of(2L));
         W3CJsonLD w3CJsonLD = mock(W3CJsonLD.class);
         when(credentialFactory.getCredential(VCFormats.LDP_VC)).thenReturn(Optional.of(w3CJsonLD));
@@ -307,7 +307,7 @@ public class StatusListCredentialServiceTest {
         StatusListCredential slc = new StatusListCredential();
         slc.setId("slid");
         slc.setStatusPurpose("revocation");
-        when(statusListCredentialRepository.findFirstByStatusPurposeAndCredentialStatusOrderByCreatedDtimesDesc(anyString(), any())).thenReturn(Optional.of(slc));
+        when(statusListCredentialRepository.findFirstByCredentialTypeAndStatusPurposeAndCredentialStatusOrderByCreatedDtimesDesc(eq(StatusListCredentialService.BITSTRING_CREDENTIAL_TYPE), anyString(), any())).thenReturn(Optional.of(slc));
         when(indexProvider.acquireIndex(anyString(), anyMap())).thenReturn(Optional.of(-1L)).thenReturn(Optional.of(-1L));
         W3CJsonLD w3CJsonLD = mock(W3CJsonLD.class);
         when(credentialFactory.getCredential(VCFormats.LDP_VC)).thenReturn(Optional.of(w3CJsonLD));

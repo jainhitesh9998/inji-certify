@@ -266,6 +266,17 @@ class StatusListPostgresTest {
         assertEquals("Bengaluru", ledger.getIndexedAttributes().get("city"));
     }
 
+    /** A Token Status List must never serve a Bitstring credential's entry: both share the table (found by the workflow run, F-05). */
+    @Test
+    void bitstringCredentialsDoNotLandOnATokenStatusList() throws Exception {
+        tokenStatusListForSdJwt(); // leaves an AVAILABLE TokenStatusList row for the revocation purpose
+        JsonNode status = issueOid4vci().get("credentials").get(0).get("credential").get("credentialStatus");
+        String listUrl = status.get("statusListCredential").asText();
+        JsonNode list = statusList(listUrl);
+        assertTrue(list.has("credentialSubject") && list.get("credentialSubject").has("encodedList"), "the Bitstring entry points at a Bitstring list, not the token list: " + list.toString().substring(0, Math.min(200, list.toString().length())));
+        assertEquals("BitstringStatusListEntry", status.get("type").asText());
+    }
+
     /** VC-API: the coordinator names the credential, not the list; the ledger supplies the list and index (P5-01). */
     @Test
     void vcApiStatusUpdateFindsTheEntryThroughTheLedger() throws Exception {
