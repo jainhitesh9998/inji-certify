@@ -13,6 +13,7 @@ from cryptography.hazmat.primitives import serialization
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8090/v1/certify"
 CONFIG = sys.argv[2] if len(sys.argv) > 2 else "FarmerCredential"
+SUBJECT = sys.argv[3] if len(sys.argv) > 3 else None   # a record id the data provider resolves (the CSV row id); claims otherwise
 results = []
 
 def call(method, path, body=None, headers=None, form=None):
@@ -59,7 +60,12 @@ token_endpoint = asmeta.get("token_endpoint") if isinstance(asmeta, dict) else N
 check("authorization server metadata", s == 200 and token_endpoint is not None, token_endpoint)
 
 # 2. offer + token
-s, _, offer = call("POST", "/pre-authorized-data", {"credential_configuration_id": CONFIG, "claims": {"fullName": "Gorge Cooper", "phone": "9876543210", "dateOfBirth": "1990-05-25", "gender": "Male"}, "expires_in": 600, "tx_code": "1234"})
+offer_request = {"credential_configuration_id": CONFIG, "expires_in": 600, "tx_code": "1234"}
+if SUBJECT:
+    offer_request["subject"] = SUBJECT
+else:
+    offer_request["claims"] = {"fullName": "Gorge Cooper", "phone": "9876543210", "dateOfBirth": "1990-05-25", "gender": "Male"}
+s, _, offer = call("POST", "/pre-authorized-data", offer_request)
 uri = offer.get("credential_offer_uri", "") if isinstance(offer, dict) else ""
 check("credential offer created", s == 200 and "credential_offer" in uri, uri[:120])
 offer_url = urllib.parse.parse_qs(urllib.parse.urlparse(uri).query).get("credential_offer_uri", [""])[0]
@@ -78,6 +84,9 @@ def token():
 s, tok = token()
 access = tok.get("access_token") if isinstance(tok, dict) else None
 check("access token", s == 200 and access is not None, {k: tok.get(k) for k in ("token_type", "expires_in", "c_nonce")} if isinstance(tok, dict) else tok)
+if access:
+    token_sub = jwt.decode(access, options={"verify_signature": False}).get("sub")
+    check("token subject", token_sub == SUBJECT if SUBJECT else isinstance(token_sub, str), token_sub)
 auth = {"Authorization": "Bearer " + (access or "")}
 
 # 3. legacy surface
@@ -86,6 +95,10 @@ legacy_nonce = n.get("c_nonce") if isinstance(n, dict) else None
 check("legacy nonce", s == 200 and legacy_nonce is not None)
 s, _, cred = call("POST", "/issuance/credential", {"credential_configuration_id": CONFIG, "proofs": {"jwt": [proof(legacy["credential_issuer"], legacy_nonce)]}}, auth)
 legacy_vc = (cred.get("credentials") or [{}])[0].get("credential") if isinstance(cred, dict) else None
+if SUBJECT and isinstance(legacy_vc, dict):
+    subject = legacy_vc.get("credentialSubject", {})
+    unresolved = [k for k, v in subject.items() if isinstance(v, str) and v.startswith("${")]
+    check("data provider resolved every template field", not unresolved, {"unresolved": unresolved, "fields": sorted(subject.keys())})
 check("legacy /issuance/credential", s == 200 and isinstance(legacy_vc, dict) and "proof" in legacy_vc,
       {"status": s, "type": legacy_vc.get("type") if isinstance(legacy_vc, dict) else cred, "vm": (legacy_vc or {}).get("proof", {}).get("verificationMethod") if isinstance(legacy_vc, dict) else None})
 

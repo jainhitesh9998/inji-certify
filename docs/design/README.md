@@ -22,3 +22,4 @@ Baseline: `inji/inji-certify` `develop` at commit `a1cfd63` (1.0.0-beta.1-SNAPSH
 | wp/ | [Work packages](./wp/) | Picking up a task |
 
 Live review with comments: https://claude.ai/code/artifact/5cf478f6-018c-4079-8825-e4a837db3323
+- [15. Deployment](15-deployment.md): what ships, configuration, database and the upgrade road for a running deployment.

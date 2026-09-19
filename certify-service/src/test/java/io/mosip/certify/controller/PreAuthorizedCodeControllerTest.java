@@ -73,6 +73,22 @@ public class PreAuthorizedCodeControllerTest {
     }
 
     @Test
+    public void generatePreAuthorizedCode_SubjectWithoutClaims_Success() throws Exception {
+        PreAuthorizedRequest request = new PreAuthorizedRequest();
+        request.setCredentialConfigurationId("test-config");
+        request.setSubject("2154189532"); // the record the data provider resolves; no claims needed
+        String expectedUri = "openid-credential-offer://?credential_offer_uri=test";
+        Mockito.when(preAuthorizedCodeService.generatePreAuthorizedCode(Mockito.any(PreAuthorizedRequest.class)))
+                .thenReturn(expectedUri);
+
+        mockMvc.perform(post("/pre-authorized-data")
+                .content(objectMapper.writeValueAsBytes(request))
+                .contentType(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.credential_offer_uri").value(expectedUri));
+    }
+
+    @Test
     public void generatePreAuthorizedCode_Failure_If_MissingConfigId() throws Exception {
         PreAuthorizedRequest request = new PreAuthorizedRequest();
         Map<String, Object> claims = new HashMap<>();

@@ -18,6 +18,8 @@ public class PreAuthCodeData implements Serializable {
 
     private String credentialConfigurationId;
     private Map<String, Object> claims;
+    /** The access token subject the offer named, else null (the claims JSON is the subject then). */
+    private String subject;
     private String txnCode;
     private long createdAt;
     private long expiresAt;
