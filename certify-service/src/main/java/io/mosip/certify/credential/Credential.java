@@ -12,9 +12,6 @@ import java.util.Map;
 import io.mosip.certify.api.dto.VCResult;
 import io.mosip.certify.core.constants.Constants;
 import io.mosip.certify.vcformatters.VCFormatter;
-import io.mosip.kernel.signature.dto.JWSSignatureRequestDto;
-import io.mosip.kernel.signature.dto.JWTSignatureResponseDto;
-import io.mosip.kernel.signature.service.SignatureService;
 import com.upokecenter.cbor.CBORObject;
 import io.mosip.certify.core.constants.ErrorConstants;
 import io.mosip.certify.core.exception.CertifyException;
@@ -41,22 +38,15 @@ public abstract class Credential{
     
     protected VCFormatter vcFormatter;
 
-    protected SignatureService signatureService;
 
     @Autowired
-    private KeyProviderRegistry keyProviders;
+    protected KeyProviderRegistry keyProviders;
 
     @Autowired
     private CwtSigningProperties cwtSigning;
 
-    /**
-     * Constructor for credentials
-     * @param vcFormatter
-     * @param signatureService
-     */
-    public Credential(VCFormatter vcFormatter, SignatureService signatureService){
+    protected Credential(VCFormatter vcFormatter) {
         this.vcFormatter = vcFormatter;
-        this.signatureService = signatureService;
     }
 
     /**
@@ -97,37 +87,10 @@ public abstract class Credential{
     }
 
     /**
-     * Creates a signature/proof and based on the actual implementation the input 
-     * could be different, for eg: Base64, Sringified JSON etc.
-     * <p>In the defaulat abstract implementation we assume 
-     * ```Base64.getUrlEncoder().encodeToString(vcInBytes)``` </p>
-     * @param vcToSign actual vc bytes 
-     * @param headers headers to be added. Can be null.
-     * @param signAlgorithm Signature algorithm RS256, PS256, ES256, etc
-     * @param appID application id as per the keymanager table
-     * @param refID reference id as per the keyamanger table
-     * @param didUrl URL/URI of the public key
+     * Signs the output of {@link #createCredential}: a Data Integrity or legacy LD proof for JSON-LD, the issuer JWS for
+     * SD-JWT, the MSO for mDoc. Keys are named the keymanager way (appID, refID); {@code didUrl} is the verification method base.
      */
-    public VCResult<?> addProof(String vcToSign, String headers, String signAlgorithm, String appID, String refID, String didUrl, String signatureCryptoSuite) {
-
-        JWSSignatureRequestDto payload = new JWSSignatureRequestDto();
-        payload.setDataToSign(vcToSign);
-        payload.setApplicationId(appID);
-        payload.setReferenceId(refID); 
-        payload.setIncludePayload(false);
-        payload.setIncludeCertificate(false);
-        payload.setIncludeCertHash(true);
-        payload.setValidateJson(false);
-        payload.setB64JWSHeaderParam(false);
-        payload.setCertificateUrl(didUrl);
-        payload.setSignAlgorithm(signAlgorithm); // RSSignature2018 --> RS256, PS256, ES256
-        JWTSignatureResponseDto jwsSignedData = signatureService.jwsSign(payload);
-        VCResult<String> vc = new VCResult<>();
-        //TODO: Get the correct default
-        vc.setFormat("vc");
-        vc.setCredential(jwsSignedData.getJwtSignedData());
-        return vc;
-    }
+    public abstract VCResult<?> addProof(String vcToSign, String signAlgorithm, String appID, String refID, String didUrl, String signatureCryptoSuite);
 
     /*
     * Signs the QR data payload using CWT signature

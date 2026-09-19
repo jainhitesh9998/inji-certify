@@ -339,7 +339,6 @@ public class StatusListCredentialService {
 
         VCResult<?> vcResult = cred.addProof(
                 vcDocument.toString(),
-                "",
                 signatureAlgo,
                 appId,
                 statusListKeyManagerRefId,

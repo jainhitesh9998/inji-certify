@@ -21,4 +21,4 @@ Owner's request of 2026-09-19: the develop-era code under `certify-service` shou
 
 Slices are taken in the order of the table, smallest first within an area, and each is recorded in `PROGRESS.md` as `R-nn`.
 
-Done: R-01 golden set names; R-02 `CertifyApplicationTests` no longer boots a second application; R-03 one `CredentialUtils`, helpers next to their only caller (area 1); R-04 issuer metadata building out of the configuration service (area 2).
+Done: R-01 golden set names; R-02 `CertifyApplicationTests` no longer boots a second application; R-03 one `CredentialUtils`, helpers next to their only caller (area 1); R-04 issuer metadata building out of the configuration service (area 2); R-05 legacy credential classes without the kernel signing path (area 3).

@@ -317,8 +317,7 @@ public class CertifyIssuanceServiceImplTest {
 
         // The holderId argument to addProof in the service is "" for LDP
         when(mockW3CJsonLD.addProof(
-                eq("{\"unsigned\":\"credential\"}"),
-                eq(""),  // Service code passes "" for LDP's addProof holderId
+                eq("{\"unsigned\":\"credential\"}"),  // Service code passes "" for LDP's addProof holderId
                 anyString(),
                 anyString(),
                 anyString(),
@@ -370,8 +369,7 @@ public class CertifyIssuanceServiceImplTest {
 
         // The holderId argument to addProof in the service is "" for LDP
         when(mockW3CJsonLD.addProof(
-                eq("{\"unsigned\":\"credential\"}"),
-                eq(""),  // Service code passes "" for LDP's addProof holderId
+                eq("{\"unsigned\":\"credential\"}"),  // Service code passes "" for LDP's addProof holderId
                 anyString(),
                 anyString(),
                 anyString(),
@@ -426,8 +424,7 @@ public class CertifyIssuanceServiceImplTest {
 
         // The holderId argument to addProof in the service is "" for LDP
         when(mockW3CJsonLD.addProof(
-                eq("{\"unsigned\":\"credential\"}"),
-                eq(""),  // Service code passes "" for LDP's addProof holderId
+                eq("{\"unsigned\":\"credential\"}"),  // Service code passes "" for LDP's addProof holderId
                 anyString(),
                 anyString(),
                 anyString(),
@@ -578,8 +575,7 @@ public class CertifyIssuanceServiceImplTest {
         when(vcFormatter.getSignatureCryptoSuite(anyString())).thenReturn("testSignatureCryptoSuite"); // Example Value
 
         when(mockSdJwt.addProof(
-                eq("{\"unsigned\":\"sdjwt_payload\"}"), // unsignedCredential
-                eq(""),                                 // holderId (now matches due to getKeyMaterial stub)
+                eq("{\"unsigned\":\"sdjwt_payload\"}"),                                 // holderId (now matches due to getKeyMaterial stub)
                 anyString(),                            // proofAlgorithm
                 anyString(),                            // keyManagerAppId
                 anyString(),                            // keyManagerRefId
@@ -631,8 +627,7 @@ public class CertifyIssuanceServiceImplTest {
         when(vcFormatter.getSignatureCryptoSuite(anyString())).thenReturn("testSignatureCryptoSuite"); // Example Value
 
         when(mockSdJwt.addProof(
-                eq("{\"unsigned\":\"sdjwt_payload\"}"), // unsignedCredential
-                eq(""),                                 // holderId (now matches due to getKeyMaterial stub)
+                eq("{\"unsigned\":\"sdjwt_payload\"}"),                                 // holderId (now matches due to getKeyMaterial stub)
                 anyString(),                            // proofAlgorithm
                 anyString(),                            // keyManagerAppId
                 anyString(),                            // keyManagerRefId
@@ -689,8 +684,7 @@ public class CertifyIssuanceServiceImplTest {
         when(vcFormatter.getSignatureCryptoSuite(anyString())).thenReturn("testSignatureCryptoSuite"); // Example Value
 
         when(mockSdJwt.addProof(
-                eq("{\"unsigned\":\"sdjwt_payload\"}"), // unsignedCredential
-                eq(""),                                 // holderId (now matches due to getKeyMaterial stub)
+                eq("{\"unsigned\":\"sdjwt_payload\"}"),                                 // holderId (now matches due to getKeyMaterial stub)
                 anyString(),                            // proofAlgorithm
                 anyString(),                            // keyManagerAppId
                 anyString(),                            // keyManagerRefId
@@ -749,8 +743,7 @@ public class CertifyIssuanceServiceImplTest {
 
         // The holderId argument to addProof in the service is "" for LDP
         when(mockW3CJsonLD.addProof(
-                eq("{\"unsigned\":\"credential\"}"),
-                eq(""),  // Service code passes "" for LDP's addProof holderId
+                eq("{\"unsigned\":\"credential\"}"),  // Service code passes "" for LDP's addProof holderId
                 anyString(),
                 anyString(),
                 anyString(),
@@ -810,8 +803,7 @@ public class CertifyIssuanceServiceImplTest {
 
         // The holderId argument to addProof in the service is "" for LDP
         when(mockW3CJsonLD.addProof(
-                eq("{\"unsigned\":\"credential\"}"),
-                eq(""),  // Service code passes "" for LDP's addProof holderId
+                eq("{\"unsigned\":\"credential\"}"),  // Service code passes "" for LDP's addProof holderId
                 anyString(),
                 anyString(),
                 anyString(),
@@ -865,7 +857,6 @@ public class CertifyIssuanceServiceImplTest {
 
         when(mockMdoc.addProof(
                 eq("unsigned_mdoc_data"),
-                eq(""),
                 anyString(),
                 anyString(),
                 anyString(),
@@ -932,7 +923,7 @@ public class CertifyIssuanceServiceImplTest {
         JsonLDObject signedCredObj = JsonLDObject.fromJson("{\"signed\":\"credential\", \"proof\":{}}");
         mockVcResultLdp.setCredential(signedCredObj);
 
-        when(mockW3CJsonLD.addProof(anyString(), anyString(), anyString(), anyString(), anyString(), anyString(), anyString()))
+        when(mockW3CJsonLD.addProof(anyString(), anyString(), anyString(), anyString(), anyString(), anyString()))
                 .thenReturn(mockVcResultLdp);
 
         CredentialResponse<?> response = issuanceService.getCredential(request);
@@ -978,7 +969,7 @@ public class CertifyIssuanceServiceImplTest {
         JsonLDObject signedCredObj = JsonLDObject.fromJson("{\"signed\":\"credential\", \"proof\":{}}");
         mockVcResultLdp.setCredential(signedCredObj);
 
-        when(mockW3CJsonLD.addProof(anyString(), anyString(), anyString(), anyString(), anyString(), anyString(), anyString()))
+        when(mockW3CJsonLD.addProof(anyString(), anyString(), anyString(), anyString(), anyString(), anyString()))
                 .thenReturn(mockVcResultLdp);
 
         // You may want to use a log capturing library to assert the warning log, but here we just ensure no exception

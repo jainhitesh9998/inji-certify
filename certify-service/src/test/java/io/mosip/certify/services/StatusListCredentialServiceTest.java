@@ -124,7 +124,6 @@ public class StatusListCredentialServiceTest {
 
         when(w3CJsonLD.addProof(
                 anyString(),
-                eq(""),
                 anyString(),
                 anyString(),
                 anyString(),
@@ -146,7 +145,7 @@ public class StatusListCredentialServiceTest {
     @Test
     public void generateStatusListCredential_JsonError_Throws() {
         when(credentialFactory.getCredential(VCFormats.LDP_VC)).thenReturn(Optional.of(credential));
-        when(credential.addProof(anyString(), anyString(), anyString(), anyString(), anyString(), anyString(), anyString()))
+        when(credential.addProof(anyString(), anyString(), anyString(), anyString(), anyString(), anyString()))
                 .thenThrow(new RuntimeException("json error"));
         try {
             service.generateStatusListCredential("revocation");
@@ -187,7 +186,6 @@ public class StatusListCredentialServiceTest {
 
         when(w3CJsonLD.addProof(
                 anyString(),
-                eq(""),
                 anyString(),
                 anyString(),
                 anyString(),
@@ -232,8 +230,7 @@ public class StatusListCredentialServiceTest {
 
         // The holderId argument to addProof in the service is "" for LDP
         when(w3CJsonLD.addProof(
-                anyString(),
-                eq(""),  // Service code passes "" for LDP's addProof holderId
+                anyString(),  // Service code passes "" for LDP's addProof holderId
                 anyString(),
                 anyString(),
                 anyString(),
@@ -248,7 +245,7 @@ public class StatusListCredentialServiceTest {
     @Test
     public void resignStatusListCredential_Error_Throws() {
         when(credentialFactory.getCredential(VCFormats.LDP_VC)).thenReturn(Optional.of(credential));
-        when(credential.addProof(anyString(), anyString(), anyString(), anyString(), anyString(), anyString(), anyString()))
+        when(credential.addProof(anyString(), anyString(), anyString(), anyString(), anyString(), anyString()))
                 .thenThrow(new RuntimeException("fail"));
         try {
             service.resignStatusListCredential("{\"foo\":\"bar\"}");
@@ -285,7 +282,6 @@ public class StatusListCredentialServiceTest {
 
         when(w3CJsonLD.addProof(
                 anyString(),
-                eq(""),
                 anyString(),
                 anyString(),
                 anyString(),
