@@ -71,6 +71,10 @@ The DID document encoded the P-256 `publicKeyMultibase` from a minimal-length X 
 ## VC-API issuer endpoints
 
 With `certify.protocol.vc-api.enabled=true`, `POST /vc-api/credentials/issue` (W3C VCALM, the CCG VC-API) takes `{credential, options}` from a client registered under `certify.protocol.vc-api.clients.<id>` (HTTP Basic with the client id and `secret`; `credential-configurations` optionally limits what it may issue), signs the body with the `ldp_vc` configuration of `issuanceStrategy: SUPPLIED` whose `@context` and `type` match, and answers `201 {verifiableCredential}`; refusals are `application/problem+json`. `POST /vc-api/credentials/status` updates a status list entry named in the request or found through the ledger by `credentialId`. Today's `POST /credentials/status` is unchanged; nothing is served under `/vc-api` unless enabled.
+
+## Four defects found by the workflow run
+
+The v1 and v2 configuration APIs evicted the `issuerMetadataCache` through `@CacheEvict`, which fails with "Cannot find cache" on a deployment whose `mosip.certify.cache.names` does not list that name (every deployment upgrading with its own list); the eviction is programmatic and tolerant now, and the name is still worth adding to the list so metadata is cached. The service jar lacked `certify-keyprovider-jca`, which the x509-file provider needs, because the service declared it with test scope; enabling `certify.keyprovider.x509-file` failed at startup with `ClassNotFoundException`. The compose stack's `certify_init.sql` created `status_list_credential.capacity` where the DDL and the entity say `capacity_in_kb` (renamed in 0.13.0), so status lists failed on a fresh compose stack. And once a Token Status List existed, a Bitstring credential issued afterwards was given an index on that JWT list because the Bitstring lookup ignored the list type; the lookup is type-aware now. All four fixed.
 # Changes in release 0.11.0
 
 ## Removal of  Artifactory dependency

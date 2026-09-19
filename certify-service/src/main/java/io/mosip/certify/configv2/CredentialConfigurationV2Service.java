@@ -28,7 +28,6 @@ import io.mosip.certify.spi.TemplateRef;
 import io.mosip.certify.spi.UnsignedCredential;
 import io.mosip.certify.tenancy.TenantContexts;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.DigestUtils;
@@ -66,12 +65,15 @@ public class CredentialConfigurationV2Service {
     private final Oid4vciIssuer issuer;
     private final AuthorizationContext authorizationContext;
     private final CredentialConfigurationV2Mapper mapper;
+    private final io.mosip.certify.services.IssuerMetadataCache issuerMetadataCache;
 
     public CredentialConfigurationV2Service(CredentialConfigRepository configurations, CredentialTemplateRepository templates,
                                             JpaConfigurationRegistry registry, List<CredentialFormatter> formatters, List<TemplateEngine> templateEngines,
                                             List<StatusProvider> statusProviders, IssuanceService issuanceService,
                                             CredentialConfigurationServiceImpl legacyService, TenantContexts tenants, Oid4vciIssuer issuer,
-                                            AuthorizationContext authorizationContext, ObjectMapper objectMapper) {
+                                            AuthorizationContext authorizationContext, ObjectMapper objectMapper,
+                                          io.mosip.certify.services.IssuerMetadataCache issuerMetadataCache) {
+        this.issuerMetadataCache = issuerMetadataCache;
         this.configurations = configurations;
         this.templates = templates;
         this.registry = registry;
@@ -87,7 +89,6 @@ public class CredentialConfigurationV2Service {
     }
 
     @Transactional
-    @CacheEvict(cacheNames = CredentialRegistry.CACHE_NAME, allEntries = true)
     public CredentialConfigurationV2 create(CredentialConfigurationV2 body) {
         String tenant = tenant();
         if (body.getId() == null || body.getId().isBlank()) {
@@ -111,6 +112,7 @@ public class CredentialConfigurationV2Service {
         row = configurations.save(row);
         dryRun(row, body.getSampleClaims());
         log.info("Added credential configuration {} ({}) for tenant {}", row.getCredentialConfigKeyId(), row.getConfigId(), tenant);
+        issuerMetadataCache.evict();
         return read(row);
     }
 
@@ -125,7 +127,6 @@ public class CredentialConfigurationV2Service {
     }
 
     @Transactional
-    @CacheEvict(cacheNames = CredentialRegistry.CACHE_NAME, allEntries = true)
     public CredentialConfigurationV2 update(String id, CredentialConfigurationV2 body) {
         String tenant = tenant();
         CredentialConfig row = find(tenant, id);
@@ -140,15 +141,16 @@ public class CredentialConfigurationV2Service {
         row = configurations.save(row);
         dryRun(row, body.getSampleClaims());
         log.info("Updated credential configuration {} ({}) for tenant {}", row.getCredentialConfigKeyId(), row.getConfigId(), tenant);
+        issuerMetadataCache.evict();
         return read(row);
     }
 
     @Transactional
-    @CacheEvict(cacheNames = CredentialRegistry.CACHE_NAME, allEntries = true)
     public void delete(String id) {
         CredentialConfig row = find(tenant(), id);
         configurations.delete(row); // template versions stay: the row can be recreated against them
         log.info("Deleted credential configuration {} ({})", row.getCredentialConfigKeyId(), row.getConfigId());
+        issuerMetadataCache.evict();
     }
 
     @Transactional(readOnly = true)

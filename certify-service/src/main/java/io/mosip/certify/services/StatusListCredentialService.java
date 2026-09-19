@@ -35,6 +35,8 @@ import java.util.*;
 @Service
 public class StatusListCredentialService {
 
+    public static final String BITSTRING_CREDENTIAL_TYPE = "BitstringStatusListCredential";
+
     @Autowired
     private StatusListCredentialRepository statusListCredentialRepository;
 
@@ -117,8 +119,9 @@ public class StatusListCredentialService {
      * @param statusPurpose the purpose of the status list (e.g., "revocation", "suspension")
      * @return Optional containing StatusListCredential if found
      */
+    /** A Bitstring list only: Token Status Lists share the table (P3-09) and must never hand out an index to a JSON-LD credential. */
     private Optional<StatusListCredential> findSuitableStatusList(String statusPurpose, StatusListCredential.CredentialStatus status) {
-        return statusListCredentialRepository.findFirstByStatusPurposeAndCredentialStatusOrderByCreatedDtimesDesc(statusPurpose, status);
+        return statusListCredentialRepository.findFirstByCredentialTypeAndStatusPurposeAndCredentialStatusOrderByCreatedDtimesDesc(BITSTRING_CREDENTIAL_TYPE, statusPurpose, status);
     }
 
     /**
@@ -177,7 +180,7 @@ public class StatusListCredentialService {
             StatusListCredential statusListCredential = new StatusListCredential();
             statusListCredential.setId(id);
             statusListCredential.setVcDocument(vcDocS);
-            statusListCredential.setCredentialType("BitstringStatusListCredential");
+            statusListCredential.setCredentialType(BITSTRING_CREDENTIAL_TYPE);
             statusListCredential.setStatusPurpose(statusPurpose);
             statusListCredential.setCapacityInKB(statusListSizeInKB);
             statusListCredential.setCredentialStatus(StatusListCredential.CredentialStatus.AVAILABLE);
