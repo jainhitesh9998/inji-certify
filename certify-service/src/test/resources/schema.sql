@@ -209,3 +209,17 @@ CREATE TABLE IF NOT EXISTS iar_session (
     cr_dtimes TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     identity_data VARCHAR
 );
+
+-- the credential ledger (mirrors db_scripts/inji_certify/ddl/certify-ledger.sql; JSONB as JSON on H2); read by the VC-API status endpoint
+CREATE TABLE IF NOT EXISTS ledger (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    credential_id VARCHAR(255),
+    issuer_id VARCHAR(255) NOT NULL,
+    issuance_date TIMESTAMP NOT NULL,
+    expiration_date TIMESTAMP,
+    credential_type VARCHAR(100) NOT NULL,
+    indexed_attributes JSON,
+    credential_status_details JSON,
+    cr_dtimes TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_ledger_tracked_credential_id UNIQUE (credential_id)
+);

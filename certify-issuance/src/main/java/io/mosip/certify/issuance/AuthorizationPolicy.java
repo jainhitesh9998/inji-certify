@@ -14,15 +14,17 @@ public interface AuthorizationPolicy {
     void check(Authorization authorization, CredentialConfiguration configuration, ProtocolVersion protocol) throws IssuanceException;
 
     /**
-     * Today's rule: a holder token whose {@code scope} contains the configuration's scope. No token is accepted
-     * only for supplied-credential configurations reached without a wire protocol (CLI) or through VC-API,
-     * whose adapter authenticates the client itself.
+     * Today's rule: a holder token whose {@code scope} contains the configuration's scope. Supplied-credential
+     * configurations reached through VC-API (the adapter authenticates the client) or without a wire protocol (CLI)
+     * need no holder token.
      */
     AuthorizationPolicy SCOPE = (authorization, configuration, protocol) -> {
+        if (protocol == ProtocolVersion.VC_API && configuration.strategy() == IssuanceStrategy.SUPPLIED) {
+            return; // the VC-API adapter authenticated the client and checked what it may issue
+        }
         if (!authorization.isPresent()) {
-            boolean trustedPath = protocol == ProtocolVersion.NONE || protocol == ProtocolVersion.VC_API;
-            if (trustedPath && configuration.strategy() == IssuanceStrategy.SUPPLIED) {
-                return;
+            if (protocol == ProtocolVersion.NONE && configuration.strategy() == IssuanceStrategy.SUPPLIED) {
+                return; // the CLI
             }
             throw new IssuanceException(IssuanceException.NOT_AUTHENTICATED, "No authorization presented");
         }

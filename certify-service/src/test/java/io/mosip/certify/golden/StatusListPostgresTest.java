@@ -101,6 +101,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @Testcontainers(disabledWithoutDocker = true)
 @TestPropertySource(properties = {
         "mosip.certify.issuer.ledger-enabled=true",
+        "certify.protocol.vc-api.enabled=true", // the VC-API status endpoint finds the entry through the ledger
+        "certify.protocol.vc-api.clients.coordinator.secret=s3cret",
         "certify.keyprovider.x509-file.enabled=true",
         "certify.keyprovider.x509-file.dev-mode=true",
         "certify.keyprovider.x509-file.path=target/status-list-postgres-pki.p12",
@@ -262,6 +264,32 @@ class StatusListPostgresTest {
         assertEquals(index, ledger.getCredentialStatusDetails().get(0).getStatusListIndex());
         assertEquals("revocation", ledger.getCredentialStatusDetails().get(0).getStatusPurpose());
         assertEquals("Bengaluru", ledger.getIndexedAttributes().get("city"));
+    }
+
+    /** VC-API: the coordinator names the credential, not the list; the ledger supplies the list and index (P5-01). */
+    @Test
+    void vcApiStatusUpdateFindsTheEntryThroughTheLedger() throws Exception {
+        JsonNode credential = issueOid4vci().get("credentials").get(0).get("credential");
+        JsonNode status = credential.get("credentialStatus");
+        String listUrl = status.get("statusListCredential").asText();
+        String listId = listUrl.substring(listUrl.lastIndexOf('/') + 1);
+        long index = Long.parseLong(status.get("statusListIndex").asText());
+        String basic = "Basic " + java.util.Base64.getEncoder().encodeToString("coordinator:s3cret".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+        MvcResult update = mockMvc.perform(post("/vc-api/credentials/status").header("Authorization", basic).contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(Map.of("credentialId", credential.get("id").asText(),
+                        "credentialStatus", Map.of("type", "BitstringStatusListEntry", "statusPurpose", "revocation"), "status", true)))).andReturn();
+        assertEquals(200, update.getResponse().getStatus(), update.getResponse().getContentAsString());
+        List<CredentialStatusTransaction> pending = transactionRepository.findByIsProcessedFalseOrderByCreatedDtimesAsc(PageRequest.of(0, 100))
+                .stream().filter(t -> listId.equals(t.getStatusListCredentialId()) && Long.valueOf(index).equals(t.getStatusListIndex())).toList();
+        assertEquals(1, pending.size(), "one transaction for the credential's own entry");
+        batchJob.updateStatusList(listId, pending);
+        assertTrue(bit(statusList(listUrl).get("credentialSubject").get("encodedList").asText(), index), "the revoked bit is set through VC-API");
+
+        MvcResult unknownPurpose = mockMvc.perform(post("/vc-api/credentials/status").header("Authorization", basic).contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(Map.of("credentialId", credential.get("id").asText(),
+                        "credentialStatus", Map.of("type", "BitstringStatusListEntry", "statusPurpose", "suspension"), "status", true)))).andReturn();
+        assertEquals(404, unknownPurpose.getResponse().getStatus(), "no suspension entry for this credential");
     }
 
     @Test
