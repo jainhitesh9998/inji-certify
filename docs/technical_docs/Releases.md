@@ -52,6 +52,9 @@ With attesters configured under `certify.as.client-attestation.attesters.<id>.jw
 
 Once a client is registered under `certify.as.clients.<client-id>.redirect-uris`, the authorization server metadata advertises `authorization_endpoint`, `pushed_authorization_request_endpoint` and `require_pushed_authorization_requests`, and wallets run the authorization code flow with pushed requests and PKCE (`S256`) against `POST /oauth/par`, `GET /oauth/authorize` and `POST /oauth/token`. The subject of an authorization comes from `certify.as.authorization.subject-mode`: `none` (default) refuses, `fixed` approves every request for `certify.as.authorization.fixed-subject` without user interaction, which is meant for conformance runs and demos only. Deployments without registered clients see no change.
 
+## Holder keys as `did:key` with RSA
+
+A proof whose `kid` is an RSA `did:key` (multicodec `0x1205`) was decoded by 1.0.0-beta.1 but never verified: the resolver built the key without its `kid`, so signature verification found no matching key and the request failed with `invalid_proof`. It verifies now on both surfaces. Every other holder key form (`jwk` header with P-256, Ed25519 or RSA; `kid` as `did:jwk` or `did:key` with Ed25519, P-256 or secp256k1) is unchanged and covered by `HolderDidMethodsTest`; see `docs/design/18-compatibility-validation.md`.
 # Changes in release 0.11.0
 
 ## Removal of  Artifactory dependency
