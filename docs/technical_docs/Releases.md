@@ -32,6 +32,10 @@ With `certify.tenancy` enabled, a tenant configured with `issuer-did` issues und
 
 `POST /pre-authorized-data` accepts an optional `subject` next to `claims`: the identifier the data provider resolves (for the CSV plugin, the row id). It becomes the access token's `sub`, so plugins that look the record up by `sub` work in the pre-authorized code flow without eSignet. Offers with `claims` behave as before.
 
+## DPoP-bound access tokens
+
+`POST /oauth/token` accepts a `DPoP` proof (RFC 9449) on every grant and then issues a sender-constrained token (`cnf.jkt`, `token_type: DPoP`) that the credential endpoints already enforce; the authorization server metadata advertises `dpop_signing_alg_values_supported`. Without a proof the token is a Bearer token, as before.
+
 ## Attestation-based client authentication
 
 With attesters configured under `certify.as.client-attestation.attesters.<id>.jwks`, `POST /oauth/par` and `POST /oauth/token` validate the `OAuth-Client-Attestation` and `OAuth-Client-Attestation-PoP` headers (draft-ietf-oauth-attestation-based-client-auth) and the authorization server metadata advertises `token_endpoint_auth_methods_supported: ["attest_jwt_client_auth"]`; `certify.as.client-attestation.required=true` refuses unauthenticated calls, as HAIP requires. Without attesters nothing changes.

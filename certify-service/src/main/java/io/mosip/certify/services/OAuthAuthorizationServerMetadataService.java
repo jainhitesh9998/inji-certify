@@ -23,6 +23,9 @@ public class OAuthAuthorizationServerMetadataService {
     @org.springframework.beans.factory.annotation.Autowired
     private org.springframework.beans.factory.ObjectProvider<io.mosip.certify.as.AsProperties> asProperties;
 
+    @org.springframework.beans.factory.annotation.Autowired
+    private org.springframework.beans.factory.ObjectProvider<io.mosip.certify.dpop.DpopProofValidator> dpopProofValidator;
+
     @Value("${mosip.certify.oauth.issuer:}")
     private String issuer;
 
@@ -66,6 +69,10 @@ public class OAuthAuthorizationServerMetadataService {
         metadata.setRequireInteractiveAuthorizationRequest(requireInteractiveAuthorizationRequest);
         // the authorization code flow is advertised once a client is registered (certify.as.clients); the endpoints
         // hang next to the token endpoint, so an unchanged deployment's document is unchanged
+        io.mosip.certify.dpop.DpopProofValidator dpop = dpopProofValidator == null ? null : dpopProofValidator.getIfAvailable();
+        if (dpop != null && dpop.getAllowedAlgorithms() != null && !dpop.getAllowedAlgorithms().isEmpty()) {
+            metadata.setDpopSigningAlgValuesSupported(dpop.getAllowedAlgorithms()); // RFC 9449 section 5.1
+        }
         io.mosip.certify.as.AsProperties as = asProperties == null ? null : asProperties.getIfAvailable(); // null when built outside Spring (unit tests)
         if (as != null && as.enabled() && tokenEndpoint != null && tokenEndpoint.endsWith("/oauth/token")) {
             String base = tokenEndpoint.substring(0, tokenEndpoint.length() - "/oauth/token".length());
