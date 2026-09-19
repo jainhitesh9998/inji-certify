@@ -18,7 +18,7 @@ Develop carries the OpenID4VCI 1.0 endpoint set, so the compatibility work is ba
 | `POST /credentials/status`, `GET /credentials/status-list/{id}`, `POST /ledger-search` | Present | Keep; backed by `StatusProvider` and the ledger port | none | none |
 | `GET /rendering-template/{id}` | Present | Keep; the template id becomes per configuration | none | none |
 | `/system-info/*` | Present | Keep at the same paths, served by the keymanager provider module; absent when another provider is active | none | none |
-| VC-API (1.2.0) | Absent | `/vc-api/credentials/issue`, `/vc-api/credentials/status` |  | none |
+| VC-API (VCALM) | Absent | `/vc-api/credentials/issue`, `/vc-api/credentials/status` (P5-01, off unless `certify.protocol.vc-api.enabled`) |  | none |
 
 Plugin and property compatibility follow the same rule. `certify-integration-api` `1.0.0-beta.1` interfaces stay published; `LegacyDataProviderAdapter` and `LegacyExternalIssuerAdapter` wrap them into the new SPI. `mosip.certify.integration.data-provider-plugin` is honoured and mapped to a `CredentialDataSource` whose id is the bean name; `mosip.certify.plugin-mode` becomes the default `issuance_strategy` for configurations that do not set one; `mosip.certify.signing.provider` defaults to `keymanager`; `mosip.certify.allow-c-nonce` maps to the `oid4vci-v1` adapter's nonce setting. Old property names resolve through an `EnvironmentPostProcessor` alias table with a one-time warning; `mosip.certify.authn.filter-urls` is replaced by matchers each adapter registers, with the old list still honoured. All aliases are removed in 2.0.0.
 

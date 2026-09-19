@@ -67,6 +67,10 @@ A proof whose `kid` is a `did:web` DID URL is resolved by fetching the DID docum
 ## P-256 keys with a leading zero byte
 
 The DID document encoded the P-256 `publicKeyMultibase` from a minimal-length X coordinate, so for about one key in 256 (an X starting with a zero byte) `did.json` published a wrong point and no verifier could check credentials signed with that key; the `did:key` holder resolver built JWK coordinates the same way, changing the thumbprint of such holder keys. Both are fixed-width now. A deployment whose P-256 signing key is affected publishes the right key after upgrading, without a key change.
+
+## VC-API issuer endpoints
+
+With `certify.protocol.vc-api.enabled=true`, `POST /vc-api/credentials/issue` (W3C VCALM, the CCG VC-API) takes `{credential, options}` from a client registered under `certify.protocol.vc-api.clients.<id>` (HTTP Basic with the client id and `secret`; `credential-configurations` optionally limits what it may issue), signs the body with the `ldp_vc` configuration of `issuanceStrategy: SUPPLIED` whose `@context` and `type` match, and answers `201 {verifiableCredential}`; refusals are `application/problem+json`. `POST /vc-api/credentials/status` updates a status list entry named in the request or found through the ledger by `credentialId`. Today's `POST /credentials/status` is unchanged; nothing is served under `/vc-api` unless enabled.
 # Changes in release 0.11.0
 
 ## Removal of  Artifactory dependency
