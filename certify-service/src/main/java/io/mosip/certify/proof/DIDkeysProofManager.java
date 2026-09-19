@@ -83,6 +83,7 @@ public class DIDkeysProofManager implements JwtProofKeyManager {
 
                 // Construct JWK
                 JWK rsaKey = new RSAKey.Builder(Base64URL.encode(modulus), Base64URL.encode(exponent))
+                        .keyID(header.getKeyID()) // the JWS key selector matches the header kid; P-256 sets it, RSA did not
                         .build();
 
                 return Optional.of(rsaKey);
