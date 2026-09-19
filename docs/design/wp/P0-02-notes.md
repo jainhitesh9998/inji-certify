@@ -1,11 +1,11 @@
 # P0-02 notes: 0.14.0 (draft 13) against develop (OpenID4VCI 1.0), same inputs
 
-Recorded with `docs/design/wp/p0-02-recorder/` from `e54539a`; compared with `goldens/v1` recorded from develop. Every
+Recorded with `docs/design/wp/p0-02-recorder/` from `e54539a`; compared with `goldens/legacy-develop` recorded from develop. Every
 difference below is something `oid4vci-d13` (P1-12) must reproduce, or a defect to decide on before the adapter ships.
 
 ## Credential request and response
 
-| Aspect | 0.14.0 (`goldens/d13`) | develop (`goldens/v1`) |
+| Aspect | 0.14.0 (`goldens/legacy-0.14.0`) | develop (`goldens/legacy-develop`) |
 | --- | --- | --- |
 | Request body | `format` (required) plus `credential_definition{@context,type}` for `ldp_vc`, `vct` for `vc+sd-jwt`, `doctype` (optional `claims`) for `mso_mdoc`; one `proof{proof_type,jwt}` | `credential_configuration_id` plus `proofs{jwt:[...]}` |
 | Configuration selection | first configuration whose `scope` is in the token's `scope`, whose `format` matches, and whose context and type lists match the request's (same size, all types contained) / `vct` equal / `doctype` equal | by `credential_configuration_id` |

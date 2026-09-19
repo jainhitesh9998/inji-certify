@@ -69,7 +69,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * Velocity, keymanager signing) issues ldp_vc and dc+sd-jwt credentials through MockMvc; every credential
  * is verified with a library Certify did not write (danubetech for Data Integrity / LD proofs, Nimbus for
  * JWS) against what the service itself publishes (did.json, jwks.json); normalized responses are compared
- * with the recorded goldens under src/test/resources/goldens/v1.
+ * with the recorded goldens under src/test/resources/goldens/legacy-develop.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -173,7 +173,7 @@ class IssuanceGoldenTest {
         JsonNode metadata = getJson("/.well-known/openid-credential-issuer");
         assertEquals(domainUrl, metadata.get("credential_issuer").asText());
         assertTrue(metadata.get("credential_configurations_supported").has(LDP_ID));
-        Goldens.assertGolden("v1/well-known/openid-credential-issuer", onlyGoldenConfigurations(metadata));
+        Goldens.assertGolden("legacy-develop/well-known/openid-credential-issuer", onlyGoldenConfigurations(metadata));
     }
 
     /** The new core's view of the same rows: every golden configuration maps, with the key the legacy columns name. */
@@ -210,7 +210,7 @@ class IssuanceGoldenTest {
         for (JsonNode key : jwks.get("keys")) {
             assertTrue(key.hasNonNull("kid") && key.hasNonNull("kty"), "kid and kty on every JWK: " + key);
         }
-        Goldens.assertGolden("v1/well-known/jwks", jwks);
+        Goldens.assertGolden("legacy-develop/well-known/jwks", jwks);
     }
 
     /**
@@ -227,7 +227,7 @@ class IssuanceGoldenTest {
             assertTrue(method.get("id").asText().startsWith("did:web:localhost:certify#"), method.get("id").asText());
         }
         assertEquals("did:web:localhost:certify", did.get("assertionMethod").get(0).asText(), "documents today's behaviour, see findings");
-        Goldens.assertGolden("v1/well-known/did", did);
+        Goldens.assertGolden("legacy-develop/well-known/did", did);
     }
 
     @Test
@@ -246,7 +246,7 @@ class IssuanceGoldenTest {
         jsonLd.setDocumentLoader(staticContextLoader);
         assertTrue(new Ed25519Signature2020LdVerifier(publicKey).verify(jsonLd), "ldp_vc proof must verify with danubetech");
 
-        Goldens.assertGolden("v1/issuance/ldp_vc-response", body);
+        Goldens.assertGolden("legacy-develop/issuance/ldp_vc-response", body);
     }
 
     @Test
@@ -273,8 +273,8 @@ class IssuanceGoldenTest {
         assertNotNull(key, "kid " + jws.getHeader().getKeyID() + " must be in jwks.json");
         assertTrue(jws.verify(new ECDSAVerifier(key.toECKey())), "SD-JWT issuer signature must verify with Nimbus");
 
-        Goldens.assertGolden("v1/issuance/dc+sd-jwt-payload", payload);
-        Goldens.assertGolden("v1/issuance/dc+sd-jwt-header", objectMapper.readTree(jws.getHeader().toString()));
+        Goldens.assertGolden("legacy-develop/issuance/dc+sd-jwt-payload", payload);
+        Goldens.assertGolden("legacy-develop/issuance/dc+sd-jwt-header", objectMapper.readTree(jws.getHeader().toString()));
     }
 
     @Test
@@ -293,7 +293,7 @@ class IssuanceGoldenTest {
         assertTrue(new DataIntegrityProofLdVerifier(new Ed25519_EdDSA_PublicKeyVerifier(publicKey)).verify(jsonLd),
                 "eddsa-rdfc-2022 proof must verify with danubetech");
 
-        Goldens.assertGolden("v1/issuance/ldp_vc-data-integrity-response", body);
+        Goldens.assertGolden("legacy-develop/issuance/ldp_vc-data-integrity-response", body);
     }
 
     @Test
@@ -310,7 +310,7 @@ class IssuanceGoldenTest {
         jsonLd.setDocumentLoader(staticContextLoader);
         assertTrue(new RsaSignature2018LdVerifier(publicKey).verify(jsonLd), "RsaSignature2018 proof must verify with danubetech");
 
-        Goldens.assertGolden("v1/issuance/ldp_vc-rsa-response", body);
+        Goldens.assertGolden("legacy-develop/issuance/ldp_vc-rsa-response", body);
     }
 
     @Test
@@ -324,7 +324,7 @@ class IssuanceGoldenTest {
         jsonLd.setDocumentLoader(staticContextLoader);
         assertTrue(new info.weboftrust.ldsignatures.verifier.Ed25519Signature2018LdVerifier(publicKey).verify(jsonLd),
                 "Ed25519Signature2018 proof must verify with danubetech");
-        Goldens.assertGolden("v1/issuance/ldp_vc-ed25519-2018-response", body);
+        Goldens.assertGolden("legacy-develop/issuance/ldp_vc-ed25519-2018-response", body);
     }
 
     @Test
@@ -355,7 +355,7 @@ class IssuanceGoldenTest {
         jsonLd.setDocumentLoader(staticContextLoader);
         assertTrue(new info.weboftrust.ldsignatures.verifier.EcdsaSecp256k1Signature2019LdVerifier(jca).verify(jsonLd),
                 "EcdsaSecp256k1Signature2019 proof must verify with danubetech + JCA");
-        Goldens.assertGolden("v1/issuance/ldp_vc-secp256k1-2019-response", body);
+        Goldens.assertGolden("legacy-develop/issuance/ldp_vc-secp256k1-2019-response", body);
     }
 
     /**
@@ -389,7 +389,7 @@ class IssuanceGoldenTest {
         verifier.update(hash);
         assertTrue(verifier.verify(com.nimbusds.jose.crypto.impl.ECDSA.transcodeSignatureToDER(signature)),
                 "EcdsaSecp256r1Signature2019 proofValue must verify with JCA over the URDNA2015 hash");
-        Goldens.assertGolden("v1/issuance/ldp_vc-secp256r1-2019-response", body);
+        Goldens.assertGolden("legacy-develop/issuance/ldp_vc-secp256r1-2019-response", body);
     }
 
     /**
@@ -462,8 +462,8 @@ class IssuanceGoldenTest {
         summary.put("validityInfoKeys", mso.get("validityInfo").getKeys().toString());
         com.fasterxml.jackson.databind.node.ObjectNode responseShape = body.deepCopy();
         ((com.fasterxml.jackson.databind.node.ObjectNode) responseShape.get("credentials").get(0)).put("credential", "<mso_mdoc>");
-        Goldens.assertGolden("v1/issuance/mso_mdoc-response", responseShape);
-        Goldens.assertGolden("v1/issuance/mso_mdoc-summary", summary);
+        Goldens.assertGolden("legacy-develop/issuance/mso_mdoc-response", responseShape);
+        Goldens.assertGolden("legacy-develop/issuance/mso_mdoc-summary", summary);
     }
 
     /**
@@ -525,8 +525,8 @@ class IssuanceGoldenTest {
         summary.put("unprotectedLabels", sign1.get(1).getKeys().toString());
         summary.put("claimLabels", claims.getKeys().toString());
         summary.put("claim169Keys", claim169Map.getKeys().toString());
-        Goldens.assertGolden("v1/issuance/ldp_vc-qr-response", body);
-        Goldens.assertGolden("v1/issuance/claim169-cwt-summary", summary);
+        Goldens.assertGolden("legacy-develop/issuance/ldp_vc-qr-response", body);
+        Goldens.assertGolden("legacy-develop/issuance/claim169-cwt-summary", summary);
     }
 
     // ---- the new surface: POST /oid4vci/credential through DefaultIssuanceService (goldens under v2) ------------
@@ -545,7 +545,7 @@ class IssuanceGoldenTest {
         JsonLDObject jsonLd = JsonLDObject.fromJson(credential.toString());
         jsonLd.setDocumentLoader(staticContextLoader);
         assertTrue(new Ed25519Signature2020LdVerifier(publicKey).verify(jsonLd), "ldp_vc from the new surface must verify with danubetech");
-        Goldens.assertGolden("v2/oid4vci/ldp_vc-response", body);
+        Goldens.assertGolden("oid4vci-1.0/oid4vci/ldp_vc-response", body);
     }
 
     @Test
@@ -566,8 +566,8 @@ class IssuanceGoldenTest {
         JWK key = jwks.getKeyByKeyId(jws.getHeader().getKeyID());
         assertNotNull(key, "kid must be in jwks.json");
         assertTrue(jws.verify(new ECDSAVerifier(key.toECKey())), "SD-JWT from the new surface must verify with Nimbus");
-        Goldens.assertGolden("v2/oid4vci/dc+sd-jwt-payload", payload);
-        Goldens.assertGolden("v2/oid4vci/dc+sd-jwt-header", objectMapper.readTree(jws.getHeader().toString()));
+        Goldens.assertGolden("oid4vci-1.0/oid4vci/dc+sd-jwt-payload", payload);
+        Goldens.assertGolden("oid4vci-1.0/oid4vci/dc+sd-jwt-header", objectMapper.readTree(jws.getHeader().toString()));
     }
 
     @Test
@@ -608,7 +608,7 @@ class IssuanceGoldenTest {
         summary.put("protectedLabels", protectedHeader.getKeys().toString());
         summary.put("unprotectedLabels", issuerAuth.get(1).getKeys().toString());
         summary.put("validityInfoKeys", mso.get("validityInfo").getKeys().toString());
-        Goldens.assertGolden("v2/oid4vci/mso_mdoc-summary", summary);
+        Goldens.assertGolden("oid4vci-1.0/oid4vci/mso_mdoc-summary", summary);
     }
 
     // Status attachment with the real status-list service needs PostgreSQL (generate_series): StatusListPostgresTest
@@ -622,7 +622,7 @@ class IssuanceGoldenTest {
         assertEquals(issuerIdentifier + "/oid4vci/nonce", metadata.get("nonce_endpoint").asText());
         assertTrue(metadata.get("credential_configurations_supported").has(LDP_ID));
         assertTrue(metadata.get("credential_configurations_supported").has(MDOC_ID));
-        Goldens.assertGolden("v2/oid4vci/openid-credential-issuer", onlyGoldenConfigurations(metadata));
+        Goldens.assertGolden("oid4vci-1.0/oid4vci/openid-credential-issuer", onlyGoldenConfigurations(metadata));
     }
 
     @Test
@@ -668,7 +668,7 @@ class IssuanceGoldenTest {
         assertTrue(offerUri.startsWith("openid-credential-offer://"), offerUri);
         String offerUrl = java.net.URLDecoder.decode(offerUri.substring(offerUri.indexOf("credential_offer_uri=") + "credential_offer_uri=".length()), StandardCharsets.UTF_8);
         String offerId = offerUrl.substring(offerUrl.lastIndexOf('/') + 1);
-        Goldens.assertGolden("v1/pre-authorized/offer-uri", offerBody);
+        Goldens.assertGolden("legacy-develop/pre-authorized/offer-uri", offerBody);
 
         JsonNode offer = getJson("/credential-offer-data/" + offerId);
         // Finding (PROGRESS.md): the offer names the issuer as mosip.certify.identifier (with servlet path) while the
@@ -678,7 +678,7 @@ class IssuanceGoldenTest {
         assertEquals(LDP_ID, offer.get("credential_configuration_ids").get(0).asText());
         JsonNode grant = offer.get("grants").get("urn:ietf:params:oauth:grant-type:pre-authorized_code");
         String code = grant.get("pre-authorized_code").asText();
-        Goldens.assertGolden("v1/pre-authorized/credential-offer", offer);
+        Goldens.assertGolden("legacy-develop/pre-authorized/credential-offer", offer);
 
         MvcResult tokenResult = mockMvc.perform(post("/oauth/token").contentType(MediaType.APPLICATION_FORM_URLENCODED)
                 .param("grant_type", "urn:ietf:params:oauth:grant-type:pre-authorized_code")
@@ -692,13 +692,13 @@ class IssuanceGoldenTest {
         assertNotNull(key, "access token kid " + accessToken.getHeader().getKeyID() + " must be in jwks.json");
         assertTrue(accessToken.verify(new com.nimbusds.jose.crypto.RSASSAVerifier(key.toRSAKey())), "access token must verify with Nimbus");
         assertEquals(SCOPE, accessToken.getJWTClaimsSet().getStringClaim("scope"));
-        Goldens.assertGolden("v1/pre-authorized/token-response", token);
+        Goldens.assertGolden("legacy-develop/pre-authorized/token-response", token);
         // Finding (PROGRESS.md): sub carries the offer claims as a JSON string in map order (PII inside the access token,
         // nondeterministic key order); parsed here so the golden is stable while the finding stands.
         com.fasterxml.jackson.databind.node.ObjectNode claims = (com.fasterxml.jackson.databind.node.ObjectNode) objectMapper.readTree(accessToken.getJWTClaimsSet().toString());
         claims.set("sub", objectMapper.readTree(claims.get("sub").asText()));
-        Goldens.assertGolden("v1/pre-authorized/access-token-claims", claims);
-        Goldens.assertGolden("v1/pre-authorized/access-token-header", objectMapper.readTree(accessToken.getHeader().toString()));
+        Goldens.assertGolden("legacy-develop/pre-authorized/access-token-claims", claims);
+        Goldens.assertGolden("legacy-develop/pre-authorized/access-token-header", objectMapper.readTree(accessToken.getHeader().toString()));
     }
 
     @Test
@@ -706,7 +706,7 @@ class IssuanceGoldenTest {
         nonce();
         MvcResult result = issue(LDP_ID, proofJwt("not-the-nonce"));
         JsonNode body = objectMapper.readTree(result.getResponse().getContentAsString());
-        Goldens.assertGolden("v1/issuance/error-invalid-nonce", objectMapper.createObjectNode()
+        Goldens.assertGolden("legacy-develop/issuance/error-invalid-nonce", objectMapper.createObjectNode()
                 .put("status", result.getResponse().getStatus()).set("body", Goldens.normalize(body)));
     }
 
@@ -714,7 +714,7 @@ class IssuanceGoldenTest {
     void unknownConfigurationIsRejectedGolden() throws Exception {
         MvcResult result = issue("NoSuchCredential", proofJwt(nonce()));
         JsonNode body = objectMapper.readTree(result.getResponse().getContentAsString());
-        Goldens.assertGolden("v1/issuance/error-unknown-configuration", objectMapper.createObjectNode()
+        Goldens.assertGolden("legacy-develop/issuance/error-unknown-configuration", objectMapper.createObjectNode()
                 .put("status", result.getResponse().getStatus()).set("body", Goldens.normalize(body)));
     }
 

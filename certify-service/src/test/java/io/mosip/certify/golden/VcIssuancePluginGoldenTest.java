@@ -52,7 +52,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 /**
  * Goldens for the VCIssuance plugin mode (the plugin builds and signs the credential): what the legacy
  * {@code VCIssuanceServiceImpl} answers for a mocked {@code VCIssuancePlugin}, recorded under
- * goldens/v1/vci-plugin; {@link VcIssuancePluginGoldenCoreTest} replays them through the core.
+ * goldens/legacy-develop/vci-plugin; {@link VcIssuancePluginGoldenCoreTest} replays them through the core.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -137,7 +137,7 @@ class VcIssuancePluginGoldenTest {
         verify(vcIssuancePlugin).getVerifiableCredentialWithLinkedDataProof(any(), anyString(), identity.capture());
         assertEquals(SCOPE, identity.getValue().get("scope"));
         assertTrue(identity.getValue().containsKey("accessTokenHash"), "the token hash travels with the identity details");
-        Goldens.assertGolden("v1/vci-plugin/ldp_vc-response", body);
+        Goldens.assertGolden("legacy-develop/vci-plugin/ldp_vc-response", body);
     }
 
     @Test
@@ -146,25 +146,25 @@ class VcIssuancePluginGoldenTest {
         JsonNode body = objectMapper.readTree(result.getResponse().getContentAsString());
         assertEquals(200, result.getResponse().getStatus(), body.toString());
         assertEquals(MDOC_BYTES, body.get("credentials").get(0).get("credential").asText());
-        Goldens.assertGolden("v1/vci-plugin/mso_mdoc-response", body);
+        Goldens.assertGolden("legacy-develop/vci-plugin/mso_mdoc-response", body);
     }
 
     @Test
     void sdJwtIsNotServedByThePluginModeGolden() throws Exception {
-        Goldens.assertGolden("v1/vci-plugin/error-unsupported-format", statusAndBody(issue(SDJWT_ID, proofJwt(nonce()))));
+        Goldens.assertGolden("legacy-develop/vci-plugin/error-unsupported-format", statusAndBody(issue(SDJWT_ID, proofJwt(nonce()))));
     }
 
     @Test
     void pluginFailuresGolden() throws Exception {
         doThrow(new VCIExchangeException("vci_exchange_failed")).when(vcIssuancePlugin).getVerifiableCredentialWithLinkedDataProof(any(), anyString(), any());
-        Goldens.assertGolden("v1/vci-plugin/error-plugin-exception", statusAndBody(issue(LDP_ID, proofJwt(nonce()))));
+        Goldens.assertGolden("legacy-develop/vci-plugin/error-plugin-exception", statusAndBody(issue(LDP_ID, proofJwt(nonce()))));
         doReturn(new VCResult<>()).when(vcIssuancePlugin).getVerifiableCredentialWithLinkedDataProof(any(), anyString(), any());
-        Goldens.assertGolden("v1/vci-plugin/error-plugin-empty", statusAndBody(issue(LDP_ID, proofJwt(nonce()))));
+        Goldens.assertGolden("legacy-develop/vci-plugin/error-plugin-empty", statusAndBody(issue(LDP_ID, proofJwt(nonce()))));
     }
 
     @Test
     void didDocumentIsNotServedInPluginModeGolden() throws Exception {
-        Goldens.assertGolden("v1/vci-plugin/error-did-unsupported", statusAndBody(mockMvc.perform(get("/.well-known/did.json")).andReturn()));
+        Goldens.assertGolden("legacy-develop/vci-plugin/error-did-unsupported", statusAndBody(mockMvc.perform(get("/.well-known/did.json")).andReturn()));
     }
 
     // ---- helpers -------------------------------------------------------------------------------------
