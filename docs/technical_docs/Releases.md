@@ -59,6 +59,10 @@ A proof whose `kid` is an RSA `did:key` (multicodec `0x1205`) was decoded by 1.0
 ## Key attestations on the new surface
 
 `POST /oid4vci/credential` validates a `key_attestation` JOSE header on `jwt` proofs and accepts the `attestation` proof type (OpenID4VCI 1.0 Appendix D and F): the attestation must be typed `key-attestation+jwt`, signed by an attester configured under `certify.protocol.oid4vci-v1.key-attestation.attesters.<id>` (`jwks`, or `trust-anchor` for an `x5c` chain), unexpired, and carry the proof key in `attested_keys`; a configuration that lists `key_attestations_required` under `proof_types_supported.jwt` refuses proofs without one and checks the accepted `key_storage` and `user_authentication` values. One credential is issued per attested key, within `batch_size`. Compatibility surfaces are unchanged (`attestation` proofs answer `unsupported_proof_type` there, as any unknown type did).
+
+## `did:web` holder keys, and `did:key` in the advertised default
+
+A proof whose `kid` is a `did:web` DID URL is resolved by fetching the DID document over HTTPS when `certify.protocol.oid4vci-v1.did-web-holders.enabled=true` (`timeout` per fetch, default 5 s); the verification method named by the `kid` supplies the key as `publicKeyJwk` or `publicKeyMultibase`, and the credential is bound to the `kid`. Off by default, so nothing changes for deployments that do not set it. The local profile's `cryptographic-binding-methods-supported` default now lists `did:jwk` and `did:key` for `ldp_vc` and `dc+sd-jwt`, the methods the issuer resolves without configuration (the compose profile already did); a deployment that enables `did:web` holders adds `did:web` to its own default or per configuration.
 # Changes in release 0.11.0
 
 ## Removal of  Artifactory dependency

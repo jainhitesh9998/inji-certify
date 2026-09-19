@@ -10,7 +10,8 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  */
 @ConfigurationProperties(prefix = "certify.protocol.oid4vci-v1")
 public record Oid4vciProperties(@DefaultValue CompatCore compatCore, @DefaultValue Notification notification,
-                                  @DefaultValue Nonce nonce, @DefaultValue Batch batch, @DefaultValue KeyAttestation keyAttestation) {
+                                  @DefaultValue Nonce nonce, @DefaultValue Batch batch, @DefaultValue KeyAttestation keyAttestation,
+                               @DefaultValue DidWebHolders didWebHolders) {
 
     public static final String COMPAT_CORE_PREFIX = "certify.protocol.oid4vci-v1.compat-core";
 
@@ -42,4 +43,10 @@ public record Oid4vciProperties(@DefaultValue CompatCore compatCore, @DefaultVal
                                  @DefaultValue("PT60S") java.time.Duration clockSkew) {}
 
     public record Attester(String jwks, String trustAnchor) {}
+
+    /**
+     * {@code did-web-holders.enabled}: a proof whose {@code kid} is a {@code did:web} DID URL is resolved by fetching the
+     * DID document over HTTPS ({@code timeout} per fetch); off by default, so such proofs are rejected as before.
+     */
+    public record DidWebHolders(@DefaultValue("false") boolean enabled, @DefaultValue("PT5S") java.time.Duration timeout) {}
 }
