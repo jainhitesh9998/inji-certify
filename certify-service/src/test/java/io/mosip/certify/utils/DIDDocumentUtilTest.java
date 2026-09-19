@@ -1,5 +1,10 @@
 package io.mosip.certify.utils;
 
+import io.ipfs.multibase.Multibase;
+import org.bouncycastle.util.BigIntegers;
+import java.security.interfaces.ECPublicKey;
+import java.security.spec.ECGenParameterSpec;
+import java.security.KeyPairGenerator;
 import com.danubetech.keyformats.jose.JWSAlgorithm;
 import io.mosip.certify.core.constants.ErrorConstants;
 import io.mosip.certify.core.constants.SignatureAlg;
@@ -288,5 +293,33 @@ class DIDDocumentUtilTest {
                 "Top-level @context must include the secp256k1 security context");
         assertFalse(verificationMethods.get(0).containsKey("@context"),
                 "@context must not appear inside verificationMethod");
+    }
+
+    /**
+     * One P-256 key in 256 has an X coordinate that starts with a zero byte; encoded minimal-length it left a stray
+     * zero at the end of the compressed point and did.json published a different key (seen once in a full run).
+     */
+    @Test
+    void p256PublicKeyMultibaseIsFixedWidthEvenWhenXStartsWithZero() throws Exception {
+        KeyPairGenerator generator = KeyPairGenerator.getInstance("EC");
+        generator.initialize(new ECGenParameterSpec("secp256r1"));
+        ECPublicKey shortX = null;
+        for (int i = 0; i < 20000 && shortX == null; i++) {
+            ECPublicKey candidate = (ECPublicKey) generator.generateKeyPair().getPublic();
+            if (BigIntegers.asUnsignedByteArray(candidate.getW().getAffineX()).length < 32) {
+                shortX = candidate;
+            }
+        }
+        assertNotNull(shortX, "no P-256 key with a short X coordinate found in 20000 tries");
+        for (ECPublicKey publicKey : List.of(shortX, (ECPublicKey) generator.generateKeyPair().getPublic())) {
+            Map<String, Object> method = ReflectionTestUtils.invokeMethod(DIDDocumentUtil.class, "generateVerificationMethod",
+                    "ES256", "EcdsaSecp256r1Signature2019", publicKey, DID_URL, "kid-ec-r1");
+            byte[] multicodec = Multibase.decode((String) method.get("publicKeyMultibase"));
+            assertEquals(2 + 33, multicodec.length, "0x8024 prefix and a 33-byte compressed point");
+            org.bouncycastle.jce.spec.ECNamedCurveParameterSpec spec = org.bouncycastle.jce.ECNamedCurveTable.getParameterSpec("secp256r1");
+            org.bouncycastle.math.ec.ECPoint point = spec.getCurve().decodePoint(java.util.Arrays.copyOfRange(multicodec, 2, multicodec.length));
+            assertEquals(publicKey.getW().getAffineX(), point.getAffineXCoord().toBigInteger(), "X must round-trip");
+            assertEquals(publicKey.getW().getAffineY(), point.getAffineYCoord().toBigInteger(), "Y must round-trip");
+        }
     }
 }

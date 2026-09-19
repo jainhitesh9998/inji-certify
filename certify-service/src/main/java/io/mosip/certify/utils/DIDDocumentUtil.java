@@ -184,10 +184,10 @@ public class DIDDocumentUtil {
         ECPublicKey ecPublicKey = (ECPublicKey) publicKey;
         BigInteger yBI = ecPublicKey.getW().getAffineY();
         byte prefixByte = yBI.testBit(0) ? (byte) 0x03 : (byte) 0x02;
-        // Compressed format: 0x02 or 0x03 || X
+        // Compressed format: 0x02 or 0x03 || X, X always 32 bytes (a minimal-length X would leave a stray zero at the end)
         byte[] compressed = ByteBuffer.allocate(1 + 32)
                 .put(prefixByte)
-                .put(BigIntegers.asUnsignedByteArray(ecPublicKey.getW().getAffineX()))
+                .put(BigIntegers.asUnsignedByteArray(32, ecPublicKey.getW().getAffineX()))
                 .array();
 
         // P-256 compressed public key multicodec prefix: 0x1201(varint form of 0x8024)

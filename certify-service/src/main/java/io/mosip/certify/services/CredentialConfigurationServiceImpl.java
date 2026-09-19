@@ -27,7 +27,6 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cache.annotation.CacheEvict;
-import org.springframework.cache.annotation.Caching;
 import io.mosip.certify.core.spi.CredentialRegistry;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
@@ -69,7 +68,6 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
     private Map<String, List<List<String>>> keyAliasMapper;
 
 
-    private static final String CREDENTIAL_CONFIG_CACHE_NAME = "credentialConfig";
 
     /** The deployment-wide values the v1 API applies to every configuration; the v2 API applies them when a body omits them. */
     public ProtocolDefaults protocolDefaults(String format) {
@@ -268,16 +266,8 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
         return credentialConfig;
     }
 
-    /**
-     * NOTE: Using @credentialCacheKeyGenerator.generateKeyFromCredentialConfigKeyId(#id) will cause
-     * an additional database lookup for CredentialConfig by id within the key generator.
-     * This is a trade-off for using declarative @CacheEvict on this method signature.
-     * The alternative is manual CacheManager.evict() after fetching the object once in this method.
-     */
     @Override
-    @Caching(evict = {
-            @CacheEvict(cacheNames = CREDENTIAL_CONFIG_CACHE_NAME, key = "@credentialCacheKeyGenerator.generateKeyFromCredentialConfigKeyId(#credentialConfigKeyId)", condition = "#credentialConfigKeyId != null"),
-            @CacheEvict(cacheNames = CredentialRegistry.CACHE_NAME, allEntries = true)})
+    @CacheEvict(cacheNames = CredentialRegistry.CACHE_NAME, allEntries = true)
     public CredentialConfigResponse updateCredentialConfiguration(String credentialConfigKeyId, CredentialConfigurationDTO credentialConfigurationDTO){
         Optional<CredentialConfig> optional = credentialConfigRepository.findByCredentialConfigKeyId(credentialConfigKeyId);
 
@@ -305,18 +295,9 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
         return credentialConfigResponse;
     }
 
-    /**
-     * NOTE: Using @credentialCacheKeyGenerator.generateKeyFromCredentialConfigKeyId(#id) will cause
-     * an additional database lookup for CredentialConfig by id within the key generator.
-     * This is a trade-off for using declarative @CacheEvict on this method signature.
-     */
     @Override
     @Transactional
-    @Caching(evict = {
-            @CacheEvict(cacheNames = CREDENTIAL_CONFIG_CACHE_NAME,
-                    key = "@credentialCacheKeyGenerator.generateKeyFromCredentialConfigKeyId(#credentialConfigKeyId)",
-                    beforeInvocation = true),
-            @CacheEvict(cacheNames = CredentialRegistry.CACHE_NAME, allEntries = true)})
+    @CacheEvict(cacheNames = CredentialRegistry.CACHE_NAME, allEntries = true)
     public String deleteCredentialConfigurationById(String credentialConfigKeyId) {
         Optional<CredentialConfig> optional = credentialConfigRepository.findByCredentialConfigKeyId(credentialConfigKeyId) ;
 
@@ -325,8 +306,6 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
             throw new CredentialConfigException(ErrorConstants.CONFIG_NOT_FOUND_FOR_DELETE, "Configuration not found for delete with ID: " + credentialConfigKeyId);
         }
 
-        // The object is fetched once here.
-        // The @CacheEvict's key SpEL will cause CredentialCacheKeyGenerator to fetch it again.
         credentialConfigRepository.delete(optional.get());
         log.info("Deleted credential configuration: {}", credentialConfigKeyId);
         return credentialConfigKeyId;

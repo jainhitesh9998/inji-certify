@@ -100,7 +100,7 @@ public class StatusListCredentialService {
      * @param id the ID of the status list credential
      * @return Optional containing StatusListCredential if found
      */
-    public Optional<StatusListCredential> findStatusListById(String id) {
+    Optional<StatusListCredential> findStatusListById(String id) {
         log.info("Finding status list credential by ID: {}", id);
 
         try {
@@ -117,7 +117,7 @@ public class StatusListCredentialService {
      * @param statusPurpose the purpose of the status list (e.g., "revocation", "suspension")
      * @return Optional containing StatusListCredential if found
      */
-    public Optional<StatusListCredential> findSuitableStatusList(String statusPurpose, StatusListCredential.CredentialStatus status) {
+    private Optional<StatusListCredential> findSuitableStatusList(String statusPurpose, StatusListCredential.CredentialStatus status) {
         return statusListCredentialRepository.findFirstByStatusPurposeAndCredentialStatusOrderByCreatedDtimesDesc(statusPurpose, status);
     }
 
@@ -128,7 +128,7 @@ public class StatusListCredentialService {
      * @return the generated StatusListCredential
      */
     @Transactional
-    public StatusListCredential generateStatusListCredential(String statusPurpose) {
+    StatusListCredential generateStatusListCredential(String statusPurpose) {
         log.info("Generating new status list credential with purpose: {}", statusPurpose);
 
         try {
@@ -241,7 +241,7 @@ public class StatusListCredentialService {
      * @return StatusListCredential that can be used for the given purpose
      */
     @Transactional
-    public StatusListCredential findOrCreateStatusList(String statusPurpose) {
+    StatusListCredential findOrCreateStatusList(String statusPurpose) {
         log.info("Finding or creating status list for purpose: {}", statusPurpose);
 
         // Try to find an existing suitable status list
@@ -258,7 +258,7 @@ public class StatusListCredentialService {
      * @param statusListId the ID of the status list
      * @return the next available index, or -1 if the list is full
      */
-    public long findNextAvailableIndex(String statusListId) {
+    long findNextAvailableIndex(String statusListId) {
         Optional<Long> availableIndex = indexProvider.acquireIndex(statusListId, Map.of());
         return availableIndex.orElse(-1L);
     }
