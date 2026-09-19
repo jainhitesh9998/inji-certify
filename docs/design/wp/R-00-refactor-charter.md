@@ -20,3 +20,5 @@ Owner's request of 2026-09-19: the develop-era code under `certify-service` shou
 | Config and wiring | `config/AppConfig`, `config/SecurityConfig`, `config/WebMvcConfig`, `CertifyServiceApplication` | Keymanager wiring in the application class; three URL lists | keymanager wiring already moved (P1-02); URL lists stay until the adapters own every path |
 
 Slices are taken in the order of the table, smallest first within an area, and each is recorded in `PROGRESS.md` as `R-nn`.
+
+Done: R-01 golden set names; R-02 `CertifyApplicationTests` no longer boots a second application.
