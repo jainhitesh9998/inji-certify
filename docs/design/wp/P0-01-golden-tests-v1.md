@@ -9,7 +9,7 @@ Record byte-exact request/response pairs for every endpoint on develop and repla
 ## Scope
 
 - Run the service with profile `local` (TestBearer tokens) and the mock CSV data provider; record for: `POST /issuance/credential` (ldp_vc, dc+sd-jwt, mso_mdoc; valid, invalid proof, missing nonce, wrong scope), `POST /nonce`, all `/.well-known/*`, `/credential-configurations` CRUD, `/credentials/status`, `/credentials/status-list/{id}`, `/ledger-search`, `/rendering-template/{id}`, `/oauth/token` (pre-auth), `/pre-authorized-data`, `/credential-offer-data/{id}`.
-- Store under `certify-service/src/test/resources/goldens/v1/<endpoint>/<case>.{request,response}.json` with a `normalize.json` per case listing volatile fields (timestamps, ids, nonces, signatures) and the rule for each (`ignore`, `regex`, `verify-signature`).
+- Store under `certify-service/src/test/resources/goldens/legacy-develop/<endpoint>/<case>.{request,response}.json` with a `normalize.json` per case listing volatile fields (timestamps, ids, nonces, signatures) and the rule for each (`ignore`, `regex`, `verify-signature`).
 - A `GoldenReplayTest` (MockMvc, profile `test`) that replays every case and diffs after normalisation; a Gradle/Maven profile `-Pgoldens-record` that re-records.
 - Do not change production code in this WP.
 

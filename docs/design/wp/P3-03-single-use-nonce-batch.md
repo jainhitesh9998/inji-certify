@@ -20,7 +20,7 @@ Single-use nonces on the draft-13 adapter and on the compatibility path (their n
 
 ## Acceptance criteria
 
-- [x] `Oid4vciNonceBatchTest` green; `IssuanceGoldenTest`, `IssuanceGoldenCoreTest`, `D13GoldenReplayTest`, `TenancyIssuanceTest` green; `goldens/v1` and `goldens/d13` byte-identical.
+- [x] `Oid4vciNonceBatchTest` green; `IssuanceGoldenTest`, `IssuanceGoldenCoreTest`, `D13GoldenReplayTest`, `TenancyIssuanceTest` green; `goldens/legacy-develop` and `goldens/legacy-0.14.0` byte-identical.
 - [x] Full `certify-service` suite green (975 tests, 0 failures).
 - [ ] CI green on the fork.
 - [x] Decision logged: consume on success only, batch size default, compatibility surfaces unchanged.

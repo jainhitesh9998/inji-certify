@@ -13,7 +13,7 @@ The `issuance_transaction` table the 1.1.0 migration created gets its first writ
 - `Oid4vciCredentialController` adds `notification_id` to the credential response; `Oid4vciIssuer.notificationEndpoint()`; `notification_endpoint` in both the default and the per-tenant metadata document (`CredentialIssuerMetadataDTO`, `TenantIssuerMetadata`).
 - `Oid4vciNotificationController`: `POST /oid4vci/notification` (JSON `notification_id`, `event`, optional `event_description`), 204 on success and the row moves to `NOTIFIED`; `400 invalid_notification_request` for a missing id or unknown event, `400 invalid_notification_id` when no row matches the id and the caller's access token; `401 invalid_token` without a token.
 - `IssuanceTransactionHousekeeping`: a scheduled purge of rows past `expires_at` every `certify.protocol.oid4vci-v1.notification.purge-interval` (default one hour).
-- Goldens: `notification_id` joins the volatile keys; the three v2 goldens that carry the new field or endpoint are re-recorded (`ldp_vc-response`, `ldp_vc-status-response`, `openid-credential-issuer`). `goldens/v1` and `goldens/d13` are untouched: the compatibility surfaces neither carry `notification_id` nor advertise the endpoint.
+- Goldens: `notification_id` joins the volatile keys; the three v2 goldens that carry the new field or endpoint are re-recorded (`ldp_vc-response`, `ldp_vc-status-response`, `openid-credential-issuer`). `goldens/legacy-develop` and `goldens/legacy-0.14.0` are untouched: the compatibility surfaces neither carry `notification_id` nor advertise the endpoint.
 - Test `Oid4vciNotificationTest`: issuance writes the row with the expected columns, the wallet's report flips it to `NOTIFIED`, the two error codes, the purge, and the metadata field.
 
 ## Outside scope
@@ -22,7 +22,7 @@ Deferred issuance (`transaction_id`, `/oid4vci/deferred_credential`, state `DEFE
 
 ## Acceptance criteria
 
-- [x] `Oid4vciNotificationTest` green; `IssuanceGoldenTest`, `IssuanceGoldenCoreTest`, `D13GoldenReplayTest`, `StatusListPostgresTest`, `TenancyIssuanceTest` green; `goldens/v1` and `goldens/d13` byte-identical.
+- [x] `Oid4vciNotificationTest` green; `IssuanceGoldenTest`, `IssuanceGoldenCoreTest`, `D13GoldenReplayTest`, `StatusListPostgresTest`, `TenancyIssuanceTest` green; `goldens/legacy-develop` and `goldens/legacy-0.14.0` byte-identical.
 - [x] Full `certify-service` suite green (969 tests, 0 failures).
 - [ ] CI green on the fork.
 - [x] Decision logged: `notification_id` is the core transaction id; retention and purge defaults.

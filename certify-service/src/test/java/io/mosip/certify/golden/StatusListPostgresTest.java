@@ -92,7 +92,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * starts on it with Flyway enabled, and a VC 2.0 {@code ldp_vc} with a revocation purpose is issued through the new
  * surface and through the compatibility surface. The credential, the Bitstring Status List credential it points to
  * and the re-signed list after a revocation are all verified with danubetech; the goldens are recorded under
- * {@code goldens/v2/oid4vci}, {@code goldens/v2/status-list} and {@code goldens/v1/issuance}.
+ * {@code goldens/oid4vci-1.0/oid4vci}, {@code goldens/oid4vci-1.0/status-list} and {@code goldens/legacy-develop/issuance}.
  * Skipped without Docker.
  */
 @SpringBootTest
@@ -239,7 +239,7 @@ class StatusListPostgresTest {
         long index = Long.parseLong(status.get("statusListIndex").asText());
         assertEquals(listUrl + "#" + index, status.get("id").asText());
         verifyDataIntegrity(credential);
-        Goldens.assertGolden("v2/oid4vci/ldp_vc-status-response", body);
+        Goldens.assertGolden("oid4vci-1.0/oid4vci/ldp_vc-status-response", body);
 
         // the list the entry points to is published, verifiable, and the entry's bit is clear
         JsonNode list = statusList(listUrl);
@@ -248,7 +248,7 @@ class StatusListPostgresTest {
         assertEquals("revocation", list.get("credentialSubject").get("statusPurpose").asText());
         assertFalse(bit(list.get("credentialSubject").get("encodedList").asText(), index), "a fresh entry is not revoked");
         verifyStatusList(list);
-        Goldens.assertGolden("v2/status-list/bitstring-status-list-credential", list);
+        Goldens.assertGolden("oid4vci-1.0/status-list/bitstring-status-list-credential", list);
 
         // the ledger row the new surface's listener writes carries the status entry and the indexed plugin data
         Ledger ledger = ledgerRepository.findByCredentialId(credential.get("id").asText()).orElseThrow();
@@ -298,7 +298,7 @@ class StatusListPostgresTest {
         assertEquals(viaNew.get("statusListCredential").asText(), viaLegacy.get("statusListCredential").asText(), "both surfaces draw from the same list");
         assertNotEquals(viaNew.get("statusListIndex").asText(), viaLegacy.get("statusListIndex").asText(), "each credential gets its own index");
         verifyDataIntegrity(credential);
-        Goldens.assertGolden("v1/issuance/ldp_vc-status-response", body);
+        Goldens.assertGolden("legacy-develop/issuance/ldp_vc-status-response", body);
     }
 
     // ---- helpers -------------------------------------------------------------------------------------

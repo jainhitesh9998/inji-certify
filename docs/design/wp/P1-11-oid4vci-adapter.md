@@ -19,7 +19,7 @@ The spec-clean surface exists and issues a credential end to end through `Defaul
 
 ## Acceptance criteria
 
-- [x] `IssuanceGoldenTest.oid4vciLdpVcIssuanceGoldenAndIndependentVerification`: an Ed25519Signature2020 `ldp_vc` issued through the new surface from the same configuration and proof as the legacy golden, verified with danubetech against `did.json`; golden recorded under `goldens/v2/oid4vci`.
+- [x] `IssuanceGoldenTest.oid4vciLdpVcIssuanceGoldenAndIndependentVerification`: an Ed25519Signature2020 `ldp_vc` issued through the new surface from the same configuration and proof as the legacy golden, verified with danubetech against `did.json`; golden recorded under `goldens/oid4vci-1.0/oid4vci`.
 - [x] Spec error names on the new surface (`invalid_credential_request`, `invalid_nonce`).
 - [x] Legacy goldens unchanged; ArchUnit unchanged.
 - [x] Full `certify-service` suite green: 891 tests.

@@ -16,7 +16,7 @@ Every other rule below serves these three; when they conflict, this order decide
 
 ## Rules that every change must respect
 
-1. Zero wire-byte change until Phase 3. The golden tests (`goldens/v1`, `goldens/d13`) and the signature vectors are the definition of "unchanged"; if a change cannot keep them green, the change is wrong.
+1. Zero wire-byte change until Phase 3. The golden tests (`goldens/legacy-develop`, `goldens/legacy-0.14.0`) and the signature vectors are the definition of "unchanged"; if a change cannot keep them green, the change is wrong.
 2. Keymanager stays an embedded library and the default provider. It is wrapped as `certify-keyprovider-keymanager`, which carries its component scan, `mosip.keymanager.dao.enabled=false` JPA wiring and `initKeys`; it is never called over HTTP; `io.mosip.kernel` imports live only in that module once WP P1-02 lands. Existing deployments keep the same jar, properties, tables, key policies and rotation, `kid` values and signature bytes. Other key managers plug in above it through `KeyProvider`; PKI formats (mDoc/mDL, SD-JWT `x5c`) use the `x509` providers and `CertificateChainPolicy` (`docs/design/06a-x509-pki-and-mdoc.md`).
 3. Every database change is additive, shipped as a Flyway migration with a rollback script under `db_upgrade_script`, backfilled in the same migration, and rehearsed on a develop dump. Nothing is renamed or dropped before the 2.0.0 sunset. `spring.jpa.hibernate.ddl-auto` stays `none`.
 4. Tenant-ready, single-tenant by default: new core types carry `tenantId` (default `default`), new tenant-scoped tables get `tenant_id VARCHAR(64) NOT NULL DEFAULT 'default'`, and no entity embeds the tenant in its identity.

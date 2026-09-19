@@ -57,7 +57,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
- * Replays the draft-13 goldens recorded from 0.14.0 (goldens/d13, P0-02) against the oid4vci-d13 adapter: the same
+ * Replays the draft-13 goldens recorded from 0.14.0 (goldens/legacy-0.14.0, P0-02) against the oid4vci-d13 adapter: the same
  * configurations and mock data as the recorder, the 0.14.0 request bodies on {@code /issuance/credential},
  * {@code /issuance/vd12/credential} and {@code /issuance/vd11/credential}, and the 0.14.0 error answers. Credentials
  * are verified with libraries Certify did not write. The two documented deviations (P0-02-notes.md, decision log) are
@@ -127,7 +127,7 @@ class D13GoldenReplayTest {
         JsonLDObject jsonLd = JsonLDObject.fromJson(credential.toString());
         jsonLd.setDocumentLoader(staticContextLoader);
         assertTrue(new Ed25519Signature2020LdVerifier(publicKey).verify(jsonLd), "ldp_vc through the d13 adapter must verify with danubetech");
-        Goldens.assertGolden("d13/issuance/ldp_vc-response", body);
+        Goldens.assertGolden("legacy-0.14.0/issuance/ldp_vc-response", body);
     }
 
     @Test
@@ -135,11 +135,11 @@ class D13GoldenReplayTest {
         MvcResult vd12 = issue("/issuance/vd12/credential", ldpRequest(LDP_TYPES, proofJwt(nonce())));
         JsonNode vd12Body = objectMapper.readTree(vd12.getResponse().getContentAsString());
         assertEquals(200, vd12.getResponse().getStatus(), vd12Body.toString());
-        Goldens.assertGolden("d13/issuance/vd12-ldp_vc-response", vd12Body);
+        Goldens.assertGolden("legacy-0.14.0/issuance/vd12-ldp_vc-response", vd12Body);
         MvcResult vd11 = issue("/issuance/vd11/credential", ldpRequest(LDP_TYPES, proofJwt(nonce())));
         JsonNode vd11Body = objectMapper.readTree(vd11.getResponse().getContentAsString());
         assertEquals(200, vd11.getResponse().getStatus(), vd11Body.toString());
-        Goldens.assertGolden("d13/issuance/vd11-ldp_vc-response", vd11Body);
+        Goldens.assertGolden("legacy-0.14.0/issuance/vd11-ldp_vc-response", vd11Body);
     }
 
     @Test
@@ -154,12 +154,12 @@ class D13GoldenReplayTest {
         JWK key = jwks.getKeyByKeyId(jws.getHeader().getKeyID());
         assertNotNull(key, "kid must be in jwks.json");
         assertTrue(jws.verify(new ECDSAVerifier(key.toECKey())), "SD-JWT through the d13 adapter must verify with Nimbus");
-        Goldens.assertGolden("d13/issuance/vc+sd-jwt-header", objectMapper.readTree(jws.getHeader().toString()));
-        Goldens.assertGolden("d13/issuance/vc+sd-jwt-payload", objectMapper.readTree(jws.getPayload().toString()));
+        Goldens.assertGolden("legacy-0.14.0/issuance/vc+sd-jwt-header", objectMapper.readTree(jws.getHeader().toString()));
+        Goldens.assertGolden("legacy-0.14.0/issuance/vc+sd-jwt-payload", objectMapper.readTree(jws.getPayload().toString()));
         ObjectNode shape = body.deepCopy();
         shape.put("credential", "<vc+sd-jwt>");
         shape.put("disclosures", parts.length - 1);
-        Goldens.assertGolden("d13/issuance/vc+sd-jwt-response", shape);
+        Goldens.assertGolden("legacy-0.14.0/issuance/vc+sd-jwt-response", shape);
     }
 
     @Test
@@ -213,23 +213,23 @@ class D13GoldenReplayTest {
         summary.put("validityInfoKeys", "[\"validFrom\", \"validUntil\"]");
         ObjectNode shape = body.deepCopy();
         shape.put("credential", "<mso_mdoc>");
-        Goldens.assertGolden("d13/issuance/mso_mdoc-response", shape);
-        Goldens.assertGolden("d13/issuance/mso_mdoc-summary", summary);
+        Goldens.assertGolden("legacy-0.14.0/issuance/mso_mdoc-response", shape);
+        Goldens.assertGolden("legacy-0.14.0/issuance/mso_mdoc-summary", summary);
     }
 
     @Test
     void errorAnswersReplay() throws Exception {
         MvcResult wrongNonce = issue("/issuance/credential", ldpRequest(LDP_TYPES, proofJwt("not-the-nonce")));
-        Goldens.assertGolden("d13/issuance/error-invalid-nonce", statusAndBody(wrongNonce));
+        Goldens.assertGolden("legacy-0.14.0/issuance/error-invalid-nonce", statusAndBody(wrongNonce));
         String fresh = objectMapper.readTree(wrongNonce.getResponse().getContentAsString()).get("c_nonce").asText();
         MvcResult retry = issue("/issuance/credential", ldpRequest(LDP_TYPES, proofJwt(fresh)));
         assertEquals(200, retry.getResponse().getStatus(), "the c_nonce handed out in the error is the one to use next: " + retry.getResponse().getContentAsString());
 
-        Goldens.assertGolden("d13/issuance/error-unknown-type", statusAndBody(issue("/issuance/credential",
+        Goldens.assertGolden("legacy-0.14.0/issuance/error-unknown-type", statusAndBody(issue("/issuance/credential",
                 ldpRequest(List.of("VerifiableCredential", "NoSuchCredential"), proofJwt(nonce())))));
-        Goldens.assertGolden("d13/issuance/error-unsupported-format", statusAndBody(issue("/issuance/credential", Map.of("format", "jwt_vc_json",
+        Goldens.assertGolden("legacy-0.14.0/issuance/error-unsupported-format", statusAndBody(issue("/issuance/credential", Map.of("format", "jwt_vc_json",
                 "credential_definition", Map.of("@context", LDP_CONTEXT, "type", LDP_TYPES), "proof", proof(proofJwt(nonce()))))));
-        Goldens.assertGolden("d13/issuance/error-missing-proof", statusAndBody(issue("/issuance/credential", Map.of("format", "ldp_vc",
+        Goldens.assertGolden("legacy-0.14.0/issuance/error-missing-proof", statusAndBody(issue("/issuance/credential", Map.of("format", "ldp_vc",
                 "credential_definition", Map.of("@context", LDP_CONTEXT, "type", LDP_TYPES)))));
     }
 
@@ -248,11 +248,11 @@ class D13GoldenReplayTest {
         MvcResult latest = mockMvc.perform(get("/.well-known/openid-credential-issuer?version=latest")).andReturn();
         assertEquals(200, latest.getResponse().getStatus(), latest.getResponse().getContentAsString());
         assertNotNull(latest.getResponse().getHeader("Deprecation"), "versioned metadata is deprecated from day one");
-        Goldens.assertGolden("d13/well-known/openid-credential-issuer-latest", onlyGoldenConfigurations(objectMapper.readTree(latest.getResponse().getContentAsString())));
-        Goldens.assertGolden("d13/well-known/openid-credential-issuer-vd12", onlyGoldenConfigurations(getJson("/.well-known/openid-credential-issuer?version=vd12")));
-        Goldens.assertGolden("d13/well-known/openid-credential-issuer-vd11", onlyGoldenConfigurations(getJson("/.well-known/openid-credential-issuer?version=vd11")));
-        Goldens.assertGolden("d13/well-known/issuance-openid-credential-issuer", onlyGoldenConfigurations(getJson("/issuance/.well-known/openid-credential-issuer")));
-        Goldens.assertGolden("d13/well-known/openid-credential-issuer-unknown-version",
+        Goldens.assertGolden("legacy-0.14.0/well-known/openid-credential-issuer-latest", onlyGoldenConfigurations(objectMapper.readTree(latest.getResponse().getContentAsString())));
+        Goldens.assertGolden("legacy-0.14.0/well-known/openid-credential-issuer-vd12", onlyGoldenConfigurations(getJson("/.well-known/openid-credential-issuer?version=vd12")));
+        Goldens.assertGolden("legacy-0.14.0/well-known/openid-credential-issuer-vd11", onlyGoldenConfigurations(getJson("/.well-known/openid-credential-issuer?version=vd11")));
+        Goldens.assertGolden("legacy-0.14.0/well-known/issuance-openid-credential-issuer", onlyGoldenConfigurations(getJson("/issuance/.well-known/openid-credential-issuer")));
+        Goldens.assertGolden("legacy-0.14.0/well-known/openid-credential-issuer-unknown-version",
                 statusAndBody(mockMvc.perform(get("/.well-known/openid-credential-issuer?version=vd10")).andReturn()));
         // without a version the current (OpenID4VCI 1.0) document keeps answering
         JsonNode current = getJson("/.well-known/openid-credential-issuer");

@@ -2,7 +2,7 @@
 
 Owner's request of 2026-09-19: the develop-era code under `certify-service` should be reviewed file by file and made tasteful. Rules for every slice (`wp/r-<nn>-<slug>` branches, one area each, the full suite and CI as gates):
 
-1. Behaviour is fixed by the goldens (`goldens/v1`, `goldens/d13`, `goldens/v2`) and the signature vectors; a slice that cannot keep them green is wrong.
+1. Behaviour is fixed by the goldens (`goldens/legacy-develop`, `goldens/legacy-0.14.0`, `goldens/oid4vci-1.0`) and the signature vectors; a slice that cannot keep them green is wrong.
 2. No abstraction for its own sake: a new interface, base class or indirection needs a sentence in the slice's spec saying what it removes or enables. Prefer deleting code, narrowing visibility, removing dead branches, naming things for what they do, and moving a method next to the data it uses.
 3. Plugin interfaces (`certify-integration-api`), property names and endpoints are untouched; internal classes may be renamed, merged or removed.
 4. Each slice lists the files it changed with one line per file: what was wrong, what changed.

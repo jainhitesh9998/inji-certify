@@ -1,6 +1,6 @@
 # Recording the draft-13 goldens from release 0.14.0
 
-The files under `certify-service/src/test/resources/goldens/d13` were produced by `D13GoldenRecorder` running inside a
+The files under `certify-service/src/test/resources/goldens/legacy-0.14.0` were produced by `D13GoldenRecorder` running inside a
 checkout of release 0.14.0 (`e54539a`), in process: the real service on H2 with the PKCS#12 keymanager, Velocity and
 the `local` profile's TestBearer filter, driven through MockMvc with the same mock data and configurations as the v1
 goldens (`IssuanceGoldenTest`). To re-record:
@@ -14,7 +14,7 @@ cp certify-service/src/test/resources/goldens/templates/golden-{ldp,sdjwt,mdoc}.
 export JAVA_HOME=$(/usr/libexec/java_home -v 21)
 (cd /tmp/certify-0.14.0 && mvn -B -ntp -s "$OLDPWD/.mvn/settings-local.xml" -Dmaven.legacyLocalRepo=true -Dgpg.skip=true -Dmaven.gitcommitid.skip=true -DskipTests -pl certify-core,certify-integration-api,certify-service -am install)
 (cd /tmp/certify-0.14.0 && mvn -B -ntp -s "$OLDPWD/.mvn/settings-local.xml" -Dmaven.legacyLocalRepo=true -Dgpg.skip=true -Dmaven.gitcommitid.skip=true -pl certify-service test -Dtest=D13GoldenRecorder -Dsurefire.failIfNoSpecifiedTests=false)
-rm -rf certify-service/src/test/resources/goldens/d13 && cp -R /tmp/certify-0.14.0/certify-service/src/test/resources/goldens/d13 certify-service/src/test/resources/goldens/d13
+rm -rf certify-service/src/test/resources/goldens/legacy-0.14.0 && cp -R /tmp/certify-0.14.0/certify-service/src/test/resources/goldens/legacy-0.14.0 certify-service/src/test/resources/goldens/legacy-0.14.0
 ```
 
 A second run of the recorder must report no recorded files (the set is stable). `d13-schema-patch.sql` replaces the

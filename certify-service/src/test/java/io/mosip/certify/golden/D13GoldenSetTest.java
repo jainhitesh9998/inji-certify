@@ -31,7 +31,7 @@ class D13GoldenSetTest {
     @Test
     void goldenSetIsCompleteAndNormalized() throws Exception {
         for (String name : EXPECTED) {
-            Path file = Goldens.goldenPath("d13/" + name);
+            Path file = Goldens.goldenPath("legacy-0.14.0/" + name);
             assertTrue(Files.exists(file), "missing golden " + file);
             String content = Files.readString(file, StandardCharsets.UTF_8);
             JsonNode node = Goldens.mapper().readTree(content);
@@ -40,9 +40,9 @@ class D13GoldenSetTest {
             assertTrue(Goldens.mapper().writeValueAsString(Goldens.normalize(node)).equals(Goldens.mapper().writeValueAsString(node)),
                     name + " must already be in normalized form");
         }
-        try (var files = Files.walk(Goldens.goldenPath("d13").getParent().resolve("d13"))) {
+        try (var files = Files.walk(Goldens.goldenPath("legacy-0.14.0").getParent().resolve("legacy-0.14.0"))) {
             long count = files.filter(p -> p.toString().endsWith(".json")).count();
-            assertTrue(count == EXPECTED.size(), "unexpected golden files under d13: " + count + " vs " + EXPECTED.size());
+            assertTrue(count == EXPECTED.size(), "unexpected golden files under legacy-0.14.0: " + count + " vs " + EXPECTED.size());
         }
     }
 }

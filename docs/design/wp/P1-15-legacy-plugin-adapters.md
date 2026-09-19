@@ -10,7 +10,7 @@ The core serves both plugin modes. `DataProviderPlugin` already reaches the core
 
 - `LegacyExternalIssuer` (`io.mosip.certify.oid4vci`, id `vci-plugin`): the calls and error codes of `VCIssuanceServiceImpl`: `ldp_vc` through `getVerifiableCredentialWithLinkedDataProof`, `mso_mdoc` through `getVerifiableCredential`, any other format refused as `unsupported_credential_format`; identity details are the token claims plus `accessTokenHash`; a `VCIExchangeException` keeps its code as message, an empty result is `vc_issuance_failed`. The plugin is resolved lazily, so the bean exists in both modes and the core picks the single `ExternalIssuer` for `EXTERNAL` configurations.
 - `CoreBackedVCIssuanceService`: conditional on the flag alone (both plugin modes); `getDIDDocument` answers `unsupported_in_current_plugin_mode` in VCIssuance mode as the legacy service does.
-- Goldens: `VcIssuancePluginGoldenTest` records the VCIssuance-mode answers of the legacy service for a mocked plugin under `goldens/v1/vci-plugin` (ldp_vc and mDoc responses, unsupported SD-JWT, plugin exception, empty plugin result, DID document refusal); `VcIssuancePluginGoldenCoreTest` replays them through the core.
+- Goldens: `VcIssuancePluginGoldenTest` records the VCIssuance-mode answers of the legacy service for a mocked plugin under `goldens/legacy-develop/vci-plugin` (ldp_vc and mDoc responses, unsupported SD-JWT, plugin exception, empty plugin result, DID document refusal); `VcIssuancePluginGoldenCoreTest` replays them through the core.
 
 ## Outside scope
 

@@ -53,7 +53,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 /**
  * Records the draft-13 goldens from release 0.14.0 (this tree, e54539a): the real service on H2 with the PKCS#12
  * keymanager, Velocity and the TestBearer filter, driven through MockMvc with the same mock data and the same
- * configurations as develop's v1 goldens. Output goes to src/test/resources/goldens/d13 and is copied into the
+ * configurations as develop's v1 goldens. Output goes to src/test/resources/goldens/legacy-0.14.0 and is copied into the
  * rebuild branch, where the oid4vci-d13 adapter must reproduce it. Runs in this tree only.
  */
 @SpringBootTest
@@ -111,15 +111,15 @@ class D13GoldenRecorder {
 
     @Test
     void wellKnownGoldens() throws Exception {
-        Goldens.assertGolden("d13/well-known/openid-credential-issuer-latest", getJson("/.well-known/openid-credential-issuer"));
-        Goldens.assertGolden("d13/well-known/openid-credential-issuer-vd12", getJson("/.well-known/openid-credential-issuer?version=vd12"));
-        Goldens.assertGolden("d13/well-known/openid-credential-issuer-vd11", getJson("/.well-known/openid-credential-issuer?version=vd11"));
-        Goldens.assertGolden("d13/well-known/issuance-openid-credential-issuer", getJson("/issuance/.well-known/openid-credential-issuer"));
-        Goldens.assertGolden("d13/well-known/did", getJson("/.well-known/did.json"));
-        Goldens.assertGolden("d13/well-known/issuance-did", getJson("/issuance/.well-known/did.json"));
-        Goldens.assertGolden("d13/well-known/jwks", getJson("/.well-known/jwks.json"));
-        Goldens.assertGolden("d13/well-known/oauth-authorization-server", getJson("/.well-known/oauth-authorization-server"));
-        Goldens.assertGolden("d13/well-known/openid-credential-issuer-unknown-version", statusAndBody(mockMvc.perform(get("/.well-known/openid-credential-issuer?version=vd10")).andReturn()));
+        Goldens.assertGolden("legacy-0.14.0/well-known/openid-credential-issuer-latest", getJson("/.well-known/openid-credential-issuer"));
+        Goldens.assertGolden("legacy-0.14.0/well-known/openid-credential-issuer-vd12", getJson("/.well-known/openid-credential-issuer?version=vd12"));
+        Goldens.assertGolden("legacy-0.14.0/well-known/openid-credential-issuer-vd11", getJson("/.well-known/openid-credential-issuer?version=vd11"));
+        Goldens.assertGolden("legacy-0.14.0/well-known/issuance-openid-credential-issuer", getJson("/issuance/.well-known/openid-credential-issuer"));
+        Goldens.assertGolden("legacy-0.14.0/well-known/did", getJson("/.well-known/did.json"));
+        Goldens.assertGolden("legacy-0.14.0/well-known/issuance-did", getJson("/issuance/.well-known/did.json"));
+        Goldens.assertGolden("legacy-0.14.0/well-known/jwks", getJson("/.well-known/jwks.json"));
+        Goldens.assertGolden("legacy-0.14.0/well-known/oauth-authorization-server", getJson("/.well-known/oauth-authorization-server"));
+        Goldens.assertGolden("legacy-0.14.0/well-known/openid-credential-issuer-unknown-version", statusAndBody(mockMvc.perform(get("/.well-known/openid-credential-issuer?version=vd10")).andReturn()));
     }
 
     // ---- POST /issuance/credential (draft-13 body) ---------------------------------------------------
@@ -130,7 +130,7 @@ class D13GoldenRecorder {
         JsonNode body = remember(result);
         assertEquals(200, result.getResponse().getStatus(), body.toString());
         assertEquals("Ed25519Signature2020", body.get("credential").get("proof").get("type").asText());
-        Goldens.assertGolden("d13/issuance/ldp_vc-response", body);
+        Goldens.assertGolden("legacy-0.14.0/issuance/ldp_vc-response", body);
     }
 
     @Test
@@ -139,12 +139,12 @@ class D13GoldenRecorder {
         JsonNode vd12Body = remember(vd12);
         assertEquals(200, vd12.getResponse().getStatus(), vd12Body.toString());
         assertEquals("ldp_vc", vd12Body.get("format").asText(), "draft 12 echoes the format");
-        Goldens.assertGolden("d13/issuance/vd12-ldp_vc-response", vd12Body);
+        Goldens.assertGolden("legacy-0.14.0/issuance/vd12-ldp_vc-response", vd12Body);
 
         MvcResult vd11 = issue("/issuance/vd11/credential", ldpRequest(LDP_TYPES, proofJwt(cNonce)));
         JsonNode vd11Body = remember(vd11);
         assertEquals(200, vd11.getResponse().getStatus(), vd11Body.toString());
-        Goldens.assertGolden("d13/issuance/vd11-ldp_vc-response", vd11Body);
+        Goldens.assertGolden("legacy-0.14.0/issuance/vd11-ldp_vc-response", vd11Body);
     }
 
     @Test
@@ -156,12 +156,12 @@ class D13GoldenRecorder {
         String[] parts = sdJwt.split("~");
         assertTrue(parts.length >= 3, "issuer JWS plus disclosures: " + parts.length);
         JWSObject jws = JWSObject.parse(parts[0]);
-        Goldens.assertGolden("d13/issuance/vc+sd-jwt-header", objectMapper.readTree(jws.getHeader().toString()));
-        Goldens.assertGolden("d13/issuance/vc+sd-jwt-payload", objectMapper.readTree(jws.getPayload().toString()));
+        Goldens.assertGolden("legacy-0.14.0/issuance/vc+sd-jwt-header", objectMapper.readTree(jws.getHeader().toString()));
+        Goldens.assertGolden("legacy-0.14.0/issuance/vc+sd-jwt-payload", objectMapper.readTree(jws.getPayload().toString()));
         ObjectNode shape = body.deepCopy();
         shape.put("credential", "<vc+sd-jwt>");
         shape.put("disclosures", parts.length - 1);
-        Goldens.assertGolden("d13/issuance/vc+sd-jwt-response", shape);
+        Goldens.assertGolden("legacy-0.14.0/issuance/vc+sd-jwt-response", shape);
     }
 
     @Test
@@ -194,24 +194,24 @@ class D13GoldenRecorder {
         summary.put("validityInfoKeys", mso.get("validityInfo").getKeys().toString());
         ObjectNode shape = body.deepCopy();
         shape.put("credential", "<mso_mdoc>");
-        Goldens.assertGolden("d13/issuance/mso_mdoc-response", shape);
-        Goldens.assertGolden("d13/issuance/mso_mdoc-summary", summary);
+        Goldens.assertGolden("legacy-0.14.0/issuance/mso_mdoc-response", shape);
+        Goldens.assertGolden("legacy-0.14.0/issuance/mso_mdoc-summary", summary);
     }
 
     @Test
     void errorGoldens() throws Exception {
         MvcResult wrongNonce = issue("/issuance/credential", ldpRequest(LDP_TYPES, proofJwt("not-the-nonce")));
-        Goldens.assertGolden("d13/issuance/error-invalid-nonce", statusAndBody(wrongNonce));
+        Goldens.assertGolden("legacy-0.14.0/issuance/error-invalid-nonce", statusAndBody(wrongNonce));
         remember(wrongNonce); // the error carries the c_nonce the wallet must use next
         MvcResult unknownType = issue("/issuance/credential", ldpRequest(List.of("VerifiableCredential", "NoSuchCredential"), proofJwt(cNonce)));
-        Goldens.assertGolden("d13/issuance/error-unknown-type", statusAndBody(unknownType));
+        Goldens.assertGolden("legacy-0.14.0/issuance/error-unknown-type", statusAndBody(unknownType));
         remember(unknownType);
         MvcResult unsupportedFormat = issue("/issuance/credential", Map.of("format", "jwt_vc_json",
                 "credential_definition", Map.of("@context", LDP_CONTEXT, "type", LDP_TYPES), "proof", proof(proofJwt(cNonce))));
-        Goldens.assertGolden("d13/issuance/error-unsupported-format", statusAndBody(unsupportedFormat));
+        Goldens.assertGolden("legacy-0.14.0/issuance/error-unsupported-format", statusAndBody(unsupportedFormat));
         remember(unsupportedFormat);
         MvcResult noProof = issue("/issuance/credential", Map.of("format", "ldp_vc", "credential_definition", Map.of("@context", LDP_CONTEXT, "type", LDP_TYPES)));
-        Goldens.assertGolden("d13/issuance/error-missing-proof", statusAndBody(noProof));
+        Goldens.assertGolden("legacy-0.14.0/issuance/error-missing-proof", statusAndBody(noProof));
         remember(noProof);
     }
 
@@ -225,25 +225,25 @@ class D13GoldenRecorder {
                         "expires_in", 600, "tx_code", "1234")))).andReturn();
         JsonNode offerBody = objectMapper.readTree(offerResult.getResponse().getContentAsString());
         assertEquals(200, offerResult.getResponse().getStatus(), offerBody.toString());
-        Goldens.assertGolden("d13/pre-authorized/offer-uri", offerBody);
+        Goldens.assertGolden("legacy-0.14.0/pre-authorized/offer-uri", offerBody);
         String offerUri = offerBody.get("credential_offer_uri").asText();
         String offerUrl = java.net.URLDecoder.decode(offerUri.substring(offerUri.indexOf("credential_offer_uri=") + "credential_offer_uri=".length()), StandardCharsets.UTF_8);
         JsonNode offer = getJson("/credential-offer-data/" + offerUrl.substring(offerUrl.lastIndexOf('/') + 1));
-        Goldens.assertGolden("d13/pre-authorized/credential-offer", offer);
+        Goldens.assertGolden("legacy-0.14.0/pre-authorized/credential-offer", offer);
         String code = offer.get("grants").get("urn:ietf:params:oauth:grant-type:pre-authorized_code").get("pre-authorized_code").asText();
         MvcResult tokenResult = mockMvc.perform(post("/oauth/token").contentType(MediaType.APPLICATION_FORM_URLENCODED)
                 .param("grant_type", "urn:ietf:params:oauth:grant-type:pre-authorized_code")
                 .param("pre-authorized_code", code).param("tx_code", "1234")).andReturn();
         JsonNode token = objectMapper.readTree(tokenResult.getResponse().getContentAsString());
         assertEquals(200, tokenResult.getResponse().getStatus(), token.toString());
-        Goldens.assertGolden("d13/pre-authorized/token-response", token);
+        Goldens.assertGolden("legacy-0.14.0/pre-authorized/token-response", token);
         SignedJWT accessToken = SignedJWT.parse(token.get("access_token").asText());
         ObjectNode claims = (ObjectNode) objectMapper.readTree(accessToken.getJWTClaimsSet().toString());
         if (claims.get("sub") != null && claims.get("sub").asText().startsWith("{")) {
             claims.set("sub", objectMapper.readTree(claims.get("sub").asText())); // develop's finding: claims JSON inside sub
         }
-        Goldens.assertGolden("d13/pre-authorized/access-token-claims", claims);
-        Goldens.assertGolden("d13/pre-authorized/access-token-header", objectMapper.readTree(accessToken.getHeader().toString()));
+        Goldens.assertGolden("legacy-0.14.0/pre-authorized/access-token-claims", claims);
+        Goldens.assertGolden("legacy-0.14.0/pre-authorized/access-token-header", objectMapper.readTree(accessToken.getHeader().toString()));
     }
 
     // ---- helpers -------------------------------------------------------------------------------------
