@@ -28,6 +28,10 @@ With `certify.tenancy` enabled, a tenant configured with `issuer-did` issues und
 
 `POST /issuance/credential` with the 1.0.0-beta.1 body (`credential_configuration_id`, `proofs`) keeps working and is deprecated from this release: every answer carries `Deprecation` and `Link` headers, calls are counted in `certify.deprecated.calls{endpoint=oid4vci-v1-compat-credential}`, and `mosip.certify.deprecated.oid4vci-v1-compat-credential.enabled=false` answers `410 Gone`. Replacement: `POST /oid4vci/credential` (OpenID4VCI 1.0, advertised by `GET /oid4vci/.well-known/openid-credential-issuer`). `POST /nonce` stays. Removal no earlier than two minor releases after this one, never in a patch.
 
+## Pre-authorized offers may name a subject
+
+`POST /pre-authorized-data` accepts an optional `subject` next to `claims`: the identifier the data provider resolves (for the CSV plugin, the row id). It becomes the access token's `sub`, so plugins that look the record up by `sub` work in the pre-authorized code flow without eSignet. Offers with `claims` behave as before.
+
 # Changes in release 0.11.0
 
 ## Removal of  Artifactory dependency

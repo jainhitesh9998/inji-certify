@@ -60,11 +60,18 @@ Expected: `["FarmerCredential", ...]` and a token endpoint under Certify's own U
 `/pre-authorized-data` is unauthenticated in the stack configuration (`mosip.certify.security.ignore-auth-urls`).
 Claim keys must be among the configuration's `claims` metadata (last path segment); anything else is refused with
 `unknown_claims`, and note the refusal comes back as HTTP 200 with an `errors` array (legacy envelope, logged as a
-finding). With Certify as its own authorization server the identity data *is* the offer's claims: the `rebuild`
-profile selects `PreAuthDataProviderPlugin` (the CSV plugin expects an eSignet subject, the CSV row id in `sub`,
-which this flow never produces). For `FarmerCredential` the seed allows `fullName`, `phone`, `dateOfBirth` and
-`gender`; template fields the offer does not carry render as their literal placeholder (`${state}`), so add the
-fields you need to the configuration's `claims` (v1 or v2 API) or send all four:
+finding). With Certify as its own authorization server there are two ways to name the identity data. An offer with a
+`subject` puts that value in the access token's `sub`, exactly as an eSignet token would carry the individual id, so
+the farmer profile's CSV plugin resolves the row (`2154189532` is Gorge Cooper in `farmer_identity_data.csv`) and
+every template field is filled:
+```bash
+curl -s http://localhost:8090/v1/certify/pre-authorized-data \
+  -H 'Content-Type: application/json' \
+  -d '{"credential_configuration_id":"FarmerCredential","subject":"2154189532","expires_in":600,"tx_code":"1234"}'
+```
+An offer with `claims` instead makes the claims the identity data; that needs
+`mosip.certify.integration.data-provider-plugin=PreAuthDataProviderPlugin` (the CSV plugin cannot resolve a JSON
+`sub`), and template fields the offer does not carry render as their literal placeholder (`${state}`):
 ```bash
 curl -s http://localhost:8090/v1/certify/pre-authorized-data \
   -H 'Content-Type: application/json' \

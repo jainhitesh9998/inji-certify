@@ -102,6 +102,7 @@ public class PreAuthorizedCodeService {
         PreAuthCodeData codeData = PreAuthCodeData.builder()
                 .credentialConfigurationId(request.getCredentialConfigurationId())
                 .claims(request.getClaims())
+                .subject(blankToNull(request.getSubject()))
                 .txnCode(request.getTxCode())
                 .createdAt(currentTime)
                 .expiresAt(currentTime + (expirySeconds * 1000L)).build();
@@ -125,7 +126,15 @@ public class PreAuthorizedCodeService {
         }
 
         CredentialConfigurationSupportedDTO config = supportedConfigs.get(request.getCredentialConfigurationId());
-        validateClaims(config, request.getClaims());
+        // a subject names the record the data provider resolves; otherwise the claims are the identity data and are
+        // validated as before (bean validation already refused an offer with neither)
+        if (blankToNull(request.getSubject()) == null) {
+            validateClaims(config, request.getClaims() == null ? Map.of() : request.getClaims());
+        }
+    }
+
+    private static String blankToNull(String value) {
+        return value == null || value.isBlank() ? null : value.trim();
     }
 
     private void validateClaims(CredentialConfigurationSupportedDTO config, Map<String, Object> providedClaims) {
@@ -350,7 +359,9 @@ public class PreAuthorizedCodeService {
      */
     private String generateAccessToken(PreAuthCodeData codeData) {
         try {
-            String claimsJson = objectMapper.writeValueAsString(codeData.getClaims());
+            // the token subject: the record the offer named, else the offer's claims as JSON (PreAuthDataProviderPlugin reads them from the cache)
+            String claimsJson = codeData.getSubject() != null ? codeData.getSubject()
+                    : objectMapper.writeValueAsString(codeData.getClaims() == null ? Map.of() : codeData.getClaims());
             String credentialConfigId = codeData.getCredentialConfigurationId();
 
             // Lookup credential configuration in database

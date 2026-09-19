@@ -144,6 +144,44 @@ public class PreAuthorizedCodeServiceTest {
     }
 
     @Test
+    public void generatePreAuthorizedCode_SubjectWithoutClaims_SkipsClaimValidation() {
+        PreAuthorizedRequest subjectRequest = new PreAuthorizedRequest();
+        subjectRequest.setCredentialConfigurationId(CONFIG_ID);
+        subjectRequest.setSubject("2154189532");
+
+        String result = preAuthorizedCodeService.generatePreAuthorizedCode(subjectRequest);
+
+        Assert.assertTrue(result.startsWith("openid-credential-offer://?credential_offer_uri="));
+        org.mockito.ArgumentCaptor<PreAuthCodeData> stored = org.mockito.ArgumentCaptor.forClass(PreAuthCodeData.class);
+        verify(vciCacheService).setPreAuthCodeData(anyString(), stored.capture());
+        Assert.assertEquals("2154189532", stored.getValue().getSubject());
+    }
+
+    @Test
+    public void exchangePreAuthorizedCode_WithSubject_UsesItAsTheTokenSubject() throws Exception {
+        String preAuthCode = "subject-pre-auth-code";
+        OAuthTokenRequest tokenRequest = new OAuthTokenRequest();
+        tokenRequest.setGrant_type(Constants.PRE_AUTHORIZED_CODE_GRANT_TYPE);
+        tokenRequest.setPre_authorized_code(preAuthCode);
+        PreAuthCodeData codeData = PreAuthCodeData.builder()
+                .credentialConfigurationId(CONFIG_ID)
+                .subject("2154189532")
+                .createdAt(System.currentTimeMillis())
+                .expiresAt(System.currentTimeMillis() + 600000)
+                .build();
+        when(vciCacheService.getPreAuthCodeData(preAuthCode)).thenReturn(codeData);
+        when(vciCacheService.claimPreAuthCode(preAuthCode)).thenReturn(true);
+        when(vciCacheService.setPreAuthTransaction(anyString(), any(PreAuthTransaction.class))).thenReturn(null);
+        when(accessTokenJwtUtil.generateSignedJwt(anyString(), anyString(), anyString(), anyString(), anyString(), anyInt()))
+                .thenReturn("test.jwt.token");
+
+        OAuthTokenResponse response = preAuthorizedCodeService.exchangePreAuthorizedCode(tokenRequest);
+
+        Assert.assertEquals("test.jwt.token", response.getAccessToken());
+        verify(accessTokenJwtUtil).generateSignedJwt(org.mockito.ArgumentMatchers.eq("2154189532"), anyString(), anyString(), anyString(), anyString(), anyInt());
+    }
+
+    @Test
     public void generatePreAuthorizedCode_WithTxCode_Success() {
         request.setTxCode("1234");
         String result = preAuthorizedCodeService.generatePreAuthorizedCode(request);
