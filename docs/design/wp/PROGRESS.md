@@ -4,6 +4,7 @@ Newest first. One entry per work package or notable finding. Branch names are on
 
 | When (UTC) | WP | State | Branch | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-09-19 | R-00 refactor charter | done | `design/extensibility` | Owner-requested file-by-file refactor of the legacy service code; rules and inventory in `R-00-refactor-charter.md`; slices follow as `R-nn`. |
 | 2026-09-19 | P3-04 subject in the pre-authorized offer | done | `wp/p3-04-preauth-subject` | `POST /pre-authorized-data` takes an optional `subject` that becomes the access token `sub`, so the CSV plugin (and any `sub`-resolving plugin) works in the pre-authorized code flow without eSignet; claims-based offers unchanged. Owner's request of 2026-09-19. Compose smoke run with the CSV plugin: 20 checks green, all 15 template fields resolved from the CSV row. Full service suite 988 green. |
 | 2026-09-19 | P2-11 per-tenant issuer display and authorization servers | done | `wp/p2-11-tenant-issuer-display` | `certify.tenancy.tenants.<id>.display` and `.authorization-servers` replace the deployment's values in the tenant's `/oid4vci` metadata document; the default document is untouched. Full service suite 983 green. |
 | 2026-09-19 | P2-10 path tenant resolver | done | `wp/p2-10-path-tenant-resolver` | `certify.tenancy.resolver=path`: a configured tenant lives under `/t/{tenant}/oid4vci/...` with `{deployment}/t/{tenant}/oid4vci` as its identifier; new-surface controllers mapped at both forms; unknown path tenants are the default. Full service suite 983 green. |
