@@ -37,6 +37,9 @@ public class StatusListUpdateBatchJob {
     private StatusListCredentialRepository statusListRepository;
 
     @Autowired
+    private org.springframework.beans.factory.ObjectProvider<io.mosip.certify.status.TokenStatusListService> tokenStatusLists;
+
+    @Autowired
     private StatusListCredentialService statusListCredentialService;
 
     @Value("${mosip.certify.batch.status-list-update.enabled:true}")
@@ -132,6 +135,21 @@ public class StatusListUpdateBatchJob {
 
             // Apply transaction updates to the status data
             Map<Long, Boolean> updatedStatuses = getUpdatedStatus(transactions);
+            if (io.mosip.certify.status.TokenStatusListService.TYPE.equals(statusListCredential.getCredentialType())) {
+                // a Token Status List is a signed JWT, not a VC document
+                io.mosip.certify.status.TokenStatusListService tokenLists = tokenStatusLists == null ? null : tokenStatusLists.getIfAvailable();
+                if (tokenLists == null) {
+                    throw new CertifyException(ErrorConstants.STATUS_LIST_UPDATE_FAILED, "Token status lists are not available");
+                }
+                tokenLists.update(statusListCredential, updatedStatuses);
+                LocalDateTime processedTime = LocalDateTime.now();
+                for (CredentialStatusTransaction txn : transactions) {
+                    txn.setProcessedTime(processedTime);
+                    txn.setIsProcessed(true);
+                }
+                transactionRepository.saveAll(transactions);
+                return;
+            }
 
             JSONObject vcDocument = new JSONObject(statusListCredential.getVcDocument());
 

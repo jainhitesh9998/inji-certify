@@ -86,13 +86,16 @@ final class CredentialConfigurationV2Mapper {
         row.setOrder(display == null ? null : display.getOrder());
 
         CredentialConfigurationV2.Protocol protocol = body.getProtocol() == null ? new CredentialConfigurationV2.Protocol() : body.getProtocol();
+        // the entity refuses null lists; a format without a deployment default gets an empty list
         row.setCryptographicBindingMethodsSupported(protocol.getCryptographicBindingMethodsSupported() != null
-                ? protocol.getCryptographicBindingMethodsSupported() : defaults.cryptographicBindingMethodsSupported());
+                ? protocol.getCryptographicBindingMethodsSupported()
+                : defaults.cryptographicBindingMethodsSupported() != null ? defaults.cryptographicBindingMethodsSupported() : List.of());
         // the legacy column names the suite for Data Integrity formats and the JOSE algorithm otherwise, as the v1 API writes it
         row.setCredentialSigningAlgValuesSupported(protocol.getCredentialSigningAlgValuesSupported() != null
                 ? protocol.getCredentialSigningAlgValuesSupported()
                 : List.of(signing.getCryptosuite() != null ? signing.getCryptosuite() : signing.getAlg()));
-        row.setProofTypesSupported(protocol.getProofTypesSupported() != null ? protocol.getProofTypesSupported() : defaults.proofTypesSupported());
+        row.setProofTypesSupported(protocol.getProofTypesSupported() != null ? protocol.getProofTypesSupported()
+                : defaults.proofTypesSupported() != null ? defaults.proofTypesSupported() : Map.of());
         row.setProtocolOverrides(protocol.getOverrides());
 
         row.setQrSettings(body.getQr() == null ? null : body.getQr().getSettings());

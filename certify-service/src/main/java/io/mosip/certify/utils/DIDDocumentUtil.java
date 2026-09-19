@@ -113,17 +113,19 @@ public class DIDDocumentUtil {
     private List<PublicKeyDescriptor> fetchKeys(List<String> keyParams) {
         String appId = keyParams.get(0);
         String refId = keyParams.get(1);
-        KeyRef ref = LegacyKeyRefs.keymanager(appId, refId);
+        // a provider-prefixed column ("x509-file:issuer-es256", P3-01) names another KeyProvider; plain values are keymanager's
+        KeyRef ref = appId != null && appId.contains(":") ? KeyRef.parse(appId) : LegacyKeyRefs.keymanager(appId, refId);
         List<PublicKeyDescriptor> keys;
         try {
             keys = keyProviders.provider(ref.provider()).publicKeys(ref);
-        } catch (SigningException e) {
-            log.error("No certificates found for appId: {} and refId: {}", appId, refId, e);
-            throw new CertifyException("No certificates found");
+        } catch (RuntimeException e) {
+            // one configuration whose key is not available must not take the whole DID document down; its own issuance fails on its own
+            log.error("No certificates found for key {} (appId: {}, refId: {}); leaving it out of the DID document", ref, appId, refId, e);
+            return List.of();
         }
         if (keys == null || keys.isEmpty()) {
-            log.error("No certificates found for appId: {} and refId: {}", appId, refId);
-            throw new CertifyException("No certificates found");
+            log.error("No certificates found for appId: {} and refId: {}; leaving it out of the DID document", appId, refId);
+            return List.of();
         }
         return keys;
     }

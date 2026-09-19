@@ -101,6 +101,13 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @Testcontainers(disabledWithoutDocker = true)
 @TestPropertySource(properties = {
         "mosip.certify.issuer.ledger-enabled=true",
+        "certify.keyprovider.x509-file.enabled=true",
+        "certify.keyprovider.x509-file.dev-mode=true",
+        "certify.keyprovider.x509-file.path=target/status-list-postgres-pki.p12",
+        "certify.keyprovider.x509-file.password=pki-test",
+        "certify.keyprovider.x509-file.keys[0].alias=sdjwt-es256",
+        "certify.keyprovider.x509-file.keys[0].algorithm=ES256",
+        "certify.status.token-status-list.key-ref=x509-file:sdjwt-es256",
         "mosip.certify.indexed-mappings.city=$.city",
         "mosip.certify.data-provider-plugin.id-field-prefix-uri=urn:uuid:", // the ledger keys rows by credential id
         "mosip.certify.batch.status-list-update.enabled=false", // the test drives the batch step itself
@@ -302,6 +309,70 @@ class StatusListPostgresTest {
     }
 
     // ---- helpers -------------------------------------------------------------------------------------
+
+    /** Token Status List (draft-ietf-oauth-status-list) for an SD-JWT VC signed under the x509-file dev CA: the credential's status.status_list, the served list JWT, and a revocation through the batch job. */
+    @Test
+    void tokenStatusListForSdJwt() throws Exception {
+        String configId = "TokenStatusSdJwt";
+        if (mockMvc.perform(get("/v2/credential-configurations/" + configId)).andReturn().getResponse().getStatus() == 404) {
+            java.nio.file.Path template = java.nio.file.Path.of("src/test/resources/goldens/templates/golden-sdjwt.vm");
+            if (!java.nio.file.Files.exists(template)) {
+                template = java.nio.file.Path.of("certify-service").resolve(template);
+            }
+            Map<String, Object> body = new java.util.LinkedHashMap<>();
+            body.put("id", configId);
+            body.put("scope", "sample_vc_ldp");
+            body.put("format", "dc+sd-jwt");
+            body.put("formatConfig", Map.of("vct", configId, "sdClaims", List.of("$.fullName"), "sdJwtClaims", Map.of("fullName", Map.of("display", List.of(Map.of("name", "Full name", "locale", "en"))))));
+            body.put("signing", Map.of("provider", "x509-file", "alias", "sdjwt-es256", "alg", "ES256", "x5c", "without-anchor"));
+            body.put("template", Map.of("content", java.nio.file.Files.readString(template, java.nio.charset.StandardCharsets.UTF_8)));
+            body.put("status", Map.of("mechanism", "TokenStatusList", "purposes", List.of("revocation")));
+            body.put("display", Map.of("display", List.of(Map.of("name", configId, "locale", "en")), "order", List.of("fullName")));
+            MvcResult created = mockMvc.perform(post("/v2/credential-configurations").contentType(MediaType.APPLICATION_JSON).content(objectMapper.writeValueAsString(body))).andReturn();
+            assertEquals(201, created.getResponse().getStatus(), created.getResponse().getContentAsString());
+        }
+        String proof = proofJwt(nonce("/oid4vci/nonce"), issuerIdentifier + "/oid4vci");
+        MvcResult result = mockMvc.perform(post("/oid4vci/credential").header("Authorization", "TestBearer demo")
+                .contentType(MediaType.APPLICATION_JSON).content(objectMapper.writeValueAsString(Map.of(
+                        "credential_configuration_id", configId, "proofs", Map.of("jwt", List.of(proof)))))).andReturn();
+        JsonNode body = objectMapper.readTree(result.getResponse().getContentAsString());
+        assertEquals(200, result.getResponse().getStatus(), body.toString());
+        SignedJWT credential = SignedJWT.parse(body.get("credentials").get(0).get("credential").asText().split("~")[0]);
+        Map<String, Object> statusList = (Map<String, Object>) credential.getJWTClaimsSet().getJSONObjectClaim("status").get("status_list");
+        long idx = ((Number) statusList.get("idx")).longValue();
+        String uri = statusList.get("uri").toString();
+        assertTrue(uri.startsWith(domainUrl + "/v1/certify/credentials/token-status-list/"), uri);
+        String listId = uri.substring(uri.lastIndexOf('/') + 1);
+
+        MvcResult fetched = mockMvc.perform(get("/credentials/token-status-list/" + listId).accept("application/statuslist+jwt")).andReturn();
+        assertEquals(200, fetched.getResponse().getStatus());
+        assertEquals("application/statuslist+jwt", fetched.getResponse().getContentType());
+        SignedJWT list = SignedJWT.parse(fetched.getResponse().getContentAsString());
+        assertEquals("statuslist+jwt", list.getHeader().getType().getType());
+        assertEquals(1, list.getHeader().getX509CertChain().size(), "the leaf only, no anchor");
+        java.security.cert.X509Certificate leaf = (java.security.cert.X509Certificate) java.security.cert.CertificateFactory.getInstance("X.509")
+                .generateCertificate(new ByteArrayInputStream(list.getHeader().getX509CertChain().get(0).decode()));
+        assertTrue(list.verify(new com.nimbusds.jose.crypto.ECDSAVerifier((java.security.interfaces.ECPublicKey) leaf.getPublicKey())), "the list verifies with its x5c leaf");
+        assertEquals(uri, list.getJWTClaimsSet().getSubject());
+        Map<String, Object> claim = list.getJWTClaimsSet().getJSONObjectClaim("status_list");
+        assertEquals(1, ((Number) claim.get("bits")).intValue());
+        assertFalse(io.mosip.certify.status.TokenStatusListService.get(io.mosip.certify.status.TokenStatusListService.decode(claim.get("lst").toString()), idx), "fresh entry is not revoked");
+
+        CredentialStatusTransaction revocation = new CredentialStatusTransaction();
+        revocation.setCredentialId("token-status-" + idx);
+        revocation.setStatusPurpose("revocation");
+        revocation.setStatusValue(true);
+        revocation.setStatusListCredentialId(listId);
+        revocation.setStatusListIndex(idx);
+        revocation.setCreatedDtimes(java.time.LocalDateTime.now());
+        revocation.setIsProcessed(false);
+        transactionRepository.save(revocation);
+        batchJob.updateStatusList(listId, List.of(revocation));
+        SignedJWT updated = SignedJWT.parse(mockMvc.perform(get("/credentials/token-status-list/" + listId)).andReturn().getResponse().getContentAsString());
+        Map<String, Object> after = updated.getJWTClaimsSet().getJSONObjectClaim("status_list");
+        assertTrue(io.mosip.certify.status.TokenStatusListService.get(io.mosip.certify.status.TokenStatusListService.decode(after.get("lst").toString()), idx), "revoked");
+        assertTrue(updated.verify(new com.nimbusds.jose.crypto.ECDSAVerifier((java.security.interfaces.ECPublicKey) leaf.getPublicKey())), "the re-signed list verifies");
+    }
 
     private JsonNode issueOid4vci() throws Exception {
         String proof = proofJwt(nonce("/oid4vci/nonce"), issuerIdentifier + "/oid4vci");
