@@ -79,6 +79,10 @@ The v1 and v2 configuration APIs evicted the `issuerMetadataCache` through `@Cac
 ## Offer page
 
 With `certify.offer-page.enabled=true`, `{servletPath}/offer/` serves a page that creates a pre-authorized credential offer for a chosen configuration and subject, shows the `openid-credential-offer://` deep link as a QR code for a wallet, and can run the pre-authorized code flow itself (token, `c_nonce`, a proof signed in the browser, the credential). Off by default.
+
+## Metadata location for the `/oid4vci` surface
+
+OpenID4VCI 1.0 (section 12.2.2) forms the metadata URL of a Credential Issuer Identifier with a path by inserting `/.well-known/openid-credential-issuer` between host and path, so the new surface's document must also be reachable at `https://<host>/.well-known/openid-credential-issuer/v1/certify/oid4vci` (and `.../v1/certify/t/<tenant>/oid4vci` for path tenants). Certify keeps serving it under the servlet path; the compose stack's nginx maps the inserted form, and a deployment's proxy must do the same (`docs/design/15-deployment.md`).
 # Changes in release 0.11.0
 
 ## Removal of  Artifactory dependency

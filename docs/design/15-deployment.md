@@ -36,6 +36,10 @@ The issuer identity is unchanged: `mosip.certify.identifier` and `mosip.certify.
 
 Keys: keymanager stays the default provider with the same `key_policy_def`, keystore (`CERTIFY_PKCS12` mount or the HSM client that `configure_start.sh` installs when `install_hsm_client=true`), aliases and rotation; `kid` values and signature bytes are unchanged. The `x509-file` provider is opt-in for deployments with their own PKI.
 
+### Well-known documents and the proxy
+
+Certify is mounted at `server.servlet.path` (`/v1/certify`), so it cannot answer host-root URLs itself. The documents wallets fetch from the root must be mapped by the proxy in front (the compose stack's `certify-nginx.conf` is the reference): `/.well-known/openid-credential-issuer` and `/.well-known/oauth-authorization-server` for the compatibility surface, whose identifiers are the bare domain; `/.well-known/openid-credential-issuer/v1/certify/oid4vci` for the new surface, whose identifier has a path and whose metadata OpenID4VCI 1.0 section 12.2.2 places by inserting the well-known segment between host and path (the same form with `/t/<tenant>/` for path tenants); `/.well-known/jwks.json` and `/.well-known/did.json`. A deployment that exposes port 8090 directly breaks every wallet at the first metadata fetch.
+
 ## Database
 
 `spring.jpa.hibernate.ddl-auto` stays `none`. On startup Flyway runs with `baselineOnMigrate=true` and baseline version `1.0.0.003`:
