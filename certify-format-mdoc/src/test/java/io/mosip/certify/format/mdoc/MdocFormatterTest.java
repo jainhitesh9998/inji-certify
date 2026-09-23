@@ -40,7 +40,7 @@ class MdocFormatterTest {
 
     static final JcaKeyProvider KEYS = JcaKeyProvider.devMode();
     static final IssuanceContext CONTEXT = new IssuanceContext(TenantContext.DEFAULT, null, List.of(), ProtocolVersion.OID4VCI_1_0, "c",
-            Instant.parse("2026-09-18T10:00:00Z"), Map.of());
+            Instant.now() /* the dev certificates are valid from two days before the run */, Map.of());
     // the holder key as the proof carries it: did:jwk of a P-256 public JWK
     static final String HOLDER_JWK = "{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\",\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"}";
     static final String HOLDER = "did:jwk:" + Base64.getUrlEncoder().withoutPadding().encodeToString(HOLDER_JWK.getBytes());
