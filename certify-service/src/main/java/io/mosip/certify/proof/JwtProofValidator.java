@@ -109,11 +109,18 @@ public class JwtProofValidator implements ProofValidator {
                         .claim("nonce", cNonce);
             }
 
-            // if the proof contains issuer claim, then it should match with the client id ref: https://openid.net/specs/openid-4-verifiable-credential-issuance-1_0-ID1.html#section-7.2.1.1-2.2.2.1
-            // https://github.com/openid/OpenID4VCI/issues/349
+            // OpenID4VCI 1.0 F.1: iss, when present, is the client_id; it is omitted in the anonymous pre-authorized code
+            // flow. Wallets in the field (Inji, for issuers that expose a nonce endpoint) put their own holder DID there
+            // instead; that names the very key that signs the proof, so it is accepted when no client_id is known.
             Set<String> requiredClaims = new HashSet<>(DEFAULT_REQUIRED_CLAIMS);
-            if(jwt.getJWTClaimsSet().getClaim("iss") != null) {
-                proofJwtClaimsBuilder.issuer(clientId);
+            String proofIssuer = jwt.getJWTClaimsSet().getIssuer();
+            if (proofIssuer != null) {
+                if (!StringUtils.isEmpty(clientId)) {
+                    proofJwtClaimsBuilder.issuer(clientId);
+                } else if (!proofIssuer.equals(holderDidWithoutFragment(jwt.getHeader()))) {
+                    log.error("Proof iss {} is neither a client_id nor the holder's own DID", proofIssuer);
+                    return false;
+                }
             }
             if(jwt.getJWTClaimsSet().getClaim("exp") != null) {
                 requiredClaims.add("exp");
@@ -155,6 +162,16 @@ public class JwtProofValidator implements ProofValidator {
         return false;
     }
 
+
+    /** The DID the proof header names (did:jwk of its jwk, or the kid) without a fragment, or null. */
+    private String holderDidWithoutFragment(JWSHeader header) {
+        String did = getInstance(header.getKeyID()).getDID(header).orElse(null);
+        if (did == null) {
+            return null;
+        }
+        int fragment = did.indexOf('#');
+        return fragment < 0 ? did : did.substring(0, fragment);
+    }
 
     /**
      * @param proofJwt from the credential request.
