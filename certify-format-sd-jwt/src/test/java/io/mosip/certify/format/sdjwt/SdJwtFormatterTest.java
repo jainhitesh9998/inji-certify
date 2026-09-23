@@ -39,7 +39,7 @@ class SdJwtFormatterTest {
 
     static final JcaKeyProvider KEYS = JcaKeyProvider.devMode();
     static final IssuanceContext CONTEXT = new IssuanceContext(TenantContext.defaultTenant("https://issuer.example/v1/certify", null), null, List.of(),
-            ProtocolVersion.OID4VCI_1_0, "c", Instant.parse("2026-09-18T10:00:00Z"), Map.of());
+            ProtocolVersion.OID4VCI_1_0, "c", Instant.now() /* the dev certificates are valid from two days before the run */, Map.of());
     final SdJwtFormatter formatter = new SdJwtFormatter(new ObjectMapper());
 
     CredentialConfiguration configuration(String sdClaim) {
