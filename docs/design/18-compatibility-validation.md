@@ -24,7 +24,7 @@ that proves each item still works on the new surface (`POST /oid4vci/credential`
 | `kid: did:web:wallet.example#key-1` | any key the DID document publishes (`publicKeyJwk` or `publicKeyMultibase`) | the `kid` as sent | rejected (`invalid_proof`) | resolved when `certify.protocol.oid4vci-v1.did-web-holders.enabled` is set (P3-11); rejected as before otherwise |
 
 Proof claim checks (`typ openid4vci-proof+jwt`, allowed `alg`, exactly one of `kid` or `jwk`, `aud`, `iat`,
-`nonce`, optional `exp`, `iss` equal to the client id when present) are the `develop` code and stay covered by
+`nonce`, optional `exp`, `iss` equal to the client id when present, or, in the anonymous pre-authorized flow, the holder's own DID as Inji Wallet sends it since F-07) are the `develop` code and stay covered by
 `JwtProofValidatorTest`; the new surface adds names for the failures (`invalid_proof`, `invalid_nonce`) that the
 compatibility surface reports as a plain `invalid_proof`.
 
