@@ -15,10 +15,15 @@ import io.mosip.certify.spi.UnsignedCredential;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayInputStream;
+import io.mosip.certify.signing.CoseHeaderPolicy;
+import io.mosip.certify.signing.JwsHeaderPolicy;
+import io.mosip.certify.spi.SigningConfig;
+
 import java.security.Signature;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
@@ -103,11 +108,40 @@ class MdocFormatterTest {
     }
 
     @Test
-    void theLegacyValidityPeriodStillApplies() {
-        // certify.format.mdoc.validity-period-years is the alias of mso-validity (decision D7)
-        MdocProperties legacy = new MdocProperties("SHA-256", "1.0", Duration.ofDays(90), 2);
-        assertEquals(Duration.ofDays(730), legacy.validity());
-        assertEquals(Duration.ofDays(90), new MdocProperties("SHA-256", "1.0", Duration.ofDays(90), null).validity());
-        assertEquals(Duration.ofDays(90), new MdocProperties("SHA-256", "1.0", null, null).validity());
+    void anExplicitMsoValidityWinsOverTheLegacyPeriod() {
+        // decision D7: mso-validity first, the deprecated validity-period-years only as a fallback, otherwise P90D
+        assertEquals(Duration.ofDays(90), new MdocProperties("SHA-256", "1.0", Duration.ofDays(90), 2).validity());
+        assertEquals(Duration.ofDays(730), new MdocProperties("SHA-256", "1.0", null, 2).validity());
+        assertEquals(Duration.ofDays(90), new MdocProperties("SHA-256", "1.0", null, null).validity(),
+                "the P90D default is applied in validity(), not by the binder");
+    }
+
+    @Test
+    void invalidMsoSettingsAreRefusedAtStartup() {
+        // ISO/IEC 18013-5 9.1.2.4 defines only MSO version 1.0
+        assertThrows(IllegalArgumentException.class, () -> new MdocProperties("SHA-256", "2.0", null, null));
+        assertThrows(IllegalArgumentException.class, () -> new MdocProperties("SHA-256", "1.0", Duration.ZERO, null));
+        assertThrows(IllegalArgumentException.class, () -> new MdocProperties("SHA-256", "1.0", Duration.ofDays(-1), null));
+        assertThrows(IllegalArgumentException.class, () -> new MdocProperties("SHA-256", "1.0", null, 0));
+    }
+
+    @Test
+    void validityNeverPrecedesTheSigningInstant() {
+        Instant signed = Instant.parse("2024-01-01T00:00:00Z");
+        FormatException expired = assertThrows(FormatException.class,
+                () -> MdocProcessor.validityInfo(signed, Duration.ofDays(90), Instant.parse("2023-12-31T23:59:59Z")));
+        assertEquals("certificate_chain_invalid", expired.getErrorCode(),
+                "a DSC that expired before the signing instant is a chain fault, refused before the later checks");
+    }
+
+    @Test
+    void aFullX5chainCannotCarryASelfSignedAnchor() {
+        SigningContext full = new SigningContext(new SigningConfig(MdlFixtures.dsc().ref(), MdlFixtures.dsc().algorithm(), null, null,
+                new CoseHeaderPolicy(JwsHeaderPolicy.ChainInclusion.FULL, null, false), null), MdlFixtures.dsc(), MdlFixtures.KEYS);
+        UnsignedCredential unsigned = formatter.build(ClaimSet.of(MdlFixtures.mdl()), configuration(), CONTEXT,
+                HolderBinding.did(HOLDER, "jwt"));
+        FormatException refused = assertThrows(FormatException.class, () -> formatter.sign(unsigned, full, CONTEXT));
+        assertEquals("certificate_chain_invalid", refused.getErrorCode());
+        assertTrue(refused.getMessage().contains("self-signed"), refused.getMessage());
     }
 }

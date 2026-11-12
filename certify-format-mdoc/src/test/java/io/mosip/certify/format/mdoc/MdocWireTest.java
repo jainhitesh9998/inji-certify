@@ -156,19 +156,19 @@ class MdocWireTest {
     }
 
     @Test
-    void digestIdsAreARandomPermutationPerNamespace() {
-        Set<Integer> expected = new HashSet<>();
-        for (int i = 0; i < 12; i++) {
-            expected.add(i);
-        }
-        Set<String> orders = new HashSet<>();
+    void digestIdsAreRandomDistinctUints() {
+        Set<String> runs = new HashSet<>();
         for (int run = 0; run < 12; run++) {
             CBORObject issuerSigned = issuerSigned(issue(MdlFixtures.mdl()));
-            Set<Integer> ids = itemsById(issuerSigned, MdlFixtures.MDL_NAMESPACE).keySet();
-            assertEquals(expected, ids, "digestIDs are 0..n-1, unique within the namespace");
-            orders.add(ids.toString() + "@" + itemOrder(issuerSigned));
+            List<Integer> ids = new ArrayList<>(itemsById(issuerSigned, MdlFixtures.MDL_NAMESPACE).keySet());
+            assertEquals(12, ids.size(), "one digestID per element");
+            assertEquals(12, new HashSet<>(ids).size(), "digestIDs are unique within the namespace");
+            for (int id : ids) {
+                assertTrue(id >= 0, "digestID is a uint: " + id);
+            }
+            runs.add(ids + "@" + itemOrder(issuerSigned));
         }
-        assertTrue(orders.size() > 1, "the digestIDs are shuffled per issuance, not assigned in template order");
+        assertTrue(runs.size() > 1, "the digestIDs are random per issuance, not a permutation of 0..n-1");
     }
 
     private static String itemOrder(CBORObject issuerSigned) {
@@ -179,6 +179,107 @@ class MdocWireTest {
                     + ":" + CBORObject.DecodeFromBytes(array.get(i).Untag().GetByteString()).get("digestID").AsInt32());
         }
         return String.join(",", identifiers);
+    }
+
+    @Test
+    void typedTextIsNeverGuessedAsADate() {
+        // document_number and the code sign/value are tstr in Table 5: a YYYY-MM-DD-looking value stays text
+        Map<String, Object> privilege = new LinkedHashMap<>();
+        privilege.put("vehicle_category_code", "B");
+        privilege.put("codes", List.of(Map.of("code", "01", "sign", "2024-01-01", "value", "2024-01-02")));
+        Map<String, Object> document = MdlFixtures.with("document_number", "2024-01-01");
+        MdlFixtures.items(document, MdlFixtures.MDL_NAMESPACE).stream()
+                .filter(item -> "driving_privileges".equals(item.get("elementIdentifier")))
+                .forEach(item -> item.put("elementValue", List.of(privilege)));
+
+        Map<String, CBORObject> values = valuesByIdentifier(issuerSigned(issue(document)), MdlFixtures.MDL_NAMESPACE);
+        assertEquals(CBORType.TextString, values.get("document_number").getType(),
+                "a tstr typed by Table 5 is not run through the YYYY-MM-DD heuristic");
+        assertFalse(values.get("document_number").isTagged(), "no tag 1004 on a typed text element");
+        CBORObject code = values.get("driving_privileges").get(0).get("codes").get(0);
+        assertEquals(CBORType.TextString, code.get("sign").getType());
+        assertFalse(code.get("sign").isTagged());
+        assertEquals(CBORType.TextString, code.get("value").getType());
+        assertFalse(code.get("value").isTagged());
+    }
+
+    @Test
+    void issueAndExpiryDateTakeTdateOrFullDate() {
+        Map<String, Object> document = MdlFixtures.with("issue_date", "2024-01-01T10:15:30Z");
+        Map<String, CBORObject> values = valuesByIdentifier(issuerSigned(issue(document)), MdlFixtures.MDL_NAMESPACE);
+        assertTrue(values.get("issue_date").HasMostOuterTag(0), "a tdate-shaped issue_date is #6.0");
+        assertEquals("2024-01-01T10:15:30Z", values.get("issue_date").Untag().AsString());
+        assertTrue(values.get("expiry_date").HasMostOuterTag(1004), "a full-date-shaped expiry_date is #6.1004");
+        // inside driving_privileges the dates stay full-date even when a tdate would be accepted at top level
+        assertEquals(1004, values.get("driving_privileges").get(0).get("issue_date").getMostOuterTag().ToInt32Checked());
+    }
+
+    @Test
+    void impossibleDatesAreRefused() {
+        for (String[] element : new String[][] {{"birth_date", "2023-02-31"}, {"expiry_date", "2024-13-01"},
+                {"issue_date", "2023-02-31T10:00:00Z"}, {"portrait_capture_date", "2023-02-31T10:00:00Z"}}) {
+            FormatException e = assertThrows(FormatException.class, () -> formatter().build(
+                    ClaimSet.of(MdlFixtures.with(element[0], element[1])), MdlFixtures.configuration(formatter()),
+                    MdlFixtures.context(), MdlFixtures.holder()), element[0] + " " + element[1]);
+            assertEquals("mdoc_data_model_invalid", e.getErrorCode(), element[0] + " " + element[1]);
+        }
+    }
+
+    @Test
+    void portraitMustBeADecodableImage() {
+        // a JPEG header with no image behind it is refused
+        FormatException fake = assertThrows(FormatException.class, () -> formatter().build(
+                ClaimSet.of(MdlFixtures.with("portrait", Base64.getEncoder().encodeToString(
+                        new byte[] {(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, 0x00, 0x01, 0x02, 0x03}))),
+                MdlFixtures.configuration(formatter()), MdlFixtures.context(), MdlFixtures.holder()));
+        assertEquals("mdoc_data_model_invalid", fake.getErrorCode());
+        assertTrue(fake.getMessage().contains("decode"), fake.getMessage());
+
+        // a JP2 signature box followed by ftyp is accepted (ImageIO has no JP2 reader by default)
+        byte[] jp2 = new byte[32];
+        byte[] signature = {0x00, 0x00, 0x00, 0x0C, 0x6A, 0x50, 0x20, 0x20, 0x0D, 0x0A, (byte) 0x87, 0x0A};
+        System.arraycopy(signature, 0, jp2, 0, signature.length);
+        byte[] ftyp = {0x00, 0x00, 0x00, 0x14, 0x66, 0x74, 0x79, 0x70, 0x6A, 0x70, 0x32, 0x20};
+        System.arraycopy(ftyp, 0, jp2, signature.length, ftyp.length);
+        formatter().build(ClaimSet.of(MdlFixtures.with("portrait", Base64.getEncoder().encodeToString(jp2))),
+                MdlFixtures.configuration(formatter()), MdlFixtures.context(), MdlFixtures.holder());
+    }
+
+    @Test
+    void duplicateElementIdentifiersWithinANamespaceAreRefused() {
+        Map<String, Object> document = MdlFixtures.mdl();
+        MdlFixtures.items(document, MdlFixtures.MDL_NAMESPACE).add(MdlFixtures.item("given_name", "Jane again"));
+        FormatException duplicate = assertThrows(FormatException.class, () -> formatter().build(ClaimSet.of(document),
+                MdlFixtures.configuration(formatter()), MdlFixtures.context(), MdlFixtures.holder()));
+        assertEquals("mdoc_data_model_invalid", duplicate.getErrorCode());
+        assertTrue(duplicate.getMessage().contains("given_name"), duplicate.getMessage());
+    }
+
+    @Test
+    void drivingPrivilegesFollowTheCddl() {
+        Map<String, Object> emptyCodes = new LinkedHashMap<>();
+        emptyCodes.put("vehicle_category_code", "B");
+        emptyCodes.put("codes", List.of());
+        Map<String, Object> unknownKey = new LinkedHashMap<>();
+        unknownKey.put("vehicle_category_code", "B");
+        unknownKey.put("restrictions", "glasses");
+        for (Map<String, Object> privilege : List.of(emptyCodes, unknownKey)) {
+            FormatException e = assertThrows(FormatException.class, () -> formatter().build(
+                    ClaimSet.of(MdlFixtures.with("driving_privileges", List.of(privilege))), MdlFixtures.configuration(formatter()),
+                    MdlFixtures.context(), MdlFixtures.holder()));
+            assertEquals("mdoc_data_model_invalid", e.getErrorCode());
+        }
+    }
+
+    @Test
+    void table5ValueRangesAreChecked() {
+        for (String[] element : new String[][] {{"sex", "3"}, {"nationality", "India"}, {"resident_country", "in"},
+                {"height", "9223372036854775808"}}) {
+            FormatException e = assertThrows(FormatException.class, () -> formatter().build(
+                    ClaimSet.of(MdlFixtures.with(element[0], element[1])), MdlFixtures.configuration(formatter()),
+                    MdlFixtures.context(), MdlFixtures.holder()), element[0] + " " + element[1]);
+            assertEquals("mdoc_data_model_invalid", e.getErrorCode(), element[0] + " " + element[1]);
+        }
     }
 
     @Test
@@ -267,6 +368,36 @@ class MdocWireTest {
         assertArrayEquals(Base64.getUrlDecoder().decode("x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"), (byte[]) ec2.get(-3));
     }
 
+    @Test
+    void anEvenYCompressedP256DidKeyIsDecoded() {
+        byte[] x = Base64.getUrlDecoder().decode("f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU");
+        byte[] y = Base64.getUrlDecoder().decode("x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0");
+        byte[] uncompressed = new byte[65];
+        uncompressed[0] = 0x04;
+        System.arraycopy(x, 0, uncompressed, 1, 32);
+        System.arraycopy(y, 0, uncompressed, 33, 32);
+        org.bouncycastle.math.ec.ECCurve curve = org.bouncycastle.jce.ECNamedCurveTable
+                .getParameterSpec("secp256r1").getCurve();
+        org.bouncycastle.math.ec.ECPoint point = curve.decodePoint(uncompressed);
+        if (point.getAffineYCoord().toBigInteger().testBit(0)) {
+            point = point.negate(); // choose the even-y representative so the compressed prefix is 0x02
+        }
+        byte[] compressed = point.getEncoded(true);
+        assertEquals(0x02, compressed[0] & 0xFF, "an even y compresses with prefix 02");
+        byte[] prefixed = new byte[compressed.length + 2];
+        prefixed[0] = (byte) 0x80;
+        prefixed[1] = 0x24;
+        System.arraycopy(compressed, 0, prefixed, 2, compressed.length);
+
+        Map<Object, Object> ec2 = MdocCoseKey.fromHolder(
+                "did:key:" + Multibase.encode(Multibase.Base.Base58BTC, prefixed), MAPPER);
+        assertEquals(2, ec2.get(1));
+        assertEquals(1, ec2.get(-1));
+        assertArrayEquals(x, (byte[]) ec2.get(-2));
+        assertArrayEquals(org.bouncycastle.util.BigIntegers.asUnsignedByteArray(32, point.getAffineYCoord().toBigInteger()),
+                (byte[]) ec2.get(-3), "the even y is recovered from the compressed point");
+    }
+
     /** The fixture holder's P-256 point in compressed form, prefixed with the P-256 multicodec. */
     private static byte[] compressedP256() {
         byte[] x = Base64.getUrlDecoder().decode("f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU");
@@ -299,6 +430,15 @@ class MdocWireTest {
     }
 
     @Test
+    void ageOverAnyTwoDigitThresholdIsABool() {
+        Map<String, CBORObject> values = valuesByIdentifier(
+                issuerSigned(issue(MdlFixtures.with("age_over_21", "true"))), MdlFixtures.MDL_NAMESPACE);
+        assertEquals(CBORType.Boolean, values.get("age_over_21").getType(),
+                "age_over_NN matches age_over_\\d{2}, not a fixed list of ten thresholds");
+        assertTrue(values.get("age_over_21").AsBoolean());
+    }
+
+    @Test
     void unusableHolderKeysAreInvalidProof() {
         FormatException missing = assertThrows(FormatException.class, () -> formatter().build(ClaimSet.of(MdlFixtures.mdl()),
                 MdlFixtures.configuration(formatter()), MdlFixtures.context(), HolderBinding.NONE));
@@ -309,6 +449,25 @@ class MdocWireTest {
                 HolderBinding.did("did:jwk:" + Base64.getUrlEncoder().withoutPadding()
                         .encodeToString("{\"kty\":\"EC\",\"crv\":\"secp256k1\"}".getBytes()), "jwt")));
         assertEquals("invalid_proof", secp256k1.getErrorCode());
+
+        // an EC point that is not on the curve is refused, not encoded as a COSE_Key
+        String offCurve = "{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\",\"y\":\"AQ\"}";
+        FormatException point = assertThrows(FormatException.class, () -> formatter().build(ClaimSet.of(MdlFixtures.mdl()),
+                MdlFixtures.configuration(formatter()), MdlFixtures.context(),
+                HolderBinding.did("did:jwk:" + Base64.getUrlEncoder().withoutPadding().encodeToString(offCurve.getBytes()), "jwt")));
+        assertEquals("invalid_proof", point.getErrorCode());
+        assertTrue(point.getMessage().contains("not on"), point.getMessage());
+
+        // an Ed25519 x that is not exactly 32 bytes is refused, never zero-padded into a different key
+        String shortEd25519 = "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\""
+                + Base64.getUrlEncoder().withoutPadding().encodeToString(java.util.Arrays.copyOf(
+                        Base64.getUrlDecoder().decode("11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"), 31))
+                + "\"}";
+        FormatException shortKey = assertThrows(FormatException.class, () -> formatter().build(ClaimSet.of(MdlFixtures.mdl()),
+                MdlFixtures.configuration(formatter()), MdlFixtures.context(),
+                HolderBinding.did("did:jwk:" + Base64.getUrlEncoder().withoutPadding().encodeToString(shortEd25519.getBytes()), "jwt")));
+        assertEquals("invalid_proof", shortKey.getErrorCode());
+        assertTrue(shortKey.getMessage().contains("32"), shortKey.getMessage());
     }
 
     @Test
@@ -365,7 +524,7 @@ class MdocWireTest {
 
         // with formatConfig.elementTypes the same namespace is typed
         Map<String, Object> typedConfig = Map.of("docType", MdlFixtures.MDL_DOCTYPE,
-                "elementTypes", Map.of("org.example.custom", Map.of("photo", "bstr", "level", "uint")));
+                "elementTypes", Map.of("org.example.custom", Map.of("photo", "bstr", "level", "uint", "issued_on", "tstr")));
         MdocFormatter formatter = formatter();
         UnsignedCredential unsigned = formatter.build(ClaimSet.of(document), MdlFixtures.configuration(formatter, typedConfig),
                 MdlFixtures.context(), MdlFixtures.holder());
@@ -373,6 +532,17 @@ class MdocWireTest {
         Map<String, CBORObject> typed = valuesByIdentifier(issuerSigned((String) issued.credential()), "org.example.custom");
         assertEquals(CBORType.ByteString, typed.get("photo").getType());
         assertEquals(CBORType.Integer, typed.get("level").getType());
+        assertEquals(CBORType.TextString, typed.get("issued_on").getType(), "a typed tstr is not tagged as a date");
+        assertFalse(typed.get("issued_on").isTagged());
+    }
+
+    @Test
+    void anOverrideCannotChangeATable5Element() {
+        FormatException changed = assertThrows(FormatException.class, () -> formatter().parseConfig(Map.of(
+                "docType", MdlFixtures.MDL_DOCTYPE,
+                "elementTypes", Map.of(MdlFixtures.MDL_NAMESPACE, Map.of("document_number", "uint")))));
+        assertEquals(MdocConstants.ERROR_DATA_MODEL, changed.getErrorCode());
+        assertTrue(changed.getMessage().contains("document_number"), changed.getMessage());
     }
 
     private static Map<String, CBORObject> valuesByIdentifier(CBORObject issuerSigned, String namespace) {

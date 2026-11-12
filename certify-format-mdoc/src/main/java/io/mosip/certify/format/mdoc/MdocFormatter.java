@@ -60,8 +60,10 @@ public class MdocFormatter implements CredentialFormatter {
     @Override
     public FormatConfig parseConfig(Map<String, Object> raw) {
         Map<String, Object> copy = raw == null ? Map.of() : raw;
+        Object doctype = copy.containsKey(RAW_DOCTYPE) ? copy.get(RAW_DOCTYPE) : copy.get("doctype");
         if (copy.get(MdocConstants.ELEMENT_TYPES) != null) {
-            MdocElementTypes.of(copy.get(MdocConstants.ELEMENT_TYPES)); // refuse a malformed table when the row is saved
+            // refuse a malformed table, or one that would change a Table 5 element, when the row is saved
+            MdocElementTypes.of(copy.get(MdocConstants.ELEMENT_TYPES), doctype == null ? null : String.valueOf(doctype));
         }
         MdocProcessor.digestAlgorithmName(properties.digestAlgorithm());
         return new FormatConfig.Generic(copy, String.valueOf(copy.get(RAW_DOCTYPE)));
@@ -131,6 +133,15 @@ public class MdocFormatter implements CredentialFormatter {
             byte[] msoCbor = MdocProcessor.encodeToTaggedCBOR(mso);
             CoseHeaderPolicy policy = signing.config().coseHeaders() == null ? CoseHeaderPolicy.mdocIssuerAuth()
                     : new CoseHeaderPolicy(signing.config().coseHeaders().x5chain(), null, false); // the configuration's x5chain choice
+            if (policy.x5chain() == io.mosip.certify.signing.JwsHeaderPolicy.ChainInclusion.FULL) {
+                X509Certificate root = signing.key().chain() == null ? null : signing.key().chain().root().orElse(null);
+                if (root != null && root.getSubjectX500Principal().equals(root.getIssuerX500Principal())) {
+                    // HAIP forbids carrying the trust anchor; the verifier must supply the IACA itself (D9, 9.1.2.4)
+                    throw new FormatException("certificate_chain_invalid", "x5chain FULL would carry the self-signed trust anchor "
+                            + root.getSubjectX500Principal() + " in the IssuerAuth; an mDL carries at most the DSC and its intermediates"
+                            + " (HAIP, without-anchor)");
+                }
+            }
             try {
                 io.mosip.certify.signing.CertificateChainPolicy.check(signing.key().chain(), now);
             } catch (io.mosip.certify.signing.SigningException e) {

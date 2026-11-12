@@ -22,6 +22,7 @@ import java.time.LocalDate;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
+import java.time.format.ResolverStyle;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.Map;
@@ -38,9 +39,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  *
  * <p>The wire rules of ISO/IEC 18013-5 that this class owns: {@code tdate} is tag 0 around a 20-character RFC 3339
  * string without fractional seconds (9.1.2.4); an IssuerSignedItem is digested over its tag-24 encoding with the
- * algorithm the MSO declares (9.1.2.5); {@code digestID} is a per-namespace random permutation of {@code 0..n-1} so
- * that identifiers reveal neither element order nor count across issuances (9.1.2.5); element values are encoded by
- * the {@link MdocElementTypes} table rather than by guessing (7.2.1).
+ * algorithm the MSO declares (9.1.2.5); {@code digestID} is a random distinct {@code uint} per namespace, drawn from a
+ * range much larger than the element count, so a disclosed identifier reveals nothing about the order or the number of
+ * elements (9.1.2.5); element values are encoded by the {@link MdocElementTypes} table rather than by guessing (7.2.1),
+ * and the {@code YYYY-MM-DD} heuristic applies only to namespaces that have no type table at all.
  */
 public class MdocProcessor {
 
@@ -50,8 +52,12 @@ public class MdocProcessor {
             "SHA256", "SHA-256", "SHA-256", "SHA-256",
             "SHA384", "SHA-384", "SHA-384", "SHA-384",
             "SHA512", "SHA-512", "SHA-512", "SHA-512");
-    private static final DateTimeFormatter TDATE =
-            DateTimeFormatter.ofPattern(MdocConstants.TDATE_PATTERN).withZone(ZoneOffset.UTC);
+    private static final DateTimeFormatter TDATE = DateTimeFormatter.ofPattern(MdocConstants.TDATE_PATTERN)
+            .withResolverStyle(ResolverStyle.STRICT).withZone(ZoneOffset.UTC);
+    private static final DateTimeFormatter FULL_DATE = DateTimeFormatter.ofPattern(MdocConstants.FULL_DATE_PATTERN)
+            .withResolverStyle(ResolverStyle.STRICT);
+    private static final DateTimeFormatter TDATE_INPUT = DateTimeFormatter.ofPattern("uuuu-MM-dd'T'HH:mm:ssXXX")
+            .withResolverStyle(ResolverStyle.STRICT);
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final java.util.concurrent.atomic.AtomicBoolean DIGEST_ID_WARNING = new java.util.concurrent.atomic.AtomicBoolean();
 
@@ -122,13 +128,13 @@ public class MdocProcessor {
     static final String ELEMENT_VALUES = "_elementValues";
 
     /**
-     * Process items within a namespace: type the value, then give each element a {@code digestID} drawn from a random
-     * permutation of {@code 0..n-1}. A {@code digestID} the template carries is ignored (18013-5 9.1.2.5: identifiers
-     * must not reveal information) and the first such template is reported once.
+     * Process items within a namespace: type the value, then give each element a random distinct {@code digestID} from
+     * {@code 0..2^31-1}. A {@code digestID} the template carries is ignored (18013-5 9.1.2.5: identifiers must not
+     * reveal information) and the first such template is reported once.
      */
     private List<Map<String, Object>> processNamespaceItems(String namespaceName, JsonNode namespaceItems, MdocElementTypes elementTypes) {
         List<Map<String, Object>> processedItems = new ArrayList<>();
-        List<Integer> digestIds = new ArrayList<>();
+        Set<String> identifiers = new HashSet<>();
         boolean templateCarriedIds = false;
 
         for (JsonNode item : namespaceItems) {
@@ -137,43 +143,94 @@ public class MdocProcessor {
                 templateCarriedIds = true;
             }
             String identifier = item.get(MdocConstants.ELEMENT_IDENTIFIER).asText();
-            Object value = convertValue(namespaceName, identifier, item.get(MdocConstants.ELEMENT_VALUE), elementTypes);
+            if (!identifiers.add(identifier)) {
+                throw dataModelError(identifier, "appears twice in namespace " + namespaceName
+                        + "; elementIdentifier must be unique within a namespace (ISO/IEC 18013-5 7.2.1)");
+            }
+            ConvertedValue converted = convertValue(namespaceName, identifier, item.get(MdocConstants.ELEMENT_VALUE), elementTypes);
             itemMap.put(MdocConstants.ELEMENT_IDENTIFIER, identifier);
-            itemMap.put(MdocConstants.ELEMENT_VALUE, value);
+            itemMap.put(MdocConstants.ELEMENT_VALUE, converted.logical());
+            if (converted.wire() != null) {
+                itemMap.put(MdocConstants.WIRE_VALUE, converted.wire());
+            }
             processedItems.add(itemMap);
-            digestIds.add(processedItems.size() - 1);
         }
         if (templateCarriedIds && DIGEST_ID_WARNING.compareAndSet(false, true)) {
-            log.warn("Template namespace {} carries digestID values; they are ignored and replaced by a random permutation "
-                    + "of 0..n-1 so the identifiers reveal nothing (ISO/IEC 18013-5 9.1.2.5)", namespaceName);
+            log.warn("Template namespace {} carries digestID values; they are ignored and replaced by random distinct uints "
+                    + "so the identifiers reveal nothing (ISO/IEC 18013-5 9.1.2.5)", namespaceName);
         }
-        if (digestIds.size() != 1) {
-            Collections.shuffle(digestIds, RANDOM);
-        }
-        for (int i = 0; i < processedItems.size(); i++) {
-            processedItems.get(i).put(MdocConstants.DIGEST_ID, digestIds.get(i));
+        for (Map<String, Object> processedItem : processedItems) {
+            processedItem.put(MdocConstants.DIGEST_ID, distinctDigestId(processedItems));
         }
         return processedItems;
     }
 
+    /** A random {@code digestID} not yet used in this namespace (18013-5 9.1.2.5). */
+    private static int distinctDigestId(List<Map<String, Object>> items) {
+        Set<Integer> used = new HashSet<>();
+        for (Map<String, Object> item : items) {
+            Object id = item.get(MdocConstants.DIGEST_ID);
+            if (id instanceof Integer value) {
+                used.add(value);
+            }
+        }
+        int candidate;
+        do {
+            candidate = RANDOM.nextInt() & Integer.MAX_VALUE; // 0..2^31-1, non-negative by construction
+        } while (used.contains(candidate));
+        return candidate;
+    }
+
+    /** A value in both shapes: the Java value the validator and a preview see, and its exact CBOR encoding when typed. */
+    private record ConvertedValue(Object logical, DataItem wire) {}
+
     /** Encodes one element value in the type its namespace's table declares (7.2.1 Table 5). */
-    private Object convertValue(String namespaceName, String identifier, JsonNode value, MdocElementTypes elementTypes) {
+    private ConvertedValue convertValue(String namespaceName, String identifier, JsonNode value, MdocElementTypes elementTypes) {
         Optional<MdocElementTypes.Type> type = elementTypes == null ? Optional.empty() : elementTypes.type(namespaceName, identifier);
         if (type.isEmpty()) {
-            // an untyped namespace keeps the pre-M-03 behaviour: strings stay strings, and preprocessForCBOR tags YYYY-MM-DD
-            return plain(value);
+            Object logical = plain(value);
+            // Only a namespace without any type table keeps the pre-M-03 heuristic. In a namespace that has a table an
+            // unlisted (new) identifier is written exactly as the template gives it, never guessed to be a date.
+            boolean heuristic = elementTypes == null || !elementTypes.hasTable(namespaceName);
+            return new ConvertedValue(logical, heuristic ? null : convertToDataItem(logical));
         }
         if (value == null || value.isNull()) {
             throw dataModelError(identifier, "has no value; the signed document must carry one");
         }
         return switch (type.get()) {
-            case TSTR -> text(identifier, value);
-            case UINT -> unsigned(identifier, value);
-            case BOOL -> bool(identifier, value);
-            case BSTR -> bytes(identifier, value);
-            case FULL_DATE -> tagged(MdocConstants.CBOR_TAG_FULL_DATE, fullDate(identifier, text(identifier, value)));
-            case TDATE -> tagged(MdocConstants.CBOR_TAG_TDATE, tdate(identifier, text(identifier, value)));
-            case DRIVING_PRIVILEGES -> drivingPrivileges(identifier, value);
+            case TSTR -> {
+                String text = text(identifier, value);
+                yield new ConvertedValue(text, new UnicodeString(text));
+            }
+            case UINT -> {
+                long number = unsigned(identifier, value);
+                yield new ConvertedValue(number, new UnsignedInteger(number));
+            }
+            case BOOL -> {
+                boolean flag = bool(identifier, value);
+                yield new ConvertedValue(flag, flag ? SimpleValue.TRUE : SimpleValue.FALSE);
+            }
+            case BSTR -> {
+                byte[] bytes = bytes(identifier, value);
+                yield new ConvertedValue(bytes, new ByteString(bytes));
+            }
+            case FULL_DATE -> {
+                String date = fullDate(identifier, text(identifier, value));
+                yield new ConvertedValue(date, taggedItem(MdocConstants.CBOR_TAG_FULL_DATE, date));
+            }
+            case TDATE -> {
+                String dateTime = tdate(identifier, text(identifier, value));
+                yield new ConvertedValue(dateTime, taggedItem(MdocConstants.CBOR_TAG_TDATE, dateTime));
+            }
+            case FULL_DATE_OR_TDATE -> {
+                String date = text(identifier, value);
+                if (isFullDate(date)) {
+                    yield new ConvertedValue(fullDate(identifier, date), taggedItem(MdocConstants.CBOR_TAG_FULL_DATE, date));
+                }
+                String dateTime = tdate(identifier, date);
+                yield new ConvertedValue(dateTime, taggedItem(MdocConstants.CBOR_TAG_TDATE, dateTime));
+            }
+            case DRIVING_PRIVILEGES -> new ConvertedValue(drivingPrivileges(identifier, value), encodedDrivingPrivileges(identifier, value));
         };
     }
 
@@ -191,22 +248,29 @@ public class MdocProcessor {
         return value.asText();
     }
 
-    private static Object unsigned(String identifier, JsonNode value) {
-        long number;
+    private static long unsigned(String identifier, JsonNode value) {
+        java.math.BigInteger number;
         if (value.isIntegralNumber()) {
-            number = value.asLong();
-        } else if (value.isTextual() && value.asText().trim().matches("\\d{1,19}")) {
-            number = Long.parseLong(value.asText().trim());
+            number = value.bigIntegerValue();
+        } else if (value.isTextual() && value.asText().trim().matches("\\d+")) {
+            try {
+                number = new java.math.BigInteger(value.asText().trim());
+            } catch (NumberFormatException e) {
+                throw dataModelError(identifier, "must be an unsigned integer (uint), was " + value);
+            }
         } else {
             throw dataModelError(identifier, "must be an unsigned integer (uint), was " + value);
         }
-        if (number < 0) {
+        if (number.signum() < 0) {
             throw dataModelError(identifier, "must be an unsigned integer (uint), was " + number);
         }
-        return number <= Integer.MAX_VALUE ? (Object) (int) number : (Object) number;
+        if (number.bitLength() > 63) {
+            throw dataModelError(identifier, "overflows the unsigned integer (uint) this issuer can encode, was " + number);
+        }
+        return number.longValue();
     }
 
-    private static Object bool(String identifier, JsonNode value) {
+    private static boolean bool(String identifier, JsonNode value) {
         if (value.isBoolean()) {
             return value.asBoolean();
         }
@@ -237,61 +301,66 @@ public class MdocProcessor {
         }
     }
 
+    /** A {@code full-date}; parsed with {@link ResolverStyle#STRICT} so {@code 2023-02-31} is refused (7.2.1). */
     private static String fullDate(String identifier, String value) {
         if (!value.matches("\\d{4}-\\d{2}-\\d{2}")) {
             throw dataModelError(identifier, "must be a full-date (YYYY-MM-DD), was " + value);
         }
         try {
-            LocalDate.parse(value, DateTimeFormatter.ofPattern(MdocConstants.FULL_DATE_PATTERN));
+            LocalDate.parse(value, FULL_DATE);
         } catch (DateTimeParseException e) {
-            throw dataModelError(identifier, "must be a full-date (YYYY-MM-DD), was " + value);
+            throw dataModelError(identifier, "must be a real full-date (YYYY-MM-DD), was " + value);
         }
         return value;
     }
 
-    /** RFC 3339 without fractional seconds, as {@code tdate} requires (18013-5 9.1.2.4). */
-    private static String tdate(String identifier, String value) {
+    private static boolean isFullDate(String value) {
+        if (!value.matches("\\d{4}-\\d{2}-\\d{2}")) {
+            return false;
+        }
         try {
-            return TDATE.format(Instant.parse(value));
+            LocalDate.parse(value, FULL_DATE);
+            return true;
         } catch (DateTimeParseException e) {
-            throw dataModelError(identifier, "must be an RFC 3339 date-time such as 2024-01-31T10:15:30Z, was " + value);
+            return false;
         }
     }
 
+    /** RFC 3339 without fractional seconds, as {@code tdate} requires (18013-5 9.1.2.4); parsed strictly. */
+    private static String tdate(String identifier, String value) {
+        try {
+            return TDATE.format(TDATE_INPUT.parse(value, Instant::from));
+        } catch (DateTimeParseException e) {
+            throw dataModelError(identifier, "must be a real RFC 3339 date-time such as 2024-01-31T10:15:30Z, was " + value);
+        }
+    }
+
+    /** {@code full-date} only, for the dates inside {@code driving_privileges} (7.2.1 Table 5). */
+    private static DataItem encodedFullDate(String identifier, String value) {
+        return taggedItem(MdocConstants.CBOR_TAG_FULL_DATE, fullDate(identifier, value));
+    }
+
+    private static final Set<String> PRIVILEGE_KEYS = Set.of("vehicle_category_code", "issue_date", "expiry_date", "codes");
+    private static final Set<String> CODE_KEYS = Set.of("code", "sign", "value");
+
     /** {@code driving_privileges}: an array of {vehicle_category_code, issue_date, expiry_date, codes[]} maps. */
     private List<Object> drivingPrivileges(String identifier, JsonNode value) {
-        if (!value.isArray()) {
-            throw dataModelError(identifier, "must be an array of driving privileges, was " + value);
-        }
         List<Object> privileges = new ArrayList<>();
-        for (JsonNode privilege : value) {
-            if (!privilege.isObject()) {
-                throw dataModelError(identifier, "must contain driving privilege maps, found " + privilege);
-            }
+        for (JsonNode privilege : privileges(identifier, value)) {
             Map<String, Object> map = new LinkedHashMap<>();
-            JsonNode category = privilege.get("vehicle_category_code");
-            if (category == null || !category.isTextual()) {
-                throw dataModelError(identifier, "carries a driving privilege without a vehicle_category_code (tstr)");
-            }
-            map.put("vehicle_category_code", category.asText());
+            map.put("vehicle_category_code", text(identifier, privilege.get("vehicle_category_code")));
             for (String date : new String[] {"issue_date", "expiry_date"}) {
                 JsonNode node = privilege.get(date);
                 if (node != null && !node.isNull()) {
-                    map.put(date, tagged(MdocConstants.CBOR_TAG_FULL_DATE, fullDate(identifier + "." + date, text(identifier + "." + date, node))));
+                    map.put(date, fullDate(identifier + "." + date, text(identifier + "." + date, node)));
                 }
             }
             JsonNode codes = privilege.get("codes");
             if (codes != null && !codes.isNull()) {
-                if (!codes.isArray()) {
-                    throw dataModelError(identifier + ".codes", "must be an array of {code, sign, value} maps");
-                }
                 List<Object> codeList = new ArrayList<>();
                 for (JsonNode code : codes) {
-                    if (!code.isObject() || code.get("code") == null || !code.get("code").isTextual()) {
-                        throw dataModelError(identifier + ".codes", "must contain maps with a code (tstr)");
-                    }
                     Map<String, Object> codeMap = new LinkedHashMap<>();
-                    codeMap.put("code", code.get("code").asText());
+                    codeMap.put("code", text(identifier + ".codes.code", code.get("code")));
                     for (String optional : new String[] {"sign", "value"}) {
                         JsonNode node = code.get(optional);
                         if (node != null && !node.isNull()) {
@@ -303,6 +372,81 @@ public class MdocProcessor {
                 map.put("codes", codeList);
             }
             privileges.add(map);
+        }
+        return privileges;
+    }
+
+    /** The CBOR form of {@code driving_privileges}: the dates are full-date even where Table 5 allows a tdate. */
+    private static DataItem encodedDrivingPrivileges(String identifier, JsonNode value) {
+        Array array = new Array();
+        for (JsonNode privilege : privileges(identifier, value)) {
+            co.nstant.in.cbor.model.Map map = new co.nstant.in.cbor.model.Map();
+            map.put(new UnicodeString("vehicle_category_code"), new UnicodeString(text(identifier, privilege.get("vehicle_category_code"))));
+            for (String date : new String[] {"issue_date", "expiry_date"}) {
+                JsonNode node = privilege.get(date);
+                if (node != null && !node.isNull()) {
+                    map.put(new UnicodeString(date), encodedFullDate(identifier + "." + date, text(identifier + "." + date, node)));
+                }
+            }
+            JsonNode codes = privilege.get("codes");
+            if (codes != null && !codes.isNull()) {
+                Array codeArray = new Array();
+                for (JsonNode code : codes) {
+                    co.nstant.in.cbor.model.Map codeMap = new co.nstant.in.cbor.model.Map();
+                    codeMap.put(new UnicodeString("code"), new UnicodeString(text(identifier + ".codes.code", code.get("code"))));
+                    for (String optional : new String[] {"sign", "value"}) {
+                        JsonNode node = code.get(optional);
+                        if (node != null && !node.isNull()) {
+                            codeMap.put(new UnicodeString(optional), new UnicodeString(text(identifier + ".codes." + optional, node)));
+                        }
+                    }
+                    codeArray.add(codeMap);
+                }
+                map.put(new UnicodeString("codes"), codeArray);
+            }
+            array.add(map);
+        }
+        return array;
+    }
+
+    /** Validates the shape of every driving privilege, refusing empty {@code codes} and unknown keys (Table 5, CDDL). */
+    private static List<JsonNode> privileges(String identifier, JsonNode value) {
+        if (!value.isArray() || value.isEmpty()) {
+            throw dataModelError(identifier, "must be a non-empty array of driving privileges, was " + value);
+        }
+        List<JsonNode> privileges = new ArrayList<>();
+        for (JsonNode privilege : value) {
+            if (!privilege.isObject()) {
+                throw dataModelError(identifier, "must contain driving privilege maps, found " + privilege);
+            }
+            privilege.fieldNames().forEachRemaining(key -> {
+                if (!PRIVILEGE_KEYS.contains(key)) {
+                    throw dataModelError(identifier, "has an unknown driving privilege key '" + key + "' (expected one of "
+                            + PRIVILEGE_KEYS + ")");
+                }
+            });
+            JsonNode category = privilege.get("vehicle_category_code");
+            if (category == null || !category.isTextual() || category.asText().isBlank()) {
+                throw dataModelError(identifier, "carries a driving privilege without a vehicle_category_code (tstr)");
+            }
+            JsonNode codes = privilege.get("codes");
+            if (codes != null && !codes.isNull()) {
+                if (!codes.isArray() || codes.isEmpty()) {
+                    throw dataModelError(identifier + ".codes", "must carry at least one code (CDDL [+ Code]), was " + codes);
+                }
+                for (JsonNode code : codes) {
+                    if (!code.isObject() || code.get("code") == null || !code.get("code").isTextual()) {
+                        throw dataModelError(identifier + ".codes", "must contain maps with a code (tstr)");
+                    }
+                    code.fieldNames().forEachRemaining(key -> {
+                        if (!CODE_KEYS.contains(key)) {
+                            throw dataModelError(identifier + ".codes", "has an unknown code key '" + key + "' (expected one of "
+                                    + CODE_KEYS + ")");
+                        }
+                    });
+                }
+            }
+            privileges.add(privilege);
         }
         return privileges;
     }
@@ -362,9 +506,14 @@ public class MdocProcessor {
             Map<Integer, byte[]> digestMap = new HashMap<>();
 
             for (Map<String, Object> element : elements) {
-                // 1) Encode element (IssuerSignedItem) to CBOR
+                // 1) Encode element (IssuerSignedItem) to CBOR, with the typed value pre-built where the table gave one
+                Map<String, Object> wireElement = new LinkedHashMap<>(element);
+                Object typed = wireElement.remove(MdocConstants.WIRE_VALUE);
+                if (typed != null) {
+                    wireElement.put(MdocConstants.ELEMENT_VALUE, typed);
+                }
                 ByteArrayOutputStream innerBaos = new ByteArrayOutputStream();
-                new CborEncoder(innerBaos).encode(convertToDataItem(preprocessForCBOR(element)));
+                new CborEncoder(innerBaos).encode(convertToDataItem(preprocessForCBOR(wireElement)));
                 byte[] elementCbor = innerBaos.toByteArray();
                 encodedElements.add(elementCbor);
 
@@ -575,10 +724,18 @@ public class MdocProcessor {
      * Creates a CBOR tagged date (tag 1004) for date-only strings
      */
     private static Map<String, Object> createCBORTaggedDate(String dateStr) {
-        return tagged(MdocConstants.CBOR_TAG_FULL_DATE, dateStr);
+        return taggedMap(MdocConstants.CBOR_TAG_FULL_DATE, dateStr);
     }
 
-    private static Map<String, Object> tagged(int tag, String value) {
+    /** A pre-built tagged text item: {@code #6.<tag>(tstr)} with no heuristic applied later. */
+    private static DataItem taggedItem(int tag, String value) {
+        UnicodeString item = new UnicodeString(value);
+        item.setTag(tag);
+        return item;
+    }
+
+    /** A JSON-friendly tagged text value ({@code __cbor_tag}/{@code __cbor_value}) for maps that stay serialisable. */
+    private static Map<String, Object> taggedMap(int tag, String value) {
         Map<String, Object> taggedValue = new LinkedHashMap<>();
         taggedValue.put(MdocConstants.__CBOR_TAG, tag);
         taggedValue.put(MdocConstants.__CBOR_VALUE, value);
@@ -596,10 +753,16 @@ public class MdocProcessor {
         if (notAfter != null && notAfter.isBefore(until)) {
             until = notAfter.truncatedTo(ChronoUnit.SECONDS);
         }
+        if (!until.isAfter(signed)) {
+            // 9.1.2.4/9.3.3: a document whose validity ends before it is signed can never be valid. This is a certificate
+            // fault, refused here before the generic chain check so the operator sees the DSC that is already expired.
+            throw new FormatException("certificate_chain_invalid", "the document signer certificate expires at " + notAfter
+                    + ", not after the signing instant " + signed + "; the MSO would not be valid");
+        }
         Map<String, Object> validityInfo = new HashMap<>();
-        validityInfo.put(MdocConstants.VALID_FROM, tagged(MdocConstants.CBOR_TAG_TDATE, TDATE.format(signed)));
-        validityInfo.put(MdocConstants.VALID_UNTIL, tagged(MdocConstants.CBOR_TAG_TDATE, TDATE.format(until)));
-        validityInfo.put(MdocConstants.SIGNED, tagged(MdocConstants.CBOR_TAG_TDATE, TDATE.format(signed)));
+        validityInfo.put(MdocConstants.VALID_FROM, taggedMap(MdocConstants.CBOR_TAG_TDATE, TDATE.format(signed)));
+        validityInfo.put(MdocConstants.VALID_UNTIL, taggedMap(MdocConstants.CBOR_TAG_TDATE, TDATE.format(until)));
+        validityInfo.put(MdocConstants.SIGNED, taggedMap(MdocConstants.CBOR_TAG_TDATE, TDATE.format(signed)));
         return validityInfo;
     }
 

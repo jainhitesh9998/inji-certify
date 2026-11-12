@@ -21,7 +21,8 @@ public final class MdocElementTypes {
 
     /** The CBOR types of Table 5. */
     public enum Type {
-        TSTR, UINT, BOOL, BSTR, FULL_DATE, TDATE, DRIVING_PRIVILEGES;
+        TSTR, UINT, BOOL, BSTR, FULL_DATE, TDATE, /** {@code full-date} or {@code tdate}, chosen by the value's shape (Table 5). */
+        FULL_DATE_OR_TDATE, DRIVING_PRIVILEGES;
 
         static Optional<Type> parse(String value) {
             if (value == null) {
@@ -30,6 +31,10 @@ public final class MdocElementTypes {
             String normalized = value.trim().toUpperCase(Locale.ROOT).replace('-', '_').replace(" ", "_");
             if ("ARRAY".equals(normalized) || "DRIVINGPRIVILEGES".equals(normalized)) {
                 return Optional.of(DRIVING_PRIVILEGES);
+            }
+            if ("DATE_OR_TDATE".equals(normalized) || "FULL_DATE_OR_TDATE".equals(normalized)
+                    || "FULLDATEORTDATE".equals(normalized)) {
+                return Optional.of(FULL_DATE_OR_TDATE);
             }
             for (Type type : values()) {
                 if (type.name().equals(normalized)) {
@@ -41,6 +46,8 @@ public final class MdocElementTypes {
     }
 
     static final String MDL_NAMESPACE = "org.iso.18013.5.1";
+    /** The mDL document type Table 5 defines. */
+    static final String MDL_DOCTYPE = "org.iso.18013.5.1.mDL";
 
     /** The mandatory elements of Table 5: a {@code org.iso.18013.5.1.mDL} without one of them is not an mDL. */
     static final Set<String> MDL_MANDATORY = Set.of("family_name", "given_name", "birth_date", "issue_date", "expiry_date",
@@ -56,7 +63,7 @@ public final class MdocElementTypes {
         this.tables = tables;
     }
 
-    /** No type table at all: every namespace takes the pre-M-03 heuristic. */
+    /** No configuration override: the built-in mDL table still applies; namespaces without a built-in table keep the heuristic. */
     public static MdocElementTypes none() {
         return NONE;
     }
@@ -64,11 +71,24 @@ public final class MdocElementTypes {
     /** The built-in table plus the configuration's override (none when the configuration carries none). */
     public static MdocElementTypes forConfig(FormatConfig configuration) {
         Object raw = configuration == null || configuration.raw() == null ? null : configuration.raw().get(MdocConstants.ELEMENT_TYPES);
-        return raw == null ? NONE : of(raw);
+        if (raw == null) {
+            return NONE;
+        }
+        Object doctype = configuration.raw().get(MdocConstants.DOCTYPE);
+        return of(raw, doctype == null ? null : String.valueOf(doctype));
     }
 
     /** The built-in table plus {@code elementTypes}, a {@code {namespace: {element: type}}} map. */
     public static MdocElementTypes of(Object elementTypes) {
+        return of(elementTypes, null);
+    }
+
+    /**
+     * The built-in table plus {@code elementTypes}, refusing an override that changes a Table 5 element's type: the
+     * table is the document's data model, not a suggestion (7.2.1; decision D6). New identifiers and other namespaces are
+     * free to be typed.
+     */
+    public static MdocElementTypes of(Object elementTypes, String docType) {
         if (!(elementTypes instanceof Map<?, ?> byNamespace)) {
             throw new FormatException(MdocConstants.ERROR_TEMPLATE,
                     MdocConstants.ELEMENT_TYPES + " must be a map of namespace to element to type, was " + elementTypes);
@@ -84,8 +104,16 @@ public final class MdocElementTypes {
                 Type type = Type.parse(element.getValue() == null ? null : String.valueOf(element.getValue()))
                         .orElseThrow(() -> new FormatException(MdocConstants.ERROR_TEMPLATE,
                                 MdocConstants.ELEMENT_TYPES + "." + namespace.getKey() + "." + element.getKey() + " is not a known type: "
-                                        + element.getValue() + " (expected one of tstr, uint, bool, bstr, full-date, tdate, driving_privileges)"));
-                byElement.put(String.valueOf(element.getKey()), type);
+                                        + element.getValue() + " (expected one of tstr, uint, bool, bstr, full-date, tdate, date_or_tdate, driving_privileges)"));
+                String identifier = String.valueOf(element.getKey());
+                Optional<Type> builtIn = builtInType(String.valueOf(namespace.getKey()), identifier);
+                if (MDL_DOCTYPE.equals(docType) && builtIn.isPresent() && builtIn.get() != type) {
+                    throw new FormatException(MdocConstants.ERROR_DATA_MODEL,
+                            MdocConstants.ELEMENT_TYPES + "." + namespace.getKey() + "." + identifier
+                                    + " would change a Table 5 element from " + builtIn.get() + " to " + type
+                                    + "; the ISO/IEC 18013-5 data model is not configurable");
+                }
+                byElement.put(identifier, type);
             }
             tables.put(String.valueOf(namespace.getKey()), byElement);
         }
@@ -98,10 +126,23 @@ public final class MdocElementTypes {
         if (override != null && override.containsKey(element)) {
             return Optional.of(override.get(element));
         }
-        if (MDL_NAMESPACE.equals(namespace) && MDL.containsKey(element)) {
-            return Optional.of(MDL.get(element));
+        return builtInType(namespace, element);
+    }
+
+    /** Whether the namespace has a type table at all (its own override or the built-in mDL table). */
+    public boolean hasTable(String namespace) {
+        return tables.containsKey(namespace) || MDL_NAMESPACE.equals(namespace);
+    }
+
+    /** The built-in Table 5 type of an element, never a configuration override. */
+    public static Optional<Type> builtInType(String namespace, String element) {
+        if (!MDL_NAMESPACE.equals(namespace)) {
+            return Optional.empty();
         }
-        return Optional.empty();
+        if (element.matches("age_over_\\d{2}")) {
+            return Optional.of(Type.BOOL);
+        }
+        return Optional.ofNullable(MDL.get(element));
     }
 
     /** Whether this element lives in the built-in mDL namespace (the validator's subject). */
@@ -115,8 +156,8 @@ public final class MdocElementTypes {
         table.put("family_name", Type.TSTR);
         table.put("given_name", Type.TSTR);
         table.put("birth_date", Type.FULL_DATE);
-        table.put("issue_date", Type.FULL_DATE);
-        table.put("expiry_date", Type.FULL_DATE);
+        table.put("issue_date", Type.FULL_DATE_OR_TDATE);
+        table.put("expiry_date", Type.FULL_DATE_OR_TDATE);
         table.put("issuing_country", Type.TSTR);
         table.put("issuing_authority", Type.TSTR);
         table.put("document_number", Type.TSTR);
@@ -135,9 +176,7 @@ public final class MdocElementTypes {
         table.put("portrait_capture_date", Type.TDATE);
         table.put("age_in_years", Type.UINT);
         table.put("age_birth_year", Type.UINT);
-        for (String age : new String[] {"13", "16", "18", "21", "25", "60", "62", "65", "68", "70"}) {
-            table.put("age_over_" + age, Type.BOOL);
-        }
+        // age_over_NN for any two-digit NN, matched by pattern in builtInType (7.2.1 Table 5)
         table.put("issuing_jurisdiction", Type.TSTR);
         table.put("nationality", Type.TSTR);
         table.put("resident_city", Type.TSTR);

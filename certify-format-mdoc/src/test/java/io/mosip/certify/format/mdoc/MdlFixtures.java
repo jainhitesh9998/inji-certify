@@ -25,10 +25,30 @@ final class MdlFixtures {
 
     static final String MDL_DOCTYPE = "org.iso.18013.5.1.mDL";
     static final String MDL_NAMESPACE = "org.iso.18013.5.1";
-    /** A minimal JPEG: SOI, APP0/JFIF header, EOI. Synthetic, no person in it. */
-    static final byte[] JPEG = {(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, (byte) 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00,
-            0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, (byte) 0xFF, (byte) 0xD9};
-    static final String PORTRAIT = Base64.getEncoder().encodeToString(JPEG);
+    /**
+     * A small synthetic JPEG (64x80, 1419 bytes) of a drawn face silhouette, generated once with ImageIO and checked in
+     * as base64: no real person, and small enough that a verifier can really decode it (7.2.1 portrait).
+     */
+    static final String PORTRAIT_BASE64 = "/9j/4AAQSkZJRgABAgAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PT"
+            + "gyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCABQ"
+            + "AEADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhBy"
+            + "JxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKT"
+            + "lJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAA"
+            + "AAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRom"
+            + "JygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExc"
+            + "bHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD2qiiiuY1CiuT8T+LxpbtZWIV7sffc8rH/AImvP7vUr2/cvdXU"
+            + "spP95jgfQdBUSmkaRptntlFeJ2mpXtg4e1upYiP7rHB+o6GvQPDHi8ao62V8FS7P3HHCyf4GiM0wlTaOsoooqzMKzNf1P+ydGnuhjzANsYP948"
+            + "D/AB/CtOuK+IsxWzsYM8PIzn/gIA/9mpSdkVFXdjgHdpHZ3Ys7HJJPJNX7LQtU1FN9rZSuh6OflU/QnArZ8GeH49UuHvLtN1tAcBD0d+uD7D+o"
+            + "rutI13StaE40u7juBbN5cgQEbT26jpwcEccVlGF1dmsp2dkeWXuhappyb7qylRB1cfMo+pGRVBHaN1dGKupyCDyDXsWr67pWiiAapdx24uW8uM"
+            + "OCdx79B05GSeOa4Xxn4fj0u4S8tE2205wUHRH64Hsf6GiULK6CNS+jO50DU/7W0aC6OPMI2yAf3hwf8fxrTrivh1MWs76DPCSK4/4ECP8A2Wu1"
+            + "rWLujKSs7BXFfEWEtZ2M+OEkZD/wIA/+y12tZmv6Z/a2jT2ox5hG6Mn+8OR/h+NEldBF2dyj4JRV8L25XqzuW+u4j+QFX9J0DS9D+0f2ZZx232"
+            + "h98uwn5j+J4HJ4HHNcz4D1QRCbR7g7JVcvGG4P+0v1GM/nXTpq8I1afTrjbbzLhoN7f69CoyV9w2QQM4wD3og7oJq0hNW0DS9c+z/2nZx3P2d9"
+            + "8W8n5T+B5HA4PHFUPGyK3he4LdVdCv13AfyJrQvdXhtbq3s4ts95NIqiBX+ZUz8znrgKMnnqcDvXMePNUEoh0e3O+VnDyBeT/sr9TnP5UTfuhB"
+            + "XkP+HUJWzvp8cPIqD/AICCf/Zq7WszQNM/snRoLU48wDdIR/ePJ/w/CtOiKsgk7u4UUUUyTlfEnhM3839oac4hvRyRnAcjvns1Yk3iLU7WD7Hr"
+            + "+jR3iL/z3jxn3zgqfqBXotFTy9UWpaWZ5vb65fzRtbeHdBgsVk+8baEfzAAH1Nb3hvwmbCb+0NRcTXp5AzkIT3z3auqoo5dbsHLSyCiiiqICii"
+            + "igAooooAKKKKACiiigD//Z";
+    static final byte[] JPEG = Base64.getDecoder().decode(PORTRAIT_BASE64);
+    static final String PORTRAIT = PORTRAIT_BASE64;
     /**
      * The instant the tests issue at: the current instant (F-09), carrying fractional seconds so that the truncation
      * ISO/IEC 18013-5 9.1.2.4 requires is visible, and inside the dev certificates' validity window.
@@ -162,10 +182,14 @@ final class MdlFixtures {
         return document;
     }
 
-    /** The document with one element's value replaced. */
+    /** The document with one element's value replaced, or with the element added when it is optional and absent. */
     static Map<String, Object> with(String identifier, Object value) {
         Map<String, Object> document = mdl();
-        for (Map<String, Object> item : items(document, MDL_NAMESPACE)) {
+        List<Map<String, Object>> items = items(document, MDL_NAMESPACE);
+        if (items.stream().noneMatch(item -> identifier.equals(item.get("elementIdentifier")))) {
+            items.add(item(identifier, value));
+        }
+        for (Map<String, Object> item : items) {
             if (identifier.equals(item.get("elementIdentifier"))) {
                 item.put("elementValue", value);
             }

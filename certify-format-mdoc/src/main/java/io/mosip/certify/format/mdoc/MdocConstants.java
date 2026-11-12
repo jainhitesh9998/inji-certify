@@ -17,6 +17,8 @@ final class MdocConstants {
     static final String DID_KEY_PREFIX = "did:key:";
     static final String __CBOR_TAG = "__cbor_tag";
     static final String __CBOR_VALUE = "__cbor_value";
+    /** Internal key of a processed element: its pre-built, exact CBOR encoding when the type table gave one. */
+    static final String WIRE_VALUE = "_wireValue";
     /** The optional per-namespace element type table of a configuration ({@code formatConfig.elementTypes}). */
     static final String ELEMENT_TYPES = "elementTypes";
 
