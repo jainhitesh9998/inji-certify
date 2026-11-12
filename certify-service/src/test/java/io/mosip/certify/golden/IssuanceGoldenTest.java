@@ -934,9 +934,10 @@ class IssuanceGoldenTest {
     }
 
     /**
-     * The data provider answers after 2 ms, as any real one does, so the core path's validFrom (the request instant)
-     * and signed (the formatter's wall clock) always differ: the G8 gap the core samples declare then reproduces on
-     * every run instead of all but the runs where both fall in one millisecond.
+     * The data provider answers after 2 ms, as any real one does, so time passes between the request instant and the
+     * signing step on every run. Before M-02 that made the core path's signed (the formatter's wall clock) later than
+     * its validFrom (the request instant), G8; the formatter now decides both in {@code sign()} as one instant, and the
+     * core samples declaring no {@code mso.validityInfo} gap is the proof that the delay no longer matters.
      */
     void answerAfterTwoMilliseconds() throws Exception {
         when(dataProviderPlugin.fetchData(any())).thenAnswer(inv -> {

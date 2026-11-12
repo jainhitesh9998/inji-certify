@@ -47,27 +47,25 @@ final class MdocSampleWriter {
     }
 
     // What the keymanager-signed mDoc of either issuance path cannot pass yet (docs/design/20-mdl-issuer.md gaps).
-    private static final String G1_MILLISECONDS = "G1: signed/validFrom/validUntil carry milliseconds (UTC_DATETIME_PATTERN); fixed by M-02";
-    private static final String G1_UNTAGGED = "G1: through the core validFrom/validUntil come from the template engine as a plain tstr without tag 0; fixed by M-02";
-    private static final String G3_MISSING = "G3: the golden template carries family_name, birth_date and resident_city only, and nothing checks Table 5 mandatory elements; fixed by M-03";
+    private static final String G1_MILLISECONDS = "G1: the legacy utils.MDocProcessor writes signed/validFrom/validUntil with milliseconds"
+            + " (UTC_DATETIME_PATTERN); the refactored formatter (M-02) does not, and the legacy path is retired with the compat-core flip";
 
     static final List<Gap> TDATE_MILLISECONDS = List.of(
             new Gap("mso.validityInfo.tdateTags", "fractionalSeconds:signed", G1_MILLISECONDS),
             new Gap("mso.validityInfo.tdateTags", "fractionalSeconds:validFrom", G1_MILLISECONDS),
             new Gap("mso.validityInfo.tdateTags", "fractionalSeconds:validUntil", G1_MILLISECONDS));
-    static final List<Gap> TDATE_UNTAGGED = List.of(
-            new Gap("mso.validityInfo.tdateTags", "untagged:validFrom", G1_UNTAGGED),
-            new Gap("mso.validityInfo.tdateTags", "untagged:validUntil", G1_UNTAGGED));
+    /**
+     * The legacy processor has no element typing: the Table 5 template's base64 portrait stays a tstr. Its dates and
+     * {@code driving_privileges} pass through its date heuristic, so portrait is the only element problem it has.
+     */
+    static final Gap LEGACY_UNTYPED_PORTRAIT = new Gap("mdl.elementTypes", "untyped:portrait",
+            "G2: the legacy utils.MDocProcessor has no element typing and writes the base64 portrait as a tstr; the refactored"
+                    + " formatter (M-03) writes a bstr, and the legacy path is retired with the compat-core flip");
     static final Gap KEYMANAGER_NO_IACA = new Gap("x5chain.iaca", "noAnchorSupplied",
             "G13: the keymanager x5chain is the master-signed leaf alone, there is no IACA to anchor it; M-06");
     /** Declared by {@link #write} exactly when the received leaf serial is not positive; zero and overlong never are. */
     static final Gap KEYMANAGER_NEGATIVE_SERIAL = new Gap("x5chain.serialNumber", "nonPositive",
             "G27: keymanager drew this certificate's serial from SecureRandom.nextLong(), negative in about half the runs; M-06/keymanager provider");
-    static final List<Gap> GOLDEN_TEMPLATE_ELEMENTS = goldenTemplateElements();
-    static final Gap SIGNED_AFTER_VALID_FROM = new Gap("mso.validityInfo", "signedAfterValidFrom",
-            "G8: through the core validFrom is the request instant and signed the formatter's wall clock, milliseconds later; fixed by M-02/M-03");
-    static final Gap MULTIPAZ_REFUSES_MSO = new Gap("mso.parse", "refused",
-            "G1: Multipaz's MobileSecurityObject parser refuses the untagged validFrom/validUntil, so a Multipaz wallet cannot read the MSO; fixed by M-02");
     private static final String D13_COMPATIBILITY = "0.14.0 wire compatibility on the draft-13 surface (decision log 2026-09-19, "
             + "D13Mdoc): wallets built for 0.14.0 parse this shape; the /oid4vci and legacy surfaces return the bare untagged form";
     static final Gap DOCUMENT_WRAPPER = new Gap("credential.shape", "documentWrapper",
@@ -75,28 +73,20 @@ final class MdocSampleWriter {
     static final Gap TAGGED_ISSUER_AUTH = new Gap("issuerAuth.untagged", "tagged",
             "the draft-13 IssuerAuth carries COSE tag 18 as 0.14.0 did (ISO/IEC 18013-5 9.1.2.4 wants it untagged); " + D13_COMPATIBILITY);
 
-    /** The legacy service path ({@code CertifyIssuanceServiceImpl} + {@code utils/MDocProcessor}) signs at validFrom. */
-    static final List<Gap> LEGACY_SERVICE_GAPS = concat(TDATE_MILLISECONDS, List.of(KEYMANAGER_NO_IACA), GOLDEN_TEMPLATE_ELEMENTS);
-    /** Every path through the core ({@code DefaultIssuanceService} + {@code certify-format-mdoc}). */
-    static final List<Gap> CORE_GAPS = concat(List.of(MULTIPAZ_REFUSES_MSO, SIGNED_AFTER_VALID_FROM), TDATE_MILLISECONDS,
-            TDATE_UNTAGGED, List.of(KEYMANAGER_NO_IACA), GOLDEN_TEMPLATE_ELEMENTS);
+    /**
+     * The legacy service path ({@code CertifyIssuanceServiceImpl} + the unchanged {@code utils/MDocProcessor}), which
+     * M-02/M-03 leave alone (rule 1: its wire bytes are the {@code legacy-develop} golden).
+     */
+    static final List<Gap> LEGACY_SERVICE_GAPS = concat(TDATE_MILLISECONDS, List.of(KEYMANAGER_NO_IACA, LEGACY_UNTYPED_PORTRAIT));
+    /**
+     * Every path through the core ({@code DefaultIssuanceService} + {@code certify-format-mdoc}): after M-02/M-03 only the
+     * missing trust anchor is left (and G27 when keymanager drew a negative serial, see {@link #gapsFor}).
+     */
+    static final List<Gap> CORE_GAPS = List.of(KEYMANAGER_NO_IACA);
     /** The draft-13 surface: the core's gaps plus the two 0.14.0 shape deviations it keeps on purpose. */
     static final List<Gap> D13_GAPS = concat(CORE_GAPS, List.of(DOCUMENT_WRAPPER, TAGGED_ISSUER_AUTH));
 
     private MdocSampleWriter() {}
-
-    /**
-     * The golden template's element problems: every Table 5 mandatory element it lacks. Its three elements are typed
-     * right (family_name and resident_city tstr, birth_date full-date from the typing heuristic), so none is untyped.
-     */
-    private static List<Gap> goldenTemplateElements() {
-        List<Gap> gaps = new ArrayList<>();
-        for (String missing : List.of("given_name", "issue_date", "expiry_date", "issuing_country", "issuing_authority",
-                "document_number", "portrait", "driving_privileges", "un_distinguishing_sign")) {
-            gaps.add(new Gap("mdl.elementTypes", "missing:" + missing, G3_MISSING));
-        }
-        return List.copyOf(gaps);
-    }
 
     @SafeVarargs
     private static List<Gap> concat(List<Gap>... lists) {

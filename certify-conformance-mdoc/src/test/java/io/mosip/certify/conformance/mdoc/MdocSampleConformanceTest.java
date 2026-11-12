@@ -60,7 +60,7 @@ class MdocSampleConformanceTest {
      * mso_mdoc credential is a plugin's opaque bytes passed through unchanged, not an IssuerSigned Certify built.
      */
     static final List<String> EXPECTED_SAMPLES = List.of(
-            "certify-format-mdoc/MdocIndependentVerificationTest-ed25519-fixture",
+            "certify-format-mdoc/MdocIndependentVerificationTest-ed25519",
             "certify-format-mdoc/MdocIndependentVerificationTest-formatter",
             "certify-service/D13GoldenReplayTest-d13",
             "certify-service/IssuanceGoldenCoreTest-legacy",

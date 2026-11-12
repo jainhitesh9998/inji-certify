@@ -20,7 +20,7 @@ class IssuanceGoldenCoreTest extends IssuanceGoldenTest {
 
     @Autowired VCIssuanceService vcIssuanceService;
 
-    /** Through the core the compatibility path has the core's validity gap (G8) too. */
+    /** Through the core the compatibility path is the refactored formatter's output, with the core's gaps. */
     @Override
     List<MdocSampleWriter.Gap> legacySurfaceMdocGaps() {
         return MdocSampleWriter.CORE_GAPS;
