@@ -14,12 +14,15 @@ import co.nstant.in.cbor.model.UnicodeString;
 import co.nstant.in.cbor.model.UnsignedInteger;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nimbusds.jose.jwk.JWK;
+import com.nimbusds.jose.jwk.OctetKeyPair;
+import com.nimbusds.jose.jwk.gen.OctetKeyPairGenerator;
 import io.mosip.certify.keyprovider.jca.JcaKeyProvider;
 import io.mosip.certify.signing.KeyRef;
 import io.mosip.certify.signing.SignatureAlgorithm;
 import io.mosip.certify.signing.SigningKey;
 import io.mosip.certify.spi.ClaimSet;
 import io.mosip.certify.spi.CredentialConfiguration;
+import io.mosip.certify.spi.FormatException;
 import io.mosip.certify.spi.HolderBinding;
 import io.mosip.certify.spi.IssuanceContext;
 import io.mosip.certify.spi.IssuedCredential;
@@ -28,6 +31,7 @@ import io.mosip.certify.spi.SigningConfig;
 import io.mosip.certify.spi.SigningContext;
 import io.mosip.certify.spi.TenantContext;
 import io.mosip.certify.spi.UnsignedCredential;
+import io.mosip.certify.testkit.mdoc.AcceptedGaps;
 import io.mosip.certify.testkit.mdoc.IndependentMdocVerifier;
 import io.mosip.certify.testkit.mdoc.MdocSamples;
 import io.mosip.certify.testkit.mdoc.Options;
@@ -46,9 +50,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -57,16 +63,18 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p>Two kinds of test:
  * <ul>
- *     <li>the baseline, today's output under every rule the harness can enforce; the checks the open gaps block
- *     (G1, G2, G9, chain-to-IACA) are asserted as <em>skipped, by name</em>, never as passed;</li>
+ *     <li>today's output under every rule, in strict mode, held to exactly the gaps it declares ({@link #FORMATTER_GAPS},
+ *     written next to the sample as its {@code .gaps} sidecar); a declared gap that starts passing fails the test
+ *     until its line is removed;</li>
  *     <li>mutations and strict-mode negatives, so a check that stops detecting what it claims to detect goes red:
  *     a re-signed-over signature, a wrong docType, an expired window, a foreign IACA, a self-signed certificate in
  *     the chain, and the strict-mode failures the M-02/M-03/M-06 work packages will flip.</li>
  * </ul>
  *
- * <p>Every credential that issues here is written to {@code target/mdoc-samples/} together with its holder key,
- * docType and IACA, for {@code certify-conformance-mdoc} and {@code docs/design/tools/verify_mdoc.py} to re-verify
- * with two more independent stacks.
+ * <p>The two samples written here ({@code MdocIndependentVerificationTest-formatter} and
+ * {@code MdocIndependentVerificationTest-ed25519-fixture}) go to {@code target/mdoc-samples/} together with their holder
+ * key, docType and gaps, for {@code certify-conformance-mdoc} and {@code docs/design/tools/verify_mdoc.py} to
+ * re-verify with two more independent stacks.
  */
 class MdocIndependentVerificationTest {
 
@@ -81,22 +89,21 @@ class MdocIndependentVerificationTest {
             + "\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"}";
     static final String HOLDER = "did:jwk:" + Base64.getUrlEncoder().withoutPadding().encodeToString(HOLDER_JWK.getBytes());
 
-    /**
-     * The checks today's output cannot satisfy yet. Listed in the one test that accepts them, so the acceptance is a
-     * reviewable line rather than a default.
-     */
-    static final Set<String> BASELINE_GAPS = Set.of(IndependentMdocVerifier.CHECK_TDATE_TAGS,
-            IndependentMdocVerifier.CHECK_CHAIN_TO_IACA, IndependentMdocVerifier.CHECK_NO_SELF_SIGNED,
-            IndependentMdocVerifier.CHECK_ELEMENT_TYPES);
+    static final Path SAMPLES = Path.of("target", "mdoc-samples");
 
-    static final List<String> EVERY_CHECK = List.of(IndependentMdocVerifier.CHECK_SIGNATURE_MULTIPAZ,
-            IndependentMdocVerifier.CHECK_SIGNATURE_AUTHLETE, IndependentMdocVerifier.CHECK_MSO_PAYLOAD_TAG,
-            IndependentMdocVerifier.CHECK_NAMESPACES, IndependentMdocVerifier.CHECK_VALUE_DIGESTS,
-            IndependentMdocVerifier.CHECK_CALCULATED_DIGESTS, IndependentMdocVerifier.CHECK_DIGEST_IDS_UNIQUE,
-            IndependentMdocVerifier.CHECK_DEVICE_KEY, IndependentMdocVerifier.CHECK_DOC_TYPE,
-            IndependentMdocVerifier.CHECK_VALIDITY_INFO, IndependentMdocVerifier.CHECK_TDATE_TAGS,
-            IndependentMdocVerifier.CHECK_CHAIN_TO_IACA, IndependentMdocVerifier.CHECK_NO_SELF_SIGNED,
-            IndependentMdocVerifier.CHECK_ELEMENT_TYPES);
+    /**
+     * What the formatter's own output cannot pass yet, by check, with the gap and the work package that closes it.
+     * Written next to each sample as its {@code .gaps} sidecar; the work package that fixes one deletes its line.
+     */
+    static final AcceptedGaps FORMATTER_GAPS = AcceptedGaps.none()
+            .gap(IndependentMdocVerifier.CHECK_TDATE_TAGS,
+                    "G1: signed/validFrom/validUntil carry milliseconds (UTC_DATETIME_PATTERN); fixed by M-02")
+            .gap(IndependentMdocVerifier.CHECK_CHAIN_TO_IACA,
+                    "the JCA dev key is a lone self-signed certificate, there is no IACA to anchor it; M-05/M-06")
+            .gap(IndependentMdocVerifier.CHECK_NO_SELF_SIGNED,
+                    "G9/G10: the self-signed dev certificate is the whole x5chain (HAIP); M-02 and M-05")
+            .gap(IndependentMdocVerifier.CHECK_ELEMENT_TYPES,
+                    "G2/G3: the fixture's two elements are untyped strings and Table 5 mandatory elements are missing; M-03");
 
     final IndependentMdocVerifier verifier = new IndependentMdocVerifier();
     final MdocFormatter formatter = new MdocFormatter(new ObjectMapper(), new MdocProperties("SHA-256", "1.0", 2));
@@ -163,19 +170,33 @@ class MdocIndependentVerificationTest {
                 + System.lineSeparator() + report);
     }
 
-    // ---- the baseline: everything today's output can satisfy ---------------------------------------------------
+    // ---- today's output, strict, held to exactly its declared gaps ---------------------------------------------
 
     @Test
-    void todayOutputPassesEveryCheckTheHarnessCanEnforce() throws Exception {
+    void todayOutputVerifiesWithExactlyTheDeclaredGaps() throws Exception {
         byte[] issuerSigned = issue(document());
         // before the assertions: the conformance module and the CI python verifier read the sample even when a check fails
-        MdocSamples.write(Path.of("target", "mdoc-samples"), "mdl-formatter", issuerSigned, JWK.parse(HOLDER_JWK), DOCTYPE);
-        VerificationReport report = verify(issuerSigned, Optional.empty(), Options.baseline(DOCTYPE));
-        report.assertAllPassed(BASELINE_GAPS);
-        assertEquals(EVERY_CHECK, report.checks().stream().map(VerificationReport.Check::name).toList(),
+        MdocSamples.write(SAMPLES, getClass(), "formatter", issuerSigned, JWK.parse(HOLDER_JWK), DOCTYPE, FORMATTER_GAPS);
+        VerificationReport report = verify(issuerSigned, Optional.empty(), Options.strict(DOCTYPE));
+        assertEquals(IndependentMdocVerifier.CHECKS, report.checks().stream().map(VerificationReport.Check::name).toList(),
                 "the harness still runs every check it claims to");
-        assertEquals(BASELINE_GAPS, report.skippedNames(),
-                "exactly the open gaps are skipped, and nothing else went unverified");
+        FORMATTER_GAPS.assertMatches(report, MdocSamples.name(getClass(), "formatter"));
+    }
+
+    @Test
+    void anEd25519HolderVerifiesByItsOkpDeviceKey() throws Exception {
+        // gap G6: the formatter cannot bind an OKP key yet (formatterCurrentlyRefusesAnEd25519Holder), so the sample
+        // is today's P-256 output with the MSO deviceKey replaced by the Ed25519 COSE_Key {1: 1, -1: 6, -2: x} and
+        // re-signed with the same DSC. M-02 replaces it with the formatter's own Ed25519 output.
+        OctetKeyPair holder = new OctetKeyPairGenerator(com.nimbusds.jose.jwk.Curve.Ed25519).generate();
+        byte[] issuerSigned = resignMso(issue(document()), mso -> mso.put(new UnicodeString("deviceKeyInfo"),
+                deviceKeyInfo(okpCoseKey(holder.getX().decode(), null))));
+        MdocSamples.write(SAMPLES, getClass(), "ed25519-fixture", issuerSigned, holder.toPublicJWK(), DOCTYPE, FORMATTER_GAPS);
+
+        VerificationReport report = verifier.verify(issuerSigned, holder.toPublicJWK(), Optional.empty(),
+                Instant.now().plusSeconds(1), Options.strict(DOCTYPE));
+        assertTrue(report.check(IndependentMdocVerifier.CHECK_DEVICE_KEY).passed(), report.toString());
+        FORMATTER_GAPS.assertMatches(report, MdocSamples.name(getClass(), "ed25519-fixture"));
     }
 
     // ---- mutations: the checks that must catch a bad credential ------------------------------------------------
@@ -304,6 +325,65 @@ class MdocIndependentVerificationTest {
         assertFails(report, IndependentMdocVerifier.CHECK_DEVICE_KEY, "the deviceKey must be the holder key");
     }
 
+    @Test
+    void aDeviceKeyCarryingThePrivateKeyFails() throws Exception {
+        OctetKeyPair holder = new OctetKeyPairGenerator(com.nimbusds.jose.jwk.Curve.Ed25519).generate();
+        byte[] leaked = resignMso(issue(document()), mso -> mso.put(new UnicodeString("deviceKeyInfo"),
+                deviceKeyInfo(okpCoseKey(holder.getX().decode(), holder.getD().decode()))));
+        VerificationReport report = verifier.verify(leaked, holder.toPublicJWK(), Optional.empty(),
+                Instant.now().plusSeconds(1), Options.baseline(DOCTYPE));
+        assertFails(report, IndependentMdocVerifier.CHECK_DEVICE_KEY, "a COSE_Key with d (label -4) must fail");
+        assertTrue(report.check(IndependentMdocVerifier.CHECK_DEVICE_KEY).message().contains("private key"), report.toString());
+    }
+
+    @Test
+    void anOkpHolderDoesNotMatchAnotherOkpKey() throws Exception {
+        OctetKeyPair holder = new OctetKeyPairGenerator(com.nimbusds.jose.jwk.Curve.Ed25519).generate();
+        OctetKeyPair other = new OctetKeyPairGenerator(com.nimbusds.jose.jwk.Curve.Ed25519).generate();
+        byte[] issuerSigned = resignMso(issue(document()), mso -> mso.put(new UnicodeString("deviceKeyInfo"),
+                deviceKeyInfo(okpCoseKey(holder.getX().decode(), null))));
+        VerificationReport report = verifier.verify(issuerSigned, other.toPublicJWK(), Optional.empty(),
+                Instant.now().plusSeconds(1), Options.baseline(DOCTYPE));
+        assertFails(report, IndependentMdocVerifier.CHECK_DEVICE_KEY, "another Ed25519 key must not match by curve alone");
+    }
+
+    @Test
+    void anExpectedUpdateBeforeValidFromFailsEvenWhenTheParseIsRepaired() throws Exception {
+        // signed t-10s, expectedUpdate t-7s, validFrom t-5s and untagged: baseline mode repairs the tag for Multipaz,
+        // and the wire ordering must still catch expectedUpdate < validFrom (ISO/IEC 18013-5 9.1.2.4)
+        Instant t = Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS);
+        byte[] bent = resignValidity(issue(document()), Map.of("signed", t.minusSeconds(10).toString(),
+                "expectedUpdate", t.minusSeconds(7).toString(), "validFrom", t.minusSeconds(5).toString()), Set.of("validFrom"));
+        VerificationReport report = verify(bent, Optional.empty(), Options.baseline(DOCTYPE));
+        assertFails(report, IndependentMdocVerifier.CHECK_VALIDITY_INFO, "expectedUpdate before validFrom must fail");
+        assertTrue(report.check(IndependentMdocVerifier.CHECK_VALIDITY_INFO).message().contains("is before validFrom"),
+                report.toString());
+    }
+
+    @Test
+    void signedAfterValidFromFailsTheWindow() throws Exception {
+        // the core path's G8: validFrom from the request instant, signed from the wall clock a moment later
+        Instant t = Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS);
+        byte[] bent = resignValidity(issue(document()), Map.of("signed", t.minusSeconds(4).toString(),
+                "validFrom", t.minusSeconds(5).toString()), Set.of());
+        VerificationReport report = verify(bent, Optional.empty(), Options.baseline(DOCTYPE));
+        assertFails(report, IndependentMdocVerifier.CHECK_VALIDITY_INFO, "signed after validFrom must fail");
+    }
+
+    @Test
+    void formatterCurrentlyRefusesAnEd25519Holder() throws Exception {
+        // gap G6: createDeviceKeyInfo knows EC2 only. M-02 binds OKP keys and replaces the ed25519 fixture sample.
+        OctetKeyPair holder = new OctetKeyPairGenerator(com.nimbusds.jose.jwk.Curve.Ed25519).generate();
+        String did = "did:jwk:" + Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(holder.toPublicJWK().toJSONString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        FormatException refused = assertThrows(FormatException.class, () -> {
+            UnsignedCredential unsigned = formatter.build(ClaimSet.of(document()), configuration(signing()), CONTEXT,
+                    HolderBinding.did(did, "jwt"));
+            formatter.sign(unsigned, signing(), CONTEXT);
+        });
+        assertTrue(refused.getMessage().contains("Ed25519"), refused.getMessage());
+    }
+
     // ---- strict mode today: each check fails, and M-02/M-03/M-06 flip these tests ------------------------------
     // These are enabled on purpose. They assert where today's output stands, so the work packages that fix it must
     // change the assertion in the same commit that changes the output; they cannot be forgotten as @Disabled tests.
@@ -408,10 +488,22 @@ class MdocIndependentVerificationTest {
 
     /**
      * Rewrites the MSO validityInfo and signs the result again with the same DSC, so a test can bend the validity
-     * dates (or drop a tdate tag) while everything else — the signature over the Sig_structure, the item digests,
-     * the COSE headers — stays as the formatter wrote it.
+     * dates (or drop a tdate tag) while everything else — the item digests, the COSE headers — stays as the formatter
+     * wrote it.
      */
     static byte[] resignValidity(byte[] issuerSigned, Map<String, String> replace, Set<String> untag) throws Exception {
+        return resignMso(issuerSigned, mso -> {
+            co.nstant.in.cbor.model.Map validity = (co.nstant.in.cbor.model.Map) mso.get(new UnicodeString("validityInfo"));
+            replace.forEach((field, text) -> validity.put(new UnicodeString(field), tdate(text)));
+            untag.forEach(field -> {
+                String text = ((UnicodeString) validity.get(new UnicodeString(field))).getString();
+                validity.put(new UnicodeString(field), new UnicodeString(text)); // same text, no #6.0 tag
+            });
+        });
+    }
+
+    /** Applies {@code mutate} to the decoded MSO and signs the result again with the same DSC. */
+    static byte[] resignMso(byte[] issuerSigned, Consumer<co.nstant.in.cbor.model.Map> mutate) throws Exception {
         co.nstant.in.cbor.model.Map root = (co.nstant.in.cbor.model.Map) decode(issuerSigned);
         Array issuerAuth = (Array) root.get(new UnicodeString("issuerAuth"));
         List<DataItem> coseSign1 = new ArrayList<>(issuerAuth.getDataItems());
@@ -419,13 +511,7 @@ class MdocIndependentVerificationTest {
         // the COSE payload is a plain bstr whose content is #6.24(bstr .cbor MSO); co.nstant models a tag as a flag
         ByteString taggedMso = (ByteString) decode(((ByteString) coseSign1.get(2)).getBytes());
         co.nstant.in.cbor.model.Map mso = (co.nstant.in.cbor.model.Map) decode(taggedMso.getBytes());
-        co.nstant.in.cbor.model.Map validity = (co.nstant.in.cbor.model.Map)
-                mso.get(new UnicodeString("validityInfo"));
-        replace.forEach((field, text) -> validity.put(new UnicodeString(field), tdate(text)));
-        untag.forEach(field -> {
-            String text = ((UnicodeString) validity.get(new UnicodeString(field))).getString();
-            validity.put(new UnicodeString(field), new UnicodeString(text)); // same text, no #6.0 tag
-        });
+        mutate.accept(mso);
         ByteString rewrittenMso = new ByteString(encode(mso));
         rewrittenMso.setTag(24); // #6.24(bstr .cbor MobileSecurityObject)
         byte[] payloadBytes = encode(rewrittenMso);
@@ -437,6 +523,24 @@ class MdocIndependentVerificationTest {
         coseSign1.set(3, new ByteString(signature));
         root.put(new UnicodeString("issuerAuth"), array(coseSign1));
         return encode(root);
+    }
+
+    /** {@code deviceKeyInfo} holding an OKP Ed25519 COSE_Key {1: 1, -1: 6, -2: x}, plus {-4: d} when given. */
+    static co.nstant.in.cbor.model.Map deviceKeyInfo(co.nstant.in.cbor.model.Map coseKey) {
+        co.nstant.in.cbor.model.Map info = new co.nstant.in.cbor.model.Map();
+        info.put(new UnicodeString("deviceKey"), coseKey);
+        return info;
+    }
+
+    static co.nstant.in.cbor.model.Map okpCoseKey(byte[] x, byte[] d) {
+        co.nstant.in.cbor.model.Map key = new co.nstant.in.cbor.model.Map();
+        key.put(new UnsignedInteger(1), new UnsignedInteger(1));
+        key.put(new co.nstant.in.cbor.model.NegativeInteger(-1), new UnsignedInteger(6));
+        key.put(new co.nstant.in.cbor.model.NegativeInteger(-2), new ByteString(x));
+        if (d != null) {
+            key.put(new co.nstant.in.cbor.model.NegativeInteger(-4), new ByteString(d));
+        }
+        return key;
     }
 
     static UnicodeString tdate(String text) {

@@ -26,19 +26,21 @@ Instant at, Options options)` returns a `VerificationReport` of named checks, ea
 | Check | Rule |
 | --- | --- |
 | `issuerSigned.parse` | the IssuerSigned parses at all; a missing `issuerAuth` or `x5chain` is a failed check, not an exception |
-| `issuerAuth.signature.multipaz`, `issuerAuth.signature.authlete` | COSE_Sign1 verifies with the `x5chain` (label 33) leaf, by both oracles |
+| `issuerAuth.signature.multipaz`, `issuerAuth.signature.authlete` | COSE_Sign1 verifies with the `x5chain` (label 33) leaf, by both oracles; a tag-18 COSE_Sign1 (the draft-13 Document) is unwrapped, not re-encoded |
 | `mso.payloadTag24` | the COSE payload is `#6.24(bstr .cbor MobileSecurityObject)` (9.1.2.4) |
-| `mso.nameSpaces` | Multipaz `IssuerNamespaces.validate` on the namespaces as received plus `validateAgainstMso`: duplicate `elementIdentifier`, duplicate `digestID`, missing fields, salt length. Its errors fail, its warnings are reported |
+| `mso.parse` | Multipaz's `MobileSecurityObject.fromDataItem` accepts the MSO as sent: a Multipaz-based wallet reads the credential through exactly this parser. Every other MSO check reads its fields from the wire with Multipaz's CBOR, so a refusal here does not cascade |
+| `mso.nameSpaces` | Multipaz `IssuerNamespaces.validate` on the namespaces as received plus `validateAgainstMso` (when Multipaz has an MSO model): duplicate `elementIdentifier`, duplicate `digestID`, missing fields, salt length. Its errors fail, its warnings are reported |
 | `mso.valueDigests` | every `IssuerSignedItem` hashes, **over the bytes as received**, to its `valueDigests` entry under the MSO's declared algorithm; every namespace in `nameSpaces` has a digest table; the verified count equals the item count |
 | `mso.valueDigests.calculateDigest` | Multipaz's `IssuerSignedItem.calculateDigest` agrees — a second opinion only, because it re-encodes: a non-preferred encoding such as `18 00` for `0` passes here and fails `mso.valueDigests`, which is the point |
 | `mso.valueDigests.digestIdsUnique` | `digestID`s unique within each namespace (9.1.2.5) |
-| `mso.deviceKey` | `deviceKeyInfo.deviceKey` is the holder key (EC2 P-256/384/521, OKP Ed25519) by Multipaz's parse and by the COSE labels; an OKP key must not carry a `y` label |
+| `mso.deviceKey` | `deviceKeyInfo.deviceKey` is the holder key by Multipaz's `CoseKey` and by the COSE labels: EC2 P-256/384/521 by x and y, OKP Ed25519 by x (kty 1, crv 6, no `y`; Nimbus cannot turn an OKP JWK into a JCA key, so x is the comparison); a COSE_Key carrying `d` (label -4) fails |
 | `mso.docType` | equals the expected doctype |
-| `mso.validityInfo` | `signed <= validFrom < validUntil`, `expectedUpdate` (when present) after `signed` and before `validUntil`, `at` inside `validFrom..validUntil`, plus Multipaz's own `MobileSecurityObject.validate` |
-| `mso.validityInfo.tdateTags` | `signed`, `validFrom`, `validUntil` and `expectedUpdate` are `#6.0(tstr)` with whole seconds (9.1.2.4, gap G1) |
+| `mso.validityInfo` | ordered from the dates **as sent**, tagged or not: `signed <= validFrom < validUntil`, `validFrom <= expectedUpdate < validUntil`, `at` inside `validFrom..validUntil`; Multipaz must read the same instants, and its `MobileSecurityObject.validate` runs when it can read the MSO as sent. A repaired parse cannot decide the window |
+| `mso.validityInfo.tdateTags` | `signed`, `validFrom`, `validUntil` and `expectedUpdate` are `#6.0(tstr)`, RFC 3339 with whole seconds and `Z`, a real calendar instant (9.1.2.4, gap G1) |
 | `x5chain.iaca` | PKIX to the supplied IACA plus `X509CertChain.validate`; **strict mode without an IACA fails** rather than skipping |
 | `x5chain.noSelfSigned` | no self-signed certificate in `x5chain` (HAIP) |
-| `mdl.elementTypes` | element types and mandatory elements against Multipaz's `DrivingLicense`: `full-date` is `#6.1004(tstr)` `YYYY-MM-DD`, `tdate` is `#6.0`, `bool` is a simple true/false, numbers are `uint`, binaries are `bstr`, `driving_privileges` is an array of maps typed through its sub-attributes, and an unknown attribute type fails |
+| `x5chain.serialNumber` | every `x5chain` serial is positive and at most 20 octets (RFC 5280 4.1.2.2; keymanager's are negative half the time, gap G27) |
+| `mdl.elementTypes` | every problem with `org.iso.18013.5.1`, not the first: Table 5 mandatory elements, elements outside the doctype, types from Multipaz's `DrivingLicense` (`tstr`, `uint`, simple true/false, `bstr`), and Table 5 where Multipaz 0.102.0 disagrees: `issue_date`/`expiry_date` are full-date **or** tdate, `portrait_capture_date` is tdate, `driving_privileges` follows 7.2.4 (`vehicle_category_code`, full-date sub-dates, `codes[].code`). `full-date` is `#6.1004(tstr)` strictly parsed (`2026-99-99` fails), `tdate` as above; an unknown attribute type fails |
 
 ### Skipped is not passed
 
@@ -47,32 +49,57 @@ still fails the assertion unless the caller names it: `assertAllPassed(Set.of(CH
 `skippedNames()` exists so a test can assert *exactly* which checks were not performed — the interesting failure is a
 check that quietly stopped running.
 
-`Options.baseline(doctype)` runs everything today's output can already satisfy; the rest is skipped with the gap that
-blocks it (G1 tdate precision, G2 element typing, G9 the trust anchor in `x5chain`, M-06 chain-to-IACA).
-`Options.strict(doctype)` runs all of them and is the gate M-02/M-03/M-06 switch the default output over to.
+`Options.strict(doctype)` runs every check; the conformance run and the formatter's own baseline test use it and hold
+the report to the sample's declared gaps (below). `Options.baseline(doctype)` skips the checks an open gap blocks (G1
+untagged or fractional tdate, G2 element typing, G9 the trust anchor in `x5chain`, chain-to-IACA) and is what the
+mutation tests use when the point is one specific check.
+
+A check that throws reports the throw as its failure, `Error`s included (a Kotlin `NotImplementedError`, a
+`StackOverflowError`); only a VM failure such as `OutOfMemoryError` propagates.
+
+### Declared gaps: `AcceptedGaps` and the `.gaps` sidecar
+
+Each sample carries the checks it is known not to pass yet, one per line with the reason and the work package that
+fixes it:
+
+```
+mso.validityInfo.tdateTags # G1: signed/validFrom/validUntil carry milliseconds (UTC_DATETIME_PATTERN); fixed by M-02
+x5chain.serialNumber? # G27: keymanager draws certificate serials from SecureRandom.nextLong(), negative in about half the runs; M-06/keymanager provider
+```
+
+`AcceptedGaps.assertMatches(report, sample)` fails on a check that does not pass and is not listed, and on a listed
+check that passes ("gap no longer present, remove it from <sample>.gaps"), so the change that fixes a gap deletes
+its line. A trailing `?` marks an intermittent gap: the product draws the failing value at random, the check still
+runs, and it may pass or fail. Unknown check names and lines without a reason are refused.
 
 ## Samples, and the two other stacks
 
-`MdocSamples.write(directory, name, issuerSignedCbor, holder, docType)` records a credential plus everything another
-verifier needs, raw CBOR and sidecars only:
+`MdocSamples.write(directory, producer, surface, credential, holder, docType, gaps)` records a credential as
+`<TestClass>-<surface>` plus everything another verifier needs, raw CBOR and sidecars only (`certify-service` writes
+the same files with its own `golden/MdocSampleWriter`, because it must not depend on this module):
 
 | File | Content |
 | --- | --- |
-| `<name>.mdoc` | the `IssuerSigned` exactly as issued |
+| `<name>.mdoc` | the credential exactly as issued: an `IssuerSigned`, or the draft-13 `Document {docType, issuerSigned}`, whose `issuerSigned` the readers slice out of the received bytes |
 | `<name>.holder.jwk` | the holder public JWK, expected to equal the MSO deviceKey |
 | `<name>.doctype` | the docType the credential configuration asked for |
+| `<name>.gaps` | the checks the sample is known not to pass yet (`AcceptedGaps`) |
 | `<name>.iaca.pem` | the IACA, written only when the chain carries a self-signed anchor behind the leaf |
 
-The producing tests are `certify-format-mdoc`'s `MdocIndependentVerificationTest`
-(`certify-format-mdoc/target/mdoc-samples/`) and `certify-service`'s `IssuanceGoldenTest` on both issuance paths
-(`certify-service/target/mdoc-samples/`). Two consumers read them:
+The first write of a producer in a JVM deletes that producer's earlier samples. The producers are
+`certify-format-mdoc`'s `MdocIndependentVerificationTest` (`formatter`, and `ed25519-fixture`: today's output re-signed
+with an Ed25519 deviceKey, until M-02 lets the formatter bind one, gap G6) and `certify-service`'s
+`IssuanceGoldenTest`/`IssuanceGoldenCoreTest` (`legacy`, `oid4vci`) and `D13GoldenReplayTest` (`d13`). Two consumers
+read them:
 
 - `certify-conformance-mdoc` re-verifies every sample with this module (see its README note: it must run after the
   producing tests, which the parent `<modules>` order guarantees in a reactor build);
 - `.github/workflows/rebuild-ci.yml` installs `docs/design/tools/requirements-verify.txt` in a venv and runs
-  `docs/design/tools/verify_mdoc.py` over every sample, passing the doctype and the IACA from the sidecars. The script
-  fails on an empty `nameSpaces`, on a namespace the MSO has no digests for, on a verified count that does not match
-  the item count, and on a non-SHA-256 `digestAlgorithm` unless `--allow-partial` asks for a partial run.
+  `docs/design/tools/verify_mdoc.py` over every sample, passing the doctype, the IACA, the holder key and the gaps from
+  the sidecars. It hashes the items over the bytes as received (SHA-256/384/512, pymdoccbor's SHA-256-only check as a
+  second opinion) and fails on duplicate identifiers or digestIDs, a non-preferred `#6.24` head, an empty
+  `nameSpaces`, a namespace the MSO has no digests for, a count mismatch, the validity order or tag 0, and a deviceKey
+  that is not the holder JWK (EC2 or OKP); a failure of a check the `.gaps` sidecar lists is reported as accepted.
 
 ## Kotlin, on purpose
 
@@ -92,6 +119,11 @@ flavour needs it, and it is not on Maven Central), so it is excluded here: the J
 A module that consumes this one resolves it from the reactor, so build them together:
 
 ```bash
-mvn -B -ntp -pl certify-testkit-mdoc,certify-format-mdoc test -Dtest='*Mdoc*'
-mvn -B -ntp -pl certify-testkit-mdoc,certify-service,certify-conformance-mdoc test -Dtest='*Mdoc*,*Conformance*'
+mvn -B -ntp -pl certify-testkit-mdoc,certify-format-mdoc -am test -Dtest='*Mdoc*,WireIssuerSignedItems*' \
+    -Dsurefire.failIfNoSpecifiedTests=false
+mvn -B -ntp -pl certify-testkit-mdoc,certify-format-mdoc,certify-service,certify-conformance-mdoc -am test \
+    -Dtest='IssuanceGolden*,*Mdoc*,*Conformance*,D13Golden*,WireIssuerSignedItems*' -Dsurefire.failIfNoSpecifiedTests=false
 ```
+
+The module's own tests (`WireIssuerSignedItemsTest`: the CBOR framing matrix; `MdocVerifierRulesTest`: the date,
+element, serial, runner and gap rules) need no other module.

@@ -16,6 +16,8 @@
     <!-- Test-only: never published. -->
     <properties>
         <maven.deploy.skip>true</maven.deploy.skip>
+        <!-- the reactor's start, in UTC, for the sample freshness gate (MdocSampleConformanceTest) -->
+        <maven.build.timestamp.format>yyyy-MM-dd'T'HH:mm:ss'Z'</maven.build.timestamp.format>
     </properties>
 
     <dependencies>
@@ -43,6 +45,16 @@
 
     <build>
         <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <!-- samples written before this build started are stale: CI fails on them, a local run skips them -->
+                    <systemPropertyVariables>
+                        <mdoc.samples.buildStart>${maven.build.timestamp}</mdoc.samples.buildStart>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
             <plugin>
                 <groupId>org.sonatype.central</groupId>
                 <artifactId>central-publishing-maven-plugin</artifactId>

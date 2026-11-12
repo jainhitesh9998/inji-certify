@@ -96,12 +96,7 @@ public class MDocProcessor {
                 validity.put(VCDM2Constants.VALID_FROM, createCBORTaggedDateTime(formattedCurrentTime));
             }
             if ("${_signed}".equals(signedValue)) {
-                // The caller's template context already substituted a concrete validFrom (LegacyTemplateParamsListener
-                // uses context.now()), and this method runs a moment later: taking signed from the wall clock here
-                // would make the MSO claim it was signed after it became valid, which an independent verifier
-                // rejects (ISO/IEC 18013-5 9.1.2.4). Sign for the instant the credential is valid from.
-                String signedTime = "${_validFrom}".equals(validFromValue) ? formattedCurrentTime : validFromValue;
-                validity.put(Constants.SIGNED, createCBORTaggedDateTime(signedTime));
+                validity.put(Constants.SIGNED, createCBORTaggedDateTime(formattedCurrentTime));
             }
             if ("${_validUntil}".equals(validUntilValue)) {
                 String futureTime = currentTime.plusYears(mDocConfig.getValidityPeriodYears())

@@ -13,6 +13,8 @@
 #
 # Run it from the repository root. JAVA_HOME must point at JDK 21.
 set -euo pipefail
+# byte order for sort and diff: a locale-aware collation sorts the baseline differently on another machine
+export LC_ALL=C
 
 BASELINE="certify-service/runtime-classpath.txt"
 GENERATED="certify-service/target/runtime-classpath.txt"

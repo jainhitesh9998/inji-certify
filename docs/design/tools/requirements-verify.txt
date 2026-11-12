@@ -7,11 +7,11 @@
 #
 # Install (CI and locally):
 #   python3 -m venv .venv-verify
-#   .venv-verify/bin/pip install --quiet -r docs/design/tools/requirements-verify.txt --require-hashes=false
+#   .venv-verify/bin/pip install --quiet -r docs/design/tools/requirements-verify.txt
 #
-# Hashes are deliberately not pinned: `cryptography` and `cffi` ship per-platform wheels, so a hash file would have
-# to carry every platform's wheel hash and would fail on the one it does not list. The versions are exact, which is
-# what keeps the verification result reproducible.
+# Hashes are deliberately not pinned (pip runs without --require-hashes): `cryptography` and `cffi` ship per-platform
+# wheels, so a hash file would have to carry every platform's wheel hash and would fail on the one it does not list.
+# The versions are exact, which is what keeps the verification result reproducible.
 
 # the verifier itself
 pymdoccbor==1.4.0

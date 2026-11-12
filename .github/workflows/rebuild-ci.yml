@@ -48,8 +48,9 @@ jobs:
       - name: Independent mDoc verifier (pymdoccbor)
         # Second, non-Java opinion on every mDoc the tests write to target/mdoc-samples/ (M-01, decision D9).
         # The Java harness (certify-testkit-mdoc: Multipaz + Authlete) runs in the test step above; this one verifies
-        # the IssuerAuth COSE_Sign1 signature, the x5chain and the element digests, and takes the docType and the IACA
-        # from the sample's sidecar files so an mDL is checked against what the credential configuration asked for.
+        # the IssuerAuth COSE_Sign1 signature, the x5chain, the element digests over the bytes as received, the
+        # deviceKey and the validity window, taking the docType, the IACA, the holder key and the accepted gaps from
+        # the sample's sidecar files. certify-conformance-mdoc decides whether a declared gap is still present.
         run: |
           python3 -m venv /tmp/verify-mdoc
           /tmp/verify-mdoc/bin/pip install --quiet -r docs/design/tools/requirements-verify.txt
@@ -68,6 +69,7 @@ jobs:
             if [ -f "${base}.iaca.pem" ]; then
               args+=(--iaca "${base}.iaca.pem")
             fi
+            args+=(--holder "${base}.holder.jwk" --gaps "${base}.gaps")
             /tmp/verify-mdoc/bin/python docs/design/tools/verify_mdoc.py "${args[@]}"
           done
         shell: bash
