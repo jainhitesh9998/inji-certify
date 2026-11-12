@@ -25,18 +25,20 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Seeded mutation fuzzing of the validator: every certificate or CRL a JCA provider (the JDK's or BouncyCastle's) will
  * construct from a mutated encoding must come back as a list of violations, never as an exception.
  *
- * <p>The baselines are fixed DER files written once by the production builders (P-256 and P-521: an IACA, a Document
- * Signer issued by it, and a CRL revoking the Document Signer) under {@code src/test/resources/io/mosip/certify/pki/fuzz},
- * and every mutant comes from a {@link Random} with a fixed seed per object, provider and curve, so a run is the same
- * on every machine and a failure names the mutant to reproduce it. A mutant flips a bit in, or overwrites, one to three
- * octets of the baseline. Each loadable IACA mutant is validated on its own and as the issuer of the baseline DS and
- * CRL; each DS mutant as a DS and as an IACA; each CRL mutant against the baseline IACA.
+ * <p>The baselines are fixed DER files written once by the production builders (P-256, P-384 and P-521: an IACA, a
+ * Document Signer issued by it, and a CRL revoking the Document Signer) under
+ * {@code src/test/resources/io/mosip/certify/pki/fuzz}, and every mutant comes from a {@link Random} with a fixed seed
+ * per object, provider and curve, so a run is the same on every machine and a failure names the mutant to reproduce
+ * it. A mutant is one of five edits of the baseline: one to three octets bit-flipped or overwritten, one to three
+ * random octets inserted at one position, one to three octets deleted at one position, the encoding truncated, or a
+ * slice of it duplicated in place. Each loadable IACA mutant is validated on its own and as the issuer of the baseline
+ * DS and CRL; each DS mutant as a DS and as an IACA; each CRL mutant against the baseline IACA.
  *
  * <p>Two properties are asserted: no validation throws, and no object whose encoding differs from its baseline passes
  * its own profile (a changed octet breaks the signature, the encoding or a rule). The encoding compared is the object's
  * own {@code getEncoded()}: BouncyCastle's provider re-encodes what it parsed to DER, so a mutant that only turned a DER
  * octet into its BER equivalent (a BOOLEAN {@code FF} into {@code 01}) comes back as the original certificate, which
- * rightly passes; the JDK keeps the mutated octets, and the signature over them fails.
+ * rightly passes; the JDK keeps the mutated octets, which the validator refuses as BER.
  *
  * <p>{@value #DEFAULT_MUTANTS} mutants per object, provider and curve run with the suite; set
  * {@code -Dpki.fuzz.mutants=2000} for a longer run.
@@ -71,7 +73,7 @@ class AnnexBValidatorFuzzTest {
     Stream<DynamicTest> noMutantMakesTheValidatorThrow() {
         List<DynamicTest> tests = new ArrayList<>();
         int curveIndex = 0;
-        for (Baseline baseline : List.of(baseline("p256"), baseline("p521"))) {
+        for (Baseline baseline : List.of(baseline("p256"), baseline("p384"), baseline("p521"))) {
             int providerIndex = 0;
             for (Provider provider : providers()) {
                 long seed = SEED + 100L * curveIndex + 10L * providerIndex;
@@ -91,7 +93,7 @@ class AnnexBValidatorFuzzTest {
     /** The baselines conform, so the mutants start from objects that reach every check. */
     @Test
     void theBaselinesConform() {
-        for (String curve : List.of("p256", "p521")) {
+        for (String curve : List.of("p256", "p384", "p521")) {
             Baseline baseline = baseline(curve);
             for (Provider provider : providers()) {
                 X509Certificate iaca = certificate(provider, baseline.iaca());
@@ -202,8 +204,22 @@ class AnnexBValidatorFuzzTest {
         }
     }
 
-    /** One to three octets of the baseline, each with one bit flipped or overwritten with a random octet. */
+    /**
+     * One edit of the baseline, chosen by the seeded random: overwritten octets (one time in three, since they are what
+     * most often still loads), inserted octets, deleted octets, a truncation or a duplicated slice (one in six each).
+     */
     static byte[] mutate(byte[] baseline, Random random) {
+        return switch (random.nextInt(6)) {
+            case 0, 1 -> overwrite(baseline, random);
+            case 2 -> insert(baseline, random);
+            case 3 -> delete(baseline, random);
+            case 4 -> truncate(baseline, random);
+            default -> duplicate(baseline, random);
+        };
+    }
+
+    /** One to three octets of the baseline, each with one bit flipped or overwritten with a random octet. */
+    static byte[] overwrite(byte[] baseline, Random random) {
         byte[] mutant = baseline.clone();
         int changes = 1 + random.nextInt(3);
         for (int i = 0; i < changes; i++) {
@@ -214,6 +230,43 @@ class AnnexBValidatorFuzzTest {
                 mutant[position] = (byte) random.nextInt(256);
             }
         }
+        return mutant;
+    }
+
+    /** One to three random octets inserted at one position (the end included). */
+    static byte[] insert(byte[] baseline, Random random) {
+        byte[] inserted = new byte[1 + random.nextInt(3)];
+        random.nextBytes(inserted);
+        int position = random.nextInt(baseline.length + 1);
+        return splice(baseline, position, position, inserted);
+    }
+
+    /** One to three octets removed at one position. */
+    static byte[] delete(byte[] baseline, Random random) {
+        int count = 1 + random.nextInt(3);
+        int position = random.nextInt(baseline.length - count + 1);
+        return splice(baseline, position, position + count, new byte[0]);
+    }
+
+    /** The baseline cut short at a random length, from one octet to all but the last. */
+    static byte[] truncate(byte[] baseline, Random random) {
+        return java.util.Arrays.copyOf(baseline, 1 + random.nextInt(baseline.length - 1));
+    }
+
+    /** A slice of one to 32 octets inserted again right after itself, as a repeated TLV or a doubled length would be. */
+    static byte[] duplicate(byte[] baseline, Random random) {
+        int length = 1 + random.nextInt(Math.min(32, baseline.length));
+        int start = random.nextInt(baseline.length - length + 1);
+        return splice(baseline, start + length, start + length,
+                java.util.Arrays.copyOfRange(baseline, start, start + length));
+    }
+
+    /** The baseline with octets {@code [from, to)} replaced by {@code replacement}. */
+    private static byte[] splice(byte[] baseline, int from, int to, byte[] replacement) {
+        byte[] mutant = new byte[baseline.length - (to - from) + replacement.length];
+        System.arraycopy(baseline, 0, mutant, 0, from);
+        System.arraycopy(replacement, 0, mutant, from, replacement.length);
+        System.arraycopy(baseline, to, mutant, from + replacement.length, baseline.length - to);
         return mutant;
     }
 

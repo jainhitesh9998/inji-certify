@@ -61,24 +61,38 @@ class OpenSslInteropTest {
         assertTrue(output.contains("certificate revoked"), output);
     }
 
-    /** {@code openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256} output is read with the same password. */
+    /**
+     * {@code openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256} output is read with the same password. With
+     * OpenSSL's default of 2048 PBKDF2 iterations it is logged as weak; with the {@code -iter 200000} the warning
+     * recommends it is read without a warning.
+     */
     @Test
     void aKeyOpenSslEncryptsIsReadable(@TempDir Path directory) throws Exception {
         requireOpenSsl();
         Path password = write(directory, "password.txt", new String(PASSWORD) + "\n");
         Path key = directory.resolve("key.pem");
         Path encrypted = directory.resolve("key.enc.pem");
+        Path reencrypted = directory.resolve("key.iter.pem");
         Path publicKey = directory.resolve("key.pub.pem");
         openssl("genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", key.toString());
         openssl("pkcs8", "-topk8", "-v2", "aes-256-cbc", "-v2prf", "hmacWithSHA256", "-in", key.toString(),
                 "-passout", "file:" + password, "-out", encrypted.toString());
+        openssl("pkcs8", "-topk8", "-v2", "aes-256-cbc", "-v2prf", "hmacWithSHA256", "-iter", "200000",
+                "-in", key.toString(), "-passout", "file:" + password, "-out", reencrypted.toString());
         openssl("pkey", "-in", key.toString(), "-pubout", "-out", publicKey.toString());
+        java.security.PublicKey expected = Pem.readPublicKey(Files.readString(publicKey, StandardCharsets.US_ASCII));
 
         String pem = Files.readString(encrypted, StandardCharsets.US_ASCII);
         assertTrue(pem.contains("BEGIN ENCRYPTED PRIVATE KEY"), pem);
         assertTrue(Pem.isEncryptedPrivateKey(pem));
-        java.security.PrivateKey read = Pem.readPrivateKey(pem, PASSWORD);
-        assertSigns(read, Pem.readPublicKey(Files.readString(publicKey, StandardCharsets.US_ASCII)));
+        List<String> warnings = PemTest.warnings(() -> assertSigns(Pem.readPrivateKey(pem, PASSWORD), expected));
+        assertEquals(1, warnings.size(), warnings::toString);
+        assertTrue(warnings.get(0).contains("(2048 iterations) and cipher aes-256-cbc: fewer than 10000 iterations"),
+                warnings.get(0));
+
+        String strong = Files.readString(reencrypted, StandardCharsets.US_ASCII);
+        assertEquals(List.of(),
+                PemTest.warnings(() -> assertSigns(Pem.readPrivateKey(strong, PASSWORD), expected)));
     }
 
     /** A key this library encrypts is decrypted by {@code openssl pkey} to the same key pair. */

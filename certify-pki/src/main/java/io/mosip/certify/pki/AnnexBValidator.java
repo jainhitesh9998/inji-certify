@@ -59,12 +59,18 @@ import java.util.function.Function;
  * <p><b>It never throws for an object a JCA provider could construct.</b> Each certificate or CRL is read once from its
  * {@code getEncoded()} DER with BouncyCastle's ASN.1 structures, never through the JCA getters (the JDK keeps what it
  * does not understand as raw octets, and BouncyCastle's provider decodes names, dates and extensions lazily, so a getter
- * can throw on first access). An encoding those structures cannot read is reported as {@code IACA_ENCODING_INVALID},
- * {@code DS_ENCODING_INVALID} or {@code CRL_ENCODING_INVALID} and no other property of that object is assessed; an IACA
- * that cannot be read while a Document Signer or CRL is checked against it is reported as {@code IACA_ENCODING_INVALID}
- * and the checks that depend on it are skipped. An extension whose DER cannot be read is reported as
- * {@code *_<EXTENSION>_MALFORMED}, a subject string that cannot be decoded as {@code *_SUBJECT_ENCODING_INVALID}.
- * Anything else thrown out of this class is a programming error.
+ * can throw on first access). An encoding those structures cannot read, or one that is BER but not DER (RFC 5280
+ * requires DER), is reported as {@code IACA_ENCODING_INVALID}, {@code DS_ENCODING_INVALID} or
+ * {@code CRL_ENCODING_INVALID} and no other property of that object is assessed; an IACA that cannot be read while a
+ * Document Signer or CRL is checked against it is reported as {@code IACA_ENCODING_INVALID} and the checks that depend
+ * on it are skipped. An extension whose value cannot be read as DER is reported as {@code *_<EXTENSION>_MALFORMED}, a
+ * subject string that cannot be decoded as {@code *_SUBJECT_ENCODING_INVALID}. Anything else thrown out of this class
+ * is a programming error.
+ *
+ * <p>A non-conforming object fails under every provider, but the rule it fails with may differ: the JDK keeps the
+ * octets it parsed, so a BER encoding re-signed over those octets is {@code *_ENCODING_INVALID}, while BouncyCastle's
+ * provider re-encodes the object to DER on construction, so the signature over the original octets no longer verifies
+ * ({@code IACA_NOT_SELF_SIGNED}, {@code DS_SIGNATURE_INVALID}, {@code CRL_SIGNATURE_INVALID}).
  *
  * <p>Rule identifiers are {@code <PROFILE>_<PROPERTY>}: {@code IACA_*}, {@code DS_*}, {@code CRL_*}. {@link #RULES} lists
  * every identifier the validator can emit; a violation list is unordered and {@link #ruleIds} returns the distinct
@@ -470,15 +476,16 @@ public final class AnnexBValidator {
 
     /**
      * Reads one extension value: exactly one DER object inside the extension's OCTET STRING (trailing octets are an
-     * error), then the extension's own structure, decoded eagerly by {@code parser}. Any failure makes the extension
-     * malformed.
+     * error, and so is an encoding that differs from its DER re-encoding, such as a basicConstraints {@code cA} written
+     * as BOOLEAN {@code 01}), then the extension's own structure, decoded eagerly by {@code parser}. Any failure makes
+     * the extension malformed.
      */
     private static <T> Ext<T> read(Extension extension, Function<ASN1Primitive, T> parser) {
         if (extension == null) {
             return new Ext<>(false, null, null);
         }
         try {
-            T value = parser.apply(Parsed.strict(extension.getExtnValue().getOctets()));
+            T value = parser.apply(Parsed.der(extension.getExtnValue().getOctets()));
             return value == null ? new Ext<>(true, null, "the extension value is empty") : new Ext<>(true, value, null);
         } catch (Exception e) {
             return new Ext<>(true, null, Parsed.describe(e));

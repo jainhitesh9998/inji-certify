@@ -155,9 +155,12 @@ One rule (module choice, decision log): **write** only PKCS#8 PBES2 with AES-256
 **read** every scheme BouncyCastle can decrypt, so a key an operator already holds keeps working: PBES2 with PBKDF2
 (any PRF and cipher BouncyCastle supports), PKCS#5 v1 (PBES1), the PKCS#12 PBE schemes, and the traditional OpenSSL
 `EC PRIVATE KEY` block with `Proc-Type: 4,ENCRYPTED` headers. A key read under a weak scheme (anything but PBES2/PBKDF2
-with HMAC-SHA-256/384/512 and AES-CBC; the traditional block always, its key derivation is one MD5 round) is logged at
-WARNING (`System.Logger` `io.mosip.certify.pki.Pem`) with the scheme named and the `openssl pkcs8 -topk8 -v2 aes-256-cbc
--v2prf hmacWithSHA256` command that re-encrypts it. PBES2 with scrypt and unknown schemes are refused with
+with HMAC-SHA-256/384/512, AES-CBC and at least 10,000 iterations, `Pem.MIN_PBKDF2_ITERATIONS`; the traditional block
+always, its key derivation is one MD5 round) is logged at WARNING (`System.Logger` `io.mosip.certify.pki.Pem`) with the
+scheme, the PRF and cipher by their OpenSSL names (`hmacWithSHA1` ... `hmacWithSHA512`, `aes-128-cbc` ... `aes-256-cbc`,
+`des-ede3-cbc`), the iteration count, and the `openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256 -iter 200000`
+command that re-encrypts it. OpenSSL's own default of 2048 iterations is below the floor, so a key written by `openssl
+pkcs8 -topk8` without `-iter` warns; that is intended. PBES2 with scrypt and unknown schemes are refused with
 `PEM_KEY_UNSUPPORTED: unsupported PBE scheme ...` before a password is tried. Reading an encrypted key without a
 password fails with `PEM_KEY_ENCRYPTED` rather than returning nothing.
 
@@ -184,19 +187,31 @@ BouncyCastle's provider decodes names, dates and extensions only when first aske
 once from its `getEncoded()` DER with BouncyCastle's ASN.1 structures (`Certificate`/`TBSCertificate`,
 `CertificateList`), every RDN, date, CRL entry and entry-extension list forced inside that one guarded read, and
 nothing is taken from the JCA getters. An encoding that cannot be read is `IACA_ENCODING_INVALID`,
-`DS_ENCODING_INVALID` or `CRL_ENCODING_INVALID` and no other property of that object is assessed; when the IACA a
-Document Signer or CRL is checked against cannot be read, `validateDs`/`validateCrl` report `IACA_ENCODING_INVALID`,
-run the object's own checks and skip the ones against the IACA. A subject string that cannot be decoded (a UTF8String
-that is not UTF-8) is `*_SUBJECT_ENCODING_INVALID`. Signatures are verified over the signed octets of that encoding
-with BouncyCastle's verifier and the subjectPublicKeyInfo, so the verdict does not depend on the provider that built
-the object; a Document Signer or CRL checked against an IACA whose key fails the key profile is `*_SIGNATURE_INVALID`
-(fail closed), not left unverified. Anything else thrown out of `AnnexBValidator` is a programming error.
+`DS_ENCODING_INVALID` or `CRL_ENCODING_INVALID` and no other property of that object is assessed, and so is one that is
+BER but not DER (RFC 5280 requires DER): an encoding that differs from its own DER re-encoding, such as a BOOLEAN TRUE
+written `01` instead of `FF`, an unsorted SET OF, a BIT STRING with a padding bit set, or a non-minimal or indefinite
+length. When the IACA a Document Signer or CRL is checked against cannot be read, `validateDs`/`validateCrl` report
+`IACA_ENCODING_INVALID`, run the object's own checks and skip the ones against the IACA. A subject string that cannot
+be decoded (a UTF8String that is not UTF-8) is `*_SUBJECT_ENCODING_INVALID`. Signatures are verified over the signed
+octets of that encoding with BouncyCastle's verifier and the subjectPublicKeyInfo; a Document Signer or CRL checked
+against an IACA whose key fails the key profile is `*_SIGNATURE_INVALID` (fail closed), not left unverified. Anything
+else thrown out of `AnnexBValidator` is a programming error.
 
-Every extension is read from its DER on its own: exactly one DER object inside the extension's OCTET STRING, then the
-extension's structure, nested names (a directoryName included) decoded in the same step. One that cannot be read is
-reported as `*_SKI_MALFORMED`, `*_AKI_MALFORMED`, `*_ISSUER_ALT_NAME_MALFORMED`, `*_CRL_DP_MALFORMED`,
-`*_KEY_USAGE_MALFORMED`, `*_BASIC_CONSTRAINTS_MALFORMED`, `DS_EKU_MALFORMED`, `CRL_AKI_MALFORMED` or
-`CRL_NUMBER_MALFORMED`, and none of its other properties are assessed. A malformed extension on the IACA a Document
+A non-conforming object fails under every provider, but the rule it fails with may depend on the provider that built
+it. The JDK keeps the octets it parsed, so a BER certificate re-signed over its BER octets reaches the DER check and is
+`*_ENCODING_INVALID`; BouncyCastle's provider re-encodes the object to DER on construction, so the same certificate
+reports DER octets the signature was not made over (`IACA_NOT_SELF_SIGNED`, `DS_SIGNATURE_INVALID`,
+`CRL_SIGNATURE_INVALID`). The DER check is BouncyCastle's re-encoding, which is syntactic: a DEFAULT value written out
+(an extension's `critical FALSE`) and a UTCTime without seconds re-encode to themselves and pass, the same under every
+provider. ECDSA signatures are malleable, since `(r, n - s)` verifies over the same tbsCertificate as `(r, s)`, so a
+certificate's fingerprint is not unique per tbsCertificate.
+
+Every extension is read from its DER on its own: exactly one DER object inside the extension's OCTET STRING, equal to
+its DER re-encoding (the OCTET STRING hides it from the check on the whole certificate), then the extension's
+structure, nested names (a directoryName included) decoded in the same step. One that cannot be read is reported as
+`*_SKI_MALFORMED`, `*_AKI_MALFORMED`, `*_ISSUER_ALT_NAME_MALFORMED`, `*_CRL_DP_MALFORMED`, `*_KEY_USAGE_MALFORMED`,
+`*_BASIC_CONSTRAINTS_MALFORMED`, `DS_EKU_MALFORMED`, `CRL_AKI_MALFORMED` or `CRL_NUMBER_MALFORMED`, and none of its
+other properties are assessed. A malformed extension on the IACA a Document
 Signer or CRL is checked against makes the dependent comparison fail (`DS_AKI_MISMATCH`, `DS_ISSUER_ALT_NAME_MISMATCH`,
 `CRL_AKI_MISMATCH`) rather than throw.
 
@@ -211,17 +226,22 @@ a rule cannot be published without a passing test. The baseline fixtures are ful
 included. The encoding rules are proved with objects a provider really constructs: the JDK reading an issuer country
 whose tag was turned into a primitive SET (the shape the third-round reviewers' fuzzing found), BouncyCastle reading a
 UTCTime with a letter in it, a self-signed IACA whose CN is the UTF8String `C3 28`, an issuerAltName directoryName
-holding `FF 5A`.
+holding `FF 5A`, and BER re-signed over its own octets (a keyUsage or AKI critical flag written as BOOLEAN `01` on an
+IACA, a Document Signer and a CRL, each checked under both providers; a basicConstraints `cA` written `01` and a keyUsage
+with a padding bit set inside the extension value).
 
-`AnnexBValidatorFuzzTest` mutates fixed DER baselines written once by the builders (P-256 and P-521: IACA, Document
-Signer, CRL; `src/test/resources/io/mosip/certify/pki/fuzz`) with a seeded `Random`, one to three octets per mutant,
-300 mutants per object, provider (JDK and BouncyCastle) and curve, and asserts that no validation throws and that no
-object whose own encoding differs from its baseline passes its own profile. It takes about 3 seconds; run
-`-Dtest=AnnexBValidatorFuzzTest -Dpki.fuzz.mutants=2000` for a longer run. It validates the DS-to-IACA path and a revoked serial with the JDK `CertPathValidator`; it runs `openssl
-verify -x509_strict -crl_check -CRLfile` and `openssl crl -CAfile`, and exchanges encrypted PKCS#8 keys with OpenSSL in
-both directions (`openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256` read here, ours decrypted by
-`openssl pkey`, an OpenSSL scrypt key refused by name) — skipping without `openssl` on the PATH, **failing** when `CI`
-is set. `PkiArchitectureTest` keeps Spring, web, JPA, Velocity, JSON-LD, keymanager and global JCA-provider
+`AnnexBValidatorFuzzTest` mutates fixed DER baselines written once by the builders (P-256, P-384 and P-521: IACA,
+Document Signer, CRL; `src/test/resources/io/mosip/certify/pki/fuzz`) with a seeded `Random`: one to three octets
+overwritten or bit-flipped, one to three octets inserted or deleted, a truncation, or a duplicated slice, 300 mutants
+per object, provider (JDK and BouncyCastle) and curve, and asserts that no validation throws and that no object whose
+own encoding differs from its baseline passes its own profile. It takes about 3 seconds; run
+`-Dtest=AnnexBValidatorFuzzTest -Dpki.fuzz.mutants=2000` for a longer run.
+
+The suite validates the DS-to-IACA path and a revoked serial with the JDK `CertPathValidator`; it runs `openssl verify
+-x509_strict -crl_check -CRLfile` and `openssl crl -CAfile`, and exchanges encrypted PKCS#8 keys with OpenSSL in both
+directions (`openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256` read here, with the iteration warning at
+OpenSSL's default and none with `-iter 200000`; ours decrypted by `openssl pkey`; an OpenSSL scrypt key refused by
+name) — skipping without `openssl` on the PATH, **failing** when `CI` is set. `PkiArchitectureTest` keeps Spring, web, JPA, Velocity, JSON-LD, keymanager and global JCA-provider
 registration (`Security.addProvider` and `Security.insertProviderAt`) out of the module.
 
 ## Outside scope

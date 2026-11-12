@@ -30,6 +30,7 @@ import org.bouncycastle.pkcs.PKCSException;
 import java.io.IOException;
 import java.io.StringReader;
 import java.io.StringWriter;
+import java.math.BigInteger;
 import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.cert.X509CRL;
@@ -52,9 +53,10 @@ import java.util.Set;
  *   <li><b>Reading</b> accepts every scheme BouncyCastle can decrypt, so a key an operator already has keeps working:
  *       PBES2 with PBKDF2 (any PRF and cipher BouncyCastle supports), the PKCS#5 v1 PBES1 schemes, the PKCS#12 PBE
  *       schemes, and the traditional OpenSSL {@code EC PRIVATE KEY} with {@code Proc-Type: 4,ENCRYPTED} and DEK-Info
- *       headers. A key read under a weak scheme (anything but PBES2/PBKDF2 with HMAC-SHA-256/384/512 and AES-CBC) is
- *       logged at WARNING with the scheme named, so the operator re-encrypts it. PBES2 with scrypt and any other scheme
- *       are refused with {@code PEM_KEY_UNSUPPORTED} before a password is tried.</li>
+ *       headers. A key read under a weak scheme (anything but PBES2/PBKDF2 with HMAC-SHA-256/384/512, AES-CBC and at
+ *       least {@value #MIN_PBKDF2_ITERATIONS} iterations) is logged at WARNING with the scheme, PRF, cipher and
+ *       iteration count named, so the operator re-encrypts it. PBES2 with scrypt and any other scheme are refused with
+ *       {@code PEM_KEY_UNSUPPORTED} before a password is tried.</li>
  * </ul>
  */
 public final class Pem {
@@ -62,10 +64,16 @@ public final class Pem {
     /** PBKDF2 iteration count for a written encrypted key; high enough for an offline IACA key, fast enough to load. */
     public static final int PBKDF2_ITERATIONS = 200_000;
 
+    /**
+     * The fewest PBKDF2 iterations a key is read with without a warning (decision log, 2026-11-13). OpenSSL's
+     * {@code pkcs8 -topk8} default of 2048 is below it, so a key written with OpenSSL's defaults warns, by intent.
+     */
+    public static final int MIN_PBKDF2_ITERATIONS = 10_000;
+
     private static final System.Logger LOG = System.getLogger(Pem.class.getName());
 
     private static final String REENCRYPT = "re-encrypt the key with openssl pkcs8 -topk8 -v2 aes-256-cbc"
-            + " -v2prf hmacWithSHA256";
+            + " -v2prf hmacWithSHA256 -iter " + PBKDF2_ITERATIONS;
 
     /** The PKCS#5 v1 (PBES1) schemes BouncyCastle decrypts, all of them weak (DES or RC2 with MD2, MD5 or SHA-1). */
     private static final Map<ASN1ObjectIdentifier, String> PKCS5_V1 = Map.of(
@@ -84,6 +92,21 @@ public final class Pem {
     /** PBES2 ciphers that are not weak. */
     private static final Set<ASN1ObjectIdentifier> STRONG_CIPHERS = Set.of(
             NISTObjectIdentifiers.id_aes128_CBC, NISTObjectIdentifiers.id_aes192_CBC, NISTObjectIdentifiers.id_aes256_CBC);
+
+    /** The PBKDF2 PRFs a warning names, by their OpenSSL ({@code -v2prf}) names; any other is named by its OID. */
+    private static final Map<ASN1ObjectIdentifier, String> PRF_NAMES = Map.of(
+            PKCSObjectIdentifiers.id_hmacWithSHA1, "hmacWithSHA1",
+            PKCSObjectIdentifiers.id_hmacWithSHA224, "hmacWithSHA224",
+            PKCSObjectIdentifiers.id_hmacWithSHA256, "hmacWithSHA256",
+            PKCSObjectIdentifiers.id_hmacWithSHA384, "hmacWithSHA384",
+            PKCSObjectIdentifiers.id_hmacWithSHA512, "hmacWithSHA512");
+
+    /** The PBES2 ciphers a warning names, by their OpenSSL ({@code -v2}) names; any other is named by its OID. */
+    private static final Map<ASN1ObjectIdentifier, String> CIPHER_NAMES = Map.of(
+            NISTObjectIdentifiers.id_aes128_CBC, "aes-128-cbc",
+            NISTObjectIdentifiers.id_aes192_CBC, "aes-192-cbc",
+            NISTObjectIdentifiers.id_aes256_CBC, "aes-256-cbc",
+            PKCSObjectIdentifiers.des_EDE3_CBC, "des-ede3-cbc");
 
 
     private Pem() {}
@@ -177,9 +200,10 @@ public final class Pem {
     }
 
     /**
-     * Why an encrypted PKCS#8 scheme is weak, or {@code null} when it is PBES2/PBKDF2 with HMAC-SHA-256/384/512 and
-     * AES-CBC. A scheme BouncyCastle cannot decrypt is refused with {@code PEM_KEY_UNSUPPORTED} and a message that names
-     * it, rather than the provider's internal error (BouncyCastle fails a scrypt key with a {@code ClassCastException}).
+     * Why an encrypted PKCS#8 scheme is weak, or {@code null} when it is PBES2/PBKDF2 with HMAC-SHA-256/384/512, AES-CBC
+     * and at least {@value #MIN_PBKDF2_ITERATIONS} iterations. A scheme BouncyCastle cannot decrypt is refused with
+     * {@code PEM_KEY_UNSUPPORTED} and a message that names it, rather than the provider's internal error (BouncyCastle
+     * fails a scrypt key with a {@code ClassCastException}).
      */
     static String weakScheme(AlgorithmIdentifier scheme) {
         ASN1ObjectIdentifier oid = scheme.getAlgorithm();
@@ -195,20 +219,34 @@ public final class Pem {
             if (!PKCSObjectIdentifiers.id_PBKDF2.equals(kdf)) {
                 String name = MiscObjectIdentifiers.id_scrypt.equals(kdf) ? "scrypt" : kdf.getId();
                 throw new PkiException("PEM_KEY_UNSUPPORTED: unsupported PBE scheme: PBES2 with " + name
-                        + " key derivation; only PBKDF2 is read. Re-encrypt the key with"
-                        + " openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256");
+                        + " key derivation; only PBKDF2 is read; " + REENCRYPT);
             }
             ASN1ObjectIdentifier prf;
+            BigInteger iterations;
+            ASN1ObjectIdentifier cipher;
             try {
-                prf = PBKDF2Params.getInstance(parameters.getKeyDerivationFunc().getParameters()).getPrf().getAlgorithm();
+                PBKDF2Params pbkdf2 = PBKDF2Params.getInstance(parameters.getKeyDerivationFunc().getParameters());
+                prf = pbkdf2.getPrf().getAlgorithm();
+                iterations = pbkdf2.getIterationCount();
+                cipher = parameters.getEncryptionScheme().getAlgorithm();
             } catch (RuntimeException e) {
                 throw new PkiException("PEM_KEY_UNSUPPORTED: unsupported PBE scheme: PBKDF2 parameters cannot be read", e);
             }
-            ASN1ObjectIdentifier cipher = parameters.getEncryptionScheme().getAlgorithm();
-            if (STRONG_PRFS.contains(prf) && STRONG_CIPHERS.contains(cipher)) {
+            List<String> weaknesses = new ArrayList<>();
+            if (!STRONG_PRFS.contains(prf)) {
+                weaknesses.add("a weak PRF");
+            }
+            if (!STRONG_CIPHERS.contains(cipher)) {
+                weaknesses.add("a weak cipher");
+            }
+            if (iterations.compareTo(BigInteger.valueOf(MIN_PBKDF2_ITERATIONS)) < 0) {
+                weaknesses.add("fewer than " + MIN_PBKDF2_ITERATIONS + " iterations");
+            }
+            if (weaknesses.isEmpty()) {
                 return null;
             }
-            return "PBES2 with PBKDF2/" + prfName(prf) + " and cipher " + cipher.getId();
+            return "PBES2 with PBKDF2/" + name(PRF_NAMES, prf) + " (" + iterations + " iterations) and cipher "
+                    + name(CIPHER_NAMES, cipher) + ": " + String.join(", ", weaknesses);
         }
         if (oid.on(PKCSObjectIdentifiers.pkcs_12PbeIds)) {
             return "PKCS#12 PBE " + oid.getId();
@@ -220,14 +258,8 @@ public final class Pem {
         throw new PkiException("PEM_KEY_UNSUPPORTED: unsupported PBE scheme " + oid.getId() + "; " + REENCRYPT);
     }
 
-    private static String prfName(ASN1ObjectIdentifier prf) {
-        if (PKCSObjectIdentifiers.id_hmacWithSHA1.equals(prf)) {
-            return "HMAC-SHA1";
-        }
-        if (PKCSObjectIdentifiers.id_hmacWithSHA224.equals(prf)) {
-            return "HMAC-SHA224";
-        }
-        return prf.getId();
+    private static String name(Map<ASN1ObjectIdentifier, String> names, ASN1ObjectIdentifier oid) {
+        return names.getOrDefault(oid, oid.getId());
     }
 
     private static void warnWeak(String scheme) {

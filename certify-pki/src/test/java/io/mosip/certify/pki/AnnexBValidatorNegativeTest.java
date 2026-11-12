@@ -74,6 +74,16 @@ class AnnexBValidatorNegativeTest {
     private static final byte[] KEY_USAGE_CRITICAL = {0x06, 0x03, 0x55, 0x1d, 0x0f, 0x01, 0x01, (byte) 0xff};
     private static final byte[] KEY_USAGE_BER_TRUE = {0x06, 0x03, 0x55, 0x1d, 0x0f, 0x01, 0x01, 0x01};
 
+    /** The authorityKeyIdentifier's OID and critical flag, and the same with the flag as BOOLEAN 01. */
+    private static final byte[] AKI_CRITICAL = {0x06, 0x03, 0x55, 0x1d, 0x23, 0x01, 0x01, (byte) 0xff};
+    private static final byte[] AKI_BER_TRUE = {0x06, 0x03, 0x55, 0x1d, 0x23, 0x01, 0x01, 0x01};
+
+    /** basicConstraints {@code CA:true, pathLen:0} with cA written as BOOLEAN 01: BER inside the extension value. */
+    private static final byte[] BASIC_CONSTRAINTS_BER = {0x30, 0x06, 0x01, 0x01, 0x01, 0x02, 0x01, 0x00};
+
+    /** keyUsage digitalSignature (07 80) with an unused bit set (07 81): BER, DER requires the padding bits zero. */
+    private static final byte[] KEY_USAGE_PADDING_SET = {0x03, 0x02, 0x07, (byte) 0x81};
+
     /** A notBefore whose UTCTime is known, and the same UTCTime with a letter in the minutes: {@code 2611010000t0Z}. */
     private static final Instant UTC_START = Instant.parse("2026-11-01T00:00:00Z");
     private static final byte[] UTC_START_DER = "261101000000Z".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
@@ -180,11 +190,12 @@ class AnnexBValidatorNegativeTest {
                         .issuer(BadCerts.rdns(BCStyle.C, new DERPrintableString("IN"), BCStyle.SERIALNUMBER,
                                 new DERUTF8String("42"), BCStyle.CN, new DERUTF8String("Bad IACA"))).build()),
                 row("IACA_NOT_SELF_SIGNED", BadCerts.iaca(keyPair).issuer(BadCerts.name("IN", null, "Another IACA")).build()),
-                // the keyUsage critical flag re-encoded as BOOLEAN 01 (BER true, not DER) after signing: the JDK keeps
-                // those octets and the signature over them fails (BouncyCastle's provider would re-encode the object to
-                // DER on construction, which gives back the original certificate)
-                row("IACA_NOT_SELF_SIGNED", BadCerts.jdkCertificate(BadCerts.patch(BadCerts.encoded(
-                        BadCerts.iaca(keyPair).serial(fixedSerial).build()), KEY_USAGE_CRITICAL, KEY_USAGE_BER_TRUE))),
+                // the keyUsage critical flag written as BOOLEAN 01 (BER true, not DER) and the IACA self-signed again
+                // over those octets: the JDK keeps them and the signature verifies, so only the DER rule catches it
+                // (aBerEncodingFailsUnderEveryProvider covers BouncyCastle's provider)
+                row("IACA_ENCODING_INVALID", BadCerts.jdkCertificate(BadCerts.resignPatched(BadCerts.encoded(
+                        BadCerts.iaca(keyPair).serial(fixedSerial).build()), KEY_USAGE_CRITICAL, KEY_USAGE_BER_TRUE,
+                        keyPair.getPrivate(), "SHA256withECDSA"))),
                 row("IACA_ISSUER_ALT_NAME_MISSING", BadCerts.iaca(keyPair).without(Extension.issuerAlternativeName).build()),
                 row("IACA_ISSUER_ALT_NAME_CRITICAL", BadCerts.iaca(keyPair).critical(Extension.issuerAlternativeName, true).build()),
                 row("IACA_ISSUER_ALT_NAME_INVALID", BadCerts.iaca(keyPair).with(Extension.issuerAlternativeName, false,
@@ -264,6 +275,9 @@ class AnnexBValidatorNegativeTest {
                 row("IACA_BASIC_CONSTRAINTS_NOT_CRITICAL", BadCerts.iaca(keyPair).critical(Extension.basicConstraints, false).build()),
                 row("IACA_BASIC_CONSTRAINTS_MALFORMED", BadCerts.iaca(keyPair).withRaw(Extension.basicConstraints, false,
                         new byte[] {0x04, 0x00}).buildJdk()),
+                // CA:true, pathLen:0 with the cA BOOLEAN written 01: readable, but BER inside the extension value
+                row("IACA_BASIC_CONSTRAINTS_MALFORMED", BadCerts.iaca(keyPair).withRaw(Extension.basicConstraints, true,
+                        BASIC_CONSTRAINTS_BER).build()),
                 row("IACA_PATHLEN", BadCerts.iaca(keyPair).with(Extension.basicConstraints, true, new BasicConstraints(true)).build()),
                 row("IACA_VALIDITY_REVERSED", BadCerts.iaca(keyPair).notBefore(Date.from(now.plus(Duration.ofDays(2))))
                         .notAfter(Date.from(now.plus(Duration.ofDays(1)))).build()),
@@ -360,9 +374,11 @@ class AnnexBValidatorNegativeTest {
                 ds("DS_ISSUER_MISMATCH", BadCerts.ds(subject, iaca, iacaKeyPair)
                         .issuer(BadCerts.name("IN", "Karnataka", "Another IACA")).build(), iaca),
                 ds("DS_SIGNATURE_INVALID", BadCerts.ds(subject, iaca, iacaKeyPair).signedBy(other.getPrivate()).build(), iaca),
-                ds("DS_SIGNATURE_INVALID", BadCerts.jdkCertificate(BadCerts.patch(BadCerts.encoded(
+                // the keyUsage critical flag written as BOOLEAN 01 and the DS re-signed by the IACA over those octets:
+                // the JDK keeps them and the signature verifies, so only the DER rule catches it
+                ds("DS_ENCODING_INVALID", BadCerts.jdkCertificate(BadCerts.resignPatched(BadCerts.encoded(
                         BadCerts.ds(subject, iaca, iacaKeyPair).serial(fixedSerial).build()),
-                        KEY_USAGE_CRITICAL, KEY_USAGE_BER_TRUE)), iaca),
+                        KEY_USAGE_CRITICAL, KEY_USAGE_BER_TRUE, iacaKeyPair.getPrivate(), "SHA256withECDSA")), iaca),
                 ds("DS_SUBJECT_COUNTRY_MISSING", BadCerts.ds(subject, iaca, iacaKeyPair)
                         .subject(BadCerts.name(null, "Karnataka", "Bad DSC")).build(), iaca),
                 ds("DS_SUBJECT_COUNTRY_DUPLICATE", BadCerts.ds(subject, iaca, iacaKeyPair)
@@ -396,6 +412,9 @@ class AnnexBValidatorNegativeTest {
                 ds("DS_KEY_USAGE_EXTRA", BadCerts.ds(subject, iaca, iacaKeyPair).with(Extension.keyUsage, true,
                         new KeyUsage(KeyUsage.digitalSignature | KeyUsage.keyCertSign)).build(), iaca),
                 ds("DS_KEY_USAGE_MALFORMED", BadCerts.ds(subject, iaca, iacaKeyPair).withRaw(Extension.keyUsage, false, NULL).buildJdk(), iaca),
+                // digitalSignature with an unused padding bit set: readable, but BER inside the extension value
+                ds("DS_KEY_USAGE_MALFORMED", BadCerts.ds(subject, iaca, iacaKeyPair).withRaw(Extension.keyUsage, true,
+                        KEY_USAGE_PADDING_SET).build(), iaca),
                 ds("DS_EKU_MISSING", BadCerts.ds(subject, iaca, iacaKeyPair).without(Extension.extendedKeyUsage).build(), iaca),
                 ds("DS_EKU_NOT_CRITICAL", BadCerts.ds(subject, iaca, iacaKeyPair).critical(Extension.extendedKeyUsage, false).build(), iaca),
                 ds("DS_EKU_INVALID", BadCerts.ds(subject, iaca, iacaKeyPair).with(Extension.extendedKeyUsage, true,
@@ -531,6 +550,9 @@ class AnnexBValidatorNegativeTest {
         return Stream.of(
                 crl("CRL_ENCODING_INVALID", BadCerts.jdkCrl(BadCerts.patch(BadCerts.encoded(
                         BadCerts.crl(iaca, fixture.iacaKeyPair).build()), COUNTRY_IN, SET_IN)), iaca),
+                // a critical AKI whose flag is written as BOOLEAN 01, re-signed over those octets: the JDK keeps them,
+                // so the DER rule reports before the criticality rule is reached
+                crl("CRL_ENCODING_INVALID", BadCerts.jdkCrl(berCrl(fixture)), iaca),
                 // the entry date of a revoked serial with a letter in it, constructed by BouncyCastle's provider
                 crl("CRL_ENCODING_INVALID", BadCerts.bcCrl(BadCerts.patch(BadCerts.encoded(
                         BadCerts.crl(iaca, fixture.iacaKeyPair).revokeAt(BigInteger.valueOf(42), Date.from(UTC_START))
@@ -582,6 +604,54 @@ class AnnexBValidatorNegativeTest {
 
     private static CrlRow crl(String ruleId, X509CRL crl, X509Certificate iaca) {
         return new CrlRow(ruleId, Set.of(ruleId), crl, iaca);
+    }
+
+    /** A CRL whose critical AKI flag is the BER BOOLEAN 01, signed by the IACA over exactly those octets. */
+    private static byte[] berCrl(Fixture fixture) {
+        return BadCerts.resignPatched(BadCerts.encoded(BadCerts.crl(fixture.iaca, fixture.iacaKeyPair)
+                        .critical(Extension.authorityKeyIdentifier, true).build()), AKI_CRITICAL, AKI_BER_TRUE,
+                fixture.iacaKeyPair.getPrivate(), "SHA256withECDSA");
+    }
+
+    /**
+     * BER where RFC 5280 requires DER, re-signed over the BER octets so the signature itself is sound: a BOOLEAN TRUE
+     * written {@code 01} instead of {@code FF}. The JDK keeps those octets (its own {@code verify} accepts the
+     * signature) and the validator refuses the encoding; BouncyCastle's provider re-encodes the object to DER on
+     * construction, where the signature over the original octets no longer verifies. The rule differs, the verdict
+     * does not: the object fails under every provider.
+     */
+    @Test
+    void aBerEncodingFailsUnderEveryProvider() throws Exception {
+        Fixture fixture = new Fixture();
+        BigInteger fixedSerial = BigInteger.ONE.shiftLeft(70).add(BigInteger.valueOf(0x5eed));
+
+        byte[] ds = BadCerts.resignPatched(BadCerts.encoded(BadCerts.ds(BadCerts.ec(256), fixture.iaca,
+                        fixture.iacaKeyPair).serial(fixedSerial).build()), KEY_USAGE_CRITICAL, KEY_USAGE_BER_TRUE,
+                fixture.iacaKeyPair.getPrivate(), "SHA256withECDSA");
+        X509Certificate jdkDs = BadCerts.jdkCertificate(ds);
+        jdkDs.verify(fixture.iaca.getPublicKey());
+        assertTrue(jdkDs.getCriticalExtensionOIDs().contains(Extension.keyUsage.getId()));
+        assertEquals(List.of("DS_ENCODING_INVALID"), AnnexBValidator.ruleIds(AnnexBValidator.validateDs(jdkDs, fixture.iaca)));
+        assertEquals(List.of("DS_SIGNATURE_INVALID"),
+                AnnexBValidator.ruleIds(AnnexBValidator.validateDs(BadCerts.bcCertificate(ds), fixture.iaca)));
+
+        KeyPair keyPair = BadCerts.ec(256);
+        byte[] iaca = BadCerts.resignPatched(BadCerts.encoded(BadCerts.iaca(keyPair).serial(fixedSerial).build()),
+                KEY_USAGE_CRITICAL, KEY_USAGE_BER_TRUE, keyPair.getPrivate(), "SHA256withECDSA");
+        X509Certificate jdkIaca = BadCerts.jdkCertificate(iaca);
+        jdkIaca.verify(keyPair.getPublic());
+        assertEquals(List.of("IACA_ENCODING_INVALID"), AnnexBValidator.ruleIds(AnnexBValidator.validateIaca(jdkIaca)));
+        assertEquals(List.of("IACA_NOT_SELF_SIGNED"),
+                AnnexBValidator.ruleIds(AnnexBValidator.validateIaca(BadCerts.bcCertificate(iaca))));
+
+        byte[] crl = berCrl(fixture);
+        X509CRL jdkCrl = BadCerts.jdkCrl(crl);
+        jdkCrl.verify(fixture.iaca.getPublicKey());
+        assertEquals(List.of("CRL_ENCODING_INVALID"),
+                AnnexBValidator.ruleIds(AnnexBValidator.validateCrl(jdkCrl, fixture.iaca)));
+        // BouncyCastle's DER keeps the AKI critical, which the profile reports as well
+        assertEquals(List.of("CRL_AKI_CRITICAL", "CRL_SIGNATURE_INVALID"),
+                AnnexBValidator.ruleIds(AnnexBValidator.validateCrl(BadCerts.bcCrl(crl), fixture.iaca)));
     }
 
     /** A revoked entry must not carry a reason code, and the production builder never writes one. */

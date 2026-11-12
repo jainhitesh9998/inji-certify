@@ -1,6 +1,7 @@
 package io.mosip.certify.pki;
 
 import org.bouncycastle.asn1.ASN1BitString;
+import org.bouncycastle.asn1.ASN1Encoding;
 import org.bouncycastle.asn1.ASN1InputStream;
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.ASN1Primitive;
@@ -42,6 +43,16 @@ import java.util.TreeSet;
  * extensions) forced inside {@link #certificate} and {@link #crl}, turns any such object into one exception at one
  * place, which the validator reports as {@code *_ENCODING_INVALID} and the builders as a named refusal. What is not
  * decoded here (attribute string values, extension values) is decoded by the caller inside its own guard.
+ *
+ * <p>The encoding must be DER, as RFC 5280 requires, not merely BER: one that differs from its own DER re-encoding (a
+ * BOOLEAN TRUE written {@code 01} instead of {@code FF}, an unsorted SET OF, non-zero BIT STRING padding, an
+ * indefinite or non-minimal length) is refused by {@link #certificate}, {@link #crl} and {@link #der}. Without that
+ * check the verdict would depend on the provider: the JDK keeps the octets it parsed, so a signature made over BER
+ * would verify, while BouncyCastle's provider re-encodes the object to DER on construction and the same signature
+ * fails. Strict verifiers (Go's {@code crypto/x509}) refuse such an encoding outright. The check is BouncyCastle's DER
+ * re-encoding, which is syntactic: a DEFAULT value encoded explicitly (an extension's {@code critical FALSE}) and a
+ * UTCTime without seconds re-encode to themselves and are not caught here; both providers keep those octets, so the
+ * verdict is the same.
  */
 final class Parsed {
 
@@ -50,8 +61,8 @@ final class Parsed {
     /**
      * The fields of a certificate the profiles read, from its DER, with the tbsCertificate octets exactly as the
      * encoding carries them and the signature value. The signature is verified over those octets with BouncyCastle's
-     * verifier and the subjectPublicKeyInfo, so the verdict depends only on the encoding the object reports, not on the
-     * provider that built it or on a JCA public key conversion.
+     * verifier and the subjectPublicKeyInfo, never through a JCA public key conversion. Because the encoding must be
+     * DER, the octets verified are the same whichever provider built the object.
      */
     record Cert(byte[] signed, byte[] signature, int version, BigInteger serial, X500Name issuer, X500Name subject,
                 Instant notBefore, Instant notAfter, SubjectPublicKeyInfo spki, Extensions extensions,
@@ -119,12 +130,13 @@ final class Parsed {
 
     /**
      * The certificate read from its DER. Throws {@link PkiException} (with the cause) when the encoding cannot be read
-     * as an X.509 Certificate, including a validity date that does not parse.
+     * as an X.509 Certificate, including a validity date that does not parse and an encoding that is BER but not DER.
      */
     static Cert certificate(X509Certificate certificate) {
         try {
             byte[] der = certificate.getEncoded();
             Certificate structure = Certificate.getInstance(strict(der));
+            requireDer(der, structure.getEncoded(ASN1Encoding.DER));
             TBSCertificate tbs = structure.getTBSCertificate();
             return new Cert(firstElement(der), signature(structure.getSignature()), tbs.getVersionNumber(),
                     tbs.getSerialNumber().getValue(), name(tbs.getIssuer()), name(tbs.getSubject()),
@@ -138,12 +150,14 @@ final class Parsed {
 
     /**
      * The CRL read from its DER, every entry included. Throws {@link PkiException} (with the cause) when the encoding
-     * cannot be read as an X.509 CertificateList, including a date or an entry extension list that does not parse.
+     * cannot be read as an X.509 CertificateList, including a date or an entry extension list that does not parse and
+     * an encoding that is BER but not DER.
      */
     static Crl crl(X509CRL crl) {
         try {
             byte[] der = crl.getEncoded();
             CertificateList structure = CertificateList.getInstance(strict(der));
+            requireDer(der, structure.getEncoded(ASN1Encoding.DER));
             TBSCertList tbs = structure.getTBSCertList();
             List<Entry> entries = new ArrayList<>();
             for (TBSCertList.CRLEntry entry : tbs.getRevokedCertificates()) {
@@ -175,6 +189,24 @@ final class Parsed {
                 throw new IOException(in.available() + " octets after the DER object");
             }
             return primitive;
+        }
+    }
+
+    /**
+     * Exactly one object, encoded in DER: {@link #strict} and then equal, octet for octet, to its own DER re-encoding.
+     * For an extension value, whose OCTET STRING hides it from the check on the enclosing certificate or CRL.
+     */
+    static ASN1Primitive der(byte[] encoding) throws IOException {
+        ASN1Primitive primitive = strict(encoding);
+        requireDer(encoding, primitive.getEncoded(ASN1Encoding.DER));
+        return primitive;
+    }
+
+    /** Refuses an encoding that differs from its DER re-encoding: BER, which RFC 5280 does not allow. */
+    private static void requireDer(byte[] encoding, byte[] reencoded) throws IOException {
+        if (!Arrays.equals(encoding, reencoded)) {
+            throw new IOException("the encoding is BER but not DER (it differs from its DER re-encoding at octet "
+                    + Arrays.mismatch(encoding, reencoded) + "); RFC 5280 requires DER");
         }
     }
 

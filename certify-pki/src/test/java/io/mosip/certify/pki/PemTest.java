@@ -25,8 +25,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * Encrypted private keys: the offline IACA flow (D3) copies a password-protected key file around. The library writes
  * only PKCS#8 PBES2 AES-256-CBC/PBKDF2-HMAC-SHA256 and reads every scheme BouncyCastle can decrypt (PKCS#5 v1, PKCS#12
- * PBE, PBES2 with any PBKDF2 PRF, the traditional OpenSSL {@code Proc-Type: 4,ENCRYPTED} block), logging a weak one at
- * WARNING; scrypt and unknown schemes are refused by name, and reading an encrypted key without a password fails loudly.
+ * PBE, PBES2 with any PBKDF2 PRF, the traditional OpenSSL {@code Proc-Type: 4,ENCRYPTED} block), logging a weak one
+ * (a weak PRF or cipher, or fewer than 10,000 PBKDF2 iterations) at WARNING; scrypt and unknown schemes are refused by
+ * name, and reading an encrypted key without a password fails loudly.
  */
 class PemTest {
 
@@ -125,7 +126,53 @@ class PemTest {
                 org.bouncycastle.asn1.nist.NISTObjectIdentifiers.id_aes256_CBC).setIterationCount(2048));
         List<String> sha1Warnings = warnings(() -> assertSigns(Pem.readPrivateKey(sha1, PASSWORD), keyPair));
         assertEquals(1, sha1Warnings.size(), sha1Warnings::toString);
-        assertTrue(sha1Warnings.get(0).contains("PBES2 with PBKDF2/HMAC-SHA1"), sha1Warnings.get(0));
+        assertTrue(sha1Warnings.get(0).contains("PBES2 with PBKDF2/hmacWithSHA1 (2048 iterations) and cipher"
+                + " aes-256-cbc: a weak PRF, fewer than 10000 iterations"), sha1Warnings.get(0));
+    }
+
+    /**
+     * A strong PRF and cipher with fewer than {@link Pem#MIN_PBKDF2_ITERATIONS} PBKDF2 iterations (OpenSSL's default
+     * 2048 included) is read and logged as weak; at the threshold it is read without a warning. The warning names the
+     * PRF and cipher as OpenSSL does and gives the command that re-encrypts with enough iterations.
+     */
+    @Test
+    void aPbkdf2IterationCountBelowTheFloorIsLoggedAsWeak() throws Exception {
+        KeyPair keyPair = BadCerts.ec(256);
+
+        String openSslDefault = pbes2(keyPair.getPrivate(), org.bouncycastle.asn1.nist.NISTObjectIdentifiers.id_aes128_CBC,
+                org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers.id_hmacWithSHA256, 2048);
+        List<String> low = warnings(() -> assertSigns(Pem.readPrivateKey(openSslDefault, PASSWORD), keyPair));
+        assertEquals(1, low.size(), low::toString);
+        assertTrue(low.get(0).contains("PBES2 with PBKDF2/hmacWithSHA256 (2048 iterations) and cipher aes-128-cbc:"
+                + " fewer than 10000 iterations"), low.get(0));
+        assertTrue(low.get(0).contains("-v2prf hmacWithSHA256 -iter 200000"), low.get(0));
+
+        String justBelow = pbes2(keyPair.getPrivate(), org.bouncycastle.asn1.nist.NISTObjectIdentifiers.id_aes256_CBC,
+                org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers.id_hmacWithSHA512, Pem.MIN_PBKDF2_ITERATIONS - 1);
+        assertEquals(1, warnings(() -> assertSigns(Pem.readPrivateKey(justBelow, PASSWORD), keyPair)).size());
+
+        String atFloor = pbes2(keyPair.getPrivate(), org.bouncycastle.asn1.nist.NISTObjectIdentifiers.id_aes192_CBC,
+                org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers.id_hmacWithSHA384, Pem.MIN_PBKDF2_ITERATIONS);
+        assertEquals(List.of(), warnings(() -> assertSigns(Pem.readPrivateKey(atFloor, PASSWORD), keyPair)));
+    }
+
+    /** A weak cipher and a weak PRF are named in the warning, each by its OpenSSL name. */
+    @Test
+    void aWeakCipherAndPrfAreNamed() throws Exception {
+        KeyPair keyPair = BadCerts.ec(256);
+        String tripleDes = pbes2(keyPair.getPrivate(), org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers.des_EDE3_CBC,
+                org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers.id_hmacWithSHA224, Pem.MIN_PBKDF2_ITERATIONS);
+        List<String> warnings = warnings(() -> assertSigns(Pem.readPrivateKey(tripleDes, PASSWORD), keyPair));
+        assertEquals(1, warnings.size(), warnings::toString);
+        assertTrue(warnings.get(0).contains("PBES2 with PBKDF2/hmacWithSHA224 (10000 iterations) and cipher"
+                + " des-ede3-cbc: a weak PRF, a weak cipher"), warnings.get(0));
+    }
+
+    private static String pbes2(PrivateKey key, org.bouncycastle.asn1.ASN1ObjectIdentifier cipher,
+                                org.bouncycastle.asn1.ASN1ObjectIdentifier prf, int iterations) throws Exception {
+        return bcEncrypted(key, new org.bouncycastle.openssl.jcajce.JceOpenSSLPKCS8EncryptorBuilder(cipher)
+                .setPRF(new org.bouncycastle.asn1.x509.AlgorithmIdentifier(prf, org.bouncycastle.asn1.DERNull.INSTANCE))
+                .setIterationCount(iterations));
     }
 
     @Test
@@ -198,7 +245,7 @@ class PemTest {
     }
 
     /** The WARNING records {@link Pem} logs while {@code action} runs (System.Logger routes to java.util.logging here). */
-    private static List<String> warnings(ThrowingRunnable action) throws Exception {
+    static List<String> warnings(ThrowingRunnable action) throws Exception {
         Logger logger = Logger.getLogger(Pem.class.getName());
         List<String> records = new ArrayList<>();
         Handler handler = new Handler() {
@@ -225,7 +272,7 @@ class PemTest {
     }
 
     @FunctionalInterface
-    private interface ThrowingRunnable {
+    interface ThrowingRunnable {
         void run() throws Exception;
     }
 

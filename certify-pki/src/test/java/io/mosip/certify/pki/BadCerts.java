@@ -756,6 +756,42 @@ final class BadCerts {
         throw new IllegalArgumentException("the DER does not contain the octets to patch");
     }
 
+    /**
+     * The signed structure with {@code find} replaced by {@code replace} (same length) inside its tbs part, and signed
+     * again over the patched tbs octets exactly as they stand, so the signature is sound over the encoding as written.
+     * For BER where RFC 5280 requires DER (a BOOLEAN TRUE written {@code 01}): every BouncyCastle writer re-encodes to
+     * DER, so the outer SEQUENCE is assembled here octet by octet, reusing the original signature AlgorithmIdentifier.
+     */
+    static byte[] resignPatched(byte[] signed, byte[] find, byte[] replace, PrivateKey key, String signatureAlgorithm) {
+        try {
+            byte[] tbs = patch(Parsed.firstElement(signed), find, replace);
+            Signature signer = Signature.getInstance(signatureAlgorithm);
+            signer.initSign(key);
+            signer.update(tbs);
+            java.io.ByteArrayOutputStream content = new java.io.ByteArrayOutputStream();
+            content.writeBytes(tbs);
+            content.writeBytes(ASN1Sequence.getInstance(signed).getObjectAt(1).toASN1Primitive()
+                    .getEncoded(org.bouncycastle.asn1.ASN1Encoding.DER));
+            content.writeBytes(new DERBitString(signer.sign()).getEncoded(org.bouncycastle.asn1.ASN1Encoding.DER));
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            out.write(0x30);
+            int length = content.size();
+            if (length < 0x80) {
+                out.write(length);
+            } else {
+                int octets = length < 0x100 ? 1 : length < 0x10000 ? 2 : 3;
+                out.write(0x80 | octets);
+                for (int i = octets - 1; i >= 0; i--) {
+                    out.write(length >>> (8 * i));
+                }
+            }
+            content.writeTo(out);
+            return out.toByteArray();
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
     static byte[] encoded(X509Certificate certificate) {
         try {
             return certificate.getEncoded();
