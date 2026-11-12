@@ -1,14 +1,18 @@
 package io.mosip.certify.pki;
 
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
+import org.bouncycastle.asn1.ASN1Primitive;
 import org.bouncycastle.asn1.DERBMPString;
 import org.bouncycastle.asn1.DERNull;
 import org.bouncycastle.asn1.DERPrintableString;
 import org.bouncycastle.asn1.DERUTF8String;
+import org.bouncycastle.asn1.x500.RDN;
 import org.bouncycastle.asn1.x500.style.BCStyle;
 import org.bouncycastle.asn1.x509.AuthorityKeyIdentifier;
 import org.bouncycastle.asn1.x509.BasicConstraints;
 import org.bouncycastle.asn1.x509.CRLNumber;
+import org.bouncycastle.asn1.x509.DistributionPoint;
+import org.bouncycastle.asn1.x509.DistributionPointName;
 import org.bouncycastle.asn1.x509.ExtendedKeyUsage;
 import org.bouncycastle.asn1.x509.Extension;
 import org.bouncycastle.asn1.x509.GeneralName;
@@ -62,6 +66,31 @@ class AnnexBValidatorNegativeTest {
     /** DER NULL, where an extension expects something else. */
     private static final byte[] NULL = {0x05, 0x00};
 
+    /** A PrintableString {@code IN}, and the same octets under the primitive SET tag no string type uses. */
+    private static final byte[] COUNTRY_IN = {0x13, 0x02, 0x49, 0x4e};
+    private static final byte[] SET_IN = {0x11, 0x02, 0x49, 0x4e};
+
+    /** The keyUsage extension's OID and critical flag, and the same with the flag as BOOLEAN 01 instead of FF. */
+    private static final byte[] KEY_USAGE_CRITICAL = {0x06, 0x03, 0x55, 0x1d, 0x0f, 0x01, 0x01, (byte) 0xff};
+    private static final byte[] KEY_USAGE_BER_TRUE = {0x06, 0x03, 0x55, 0x1d, 0x0f, 0x01, 0x01, 0x01};
+
+    /** A notBefore whose UTCTime is known, and the same UTCTime with a letter in the minutes: {@code 2611010000t0Z}. */
+    private static final Instant UTC_START = Instant.parse("2026-11-01T00:00:00Z");
+    private static final byte[] UTC_START_DER = "261101000000Z".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+    private static final byte[] UTC_START_BROKEN = "2611010000t0Z".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+
+    /** UTF8Strings whose contents are not UTF-8: C3 28 (a lead octet without its continuation) and FF 5A. */
+    private static final ASN1Primitive BAD_UTF8_CN = primitive(new byte[] {0x0c, 0x02, (byte) 0xc3, 0x28});
+    private static final ASN1Primitive BAD_UTF8_FF5A = primitive(new byte[] {0x0c, 0x02, (byte) 0xff, 0x5a});
+
+    private static ASN1Primitive primitive(byte[] der) {
+        try {
+            return ASN1Primitive.fromByteArray(der);
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
     private record Row(String ruleId, Set<String> allowed, X509Certificate certificate) {}
 
     private record DsRow(String ruleId, Set<String> allowed, X509Certificate certificate, X509Certificate iaca) {}
@@ -96,7 +125,26 @@ class AnnexBValidatorNegativeTest {
         KeyPair other = BadCerts.ec(256);
         Instant now = Instant.now().truncatedTo(ChronoUnit.SECONDS);
         Instant start = now.minus(Duration.ofDays(1));
+        BigInteger fixedSerial = BigInteger.ONE.shiftLeft(70).add(BigInteger.valueOf(0x5eed));
         return Stream.of(
+                // the issuer country's PrintableString tag (0x13) turned into a primitive SET (0x11): the JDK keeps the
+                // value as raw octets, BouncyCastle's X500Name refuses it (the reviewers' fuzz finding)
+                row("IACA_ENCODING_INVALID", BadCerts.jdkCertificate(BadCerts.patch(
+                        BadCerts.encoded(BadCerts.iaca(keyPair).serial(fixedSerial).build()),
+                        COUNTRY_IN, SET_IN))),
+                // a notBefore UTCTime with a letter in it: BouncyCastle's provider constructs the certificate and
+                // decodes the date only when it is first read
+                row("IACA_ENCODING_INVALID", BadCerts.bcCertificate(BadCerts.patch(
+                        BadCerts.encoded(BadCerts.iaca(keyPair).serial(fixedSerial).notBefore(Date.from(UTC_START)).build()),
+                        UTC_START_DER, UTC_START_BROKEN))),
+                // a common name whose UTF8String is not UTF-8 (C3 28), properly self-signed
+                row("IACA_SUBJECT_ENCODING_INVALID", BadCerts.iaca(keyPair)
+                        .subject(BadCerts.rdns(BCStyle.C, new DERPrintableString("IN"), BCStyle.CN, BAD_UTF8_CN))
+                        .issuer(BadCerts.rdns(BCStyle.C, new DERPrintableString("IN"), BCStyle.CN, BAD_UTF8_CN)).buildJdk()),
+                // a directoryName whose CN is a UTF8String FF 5A: decoding the name is part of reading the extension
+                row("IACA_ISSUER_ALT_NAME_MALFORMED", BadCerts.iaca(keyPair).with(Extension.issuerAlternativeName, false,
+                        new GeneralNames(new GeneralName(GeneralName.directoryName,
+                                BadCerts.rdns(BCStyle.CN, BAD_UTF8_FF5A)))).build()),
                 // a version 1 certificate cannot carry extensions, so the rules that require them report as well
                 new Row("IACA_VERSION_INVALID", Set.of("IACA_VERSION_INVALID", "IACA_SKI_MISSING",
                         "IACA_KEY_USAGE_MISSING", "IACA_BASIC_CONSTRAINTS_MISSING", "IACA_ISSUER_ALT_NAME_MISSING",
@@ -132,6 +180,11 @@ class AnnexBValidatorNegativeTest {
                         .issuer(BadCerts.rdns(BCStyle.C, new DERPrintableString("IN"), BCStyle.SERIALNUMBER,
                                 new DERUTF8String("42"), BCStyle.CN, new DERUTF8String("Bad IACA"))).build()),
                 row("IACA_NOT_SELF_SIGNED", BadCerts.iaca(keyPair).issuer(BadCerts.name("IN", null, "Another IACA")).build()),
+                // the keyUsage critical flag re-encoded as BOOLEAN 01 (BER true, not DER) after signing: the JDK keeps
+                // those octets and the signature over them fails (BouncyCastle's provider would re-encode the object to
+                // DER on construction, which gives back the original certificate)
+                row("IACA_NOT_SELF_SIGNED", BadCerts.jdkCertificate(BadCerts.patch(BadCerts.encoded(
+                        BadCerts.iaca(keyPair).serial(fixedSerial).build()), KEY_USAGE_CRITICAL, KEY_USAGE_BER_TRUE))),
                 row("IACA_ISSUER_ALT_NAME_MISSING", BadCerts.iaca(keyPair).without(Extension.issuerAlternativeName).build()),
                 row("IACA_ISSUER_ALT_NAME_CRITICAL", BadCerts.iaca(keyPair).critical(Extension.issuerAlternativeName, true).build()),
                 row("IACA_ISSUER_ALT_NAME_INVALID", BadCerts.iaca(keyPair).with(Extension.issuerAlternativeName, false,
@@ -140,6 +193,11 @@ class AnnexBValidatorNegativeTest {
                         BadCerts.issuerAltNames("mdoc/iaca")).build()),
                 row("IACA_ISSUER_ALT_NAME_INVALID", BadCerts.iaca(keyPair).with(Extension.issuerAlternativeName, false,
                         new GeneralNames(new GeneralName(GeneralName.rfc822Name, "pki at example.test"))).build()),
+                // only https, http, mailto and urn URIs (decision log, 2026-11-13)
+                row("IACA_ISSUER_ALT_NAME_INVALID", BadCerts.iaca(keyPair).with(Extension.issuerAlternativeName, false,
+                        BadCerts.issuerAltNames("ldap://ldap.example.test/cn=IACA")).build()),
+                row("IACA_ISSUER_ALT_NAME_INVALID", BadCerts.iaca(keyPair).with(Extension.issuerAlternativeName, false,
+                        BadCerts.issuerAltNames("https://user@credentials.example.test/iaca")).build()),
                 // a GeneralName with tag [9], which does not exist
                 row("IACA_ISSUER_ALT_NAME_MALFORMED", BadCerts.iaca(keyPair).withRaw(Extension.issuerAlternativeName, false,
                         new byte[] {0x30, 0x03, (byte) 0x89, 0x01, 0x41}).build()),
@@ -150,6 +208,27 @@ class AnnexBValidatorNegativeTest {
                         BadCerts.crlDistributionPoint("ldap://ldap.example.test/cn=IACA?certificateRevocationList")).build()),
                 row("IACA_CRL_DP_INVALID", BadCerts.iaca(keyPair).with(Extension.cRLDistributionPoints, false,
                         BadCerts.crlDistributionPoint("not a uri")).build()),
+                // the remaining CRL_DP_INVALID branches: no point, a relative name, no name, an empty fullName, a
+                // dNSName, userinfo and a port out of range
+                row("IACA_CRL_DP_INVALID", BadCerts.iaca(keyPair).with(Extension.cRLDistributionPoints, false,
+                        BadCerts.crlDistributionPoint()).build()),
+                row("IACA_CRL_DP_INVALID", BadCerts.iaca(keyPair).with(Extension.cRLDistributionPoints, false,
+                        BadCerts.crlDistributionPoint(new DistributionPoint(new DistributionPointName(
+                                DistributionPointName.NAME_RELATIVE_TO_CRL_ISSUER,
+                                new RDN(BCStyle.CN, new DERUTF8String("iaca.crl")).toASN1Primitive()), null, null))).build()),
+                row("IACA_CRL_DP_INVALID", BadCerts.iaca(keyPair).with(Extension.cRLDistributionPoints, false,
+                        BadCerts.crlDistributionPoint(new DistributionPoint(null, null,
+                                BadCerts.issuerAltNames(BadCerts.CRL_URI)))).build()),
+                row("IACA_CRL_DP_INVALID", BadCerts.iaca(keyPair).with(Extension.cRLDistributionPoints, false,
+                        BadCerts.crlDistributionPoint(new DistributionPoint(
+                                new DistributionPointName(new GeneralNames(new GeneralName[0])), null, null))).build()),
+                row("IACA_CRL_DP_INVALID", BadCerts.iaca(keyPair).with(Extension.cRLDistributionPoints, false,
+                        BadCerts.crlDistributionPoint(new DistributionPoint(new DistributionPointName(
+                                BadCerts.dnsIssuerAltNames("credentials.example.test")), null, null))).build()),
+                row("IACA_CRL_DP_INVALID", BadCerts.iaca(keyPair).with(Extension.cRLDistributionPoints, false,
+                        BadCerts.crlDistributionPoint("https://user@credentials.example.test/iaca.crl")).build()),
+                row("IACA_CRL_DP_INVALID", BadCerts.iaca(keyPair).with(Extension.cRLDistributionPoints, false,
+                        BadCerts.crlDistributionPoint("https://credentials.example.test:99999/iaca.crl")).build()),
                 // a SEQUENCE OF DistributionPoint holding a NULL
                 row("IACA_CRL_DP_MALFORMED", BadCerts.iaca(keyPair).withRaw(Extension.cRLDistributionPoints, false,
                         new byte[] {0x30, 0x02, 0x05, 0x00}).build()),
@@ -257,7 +336,21 @@ class AnnexBValidatorNegativeTest {
                 BadCerts.dnsIssuerAltNames("credentials.example.test")).build();
         X509Certificate iaca = fixture.iaca;
         KeyPair iacaKeyPair = fixture.iacaKeyPair;
+        BigInteger fixedSerial = BigInteger.ONE.shiftLeft(70).add(BigInteger.valueOf(0x5eed));
+        X509Certificate unreadableIaca = BadCerts.jdkCertificate(BadCerts.patch(
+                BadCerts.encoded(BadCerts.iaca(iacaKeyPair, "IN", "Karnataka").serial(fixedSerial).build()),
+                COUNTRY_IN, SET_IN));
         return Stream.of(
+                // the issuer country of the DS turned into a primitive SET, as for the IACA row
+                ds("DS_ENCODING_INVALID", BadCerts.jdkCertificate(BadCerts.patch(BadCerts.encoded(
+                        BadCerts.ds(subject, iaca, iacaKeyPair).serial(fixedSerial).build()), COUNTRY_IN, SET_IN)), iaca),
+                ds("DS_SUBJECT_ENCODING_INVALID", BadCerts.ds(subject, iaca, iacaKeyPair)
+                        .subject(BadCerts.rdns(BCStyle.C, new DERPrintableString("IN"), BCStyle.ST,
+                                new DERUTF8String("Karnataka"), BCStyle.CN, BAD_UTF8_CN)).buildJdk(), iaca),
+                // a conforming DS checked against an IACA that cannot be read: the IACA is reported, the checks
+                // against it are skipped
+                new DsRow("IACA_ENCODING_INVALID", Set.of("IACA_ENCODING_INVALID"),
+                        BadCerts.ds(subject, iaca, iacaKeyPair).build(), unreadableIaca),
                 new DsRow("DS_VERSION_INVALID", Set.of("DS_VERSION_INVALID", "DS_SKI_MISSING", "DS_AKI_MISSING",
                         "DS_KEY_USAGE_MISSING", "DS_EKU_MISSING", "DS_ISSUER_ALT_NAME_MISSING",
                         "DS_CRL_DP_MISSING"), BadCerts.ds(subject, iaca, iacaKeyPair).buildV1(), iaca),
@@ -267,6 +360,9 @@ class AnnexBValidatorNegativeTest {
                 ds("DS_ISSUER_MISMATCH", BadCerts.ds(subject, iaca, iacaKeyPair)
                         .issuer(BadCerts.name("IN", "Karnataka", "Another IACA")).build(), iaca),
                 ds("DS_SIGNATURE_INVALID", BadCerts.ds(subject, iaca, iacaKeyPair).signedBy(other.getPrivate()).build(), iaca),
+                ds("DS_SIGNATURE_INVALID", BadCerts.jdkCertificate(BadCerts.patch(BadCerts.encoded(
+                        BadCerts.ds(subject, iaca, iacaKeyPair).serial(fixedSerial).build()),
+                        KEY_USAGE_CRITICAL, KEY_USAGE_BER_TRUE)), iaca),
                 ds("DS_SUBJECT_COUNTRY_MISSING", BadCerts.ds(subject, iaca, iacaKeyPair)
                         .subject(BadCerts.name(null, "Karnataka", "Bad DSC")).build(), iaca),
                 ds("DS_SUBJECT_COUNTRY_DUPLICATE", BadCerts.ds(subject, iaca, iacaKeyPair)
@@ -429,7 +525,20 @@ class AnnexBValidatorNegativeTest {
         X509Certificate iaca = fixture.iaca;
         KeyPair other = BadCerts.ec(256);
         Instant now = Instant.now();
+        X509Certificate unreadableIaca = BadCerts.jdkCertificate(BadCerts.patch(BadCerts.encoded(
+                BadCerts.iaca(fixture.iacaKeyPair, "IN", "Karnataka")
+                        .serial(BigInteger.ONE.shiftLeft(70).add(BigInteger.valueOf(0x5eed))).build()), COUNTRY_IN, SET_IN));
         return Stream.of(
+                crl("CRL_ENCODING_INVALID", BadCerts.jdkCrl(BadCerts.patch(BadCerts.encoded(
+                        BadCerts.crl(iaca, fixture.iacaKeyPair).build()), COUNTRY_IN, SET_IN)), iaca),
+                // the entry date of a revoked serial with a letter in it, constructed by BouncyCastle's provider
+                crl("CRL_ENCODING_INVALID", BadCerts.bcCrl(BadCerts.patch(BadCerts.encoded(
+                        BadCerts.crl(iaca, fixture.iacaKeyPair).revokeAt(BigInteger.valueOf(42), Date.from(UTC_START))
+                                .build()), UTC_START_DER, UTC_START_BROKEN)), iaca),
+                crl("CRL_THIS_UPDATE_BEFORE_IACA", BadCerts.crl(iaca, fixture.iacaKeyPair)
+                        .thisUpdate(Date.from(iaca.getNotBefore().toInstant().minusSeconds(1))).build(), iaca),
+                new CrlRow("IACA_ENCODING_INVALID", Set.of("IACA_ENCODING_INVALID"),
+                        BadCerts.crl(iaca, fixture.iacaKeyPair).build(), unreadableIaca),
                 crl("CRL_ISSUER_MISMATCH", BadCerts.crl(iaca, fixture.iacaKeyPair)
                         .issuer(new org.bouncycastle.asn1.x500.X500Name("CN=Another IACA")).build(), iaca),
                 crl("CRL_SIGNATURE_INVALID", BadCerts.crl(iaca, fixture.iacaKeyPair).signedBy(other.getPrivate()).build(), iaca),
@@ -458,8 +567,8 @@ class AnnexBValidatorNegativeTest {
                 crl("CRL_ENTRY_EXTENSION_PRESENT", BadCerts.crl(iaca, fixture.iacaKeyPair).revokeWithReason(BigInteger.valueOf(42)).build(), iaca),
                 crl("CRL_NEXT_UPDATE_MISSING", BadCerts.crl(iaca, fixture.iacaKeyPair).withoutNextUpdate().build(), iaca),
                 crl("CRL_NEXT_UPDATE_BEFORE_THIS_UPDATE", BadCerts.crl(iaca, fixture.iacaKeyPair)
-                        .thisUpdate(Date.from(now.minus(Duration.ofMinutes(1))))
-                        .nextUpdate(Date.from(now.minus(Duration.ofDays(2)))).build(), iaca),
+                        .thisUpdate(Date.from(iaca.getNotBefore().toInstant()))
+                        .nextUpdate(Date.from(iaca.getNotBefore().toInstant().minus(Duration.ofDays(2)))).build(), iaca),
                 crl("CRL_NEXT_UPDATE_AFTER_IACA", BadCerts.crl(iaca, fixture.iacaKeyPair)
                         .nextUpdate(Date.from(iaca.getNotAfter().toInstant().plus(Duration.ofDays(1)))).build(), iaca),
                 crl("CRL_THIS_UPDATE_IN_FUTURE", BadCerts.crl(iaca, fixture.iacaKeyPair)

@@ -7,6 +7,7 @@ import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.ASN1OctetString;
 import org.bouncycastle.asn1.ASN1Primitive;
 import org.bouncycastle.asn1.ASN1PrintableString;
+import org.bouncycastle.asn1.ASN1String;
 import org.bouncycastle.asn1.ASN1UTF8String;
 import org.bouncycastle.asn1.x500.AttributeTypeAndValue;
 import org.bouncycastle.asn1.x500.RDN;
@@ -24,12 +25,10 @@ import org.bouncycastle.asn1.x509.GeneralName;
 import org.bouncycastle.asn1.x509.GeneralNames;
 import org.bouncycastle.asn1.x509.KeyPurposeId;
 import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo;
-import org.bouncycastle.cert.X509CRLHolder;
-import org.bouncycastle.cert.X509CertificateHolder;
+import org.bouncycastle.util.encoders.Hex;
 
 import java.math.BigInteger;
 import java.security.cert.X509CRL;
-import java.security.cert.X509CRLEntry;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.time.Instant;
@@ -55,9 +54,17 @@ import java.util.function.Function;
  * ({@code docs/design/12-risks-and-decisions.md}, 2026-11-13) says so.
  *
  * <p>The validator is deliberately independent of the builders: it re-derives every profile property from the DER, so a
- * certificate an operator obtained elsewhere is held to the same rules as one {@link IsoMdocProfiles} wrote. It never
- * throws on a malformed extension: an extension whose DER cannot be read is reported as {@code *_<EXTENSION>_MALFORMED}
- * and none of its other properties are assessed.
+ * certificate an operator obtained elsewhere is held to the same rules as one {@link IsoMdocProfiles} wrote.
+ *
+ * <p><b>It never throws for an object a JCA provider could construct.</b> Each certificate or CRL is read once from its
+ * {@code getEncoded()} DER with BouncyCastle's ASN.1 structures, never through the JCA getters (the JDK keeps what it
+ * does not understand as raw octets, and BouncyCastle's provider decodes names, dates and extensions lazily, so a getter
+ * can throw on first access). An encoding those structures cannot read is reported as {@code IACA_ENCODING_INVALID},
+ * {@code DS_ENCODING_INVALID} or {@code CRL_ENCODING_INVALID} and no other property of that object is assessed; an IACA
+ * that cannot be read while a Document Signer or CRL is checked against it is reported as {@code IACA_ENCODING_INVALID}
+ * and the checks that depend on it are skipped. An extension whose DER cannot be read is reported as
+ * {@code *_<EXTENSION>_MALFORMED}, a subject string that cannot be decoded as {@code *_SUBJECT_ENCODING_INVALID}.
+ * Anything else thrown out of this class is a programming error.
  *
  * <p>Rule identifiers are {@code <PROFILE>_<PROPERTY>}: {@code IACA_*}, {@code DS_*}, {@code CRL_*}. {@link #RULES} lists
  * every identifier the validator can emit; a violation list is unordered and {@link #ruleIds} returns the distinct
@@ -80,6 +87,7 @@ public final class AnnexBValidator {
 
     /** Rules both certificate profiles emit, once as {@code IACA_<rule>} and once as {@code DS_<rule>}. */
     private static final List<String> CERTIFICATE_RULES = List.of(
+            "ENCODING_INVALID",
             "VERSION_INVALID",
             "SERIAL_NOT_POSITIVE", "SERIAL_TOO_SHORT", "SERIAL_TOO_LONG",
             "SUBJECT_COUNTRY_MISSING", "SUBJECT_COUNTRY_DUPLICATE", "SUBJECT_COUNTRY_NOT_PRINTABLE",
@@ -109,6 +117,7 @@ public final class AnnexBValidator {
             "DS_VALIDITY_OUTSIDE_IACA");
 
     private static final List<String> CRL_RULES = List.of(
+            "CRL_ENCODING_INVALID",
             "CRL_ISSUER_MISMATCH", "CRL_SIGNATURE_INVALID",
             "CRL_SIGNATURE_ALGORITHM_INVALID", "CRL_SIGNATURE_ALGORITHM_MISMATCH", "CRL_ALGORITHM_IDENTIFIER_MISMATCH",
             "CRL_VERSION_INVALID",
@@ -116,7 +125,7 @@ public final class AnnexBValidator {
             "CRL_NUMBER_MISSING", "CRL_NUMBER_INVALID", "CRL_NUMBER_CRITICAL", "CRL_NUMBER_MALFORMED",
             "CRL_EXTENSION_UNEXPECTED", "CRL_ENTRY_EXTENSION_PRESENT",
             "CRL_NEXT_UPDATE_MISSING", "CRL_NEXT_UPDATE_BEFORE_THIS_UPDATE", "CRL_NEXT_UPDATE_AFTER_IACA",
-            "CRL_THIS_UPDATE_IN_FUTURE");
+            "CRL_THIS_UPDATE_IN_FUTURE", "CRL_THIS_UPDATE_BEFORE_IACA");
 
     /**
      * Every rule identifier the validator can emit, sorted. A violation with any other identifier is a programming
@@ -132,7 +141,10 @@ public final class AnnexBValidator {
      */
     public static final int MIN_SERIAL_BITS = 56;
 
-    /** How far a CRL's thisUpdate may lie after the validation instant before it is reported as in the future. */
+    /**
+     * How far a CRL's thisUpdate may lie after the validation instant before it is reported as in the future; the
+     * {@link CrlBuilder} refuses a thisUpdate further than this after the instant it builds.
+     */
     public static final Duration CLOCK_SKEW = Duration.ofMinutes(5);
 
     private static final List<String> COUNTRIES = List.of(Locale.getISOCountries());
@@ -170,66 +182,88 @@ public final class AnnexBValidator {
 
     /** IACA profile, ISO/IEC 18013-5:2021 Annex B. An empty list means the certificate conforms. */
     public static List<Violation> validateIaca(X509Certificate iaca) {
+        Objects.requireNonNull(iaca, "iaca");
         Report report = new Report("IACA");
-        version(report, iaca);
-        serial(report, iaca);
-        subject(report, iaca);
-        issuerAltName(report, iaca);
-        crlDistributionPoint(report, iaca);
-        Ext<byte[]> ski = subjectKeyIdentifier(report, iaca);
-        Ext<AuthorityKeyIdentifier> aki = authorityKeyIdentifier(report, iaca);
+        Parsed.Cert certificate = read(report, iaca);
+        if (certificate == null) {
+            return report.violations();
+        }
+        version(report, certificate);
+        serial(report, certificate);
+        subject(report, certificate.subject());
+        issuerAltName(report, certificate);
+        crlDistributionPoint(report, certificate);
+        Ext<byte[]> ski = subjectKeyIdentifier(report, certificate);
+        Ext<AuthorityKeyIdentifier> aki = authorityKeyIdentifier(report, certificate);
         if (aki.parsed() && aki.value().getKeyIdentifier() != null && ski.parsed()
                 && !Arrays.equals(aki.value().getKeyIdentifier(), ski.value())) {
             report.add("IACA_AKI_MISMATCH", "the authority key identifier is not the subject key identifier");
         }
-        unknownCriticalExtension(report, iaca);
+        unknownCriticalExtension(report, certificate);
 
-        SubjectPublicKeyInfo iacaKey = Certificates.subjectPublicKeyInfo(iaca);
+        SubjectPublicKeyInfo iacaKey = certificate.spki();
         key(report, iacaKey);
-        X500Name subject = Certificates.name(iaca.getSubjectX500Principal());
-        X500Name issuer = Certificates.name(iaca.getIssuerX500Principal());
-        if (!Arrays.equals(Certificates.der(subject), Certificates.der(issuer))) {
+        if (!Certificates.sameName(certificate.subject(), certificate.issuer())) {
             report.add("IACA_NOT_SELF_SIGNED", "the IACA subject and issuer differ");
-        } else if (Certificates.keyProblem(iacaKey) == null && !Certificates.signedBy(iaca, iaca.getPublicKey())) {
+        } else if (Certificates.keyProblem(iacaKey) == null && !certificate.signedBy(iacaKey)) {
             report.add("IACA_NOT_SELF_SIGNED", "the IACA certificate is not signed by its own key");
         }
 
-        keyUsage(report, iaca, (1 << 5) | (1 << 6), "keyCertSign and cRLSign");
-        iacaBasicConstraints(report, iaca);
-        Instant notBefore = iaca.getNotBefore().toInstant();
-        validity(report, iaca, notBefore.atZone(ZoneOffset.UTC).plusYears(20).toInstant(), "20 calendar years");
-        signature(report, iaca, curveOf(iacaKey));
+        keyUsage(report, certificate, (1 << 5) | (1 << 6), "keyCertSign and cRLSign");
+        iacaBasicConstraints(report, certificate);
+        validity(report, certificate, certificate.notBefore().atZone(ZoneOffset.UTC).plusYears(20).toInstant(),
+                "20 calendar years");
+        signature(report, certificate, curveOf(iacaKey));
         return report.violations();
     }
 
-    /** Document Signer profile of ISO/IEC 18013-5:2021 Annex B, checked against the IACA that issued it. */
+    /**
+     * Document Signer profile of ISO/IEC 18013-5:2021 Annex B, checked against the IACA that issued it. An IACA that
+     * cannot be read is reported as {@code IACA_ENCODING_INVALID}, and the checks that compare the DS with it are
+     * skipped; the DS's own checks still run.
+     */
     public static List<Violation> validateDs(X509Certificate ds, X509Certificate iaca) {
+        Objects.requireNonNull(ds, "ds");
+        Objects.requireNonNull(iaca, "iaca");
         Report report = new Report("DS");
-        version(report, ds);
-        serial(report, ds);
-        subject(report, ds);
-        List<GeneralName> dsIssuerAltNames = issuerAltName(report, ds);
-        crlDistributionPoint(report, ds);
-        subjectKeyIdentifier(report, ds);
-        Ext<AuthorityKeyIdentifier> aki = authorityKeyIdentifier(report, ds);
-        unknownCriticalExtension(report, ds);
-        key(report, Certificates.subjectPublicKeyInfo(ds));
-        keyUsage(report, ds, 1, "digitalSignature");
-        extendedKeyUsage(report, ds);
-        dsBasicConstraints(report, ds);
+        Parsed.Cert certificate = read(report, ds);
+        Parsed.Cert issuer = readIaca(report, iaca);
+        if (certificate == null) {
+            return report.violations();
+        }
+        version(report, certificate);
+        serial(report, certificate);
+        subject(report, certificate.subject());
+        List<AltName> dsIssuerAltNames = issuerAltName(report, certificate);
+        crlDistributionPoint(report, certificate);
+        subjectKeyIdentifier(report, certificate);
+        Ext<AuthorityKeyIdentifier> aki = authorityKeyIdentifier(report, certificate);
+        unknownCriticalExtension(report, certificate);
+        key(report, certificate.spki());
+        keyUsage(report, certificate, 1, "digitalSignature");
+        extendedKeyUsage(report, certificate);
+        dsBasicConstraints(report, certificate);
+        validity(report, certificate, certificate.notBefore().plus(IsoMdocProfiles.DS_MAX_VALIDITY),
+                IsoMdocProfiles.DS_MAX_VALIDITY.toDays() + " days");
+        if (issuer == null) {
+            signature(report, certificate, null);
+            return report.violations();
+        }
 
-        if (!Arrays.equals(Certificates.der(Certificates.name(ds.getIssuerX500Principal())),
-                Certificates.der(Certificates.name(iaca.getSubjectX500Principal())))) {
+        if (!Certificates.sameName(certificate.issuer(), issuer.subject())) {
             report.add("DS_ISSUER_MISMATCH", "the DS issuer is not the IACA subject");
         }
-        SubjectPublicKeyInfo iacaKey = Certificates.subjectPublicKeyInfo(iaca);
-        if (Certificates.keyProblem(iacaKey) == null && !Certificates.signedBy(ds, iaca.getPublicKey())) {
+        String keyProblem = Certificates.keyProblem(issuer.spki());
+        if (keyProblem != null) {
+            report.add("DS_SIGNATURE_INVALID", "the DS signature cannot be verified: the IACA key is outside the key"
+                    + " profile (" + keyProblem + ")");
+        } else if (!certificate.signedBy(issuer.spki())) {
             report.add("DS_SIGNATURE_INVALID", "the DS certificate is not signed by the IACA key");
         }
 
         if (!aki.malformed()) {
             byte[] declared = aki.parsed() ? aki.value().getKeyIdentifier() : null;
-            byte[] iacaKeyId = keyIdentifierOf(iaca);
+            byte[] iacaKeyId = keyIdentifierOf(issuer);
             if (declared == null) {
                 report.add("DS_AKI_MISSING", "the DS certificate has no authority key identifier keyIdentifier");
             } else if (iacaKeyId == null) {
@@ -240,33 +274,31 @@ public final class AnnexBValidator {
             }
         }
 
-        String iacaCountry = Certificates.attribute(iaca.getSubjectX500Principal(), BCStyle.C);
-        String dsCountry = Certificates.attribute(ds.getSubjectX500Principal(), BCStyle.C);
-        if (dsCountry != null && iacaCountry != null && !dsCountry.equals(iacaCountry)) {
-            report.add("DS_COUNTRY_MISMATCH", "the DS country " + dsCountry + " is not the IACA country " + iacaCountry);
+        ASN1Encodable iacaCountry = Certificates.value(issuer.subject(), BCStyle.C);
+        ASN1Encodable dsCountry = Certificates.value(certificate.subject(), BCStyle.C);
+        if (dsCountry != null && iacaCountry != null && !Certificates.sameValue(dsCountry, iacaCountry)) {
+            report.add("DS_COUNTRY_MISMATCH", "the DS country " + text(dsCountry) + " is not the IACA country "
+                    + text(iacaCountry));
         }
-        String iacaState = Certificates.attribute(iaca.getSubjectX500Principal(), BCStyle.ST);
-        String dsState = Certificates.attribute(ds.getSubjectX500Principal(), BCStyle.ST);
-        if (iacaState != null && !iacaState.equals(dsState)) {
-            report.add("DS_STATE_MISMATCH", "the DS state is not the IACA state " + iacaState);
+        ASN1Encodable iacaState = Certificates.value(issuer.subject(), BCStyle.ST);
+        ASN1Encodable dsState = Certificates.value(certificate.subject(), BCStyle.ST);
+        if (iacaState != null && (dsState == null || !Certificates.sameValue(dsState, iacaState))) {
+            report.add("DS_STATE_MISMATCH", "the DS state is not the IACA state " + text(iacaState));
         }
 
         if (dsIssuerAltNames != null && !dsIssuerAltNames.isEmpty()) {
-            Ext<List<GeneralName>> iacaIssuerAltNames = read(iaca, Extension.issuerAlternativeName,
+            Ext<List<AltName>> iacaIssuerAltNames = read(issuer.extension(Extension.issuerAlternativeName),
                     AnnexBValidator::generalNames);
             if (!iacaIssuerAltNames.parsed()) {
                 report.add("DS_ISSUER_ALT_NAME_MISMATCH", "the IACA issuerAltName is absent or malformed, so the DS"
                         + " issuerAltName cannot be a copy of it");
-            } else if (!tagged(dsIssuerAltNames).equals(tagged(iacaIssuerAltNames.value()))) {
+            } else if (!new LinkedHashSet<>(dsIssuerAltNames).equals(new LinkedHashSet<>(iacaIssuerAltNames.value()))) {
                 report.add("DS_ISSUER_ALT_NAME_MISMATCH", "the DS issuerAltName is not the IACA issuerAltName");
             }
         }
 
-        Instant notBefore = ds.getNotBefore().toInstant();
-        validity(report, ds, notBefore.plus(IsoMdocProfiles.DS_MAX_VALIDITY), IsoMdocProfiles.DS_MAX_VALIDITY.toDays()
-                + " days");
-        withinIacaValidity(report, ds, iaca);
-        signature(report, ds, curveOf(iacaKey));
+        withinIacaValidity(report, certificate, issuer);
+        signature(report, certificate, curveOf(issuer.spki()));
         return report.violations();
     }
 
@@ -276,46 +308,69 @@ public final class AnnexBValidator {
     }
 
     /**
-     * The v2 CRL an IACA publishes at its distribution point, judged at {@code at}: a thisUpdate more
-     * than {@link #CLOCK_SKEW} after {@code at} is reported as {@code CRL_THIS_UPDATE_IN_FUTURE}.
+     * The v2 CRL an IACA publishes at its distribution point, judged at {@code at}: a thisUpdate more than
+     * {@link #CLOCK_SKEW} after {@code at} is reported as {@code CRL_THIS_UPDATE_IN_FUTURE}. An IACA that cannot be
+     * read is reported as {@code IACA_ENCODING_INVALID}, and the checks that compare the CRL with it are skipped.
      */
     public static List<Violation> validateCrl(X509CRL crl, X509Certificate iaca, Instant at) {
+        Objects.requireNonNull(crl, "crl");
+        Objects.requireNonNull(iaca, "iaca");
         Objects.requireNonNull(at, "at");
         Report report = new Report("CRL");
-        if (!Arrays.equals(Certificates.der(Certificates.name(crl.getIssuerX500Principal())),
-                Certificates.der(Certificates.name(iaca.getSubjectX500Principal())))) {
-            report.add("CRL_ISSUER_MISMATCH", "the CRL issuer is not the IACA subject");
-        }
+        Parsed.Crl list;
         try {
-            crl.verify(iaca.getPublicKey());
-        } catch (Exception e) {
-            report.add("CRL_SIGNATURE_INVALID", "the CRL is not signed by the IACA key: " + e.getMessage());
+            list = Parsed.crl(crl);
+        } catch (PkiException e) {
+            list = null;
+            report.add("CRL_ENCODING_INVALID", e.getMessage());
         }
-        crlSignature(report, crl, iaca);
-        if (crl.getVersion() != 2) {
-            report.add("CRL_VERSION_INVALID", "the CRL version is " + crl.getVersion()
+        Parsed.Cert issuer = readIaca(report, iaca);
+        if (list == null) {
+            return report.violations();
+        }
+
+        if (issuer != null) {
+            if (!Certificates.sameName(list.issuer(), issuer.subject())) {
+                report.add("CRL_ISSUER_MISMATCH", "the CRL issuer is not the IACA subject");
+            }
+            String keyProblem = Certificates.keyProblem(issuer.spki());
+            if (keyProblem != null) {
+                report.add("CRL_SIGNATURE_INVALID", "the CRL signature cannot be verified: the IACA key is outside the"
+                        + " key profile (" + keyProblem + ")");
+            } else if (!list.signedBy(issuer.spki())) {
+                report.add("CRL_SIGNATURE_INVALID", "the CRL is not signed by the IACA key");
+            }
+        }
+        signatureAlgorithm(report, list.outerAlgorithm(), list.innerAlgorithm(),
+                issuer == null ? null : curveOf(issuer.spki()), "CRL", "tbsCertList");
+        if (list.version() != 2) {
+            report.add("CRL_VERSION_INVALID", "the CRL version is " + list.version()
                     + ", the profile requires an X.509 version 2 CRL");
         }
 
-        Ext<AuthorityKeyIdentifier> aki = read(crl, Extension.authorityKeyIdentifier, AuthorityKeyIdentifier::getInstance);
+        Ext<AuthorityKeyIdentifier> aki = read(list.extension(Extension.authorityKeyIdentifier),
+                AuthorityKeyIdentifier::getInstance);
         if (aki.malformed()) {
             report.add("CRL_AKI_MALFORMED", "the CRL authority key identifier cannot be read: " + aki.problem());
         } else {
             byte[] declared = aki.parsed() ? aki.value().getKeyIdentifier() : null;
-            byte[] iacaKeyId = keyIdentifierOf(iaca);
             if (declared == null) {
                 report.add("CRL_AKI_MISSING", "the CRL has no authority key identifier keyIdentifier");
-            } else if (iacaKeyId == null || !Arrays.equals(declared, iacaKeyId)) {
-                report.add("CRL_AKI_MISMATCH", "the CRL authority key identifier is not the IACA subject key identifier");
+            } else if (issuer != null) {
+                byte[] iacaKeyId = keyIdentifierOf(issuer);
+                if (iacaKeyId == null || !Arrays.equals(declared, iacaKeyId)) {
+                    report.add("CRL_AKI_MISMATCH", "the CRL authority key identifier is not the IACA subject key"
+                            + " identifier");
+                }
             }
-            if (aki.present() && Certificates.critical(crl, Extension.authorityKeyIdentifier)) {
+            if (aki.present() && list.critical(Extension.authorityKeyIdentifier)) {
                 report.add("CRL_AKI_CRITICAL", "the CRL authority key identifier is marked critical");
             }
         }
-        crlNumber(report, crl);
-        crlExtensions(report, crl);
-        entryExtensions(report, crl);
-        crlDates(report, crl, iaca, at);
+        crlNumber(report, list);
+        crlExtensions(report, list);
+        entryExtensions(report, list);
+        crlDates(report, list, issuer, at);
         return report.violations();
     }
 
@@ -365,6 +420,40 @@ public final class AnnexBValidator {
         return Collections.unmodifiableSortedSet(rules);
     }
 
+    /** The certificate under validation read from its DER, or {@code null} after reporting {@code <profile>_ENCODING_INVALID}. */
+    private static Parsed.Cert read(Report report, X509Certificate certificate) {
+        try {
+            return Parsed.certificate(certificate);
+        } catch (PkiException e) {
+            report.fail("ENCODING_INVALID", e.getMessage());
+            return null;
+        }
+    }
+
+    /** The IACA a DS or CRL is checked against, or {@code null} after reporting {@code IACA_ENCODING_INVALID}. */
+    private static Parsed.Cert readIaca(Report report, X509Certificate iaca) {
+        try {
+            return Parsed.certificate(iaca);
+        } catch (PkiException e) {
+            report.add("IACA_ENCODING_INVALID", "the IACA the " + report.profile + " is checked against cannot be read,"
+                    + " so the checks against it are skipped: " + e.getMessage());
+            return null;
+        }
+    }
+
+    /** A value for a message: the decoded string, or the DER in hex when it does not decode. */
+    private static String text(ASN1Encodable value) {
+        String decoded = Certificates.string(value);
+        if (decoded != null) {
+            return decoded;
+        }
+        try {
+            return "#" + Hex.toHexString(value.toASN1Primitive().getEncoded());
+        } catch (Exception e) {
+            return "(unreadable)";
+        }
+    }
+
     // ------------------------------------------------------------------ extension parsing
 
     /** An extension read from the DER: absent, parsed, or present but unreadable ({@link #malformed}). */
@@ -379,58 +468,48 @@ public final class AnnexBValidator {
         }
     }
 
-    private static <T> Ext<T> read(X509Certificate certificate, ASN1ObjectIdentifier oid, Function<ASN1Primitive, T> parser) {
-        return read(() -> certificate.getExtensionValue(oid.getId()), parser);
-    }
-
-    private static <T> Ext<T> read(X509CRL crl, ASN1ObjectIdentifier oid, Function<ASN1Primitive, T> parser) {
-        return read(() -> crl.getExtensionValue(oid.getId()), parser);
-    }
-
     /**
-     * Reads one extension value: the OCTET STRING the JCA hands back, then exactly one DER object inside it (trailing
-     * octets are an error), then the extension's own structure. Any failure makes the extension malformed.
+     * Reads one extension value: exactly one DER object inside the extension's OCTET STRING (trailing octets are an
+     * error), then the extension's own structure, decoded eagerly by {@code parser}. Any failure makes the extension
+     * malformed.
      */
-    private static <T> Ext<T> read(java.util.function.Supplier<byte[]> encoded, Function<ASN1Primitive, T> parser) {
-        byte[] wrapped;
-        try {
-            wrapped = encoded.get();
-        } catch (RuntimeException e) {
-            return new Ext<>(true, null, describe(e));
-        }
-        if (wrapped == null) {
+    private static <T> Ext<T> read(Extension extension, Function<ASN1Primitive, T> parser) {
+        if (extension == null) {
             return new Ext<>(false, null, null);
         }
         try {
-            byte[] octets = ASN1OctetString.getInstance(wrapped).getOctets();
-            ASN1Primitive primitive = ASN1Primitive.fromByteArray(octets);
-            if (primitive == null) {
-                return new Ext<>(true, null, "the extension value is empty");
-            }
-            T value = parser.apply(primitive);
+            T value = parser.apply(Parsed.strict(extension.getExtnValue().getOctets()));
             return value == null ? new Ext<>(true, null, "the extension value is empty") : new Ext<>(true, value, null);
         } catch (Exception e) {
-            return new Ext<>(true, null, describe(e));
+            return new Ext<>(true, null, Parsed.describe(e));
         }
-    }
-
-    private static String describe(Exception e) {
-        return e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
     }
 
     private static byte[] octetString(ASN1Primitive primitive) {
         return ASN1OctetString.getInstance(primitive).getOctets();
     }
 
-    private static List<GeneralName> generalNames(ASN1Primitive primitive) {
-        return List.of(GeneralNames.getInstance(primitive).getNames());
+    /** A GeneralName as its tag and decoded text; equal names are equal records. */
+    private record AltName(int tag, String value) {}
+
+    /** The GeneralNames, every value decoded here (a directoryName included) so a failure is a malformed extension. */
+    private static List<AltName> generalNames(ASN1Primitive primitive) {
+        return altNames(GeneralNames.getInstance(primitive));
+    }
+
+    private static List<AltName> altNames(GeneralNames names) {
+        List<AltName> values = new ArrayList<>();
+        for (GeneralName name : names.getNames()) {
+            values.add(new AltName(name.getTagNo(), Certificates.generalNameValue(name)));
+        }
+        return values;
     }
 
     /** The RFC 5280 key usage bits, index 0 digitalSignature through 8 decipherOnly, as {@link X509Certificate#getKeyUsage}. */
     private static boolean[] keyUsageBits(ASN1Primitive primitive) {
         ASN1BitString bits = ASN1BitString.getInstance(primitive);
         byte[] bytes = bits.getBytes();
-        boolean[] usage = new boolean[bytes.length * 8 - bits.getPadBits()];
+        boolean[] usage = new boolean[Math.max(0, bytes.length * 8 - bits.getPadBits())];
         for (int i = 0; i < usage.length; i++) {
             usage[i] = (bytes[i / 8] & (0x80 >>> (i % 8))) != 0;
         }
@@ -445,16 +524,21 @@ public final class AnnexBValidator {
         return purposes;
     }
 
-    /** A CRL distribution point, read eagerly so that a malformed one fails here and not halfway through the checks. */
-    private record Point(DistributionPointName name, List<GeneralName> names, boolean reasons, boolean crlIssuer) {}
+    /**
+     * A CRL distribution point, read eagerly so that a malformed one fails here and not halfway through the checks:
+     * the name's type ({@code null} when the point has no name), its fullName GeneralNames, and whether it restricts
+     * reasons or names a cRLIssuer.
+     */
+    private record Point(Integer type, List<AltName> names, boolean reasons, boolean crlIssuer) {}
 
     private static List<Point> distributionPoints(ASN1Primitive primitive) {
         List<Point> points = new ArrayList<>();
         for (DistributionPoint point : CRLDistPoint.getInstance(primitive).getDistributionPoints()) {
             DistributionPointName name = point.getDistributionPoint();
-            List<GeneralName> names = name != null && name.getType() == DistributionPointName.FULL_NAME
-                    ? List.of(GeneralNames.getInstance(name.getName()).getNames()) : List.of();
-            points.add(new Point(name, names, point.getReasons() != null, point.getCRLIssuer() != null));
+            List<AltName> names = name != null && name.getType() == DistributionPointName.FULL_NAME
+                    ? altNames(GeneralNames.getInstance(name.getName())) : List.of();
+            points.add(new Point(name == null ? null : name.getType(), names, point.getReasons() != null,
+                    point.getCRLIssuer() != null));
         }
         return points;
     }
@@ -464,25 +548,25 @@ public final class AnnexBValidator {
     }
 
     /** The IACA's declared subject key identifier, its RFC 5280 method 1 value when absent, null when malformed. */
-    private static byte[] keyIdentifierOf(X509Certificate iaca) {
-        Ext<byte[]> ski = read(iaca, Extension.subjectKeyIdentifier, AnnexBValidator::octetString);
+    private static byte[] keyIdentifierOf(Parsed.Cert iaca) {
+        Ext<byte[]> ski = read(iaca.extension(Extension.subjectKeyIdentifier), AnnexBValidator::octetString);
         if (ski.malformed()) {
             return null;
         }
-        return ski.parsed() ? ski.value() : Certificates.keyIdentifier(Certificates.subjectPublicKeyInfo(iaca));
+        return ski.parsed() ? ski.value() : Certificates.keyIdentifier(iaca.spki());
     }
 
     // ------------------------------------------------------------------ shared certificate checks
 
-    private static void version(Report report, X509Certificate certificate) {
-        if (certificate.getVersion() != 3) {
-            report.fail("VERSION_INVALID", "the certificate version is v" + certificate.getVersion()
+    private static void version(Report report, Parsed.Cert certificate) {
+        if (certificate.version() != 3) {
+            report.fail("VERSION_INVALID", "the certificate version is v" + certificate.version()
                     + ", the profile requires a version 3 certificate");
         }
     }
 
-    private static void serial(Report report, X509Certificate certificate) {
-        BigInteger serial = certificate.getSerialNumber();
+    private static void serial(Report report, Parsed.Cert certificate) {
+        BigInteger serial = certificate.serial();
         if (serial == null || serial.signum() <= 0) {
             report.fail("SERIAL_NOT_POSITIVE", "the serial number is not a positive integer");
             return;
@@ -497,8 +581,7 @@ public final class AnnexBValidator {
         }
     }
 
-    private static void subject(Report report, X509Certificate certificate) {
-        X500Name subject = Certificates.name(certificate.getSubjectX500Principal());
+    private static void subject(Report report, X500Name subject) {
         List<AttributeTypeAndValue> countries = Certificates.attributes(subject, BCStyle.C);
         if (countries.isEmpty()) {
             report.fail("SUBJECT_COUNTRY_MISSING", "the subject has no country (C)");
@@ -510,8 +593,10 @@ public final class AnnexBValidator {
         if (Certificates.attributes(subject, BCStyle.ST).size() > 1) {
             report.fail("SUBJECT_STATE_DUPLICATE", "the subject carries more than one state (ST)");
         }
-        String commonName = Certificates.attribute(certificate.getSubjectX500Principal(), BCStyle.CN);
-        if (commonName == null || commonName.isBlank()) {
+        // a CN that is present but cannot be decoded is reported below as an encoding failure, not as missing
+        List<AttributeTypeAndValue> commonNames = Certificates.attributes(subject, BCStyle.CN);
+        String commonName = commonNames.isEmpty() ? null : Certificates.string(commonNames.get(0).getValue());
+        if (commonNames.isEmpty() || (commonName != null && commonName.isBlank())) {
             report.fail("SUBJECT_CN_MISSING", "the subject has no common name (CN)");
         }
         for (RDN rdn : subject.getRDNs()) {
@@ -524,25 +609,31 @@ public final class AnnexBValidator {
                 } else if (BCStyle.SERIALNUMBER.equals(attribute.getType()) && !(value instanceof ASN1PrintableString)) {
                     report.fail("SUBJECT_ENCODING_INVALID", "the serialNumber attribute is a "
                             + value.getClass().getSimpleName() + "; X.520 defines it as a PrintableString");
+                } else if (value instanceof ASN1String && Certificates.string(value) == null) {
+                    report.fail("SUBJECT_ENCODING_INVALID", "the " + (label != null ? label
+                            : "attribute " + attribute.getType().getId()) + " cannot be decoded as a "
+                            + value.getClass().getSimpleName());
                 }
             }
         }
     }
 
     private static void country(Report report, AttributeTypeAndValue country) {
-        if (!(country.getValue() instanceof ASN1PrintableString)) {
-            report.fail("SUBJECT_COUNTRY_NOT_PRINTABLE", "the country is a " + country.getValue().getClass().getSimpleName()
+        ASN1Encodable value = country.getValue();
+        if (!(value instanceof ASN1PrintableString)) {
+            report.fail("SUBJECT_COUNTRY_NOT_PRINTABLE", "the country is a " + value.getClass().getSimpleName()
                     + "; X.520 countryName is a PrintableString");
         }
-        String value = Certificates.string(country.getValue());
-        if (!COUNTRIES.contains(value)) {
-            report.fail("SUBJECT_COUNTRY_INVALID", "the country " + value + " is not an ISO 3166-1 alpha-2 code");
+        String text = Certificates.string(value);
+        if (text != null && !COUNTRIES.contains(text)) {
+            report.fail("SUBJECT_COUNTRY_INVALID", "the country " + text + " is not an ISO 3166-1 alpha-2 code");
         }
     }
 
     /** The issuerAltName names, or null when the extension is absent or malformed. */
-    private static List<GeneralName> issuerAltName(Report report, X509Certificate certificate) {
-        Ext<List<GeneralName>> extension = read(certificate, Extension.issuerAlternativeName, AnnexBValidator::generalNames);
+    private static List<AltName> issuerAltName(Report report, Parsed.Cert certificate) {
+        Ext<List<AltName>> extension = read(certificate.extension(Extension.issuerAlternativeName),
+                AnnexBValidator::generalNames);
         if (extension.malformed()) {
             report.fail("ISSUER_ALT_NAME_MALFORMED", "the issuerAltName cannot be read: " + extension.problem());
             return null;
@@ -551,38 +642,31 @@ public final class AnnexBValidator {
             report.fail("ISSUER_ALT_NAME_MISSING", "the certificate has no issuerAltName URI or email");
             return extension.present() ? extension.value() : null;
         }
-        for (GeneralName name : extension.value()) {
-            int tag = name.getTagNo();
-            String value = Certificates.generalNameValue(name);
-            if (tag == GeneralName.uniformResourceIdentifier) {
-                if (!Certificates.isAbsoluteUri(value)) {
-                    report.fail("ISSUER_ALT_NAME_INVALID", "the issuerAltName URI " + value + " is not an absolute URI");
+        for (AltName name : extension.value()) {
+            if (name.tag() == GeneralName.uniformResourceIdentifier) {
+                if (!Certificates.isIssuerAltUri(name.value())) {
+                    report.fail("ISSUER_ALT_NAME_INVALID", "the issuerAltName URI " + name.value()
+                            + " is not an absolute https, http, mailto or urn URI");
                 }
-            } else if (tag == GeneralName.rfc822Name) {
-                if (!Certificates.isMailbox(value)) {
-                    report.fail("ISSUER_ALT_NAME_INVALID", "the issuerAltName email " + value + " is not an rfc822 mailbox");
+            } else if (name.tag() == GeneralName.rfc822Name) {
+                if (!Certificates.isMailbox(name.value())) {
+                    report.fail("ISSUER_ALT_NAME_INVALID", "the issuerAltName email " + name.value()
+                            + " is not an rfc822 mailbox");
                 }
             } else {
-                report.fail("ISSUER_ALT_NAME_INVALID", "the issuerAltName carries a GeneralName with tag " + tag
+                report.fail("ISSUER_ALT_NAME_INVALID", "the issuerAltName carries a GeneralName with tag " + name.tag()
                         + "; the profile allows a URI or an rfc822Name");
             }
         }
-        if (Certificates.critical(certificate, Extension.issuerAlternativeName)) {
+        if (certificate.critical(Extension.issuerAlternativeName)) {
             report.fail("ISSUER_ALT_NAME_CRITICAL", "the issuerAltName is marked critical");
         }
         return extension.value();
     }
 
-    private static Set<String> tagged(List<GeneralName> names) {
-        Set<String> values = new LinkedHashSet<>();
-        for (GeneralName name : names) {
-            values.add(name.getTagNo() + ":" + Certificates.generalNameValue(name));
-        }
-        return values;
-    }
-
-    private static void crlDistributionPoint(Report report, X509Certificate certificate) {
-        Ext<List<Point>> extension = read(certificate, Extension.cRLDistributionPoints, AnnexBValidator::distributionPoints);
+    private static void crlDistributionPoint(Report report, Parsed.Cert certificate) {
+        Ext<List<Point>> extension = read(certificate.extension(Extension.cRLDistributionPoints),
+                AnnexBValidator::distributionPoints);
         if (extension.malformed()) {
             report.fail("CRL_DP_MALFORMED", "the CRL distribution point cannot be read: " + extension.problem());
             return;
@@ -595,20 +679,20 @@ public final class AnnexBValidator {
             report.fail("CRL_DP_INVALID", "the CRL distribution point extension names no distribution point");
         }
         for (Point point : extension.value()) {
-            if (point.name() == null || point.name().getType() != DistributionPointName.FULL_NAME) {
+            if (point.type() == null || point.type() != DistributionPointName.FULL_NAME) {
                 report.fail("CRL_DP_INVALID", "the CRL distribution point is not a fullName");
                 continue;
             }
             if (point.names().isEmpty()) {
                 report.fail("CRL_DP_INVALID", "the CRL distribution point names no location");
             }
-            for (GeneralName name : point.names()) {
-                if (name.getTagNo() != GeneralName.uniformResourceIdentifier) {
+            for (AltName name : point.names()) {
+                if (name.tag() != GeneralName.uniformResourceIdentifier) {
                     report.fail("CRL_DP_INVALID", "the CRL distribution point carries a GeneralName with tag "
-                            + name.getTagNo() + "; the profile allows URIs");
-                } else if (!Certificates.isHttpUri(Certificates.generalNameValue(name))) {
-                    report.fail("CRL_DP_INVALID", "the CRL distribution point " + Certificates.generalNameValue(name)
-                            + " is not an absolute http or https URI");
+                            + name.tag() + "; the profile allows URIs");
+                } else if (!Certificates.isHttpUri(name.value())) {
+                    report.fail("CRL_DP_INVALID", "the CRL distribution point " + name.value()
+                            + " is not an absolute http or https URI with a host");
                 }
             }
             if (point.reasons()) {
@@ -618,13 +702,13 @@ public final class AnnexBValidator {
                 report.fail("CRL_DP_INVALID", "the CRL distribution point names a cRLIssuer; the IACA signs its own CRL");
             }
         }
-        if (Certificates.critical(certificate, Extension.cRLDistributionPoints)) {
+        if (certificate.critical(Extension.cRLDistributionPoints)) {
             report.fail("CRL_DP_CRITICAL", "the CRL distribution point is marked critical");
         }
     }
 
-    private static Ext<byte[]> subjectKeyIdentifier(Report report, X509Certificate certificate) {
-        Ext<byte[]> extension = read(certificate, Extension.subjectKeyIdentifier, AnnexBValidator::octetString);
+    private static Ext<byte[]> subjectKeyIdentifier(Report report, Parsed.Cert certificate) {
+        Ext<byte[]> extension = read(certificate.extension(Extension.subjectKeyIdentifier), AnnexBValidator::octetString);
         if (extension.malformed()) {
             report.fail("SKI_MALFORMED", "the subject key identifier cannot be read: " + extension.problem());
             return extension;
@@ -633,37 +717,33 @@ public final class AnnexBValidator {
             report.fail("SKI_MISSING", "the certificate has no subject key identifier");
             return extension;
         }
-        SubjectPublicKeyInfo spki = Certificates.subjectPublicKeyInfo(certificate);
+        SubjectPublicKeyInfo spki = certificate.spki();
         if (Certificates.keyProblem(spki) == null && !Arrays.equals(extension.value(), Certificates.keyIdentifier(spki))) {
             report.fail("SKI_MISMATCH", "the subject key identifier is not the RFC 5280 method 1 SHA-1 of the public key");
         }
-        if (Certificates.critical(certificate, Extension.subjectKeyIdentifier)) {
+        if (certificate.critical(Extension.subjectKeyIdentifier)) {
             report.fail("SKI_CRITICAL", "the subject key identifier is marked critical");
         }
         return extension;
     }
 
     /** The authorityKeyIdentifier, reported when malformed or critical; the key identifier is compared by the caller. */
-    private static Ext<AuthorityKeyIdentifier> authorityKeyIdentifier(Report report, X509Certificate certificate) {
-        Ext<AuthorityKeyIdentifier> extension = read(certificate, Extension.authorityKeyIdentifier,
+    private static Ext<AuthorityKeyIdentifier> authorityKeyIdentifier(Report report, Parsed.Cert certificate) {
+        Ext<AuthorityKeyIdentifier> extension = read(certificate.extension(Extension.authorityKeyIdentifier),
                 AuthorityKeyIdentifier::getInstance);
         if (extension.malformed()) {
             report.fail("AKI_MALFORMED", "the authority key identifier cannot be read: " + extension.problem());
             return extension;
         }
-        if (extension.present() && Certificates.critical(certificate, Extension.authorityKeyIdentifier)) {
+        if (extension.present() && certificate.critical(Extension.authorityKeyIdentifier)) {
             report.fail("AKI_CRITICAL", "the authority key identifier is marked critical");
         }
         return extension;
     }
 
-    private static void unknownCriticalExtension(Report report, X509Certificate certificate) {
-        Set<String> critical = certificate.getCriticalExtensionOIDs();
-        if (critical == null) {
-            return;
-        }
+    private static void unknownCriticalExtension(Report report, Parsed.Cert certificate) {
         Set<String> known = PROFILE_EXTENSIONS.get(report.profile);
-        for (String oid : new TreeSet<>(critical)) {
+        for (String oid : certificate.criticalExtensions()) {
             if (!known.contains(oid)) {
                 report.fail("UNKNOWN_CRITICAL_EXTENSION", "the certificate marks critical an extension the "
                         + report.profile + " profile does not define: " + oid);
@@ -679,8 +759,8 @@ public final class AnnexBValidator {
     }
 
     /** keyUsage: exactly the {@code required} RFC 5280 bits ({@code 1 << index}), critical. */
-    private static void keyUsage(Report report, X509Certificate certificate, int required, String names) {
-        Ext<boolean[]> extension = read(certificate, Extension.keyUsage, AnnexBValidator::keyUsageBits);
+    private static void keyUsage(Report report, Parsed.Cert certificate, int required, String names) {
+        Ext<boolean[]> extension = read(certificate.extension(Extension.keyUsage), AnnexBValidator::keyUsageBits);
         if (extension.malformed()) {
             report.fail("KEY_USAGE_MALFORMED", "the keyUsage extension cannot be read: " + extension.problem());
             return;
@@ -707,13 +787,13 @@ public final class AnnexBValidator {
         if ((actual & ~required) != 0 || beyond) {
             report.fail("KEY_USAGE_EXTRA", "the keyUsage extension allows more than " + names);
         }
-        if (!Certificates.critical(certificate, Extension.keyUsage)) {
+        if (!certificate.critical(Extension.keyUsage)) {
             report.fail("KEY_USAGE_NOT_CRITICAL", "the keyUsage extension is not critical");
         }
     }
 
-    private static void extendedKeyUsage(Report report, X509Certificate ds) {
-        Ext<List<String>> extension = read(ds, Extension.extendedKeyUsage, AnnexBValidator::extendedKeyUsages);
+    private static void extendedKeyUsage(Report report, Parsed.Cert ds) {
+        Ext<List<String>> extension = read(ds.extension(Extension.extendedKeyUsage), AnnexBValidator::extendedKeyUsages);
         if (extension.malformed()) {
             report.add("DS_EKU_MALFORMED", "the extendedKeyUsage extension cannot be read: " + extension.problem());
             return;
@@ -724,7 +804,7 @@ public final class AnnexBValidator {
             report.add("DS_EKU_INVALID", "the DS extendedKeyUsage carries purposes other than "
                     + IsoMdocProfiles.DS_EXTENDED_KEY_USAGE);
         }
-        if (extension.present() && !Certificates.critical(ds, Extension.extendedKeyUsage)) {
+        if (extension.present() && !ds.critical(Extension.extendedKeyUsage)) {
             report.add("DS_EKU_NOT_CRITICAL", "the extendedKeyUsage extension is not critical");
         }
     }
@@ -734,8 +814,8 @@ public final class AnnexBValidator {
      * 2021 profile lists none and the builder writes none, but an explicit end-entity marker is harmless); {@code CA:true}
      * is refused.
      */
-    private static void dsBasicConstraints(Report report, X509Certificate ds) {
-        Ext<BasicConstraints> extension = read(ds, Extension.basicConstraints, BasicConstraints::getInstance);
+    private static void dsBasicConstraints(Report report, Parsed.Cert ds) {
+        Ext<BasicConstraints> extension = read(ds.extension(Extension.basicConstraints), BasicConstraints::getInstance);
         if (extension.malformed()) {
             report.fail("BASIC_CONSTRAINTS_MALFORMED", "the basicConstraints extension cannot be read: "
                     + extension.problem());
@@ -744,8 +824,8 @@ public final class AnnexBValidator {
         }
     }
 
-    private static void iacaBasicConstraints(Report report, X509Certificate iaca) {
-        Ext<BasicConstraints> extension = read(iaca, Extension.basicConstraints, BasicConstraints::getInstance);
+    private static void iacaBasicConstraints(Report report, Parsed.Cert iaca) {
+        Ext<BasicConstraints> extension = read(iaca.extension(Extension.basicConstraints), BasicConstraints::getInstance);
         if (extension.malformed()) {
             report.fail("BASIC_CONSTRAINTS_MALFORMED", "the basicConstraints extension cannot be read: "
                     + extension.problem());
@@ -756,7 +836,7 @@ public final class AnnexBValidator {
                     "the IACA certificate is not marked as a CA in a basicConstraints extension");
             return;
         }
-        if (!Certificates.critical(iaca, Extension.basicConstraints)) {
+        if (!iaca.critical(Extension.basicConstraints)) {
             report.add("IACA_BASIC_CONSTRAINTS_NOT_CRITICAL", "the basicConstraints extension is not critical");
         }
         BigInteger pathLength = extension.value().getPathLenConstraint();
@@ -770,9 +850,9 @@ public final class AnnexBValidator {
      * The validity endpoints compared directly: {@code notAfter} must be after {@code notBefore} and no later than
      * {@code limit} (decision log, 2026-11-13).
      */
-    private static void validity(Report report, X509Certificate certificate, Instant limit, String cap) {
-        Instant notBefore = certificate.getNotBefore().toInstant();
-        Instant notAfter = certificate.getNotAfter().toInstant();
+    private static void validity(Report report, Parsed.Cert certificate, Instant limit, String cap) {
+        Instant notBefore = certificate.notBefore();
+        Instant notAfter = certificate.notAfter();
         if (!notAfter.isAfter(notBefore)) {
             report.fail("VALIDITY_REVERSED", "notAfter " + notAfter + " is not after notBefore " + notBefore);
             return;
@@ -783,14 +863,10 @@ public final class AnnexBValidator {
         }
     }
 
-    private static void withinIacaValidity(Report report, X509Certificate ds, X509Certificate iaca) {
-        Instant dsNotBefore = ds.getNotBefore().toInstant();
-        Instant dsNotAfter = ds.getNotAfter().toInstant();
-        Instant iacaNotBefore = iaca.getNotBefore().toInstant();
-        Instant iacaNotAfter = iaca.getNotAfter().toInstant();
-        if (dsNotBefore.isBefore(iacaNotBefore) || dsNotAfter.isAfter(iacaNotAfter)) {
-            report.add("DS_VALIDITY_OUTSIDE_IACA", "the DS validity " + dsNotBefore + " to " + dsNotAfter
-                    + " is not inside the IACA validity " + iacaNotBefore + " to " + iacaNotAfter);
+    private static void withinIacaValidity(Report report, Parsed.Cert ds, Parsed.Cert iaca) {
+        if (ds.notBefore().isBefore(iaca.notBefore()) || ds.notAfter().isAfter(iaca.notAfter())) {
+            report.add("DS_VALIDITY_OUTSIDE_IACA", "the DS validity " + ds.notBefore() + " to " + ds.notAfter()
+                    + " is not inside the IACA validity " + iaca.notBefore() + " to " + iaca.notAfter());
         }
     }
 
@@ -804,16 +880,9 @@ public final class AnnexBValidator {
         return (ASN1ObjectIdentifier) spki.getAlgorithm().getParameters().toASN1Primitive();
     }
 
-    private static void signature(Report report, X509Certificate certificate, ASN1ObjectIdentifier signerCurve) {
-        AlgorithmIdentifier outer = outerSignatureAlgorithm(certificate);
-        AlgorithmIdentifier inner = innerSignatureAlgorithm(certificate);
-        signatureAlgorithm(report, outer, inner, signerCurve, "certificate", "tbsCertificate");
-    }
-
-    private static void crlSignature(Report report, X509CRL crl, X509Certificate iaca) {
-        AlgorithmIdentifier outer = outerSignatureAlgorithm(crl);
-        AlgorithmIdentifier inner = innerSignatureAlgorithm(crl);
-        signatureAlgorithm(report, outer, inner, curveOf(Certificates.subjectPublicKeyInfo(iaca)), "CRL", "tbsCertList");
+    private static void signature(Report report, Parsed.Cert certificate, ASN1ObjectIdentifier signerCurve) {
+        signatureAlgorithm(report, certificate.outerAlgorithm(), certificate.innerAlgorithm(), signerCurve,
+                "certificate", "tbsCertificate");
     }
 
     /**
@@ -823,16 +892,16 @@ public final class AnnexBValidator {
      */
     private static void signatureAlgorithm(Report report, AlgorithmIdentifier outer, AlgorithmIdentifier inner,
                                            ASN1ObjectIdentifier signerCurve, String object, String signedPart) {
-        ASN1ObjectIdentifier declared = outer == null ? null : outer.getAlgorithm();
-        ASN1ObjectIdentifier required = declared == null ? null : Certificates.signatureCurve(declared);
+        ASN1ObjectIdentifier declared = outer.getAlgorithm();
+        ASN1ObjectIdentifier required = Certificates.signatureCurve(declared);
         if (required == null) {
-            report.fail("SIGNATURE_ALGORITHM_INVALID", "the " + object + " signature algorithm "
-                    + (declared == null ? "cannot be read" : declared.getId()) + " is not ecdsa-with-SHA256/384/512");
+            report.fail("SIGNATURE_ALGORITHM_INVALID", "the " + object + " signature algorithm " + declared.getId()
+                    + " is not ecdsa-with-SHA256/384/512");
         } else if (outer.getParameters() != null) {
             report.fail("SIGNATURE_ALGORITHM_INVALID", "the " + object + " signature algorithm " + declared.getId()
                     + " carries parameters; RFC 5758 section 3.2 requires the parameters field to be absent");
         }
-        if (inner == null || !inner.equals(outer)) {
+        if (!inner.equals(outer)) {
             report.fail("ALGORITHM_IDENTIFIER_MISMATCH", "the " + signedPart + " signature algorithm does not match the "
                     + object + " signature algorithm");
         }
@@ -842,43 +911,11 @@ public final class AnnexBValidator {
         }
     }
 
-    private static AlgorithmIdentifier innerSignatureAlgorithm(X509Certificate certificate) {
-        try {
-            return new X509CertificateHolder(certificate.getEncoded()).toASN1Structure().getTBSCertificate().getSignature();
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    private static AlgorithmIdentifier outerSignatureAlgorithm(X509Certificate certificate) {
-        try {
-            return new X509CertificateHolder(certificate.getEncoded()).getSignatureAlgorithm();
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    private static AlgorithmIdentifier innerSignatureAlgorithm(X509CRL crl) {
-        try {
-            return new X509CRLHolder(crl.getEncoded()).toASN1Structure().getTBSCertList().getSignature();
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    private static AlgorithmIdentifier outerSignatureAlgorithm(X509CRL crl) {
-        try {
-            return new X509CRLHolder(crl.getEncoded()).toASN1Structure().getSignatureAlgorithm();
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
     // -------------------------------------------------------------------- CRL
 
     /** RFC 5280 section 5.2.3: a non-negative cRLNumber of at most 20 DER content octets, so at most 2^159 - 1. */
-    private static void crlNumber(Report report, X509CRL crl) {
-        Ext<BigInteger> extension = read(crl, Extension.cRLNumber, AnnexBValidator::integer);
+    private static void crlNumber(Report report, Parsed.Crl crl) {
+        Ext<BigInteger> extension = read(crl.extension(Extension.cRLNumber), AnnexBValidator::integer);
         if (extension.malformed()) {
             report.add("CRL_NUMBER_MALFORMED", "the cRLNumber cannot be read: " + extension.problem());
             return;
@@ -891,20 +928,13 @@ public final class AnnexBValidator {
         if (!CrlBuilder.fitsCrlNumber(number)) {
             report.add("CRL_NUMBER_INVALID", "the cRLNumber " + number + " is outside 0..2^159-1 (20 DER content octets)");
         }
-        if (Certificates.critical(crl, Extension.cRLNumber)) {
+        if (crl.critical(Extension.cRLNumber)) {
             report.add("CRL_NUMBER_CRITICAL", "the cRLNumber is marked critical");
         }
     }
 
-    private static void crlExtensions(Report report, X509CRL crl) {
-        Set<String> extensions = new TreeSet<>();
-        if (crl.getCriticalExtensionOIDs() != null) {
-            extensions.addAll(crl.getCriticalExtensionOIDs());
-        }
-        if (crl.getNonCriticalExtensionOIDs() != null) {
-            extensions.addAll(crl.getNonCriticalExtensionOIDs());
-        }
-        for (String oid : extensions) {
+    private static void crlExtensions(Report report, Parsed.Crl crl) {
+        for (String oid : crl.extensionOids()) {
             if (!Extension.authorityKeyIdentifier.getId().equals(oid) && !Extension.cRLNumber.getId().equals(oid)) {
                 report.add("CRL_EXTENSION_UNEXPECTED", "the CRL carries an extension the profile does not define: " + oid);
             }
@@ -915,37 +945,41 @@ public final class AnnexBValidator {
      * Revoked entries must carry no entry extensions: the Annex B CRL profile, as the reviewers read it, allows none
      * (decision log, 2026-11-13; the table and its wording are to be confirmed against the purchased ISO text).
      */
-    private static void entryExtensions(Report report, X509CRL crl) {
-        Set<? extends X509CRLEntry> entries = crl.getRevokedCertificates();
-        if (entries == null) {
-            return;
-        }
-        for (X509CRLEntry entry : entries) {
+    private static void entryExtensions(Report report, Parsed.Crl crl) {
+        for (Parsed.Entry entry : crl.entries()) {
             if (entry.hasExtensions()) {
-                report.add("CRL_ENTRY_EXTENSION_PRESENT", "the entry for serial " + entry.getSerialNumber()
+                report.add("CRL_ENTRY_EXTENSION_PRESENT", "the entry for serial " + entry.serial()
                         + " carries extensions, which the profile does not allow");
             }
         }
     }
 
-    private static void crlDates(Report report, X509CRL crl, X509Certificate iaca, Instant at) {
-        Instant thisUpdate = crl.getThisUpdate().toInstant();
+    /**
+     * thisUpdate not more than {@link #CLOCK_SKEW} after {@code at} and not before the IACA's notBefore; nextUpdate
+     * present, after thisUpdate and not after the IACA's notAfter (decision log, 2026-11-13). The IACA-dependent
+     * checks are skipped when the IACA cannot be read.
+     */
+    private static void crlDates(Report report, Parsed.Crl crl, Parsed.Cert iaca, Instant at) {
+        Instant thisUpdate = crl.thisUpdate();
         if (thisUpdate.isAfter(at.plus(CLOCK_SKEW))) {
             report.add("CRL_THIS_UPDATE_IN_FUTURE", "the CRL thisUpdate " + thisUpdate + " is more than " + CLOCK_SKEW
                     + " after the validation instant " + at);
         }
-        if (crl.getNextUpdate() == null) {
+        if (iaca != null && thisUpdate.isBefore(iaca.notBefore())) {
+            report.add("CRL_THIS_UPDATE_BEFORE_IACA", "the CRL thisUpdate " + thisUpdate
+                    + " is before the IACA is valid from " + iaca.notBefore());
+        }
+        if (crl.nextUpdate() == null) {
             report.add("CRL_NEXT_UPDATE_MISSING", "the CRL has no nextUpdate");
             return;
         }
-        Instant nextUpdate = crl.getNextUpdate().toInstant();
+        Instant nextUpdate = crl.nextUpdate();
         if (!nextUpdate.isAfter(thisUpdate)) {
             report.add("CRL_NEXT_UPDATE_BEFORE_THIS_UPDATE", "the CRL nextUpdate is not after thisUpdate");
         }
-        Instant iacaNotAfter = iaca.getNotAfter().toInstant();
-        if (nextUpdate.isAfter(iacaNotAfter)) {
+        if (iaca != null && nextUpdate.isAfter(iaca.notAfter())) {
             report.add("CRL_NEXT_UPDATE_AFTER_IACA", "the CRL nextUpdate " + nextUpdate
-                    + " is after the IACA expires at " + iacaNotAfter);
+                    + " is after the IACA expires at " + iaca.notAfter());
         }
     }
 }

@@ -284,8 +284,8 @@ final class BadCerts {
 
     /** A conforming Document Signer certificate for the key pair, issued by the given IACA, ready to be mutated. */
     static Cert ds(KeyPair subjectKeyPair, X509Certificate iaca, KeyPair iacaKeyPair) {
-        String country = Certificates.attribute(iaca.getSubjectX500Principal(), BCStyle.C);
-        String state = Certificates.attribute(iaca.getSubjectX500Principal(), BCStyle.ST);
+        String country = Certificates.attribute(Certificates.subject(iaca), BCStyle.C);
+        String state = Certificates.attribute(Certificates.subject(iaca), BCStyle.ST);
         Cert cert = new Cert();
         cert.subject = name(country == null ? "IN" : country, state, "Bad DSC");
         cert.issuer = X500Name.getInstance(iaca.getSubjectX500Principal().getEncoded());
@@ -496,7 +496,7 @@ final class BadCerts {
         private X500Name issuer;
         private PrivateKey signingKey;
         private String signatureAlgorithm = "SHA256withECDSA";
-        private Date thisUpdate = Date.from(Instant.now().minus(Duration.ofMinutes(1)));
+        private Date thisUpdate;
         private Date nextUpdate = Date.from(Instant.now().plus(Duration.ofDays(30)));
         private boolean withNextUpdate = true;
         private final List<Ext> extensions = new ArrayList<>();
@@ -508,6 +508,10 @@ final class BadCerts {
 
         private Crl(X509Certificate iaca, KeyPair signingKey) {
             this.iaca = iaca;
+            // a minute ago, but never before the IACA exists (CRL_THIS_UPDATE_BEFORE_IACA)
+            Instant minuteAgo = Instant.now().minus(Duration.ofMinutes(1));
+            Instant iacaStart = iaca.getNotBefore().toInstant();
+            this.thisUpdate = Date.from(minuteAgo.isBefore(iacaStart) ? iacaStart : minuteAgo);
             this.issuer = X500Name.getInstance(iaca.getSubjectX500Principal().getEncoded());
             this.signingKey = signingKey.getPrivate();
             with(Extension.authorityKeyIdentifier, false, new AuthorityKeyIdentifier(Certificates.keyIdentifier(iaca)));
@@ -574,6 +578,11 @@ final class BadCerts {
 
         Crl revoke(BigInteger serial) {
             entries.add(new Entry(serial, thisUpdate, null));
+            return this;
+        }
+
+        Crl revokeAt(BigInteger serial, Date revokedAt) {
+            entries.add(new Entry(serial, revokedAt, null));
             return this;
         }
 
@@ -723,6 +732,72 @@ final class BadCerts {
     static byte[] csrWithSignatureAlgorithm(byte[] csr, String signatureOid, String signingAlgorithm, PrivateKey key) {
         return resign(csr, key, signingAlgorithm, new AlgorithmIdentifier(new ASN1ObjectIdentifier(signatureOid)),
                 elements -> elements);
+    }
+
+    /**
+     * The DER with the first occurrence of {@code find} replaced by {@code replace} (same length), for an encoding no
+     * builder writes: the signature is left as it was, so only the encoding rules may be relied on.
+     */
+    static byte[] patch(byte[] der, byte[] find, byte[] replace) {
+        if (find.length != replace.length) {
+            throw new IllegalArgumentException("a patch keeps the length");
+        }
+        outer:
+        for (int i = 0; i + find.length <= der.length; i++) {
+            for (int j = 0; j < find.length; j++) {
+                if (der[i + j] != find[j]) {
+                    continue outer;
+                }
+            }
+            byte[] patched = der.clone();
+            System.arraycopy(replace, 0, patched, i, replace.length);
+            return patched;
+        }
+        throw new IllegalArgumentException("the DER does not contain the octets to patch");
+    }
+
+    static byte[] encoded(X509Certificate certificate) {
+        try {
+            return certificate.getEncoded();
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    static byte[] encoded(X509CRL crl) {
+        try {
+            return crl.getEncoded();
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /** The certificate as the JDK's X.509 provider constructs it, which keeps attribute values it cannot type as raw octets. */
+    static X509Certificate jdkCertificate(byte[] der) {
+        return toCertificate(der);
+    }
+
+    static X509CRL jdkCrl(byte[] der) {
+        return toCrl(der);
+    }
+
+    /** The certificate as BouncyCastle's provider constructs it, which decodes dates and names only when first read. */
+    static X509Certificate bcCertificate(byte[] der) {
+        try {
+            return (X509Certificate) java.security.cert.CertificateFactory.getInstance("X.509", BC)
+                    .generateCertificate(new java.io.ByteArrayInputStream(der));
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    static X509CRL bcCrl(byte[] der) {
+        try {
+            return (X509CRL) java.security.cert.CertificateFactory.getInstance("X.509", BC)
+                    .generateCRL(new java.io.ByteArrayInputStream(der));
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
     }
 
     /** A CRL number extension the validator must reject: outside 0..2^159. */

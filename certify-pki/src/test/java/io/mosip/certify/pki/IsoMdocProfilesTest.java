@@ -20,6 +20,7 @@ import java.security.cert.X509CRL;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -51,13 +52,13 @@ class IsoMdocProfilesTest {
     @Test
     void theDsInheritsCountryStateAndIssuerAltNameFromTheIaca() {
         Fixture fixture = new Fixture();
-        assertEquals("IN", Certificates.attribute(fixture.ds.getSubjectX500Principal(), BCStyle.C));
-        assertEquals("Karnataka", Certificates.attribute(fixture.ds.getSubjectX500Principal(), BCStyle.ST));
-        assertEquals("Lorem Ipsum Demo DSC", Certificates.attribute(fixture.ds.getSubjectX500Principal(), BCStyle.CN));
+        assertEquals("IN", Certificates.attribute(Certificates.subject(fixture.ds), BCStyle.C));
+        assertEquals("Karnataka", Certificates.attribute(Certificates.subject(fixture.ds), BCStyle.ST));
+        assertEquals("Lorem Ipsum Demo DSC", Certificates.attribute(Certificates.subject(fixture.ds), BCStyle.CN));
         assertEquals(Certificates.issuerAltNames(fixture.iaca), Certificates.issuerAltNames(fixture.ds));
         assertEquals(List.of(Fixture.CRL_URI), Certificates.crlDistributionPointUris(fixture.ds));
-        assertArrayEquals(Certificates.der(Certificates.name(fixture.iaca.getSubjectX500Principal())),
-                Certificates.der(Certificates.name(fixture.ds.getIssuerX500Principal())),
+        assertArrayEquals(Certificates.der(Certificates.subject(fixture.iaca)),
+                Certificates.der(Certificates.issuer(fixture.ds)),
                 "the DS issuer is the IACA subject DER, byte for byte");
         assertArrayEquals(Certificates.keyIdentifier(fixture.iaca), Certificates.authorityKeyIdentifier(fixture.ds));
     }
@@ -94,7 +95,7 @@ class IsoMdocProfilesTest {
         assertArrayEquals(iacaCountry.toASN1Primitive().getEncoded(), dsCountry.toASN1Primitive().getEncoded(),
                 "the country keeps its bytes");
         assertEquals("Lorem Ipsum Demo DSC, 2026",
-                Certificates.attribute(ds.getSubjectX500Principal(), BCStyle.CN));
+                Certificates.attribute(Certificates.subject(ds), BCStyle.CN));
     }
 
     @Test
@@ -369,7 +370,8 @@ class IsoMdocProfilesTest {
     @Test
     void theCrlBuilderRefusesWhatTheValidatorWouldReport() {
         Fixture fixture = new Fixture();
-        Instant thisUpdate = Instant.parse("2026-11-01T00:00:00Z");
+        // inside the IACA validity and not ahead of now by more than the clock skew
+        Instant thisUpdate = fixture.iaca.getNotBefore().toInstant().plusSeconds(60);
         BigInteger serial = BigInteger.valueOf(99);
         assertRule("CRL_ENTRY_DUPLICATE", () -> CrlBuilder.forIaca(fixture.iaca, fixture.iacaKeyPair)
                 .revoke(serial, thisUpdate.minusSeconds(60)).revoke(serial, thisUpdate.minusSeconds(30)));
@@ -389,6 +391,143 @@ class IsoMdocProfilesTest {
                 .with(Extension.keyUsage, true, new KeyUsage(KeyUsage.keyCertSign))
                 .build();
         assertRule("CRL_IACA_INVALID", () -> CrlBuilder.forIaca(noCrlSign, keyPair));
+    }
+
+    /**
+     * thisUpdate may be back-dated, but not before the IACA exists and not ahead of the instant the CRL is built by more
+     * than the validator's clock skew: the builder refuses both, with the rule the validator reports.
+     */
+    @Test
+    void theCrlBuilderRefusesAThisUpdateInTheFutureOrBeforeTheIaca() {
+        KeyPair iacaKeyPair = BadCerts.ec(256);
+        Instant now = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+        X509Certificate iaca = IsoMdocProfiles.iaca(iacaKeyPair)
+                .country("IN").commonName("Back-dated IACA")
+                .issuerAltUri("https://example.test/iaca").crlDistributionPoint(Fixture.CRL_URI)
+                .notBefore(now.minus(Duration.ofDays(10))).validity(Duration.ofDays(400))
+                .build();
+
+        X509CRL backDated = CrlBuilder.forIaca(iaca, iacaKeyPair).crlNumber(BigInteger.ONE)
+                .thisUpdate(now.minus(Duration.ofDays(1))).build();
+        assertEquals(List.of(), AnnexBValidator.validateCrl(backDated, iaca));
+        X509CRL atTheSkew = CrlBuilder.forIaca(iaca, iacaKeyPair).crlNumber(BigInteger.ONE)
+                .thisUpdate(now.plus(AnnexBValidator.CLOCK_SKEW).minusSeconds(5)).build();
+        assertEquals(List.of(), AnnexBValidator.validateCrl(atTheSkew, iaca));
+
+        assertRule("CRL_THIS_UPDATE_IN_FUTURE", () -> CrlBuilder.forIaca(iaca, iacaKeyPair).crlNumber(BigInteger.ONE)
+                .thisUpdate(now.plus(Duration.ofMinutes(10))).build());
+        assertRule("CRL_THIS_UPDATE_BEFORE_IACA", () -> CrlBuilder.forIaca(iaca, iacaKeyPair).crlNumber(BigInteger.ONE)
+                .thisUpdate(iaca.getNotBefore().toInstant().minusSeconds(1)).build());
+    }
+
+    /**
+     * Every builder verifies the signature it produced under the public key a verifier will use, so a key pair whose
+     * private key belongs to another key is refused rather than turned into a certificate or CRL nobody can verify.
+     */
+    @Test
+    void aKeyPairWhosePrivateKeyBelongsToAnotherKeyIsRefused() {
+        Fixture fixture = new Fixture();
+        KeyPair unrelated = BadCerts.ec(256);
+        KeyPair mismatched = new KeyPair(fixture.iacaKeyPair.getPublic(), unrelated.getPrivate());
+
+        assertRule("IACA_KEYPAIR_MISMATCH", () -> IsoMdocProfiles.iaca(mismatched)
+                .country("IN").commonName("Mismatched IACA").issuerAltUri("https://example.test/iaca")
+                .crlDistributionPoint(Fixture.CRL_URI).build());
+        assertRule("DS_SIGNER_KEY_MISMATCH", () -> IsoMdocProfiles.ds(BadCerts.ec(256), fixture.iaca, mismatched)
+                .commonName("Mismatched DSC").build());
+        assertRule("CRL_SIGNER_KEY_MISMATCH", () -> CrlBuilder.forIaca(fixture.iaca, mismatched)
+                .crlNumber(BigInteger.ONE).build());
+
+        // a private key on another curve, and one the ECDSA algorithm cannot use at all
+        KeyPair p384 = BadCerts.ec(384);
+        assertRule("IACA_KEYPAIR_MISMATCH", () -> IsoMdocProfiles.iaca(new KeyPair(fixture.iacaKeyPair.getPublic(),
+                        p384.getPrivate()))
+                .country("IN").commonName("Other curve IACA").issuerAltUri("https://example.test/iaca")
+                .crlDistributionPoint(Fixture.CRL_URI).build());
+        KeyPair rsa = rsa();
+        assertRule("DS_SIGNER_KEY_MISMATCH", () -> IsoMdocProfiles.ds(BadCerts.ec(256), fixture.iaca,
+                new KeyPair(fixture.iacaKeyPair.getPublic(), rsa.getPrivate())).commonName("RSA signed DSC").build());
+        assertRule("CRL_SIGNER_KEY_MISMATCH", () -> CrlBuilder.forIaca(fixture.iaca,
+                new KeyPair(fixture.iacaKeyPair.getPublic(), rsa.getPrivate())).crlNumber(BigInteger.ONE).build());
+    }
+
+    /**
+     * An IACA the JDK can construct but the strict DER read cannot (its issuer country is a primitive SET) is refused by
+     * both builders with their named rule, not with a provider exception.
+     */
+    @Test
+    void theBuildersRefuseAnIacaTheyCannotRead() {
+        KeyPair iacaKeyPair = BadCerts.ec(256);
+        X509Certificate unreadable = BadCerts.jdkCertificate(BadCerts.patch(BadCerts.encoded(BadCerts.iaca(iacaKeyPair)
+                        .serial(BigInteger.ONE.shiftLeft(70).add(BigInteger.valueOf(0x5eed))).build()),
+                new byte[] {0x13, 0x02, 0x49, 0x4e}, new byte[] {0x11, 0x02, 0x49, 0x4e}));
+        assertRule("DS_IACA_INVALID", () -> IsoMdocProfiles.ds(BadCerts.ec(256), unreadable, iacaKeyPair)
+                .commonName("DSC under an unreadable IACA").build());
+        assertRule("CRL_IACA_INVALID", () -> CrlBuilder.forIaca(unreadable, iacaKeyPair));
+    }
+
+    private static KeyPair rsa() {
+        try {
+            java.security.KeyPairGenerator generator = java.security.KeyPairGenerator.getInstance("RSA");
+            generator.initialize(2048);
+            return generator.generateKeyPair();
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /**
+     * Without an explicit validity the IACA is valid for exactly 20 calendar years, notAfter inclusive, whatever the
+     * number of leap days: 7305 days would overrun the cap across 2100, which is not a leap year.
+     */
+    @Test
+    void theDefaultIacaValidityIsTwentyCalendarYears() {
+        KeyPair keyPair = BadCerts.ec(256);
+        for (String start : List.of("2097-01-01T00:00:00Z", "2026-11-13T00:00:00Z", "2028-02-29T12:00:00Z")) {
+            Instant notBefore = Instant.parse(start);
+            X509Certificate iaca = IsoMdocProfiles.iaca(keyPair).country("IN").commonName("Default validity IACA")
+                    .issuerAltUri("https://example.test/iaca").crlDistributionPoint(Fixture.CRL_URI)
+                    .notBefore(notBefore).build();
+            assertEquals(notBefore.atZone(java.time.ZoneOffset.UTC).plusYears(20).toInstant().minusSeconds(1),
+                    iaca.getNotAfter().toInstant(), start);
+            assertEquals(List.of(), AnnexBValidator.validateIaca(iaca), start);
+        }
+    }
+
+    /**
+     * issuerAltName: https, http, mailto and urn URIs only, http(s) with a host and without userinfo; a builder email
+     * needs a dotted domain whose last label is not numeric. The validator keeps the plain mailbox syntax.
+     */
+    @Test
+    void theIssuerAltNameAndCrlLocationsAreChecked() {
+        KeyPair keyPair = BadCerts.ec(256);
+        for (String uri : List.of("https://credentials.example.test/iaca", "HTTP://credentials.example.test/iaca",
+                "mailto:pki@credentials.example.test", "urn:example:mdl:iaca")) {
+            X509Certificate iaca = IsoMdocProfiles.iaca(keyPair).country("IN").commonName("Scheme IACA")
+                    .issuerAltUri(uri).crlDistributionPoint(Fixture.CRL_URI).build();
+            assertEquals(List.of(), AnnexBValidator.validateIaca(iaca), uri);
+        }
+        for (String uri : List.of("ldap://ldap.example.test/iaca", "javascript:alert(1)", "file:///etc/iaca",
+                "https:opaque", "https://user@credentials.example.test/iaca", "https://credentials.example.test:99999/iaca")) {
+            assertRule("IACA_ISSUER_ALT_NAME_INVALID", () -> IsoMdocProfiles.iaca(keyPair).country("IN")
+                    .commonName("Scheme IACA").issuerAltUri(uri).crlDistributionPoint(Fixture.CRL_URI).build());
+        }
+        for (String email : List.of("pki@localhost", "pki@123.456", "pki@example.123")) {
+            assertRule("IACA_ISSUER_ALT_NAME_INVALID", () -> IsoMdocProfiles.iaca(keyPair).country("IN")
+                    .commonName("Email IACA").issuerAltEmail(email).crlDistributionPoint(Fixture.CRL_URI).build());
+        }
+        X509Certificate dotted = IsoMdocProfiles.iaca(keyPair).country("IN").commonName("Email IACA")
+                .issuerAltEmail("pki@example.test").crlDistributionPoint(Fixture.CRL_URI).build();
+        assertEquals(List.of(), AnnexBValidator.validateIaca(dotted));
+        for (String crl : List.of("https://user@credentials.example.test/iaca.crl",
+                "https://credentials.example.test:99999/iaca.crl", "https://credentials.example.test:65536/iaca.crl")) {
+            assertRule("IACA_CRL_DP_INVALID", () -> IsoMdocProfiles.iaca(keyPair).country("IN").commonName("CRL IACA")
+                    .issuerAltUri("https://example.test/iaca").crlDistributionPoint(crl).build());
+        }
+        X509Certificate port = IsoMdocProfiles.iaca(keyPair).country("IN").commonName("CRL IACA")
+                .issuerAltUri("https://example.test/iaca")
+                .crlDistributionPoint("https://credentials.example.test:65535/iaca.crl").build();
+        assertEquals(List.of(), AnnexBValidator.validateIaca(port));
     }
 
     /** Without an explicit nextUpdate, the CRL is due again in 30 days or when the IACA expires, whichever is sooner. */
@@ -516,7 +655,7 @@ class IsoMdocProfilesTest {
 
     private static ASN1Encodable onlyValue(X509Certificate certificate, org.bouncycastle.asn1.ASN1ObjectIdentifier type) {
         List<ASN1Encodable> values = new ArrayList<>();
-        for (RDN rdn : Certificates.name(certificate.getSubjectX500Principal()).getRDNs(type)) {
+        for (RDN rdn : Certificates.subject(certificate).getRDNs(type)) {
             values.add(rdn.getFirst().getValue());
         }
         assertEquals(1, values.size(), "expected exactly one " + type);

@@ -26,7 +26,7 @@ the edition the profiles target.
 | --- | --- |
 | IACA certificate | Annex B: version 3; self-signed; subject `C` (ISO 3166-1 alpha-2) and `CN` mandatory, `ST`/`O` optional; issuerAltName non-critical; CRL distribution point; SubjectKeyIdentifier (RFC 5280 method 1); `keyUsage = keyCertSign + cRLSign` only, critical; `basicConstraints CA:true, pathLen:0`, critical; validity at most 20 years; `ecdsa-with-SHA256/384/512`. Module choice: P-256/384/521 only; the 20 years are calendar years in UTC, endpoints compared directly; extensions other than SKI, AKI, keyUsage, basicConstraints, issuerAltName and CRL DP must not be critical (an `extendedKeyUsage` marked critical is reported). |
 | Document Signer certificate | Annex B: issuer = the IACA subject; subject `C` (and `ST` when the IACA has one) equal to the IACA's, `CN` configured; AuthorityKeyIdentifier = IACA SubjectKeyIdentifier; SubjectKeyIdentifier; `keyUsage = digitalSignature` only, critical; `extendedKeyUsage = 1.0.18013.5.1.2`, critical; issuerAltName; CRL distribution point; validity at most 457 days. RFC 5280: inside the IACA's validity. Module choice: the builder writes no basicConstraints, and the validator accepts `CA:false` (critical or not) while refusing `CA:true`. |
-| CRL | RFC 5280: X.509 v2, signed by the IACA, AuthorityKeyIdentifier, cRLNumber of at most 20 octets, thisUpdate, nextUpdate. Annex B (*to be confirmed*): revoked entries carry **no entry extensions**; the builder writes none and the validator reports them. Module choice: the cRLNumber is supplied by the caller and must increase; no extension other than AKI and cRLNumber; thisUpdate not more than 5 minutes after the validation instant; nextUpdate not after the IACA's notAfter. |
+| CRL | RFC 5280: X.509 v2, signed by the IACA, AuthorityKeyIdentifier, cRLNumber of at most 20 octets, thisUpdate, nextUpdate. Annex B (*to be confirmed*): revoked entries carry **no entry extensions**; the builder writes none and the validator reports them. Module choice: the cRLNumber is supplied by the caller and must increase; no extension other than AKI and cRLNumber; thisUpdate not more than 5 minutes after the validation instant and not before the IACA's notBefore; nextUpdate not after the IACA's notAfter. |
 
 The DS builder copies the IACA's `C` and `ST` as `ASN1Encodable` values rather than through a string: RFC 4514 escaping
 turns `Foo, Bar` into `Foo\, Bar`, so a DS subject built from a string would differ from the IACA's in the type, the
@@ -43,11 +43,15 @@ rest as UTF8Strings, and the validator reports any other type (`*_SUBJECT_ENCODI
 
 ### Contact and CRL locations
 
-- issuerAltName: a URI of **any scheme**, as long as it is absolute (`https://...` and `mailto:...` both pass), or an
-  rfc822Name that is a syntactically valid mailbox (RFC 5321: dot-atom local part, letter-digit-hyphen domain labels;
-  quoted local parts and address literals are refused). Builder and validator call the same two checks.
-- CRL distribution point: `fullName` URIs that are absolute `http` or `https` URIs with a host; `ldap://`, `file:` and
-  strings that are not URIs are refused by both. No `reasons`, no `cRLIssuer`.
+- issuerAltName URI: scheme `https`, `http`, `mailto` or `urn` only (module choice); an `http(s)` URI needs a host, no
+  userinfo and a port of at most 65535. `ldap:`, `file:`, `javascript:` and relative references are refused. Builder
+  and validator call the same check.
+- issuerAltName rfc822Name: a syntactically valid mailbox (RFC 5321: dot-atom local part, letter-digit-hyphen domain
+  labels; quoted local parts and address literals are refused). The builders also require a domain of at least two
+  labels whose last label is not numeric (`pki@localhost` and `pki@123.456` are refused); the validator keeps the plain
+  syntax, so an address another issuer wrote is not judged on deliverability.
+- CRL distribution point: `fullName` URIs that are absolute `http` or `https` URIs with a host, no userinfo and a port
+  of at most 65535; `ldap://`, `file:` and strings that are not URIs are refused by both. No `reasons`, no `cRLIssuer`.
 
 ### Keys
 
@@ -63,12 +67,22 @@ enforce one allowlist:
   outside the field are refused (`CSR_KEY_INVALID` / `IACA_KEY_INVALID` / `DS_KEY_INVALID`);
 - RSA and every other key type are refused.
 
+Every builder verifies the signature it has just produced before returning it: the IACA's self-signature under the
+key pair's public key, a Document Signer and a CRL under the IACA certificate's public key. A `KeyPair` whose private
+key belongs to another key (or cannot sign with the curve's algorithm at all) is refused with `IACA_KEYPAIR_MISMATCH`,
+`DS_SIGNER_KEY_MISMATCH` or `CRL_SIGNER_KEY_MISMATCH` instead of producing an object nobody can verify; a key pair
+whose public key is not the IACA certificate's is refused earlier with `IACA_KEY_MISMATCH`.
+
 ### Validity
 
 The validator compares the endpoints: a Document Signer passes when `notAfter - notBefore <= 457 days` (exactly 457
 days passes) and an IACA when `notAfter <= notBefore + 20 calendar years` (UTC); `notAfter <= notBefore` is
 `*_VALIDITY_REVERSED`. The builders treat a validity `Duration` as the inclusive span RFC 5280 section 4.1.2.5
 describes and write `notAfter = notBefore + validity - 1s`, so their output is always inside the validator's caps.
+Without an explicit validity the IACA builder writes exactly 20 calendar years, `notAfter = notBefore + 20 years - 1s`
+(UTC): 7305 days would overrun the cap when the span holds only four leap days, as one starting in 2097 does (2100 is
+not a leap year). An explicit validity is capped at 7305 days (`IACA_MAX_VALIDITY`) and must also end within 20
+calendar years.
 
 A builder refuses a validity shorter than **one hour** (`IsoMdocProfiles.MIN_VALIDITY`, module choice; Annex B sets no
 minimum) or longer than the cap. A Document Signer never outlives its IACA: a `notBefore` earlier than the IACA's is
@@ -96,7 +110,9 @@ the clock (two CRLs published in the same second would then share a number). Pas
 than the last published CRL and at most `2^159 - 1`, and let the CLI/publisher keep the counter.
 
 `CrlBuilder` refuses what the validator would report: an IACA that fails `validateIaca` (one without `cRLSign` cannot
-sign a CRL) with `CRL_IACA_INVALID`, a revocation dated after thisUpdate (`CRL_ENTRY_DATE_INVALID`), a serial revoked
+sign a CRL, one that cannot be read) with `CRL_IACA_INVALID`, a thisUpdate more than 5 minutes after the instant it
+builds (`CRL_THIS_UPDATE_IN_FUTURE`; back-dating is allowed) or before the IACA's notBefore
+(`CRL_THIS_UPDATE_BEFORE_IACA`), a revocation dated after thisUpdate (`CRL_ENTRY_DATE_INVALID`), a serial revoked
 twice (`CRL_ENTRY_DUPLICATE`), and a nextUpdate after the IACA expires (`CRL_NEXT_UPDATE_AFTER_IACA`). thisUpdate
 defaults to the instant `build()` runs; nextUpdate defaults to 30 days later or the IACA's notAfter, whichever is
 sooner. Entries carry no extensions, so there is no reason code and no invalidity date.
@@ -123,7 +139,9 @@ X509CRL crl = CrlBuilder.forIaca(iaca, iacaKeyPair).crlNumber(BigInteger.valueOf
 ```
 
 `DsBuilder` validates the IACA it is given with `AnnexBValidator.validateIaca` and refuses to sign under one that does
-not conform (`DS_IACA_INVALID`), so a Document Signer can never be issued by an IACA the runtime would refuse.
+not conform or cannot be read (`DS_IACA_INVALID`), so a Document Signer can never be issued by an IACA the runtime
+would refuse. Both builders then read the IACA's subject, dates, key identifier, issuerAltName and CRL distribution
+point from its DER, as the validator does, never through the JCA getters.
 
 Private keys can be written and read encrypted, which the offline IACA flow (D3) needs:
 
@@ -133,11 +151,15 @@ PrivateKey key = Pem.readPrivateKey(pem, password);
 boolean encrypted = Pem.isEncryptedPrivateKey(pem);
 ```
 
-Reading an encrypted key without a password fails with `PEM_KEY_ENCRYPTED` rather than returning nothing; a legacy
-OpenSSL `EC PRIVATE KEY` block with `Proc-Type: 4,ENCRYPTED` headers is read the same way. Encrypted PKCS#8 is read
-when it uses PBES2 with PBKDF2 (what `openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256` and this library
-write) or a PKCS#12 PBE scheme older OpenSSL releases wrote; scrypt and every other scheme are refused with
-`PEM_KEY_UNSUPPORTED: unsupported PBE scheme ...` before a password is tried.
+One rule (module choice, decision log): **write** only PKCS#8 PBES2 with AES-256-CBC under PBKDF2/HMAC-SHA256, and
+**read** every scheme BouncyCastle can decrypt, so a key an operator already holds keeps working: PBES2 with PBKDF2
+(any PRF and cipher BouncyCastle supports), PKCS#5 v1 (PBES1), the PKCS#12 PBE schemes, and the traditional OpenSSL
+`EC PRIVATE KEY` block with `Proc-Type: 4,ENCRYPTED` headers. A key read under a weak scheme (anything but PBES2/PBKDF2
+with HMAC-SHA-256/384/512 and AES-CBC; the traditional block always, its key derivation is one MD5 round) is logged at
+WARNING (`System.Logger` `io.mosip.certify.pki.Pem`) with the scheme named and the `openssl pkcs8 -topk8 -v2 aes-256-cbc
+-v2prf hmacWithSHA256` command that re-encrypts it. PBES2 with scrypt and unknown schemes are refused with
+`PEM_KEY_UNSUPPORTED: unsupported PBE scheme ...` before a password is tried. Reading an encrypted key without a
+password fails with `PEM_KEY_ENCRYPTED` rather than returning nothing.
 
 ## Validation
 
@@ -156,12 +178,27 @@ duplicates flagged and values compared decoded (`ASN1String.getString()`) or as 
 and for a CRL its signature algorithm, AKI, CRL number, the absence of other CRL extensions and of entry extensions, and
 the date rules. `validateCrl(crl, iaca, at)` judges thisUpdate against `at`; the two-argument form uses now.
 
-**Malformed extensions never throw.** Every extension is read from its DER on its own: exactly one DER object inside
-the extension's OCTET STRING, then the extension's structure. One that cannot be read is reported as
-`*_SKI_MALFORMED`, `*_AKI_MALFORMED`, `*_ISSUER_ALT_NAME_MALFORMED`, `*_CRL_DP_MALFORMED`, `*_KEY_USAGE_MALFORMED`,
-`*_BASIC_CONSTRAINTS_MALFORMED`, `DS_EKU_MALFORMED`, `CRL_AKI_MALFORMED` or `CRL_NUMBER_MALFORMED`, and none of its other
-properties are assessed. A malformed extension on the IACA a Document Signer or CRL is checked against makes the
-dependent comparison fail (`DS_AKI_MISMATCH`, `DS_ISSUER_ALT_NAME_MISMATCH`, `CRL_AKI_MISMATCH`) rather than throw.
+**The validator never throws for an object a JCA provider constructed.** A JCA object is not a promise that its
+fields can be read: the JDK keeps attribute values and extensions it does not understand as raw octets, and
+BouncyCastle's provider decodes names, dates and extensions only when first asked. So each certificate or CRL is read
+once from its `getEncoded()` DER with BouncyCastle's ASN.1 structures (`Certificate`/`TBSCertificate`,
+`CertificateList`), every RDN, date, CRL entry and entry-extension list forced inside that one guarded read, and
+nothing is taken from the JCA getters. An encoding that cannot be read is `IACA_ENCODING_INVALID`,
+`DS_ENCODING_INVALID` or `CRL_ENCODING_INVALID` and no other property of that object is assessed; when the IACA a
+Document Signer or CRL is checked against cannot be read, `validateDs`/`validateCrl` report `IACA_ENCODING_INVALID`,
+run the object's own checks and skip the ones against the IACA. A subject string that cannot be decoded (a UTF8String
+that is not UTF-8) is `*_SUBJECT_ENCODING_INVALID`. Signatures are verified over the signed octets of that encoding
+with BouncyCastle's verifier and the subjectPublicKeyInfo, so the verdict does not depend on the provider that built
+the object; a Document Signer or CRL checked against an IACA whose key fails the key profile is `*_SIGNATURE_INVALID`
+(fail closed), not left unverified. Anything else thrown out of `AnnexBValidator` is a programming error.
+
+Every extension is read from its DER on its own: exactly one DER object inside the extension's OCTET STRING, then the
+extension's structure, nested names (a directoryName included) decoded in the same step. One that cannot be read is
+reported as `*_SKI_MALFORMED`, `*_AKI_MALFORMED`, `*_ISSUER_ALT_NAME_MALFORMED`, `*_CRL_DP_MALFORMED`,
+`*_KEY_USAGE_MALFORMED`, `*_BASIC_CONSTRAINTS_MALFORMED`, `DS_EKU_MALFORMED`, `CRL_AKI_MALFORMED` or
+`CRL_NUMBER_MALFORMED`, and none of its other properties are assessed. A malformed extension on the IACA a Document
+Signer or CRL is checked against makes the dependent comparison fail (`DS_AKI_MISMATCH`, `DS_ISSUER_ALT_NAME_MISMATCH`,
+`CRL_AKI_MISMATCH`) rather than throw.
 
 ## Tests
 
@@ -171,7 +208,16 @@ invalid input), one per rule, so every rule has a negative test that breaks only
 BouncyCastle refuses the certificate. Coverage is recorded, not declared: each negative assertion records its rule
 when it passes, and `everyRuleHasANegativeTest` (run last) compares the recorded rules with `AnnexBValidator.RULES`, so
 a rule cannot be published without a passing test. The baseline fixtures are fully conforming, random serials
-included. It validates the DS-to-IACA path and a revoked serial with the JDK `CertPathValidator`; it runs `openssl
+included. The encoding rules are proved with objects a provider really constructs: the JDK reading an issuer country
+whose tag was turned into a primitive SET (the shape the third-round reviewers' fuzzing found), BouncyCastle reading a
+UTCTime with a letter in it, a self-signed IACA whose CN is the UTF8String `C3 28`, an issuerAltName directoryName
+holding `FF 5A`.
+
+`AnnexBValidatorFuzzTest` mutates fixed DER baselines written once by the builders (P-256 and P-521: IACA, Document
+Signer, CRL; `src/test/resources/io/mosip/certify/pki/fuzz`) with a seeded `Random`, one to three octets per mutant,
+300 mutants per object, provider (JDK and BouncyCastle) and curve, and asserts that no validation throws and that no
+object whose own encoding differs from its baseline passes its own profile. It takes about 3 seconds; run
+`-Dtest=AnnexBValidatorFuzzTest -Dpki.fuzz.mutants=2000` for a longer run. It validates the DS-to-IACA path and a revoked serial with the JDK `CertPathValidator`; it runs `openssl
 verify -x509_strict -crl_check -CRLfile` and `openssl crl -CAfile`, and exchanges encrypted PKCS#8 keys with OpenSSL in
 both directions (`openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256` read here, ours decrypted by
 `openssl pkey`, an OpenSSL scrypt key refused by name) — skipping without `openssl` on the PATH, **failing** when `CI`
@@ -180,9 +226,9 @@ registration (`Security.addProvider` and `Security.insertProviderAt`) out of the
 
 ## Outside scope
 
-- **The Multipaz chain check** (an independent JVM mDoc verifier as a merge gate) is deferred to **M-01/M-06**, where
-  the shared verifier module and the DSC trust-anchor policy live; this module keeps the JDK `CertPathValidator` and
-  OpenSSL as its independent implementations.
+- **The Multipaz chain check** listed in the M-04 spec (an independent JVM mDoc verifier as a merge gate) is deferred to
+  **M-01/M-06**, where the shared verifier module and the DSC trust-anchor policy live (decision log, 2026-11-13,
+  pending owner review); this module keeps the JDK `CertPathValidator` and OpenSSL as its independent implementations.
 - A VICAL, IACA publication and CRL refresh belong to M-08; `certify-pki` only writes the objects.
 - Brainpool curves are excluded by decision (see "Keys" above); supporting them is a new decision, not a code change.
 - Confirming the *to be confirmed* readings of Annex B (the CRL entry-extension rule above) against the purchased ISO

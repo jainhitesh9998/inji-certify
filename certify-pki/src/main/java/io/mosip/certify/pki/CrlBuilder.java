@@ -1,11 +1,11 @@
 package io.mosip.certify.pki;
 
-import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.asn1.x509.AuthorityKeyIdentifier;
 import org.bouncycastle.asn1.x509.CRLNumber;
 import org.bouncycastle.asn1.x509.Extension;
 import org.bouncycastle.asn1.x509.Extensions;
 import org.bouncycastle.cert.CertIOException;
+import org.bouncycastle.cert.X509CRLHolder;
 import org.bouncycastle.cert.X509v2CRLBuilder;
 
 import java.math.BigInteger;
@@ -15,10 +15,8 @@ import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.Arrays;
 import java.util.Date;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
@@ -36,15 +34,18 @@ import java.util.Objects;
  * a number and a verifier could not tell the newer from the older.
  *
  * <p>The builder refuses what the validator would report: an IACA that fails {@link AnnexBValidator#validateIaca} (one
- * without {@code cRLSign} cannot sign a CRL), a CRL number outside 0..2^159-1, a revocation dated after thisUpdate, a
- * serial revoked twice and a nextUpdate after the IACA expires.
+ * without {@code cRLSign} cannot sign a CRL), a CRL number outside 0..2^159-1, a thisUpdate more than
+ * {@link AnnexBValidator#CLOCK_SKEW} after the instant it builds or before the IACA's notBefore, a revocation dated
+ * after thisUpdate, a serial revoked twice and a nextUpdate after the IACA expires. A thisUpdate in the past is allowed.
+ * The signature it produces is verified under the IACA certificate's public key before the CRL is returned, so a key
+ * pair whose private key belongs to another key is refused ({@code CRL_SIGNER_KEY_MISMATCH}).
  */
 public final class CrlBuilder {
 
     /** nextUpdate when the caller does not set one: 30 days after thisUpdate, or the IACA's notAfter if sooner. */
     private static final Duration DEFAULT_REFRESH = Duration.ofDays(30);
 
-    private final X509Certificate iaca;
+    private final Parsed.Cert iaca;
     private final KeyPair iacaKeyPair;
     private final Map<BigInteger, Instant> entries = new LinkedHashMap<>();
     /** thisUpdate as set by the caller; {@code null} means the instant {@link #build} runs. */
@@ -53,16 +54,8 @@ public final class CrlBuilder {
     private BigInteger crlNumber;
 
     private CrlBuilder(X509Certificate iaca, KeyPair iacaKeyPair) {
-        this.iaca = Objects.requireNonNull(iaca, "iaca");
         this.iacaKeyPair = Objects.requireNonNull(iacaKeyPair, "iacaKeyPair");
-        if (!Arrays.equals(iaca.getPublicKey().getEncoded(), iacaKeyPair.getPublic().getEncoded())) {
-            throw new PkiException("IACA_KEY_MISMATCH: the IACA signing key does not match the IACA certificate");
-        }
-        List<AnnexBValidator.Violation> violations = AnnexBValidator.validateIaca(iaca);
-        if (!violations.isEmpty()) {
-            throw new PkiException("CRL_IACA_INVALID: the IACA does not meet the Annex B profile, so it cannot sign"
-                    + " a CRL: " + violations.get(0));
-        }
+        this.iaca = IsoMdocProfiles.conformingIaca(Objects.requireNonNull(iaca, "iaca"), iacaKeyPair, "CRL_IACA_INVALID");
     }
 
     /** A v2 CRL issued by the given IACA, which must pass {@link AnnexBValidator#validateIaca}. */
@@ -70,7 +63,11 @@ public final class CrlBuilder {
         return new CrlBuilder(iaca, iacaKeyPair);
     }
 
-    /** thisUpdate, truncated to whole seconds; default the instant {@link #build} runs. */
+    /**
+     * thisUpdate, truncated to whole seconds; default the instant {@link #build} runs. It may lie in the past, but not
+     * before the IACA's notBefore ({@code CRL_THIS_UPDATE_BEFORE_IACA}) and not more than
+     * {@link AnnexBValidator#CLOCK_SKEW} after the instant {@link #build} runs ({@code CRL_THIS_UPDATE_IN_FUTURE}).
+     */
     public CrlBuilder thisUpdate(Instant thisUpdate) {
         this.thisUpdate = Objects.requireNonNull(thisUpdate, "thisUpdate").truncatedTo(ChronoUnit.SECONDS);
         return this;
@@ -122,8 +119,17 @@ public final class CrlBuilder {
             throw new PkiException("CRL_NUMBER_INVALID: the cRLNumber " + crlNumber
                     + " is outside 0..2^159-1 (20 DER content octets)");
         }
-        Instant issued = thisUpdate != null ? thisUpdate : Instant.now().truncatedTo(ChronoUnit.SECONDS);
-        Instant iacaNotAfter = iaca.getNotAfter().toInstant();
+        Instant now = Instant.now();
+        Instant issued = thisUpdate != null ? thisUpdate : now.truncatedTo(ChronoUnit.SECONDS);
+        if (issued.isAfter(now.plus(AnnexBValidator.CLOCK_SKEW))) {
+            throw new PkiException("CRL_THIS_UPDATE_IN_FUTURE: thisUpdate " + issued + " is more than "
+                    + AnnexBValidator.CLOCK_SKEW + " after now; a CRL cannot be dated ahead of its publication");
+        }
+        if (issued.isBefore(iaca.notBefore())) {
+            throw new PkiException("CRL_THIS_UPDATE_BEFORE_IACA: thisUpdate " + issued + " is before the IACA is valid"
+                    + " from " + iaca.notBefore());
+        }
+        Instant iacaNotAfter = iaca.notAfter();
         if (!issued.isBefore(iacaNotAfter)) {
             throw new PkiException("CRL_IACA_EXPIRED: the IACA expires at " + iacaNotAfter
                     + ", before the CRL's thisUpdate " + issued);
@@ -144,8 +150,8 @@ public final class CrlBuilder {
         }
         entries.forEach((serial, revokedAt) -> checkRevocationDate(serial, revokedAt, issued));
 
-        X509v2CRLBuilder builder = new X509v2CRLBuilder(
-                X500Name.getInstance(iaca.getSubjectX500Principal().getEncoded()), Date.from(issued));
+        // the IACA subject as parsed, so the CRL issuer is its DER unchanged
+        X509v2CRLBuilder builder = new X509v2CRLBuilder(iaca.subject(), Date.from(issued));
         builder.setNextUpdate(Date.from(next));
         entries.forEach((serial, revokedAt) -> builder.addCRLEntry(serial, Date.from(revokedAt), (Extensions) null));
         try {
@@ -156,7 +162,20 @@ public final class CrlBuilder {
             throw new PkiException("Cannot add an extension to the CRL", e);
         }
         String algorithm = Certificates.signatureAlgorithm(iacaKeyPair.getPublic(), "IACA");
-        return Certificates.crl(builder.build(Certificates.signer(iacaKeyPair.getPrivate(), algorithm)));
+        X509CRLHolder signed;
+        try {
+            signed = builder.build(Certificates.signer(iacaKeyPair.getPrivate(), algorithm, "CRL_SIGNER_KEY_MISMATCH"));
+        } catch (PkiException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            throw new PkiException("CRL_SIGNER_KEY_MISMATCH: the CRL cannot be signed with the private key: "
+                    + Parsed.describe(e), e);
+        }
+        if (!Certificates.verifies(signed, iaca.spki())) {
+            throw new PkiException("CRL_SIGNER_KEY_MISMATCH: the CRL signature does not verify under the IACA"
+                    + " certificate's public key, so the IACA private key belongs to another key pair");
+        }
+        return Certificates.crl(signed);
     }
 
     /** RFC 5280 section 5.2.3: a non-negative cRLNumber of at most 20 DER content octets, so 0..2^159-1. */

@@ -1,6 +1,7 @@
 package io.mosip.certify.pki;
 
 import org.bouncycastle.asn1.ASN1Encodable;
+import org.bouncycastle.asn1.ASN1Encoding;
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.ASN1OctetString;
 import org.bouncycastle.asn1.ASN1Primitive;
@@ -15,7 +16,6 @@ import org.bouncycastle.asn1.x509.DistributionPointName;
 import org.bouncycastle.asn1.x509.Extension;
 import org.bouncycastle.asn1.x509.GeneralName;
 import org.bouncycastle.asn1.x509.GeneralNames;
-import org.bouncycastle.asn1.x509.SubjectKeyIdentifier;
 import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo;
 import org.bouncycastle.asn1.sec.SECObjectIdentifiers;
 import org.bouncycastle.asn1.x9.ECNamedCurveTable;
@@ -30,12 +30,12 @@ import org.bouncycastle.math.ec.ECPoint;
 import org.bouncycastle.operator.ContentSigner;
 import org.bouncycastle.operator.OperatorCreationException;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
+import org.bouncycastle.operator.jcajce.JcaContentVerifierProviderBuilder;
 
 import java.io.IOException;
 import java.math.BigInteger;
 import java.net.URI;
 import java.net.URISyntaxException;
-import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.PrivateKey;
@@ -48,11 +48,12 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Pattern;
-import javax.security.auth.x500.X500Principal;
 
 /**
  * DER, extension, name and signature helpers shared by the Annex B builders, the CSR parser and the validator.
@@ -94,20 +95,21 @@ final class Certificates {
 
     // ---------------------------------------------------------------- names
 
-    static X500Name name(X500Principal principal) {
-        return X500Name.getInstance(principal.getEncoded());
-    }
-
-    static X500Name name(X509Certificate certificate) {
-        return name(certificate.getSubjectX500Principal());
-    }
-
     /** The DER encoding of a name, for byte-equality comparisons that must not depend on re-encoding. */
     static byte[] der(X500Name name) {
         try {
             return name.getEncoded();
         } catch (IOException e) {
             throw new PkiException("Cannot encode the name", e);
+        }
+    }
+
+    /** Whether two names have the same DER encoding; a name that cannot be encoded equals nothing. */
+    static boolean sameName(X500Name a, X500Name b) {
+        try {
+            return Arrays.equals(a.getEncoded(), b.getEncoded());
+        } catch (IOException | RuntimeException e) {
+            return false;
         }
     }
 
@@ -124,44 +126,88 @@ final class Certificates {
         return attributes;
     }
 
-    static List<AttributeTypeAndValue> attributes(X500Principal principal, ASN1ObjectIdentifier type) {
-        return attributes(name(principal), type);
+    /** The first value of an attribute anywhere in the name, as its ASN.1 value, or {@code null} when there is none. */
+    static ASN1Encodable value(X500Name name, ASN1ObjectIdentifier type) {
+        List<AttributeTypeAndValue> attributes = attributes(name, type);
+        return attributes.isEmpty() ? null : attributes.get(0).getValue();
     }
 
-    /** The decoded value of a directory string attribute, whatever its ASN.1 string type: never an escaped form. */
+    /**
+     * The decoded value of a directory string attribute, whatever its ASN.1 string type: never an escaped form. Returns
+     * {@code null} when the value cannot be decoded (a UTF8String that is not UTF-8, for one), so a caller reports it
+     * instead of throwing.
+     */
     static String string(ASN1Encodable value) {
-        return value instanceof ASN1String string ? string.getString() : value.toString();
+        try {
+            return value instanceof ASN1String string ? string.getString() : value.toString();
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
-    /** The first value of a single-valued attribute, or {@code null} when the name has none. */
-    static String attribute(X500Principal principal, ASN1ObjectIdentifier type) {
-        List<AttributeTypeAndValue> attributes = attributes(principal, type);
-        return attributes.isEmpty() ? null : string(attributes.get(0).getValue());
+    /** The decoded first value of an attribute, or {@code null} when the name has none or it cannot be decoded. */
+    static String attribute(X500Name name, ASN1ObjectIdentifier type) {
+        ASN1Encodable value = value(name, type);
+        return value == null ? null : string(value);
+    }
+
+    /**
+     * Whether two attribute values are the same: equal decoded strings when both decode, equal DER otherwise, so an
+     * undecodable value is never equal to a different one and never throws.
+     */
+    static boolean sameValue(ASN1Encodable a, ASN1Encodable b) {
+        String left = string(a);
+        String right = string(b);
+        if (left != null && right != null) {
+            return left.equals(right);
+        }
+        try {
+            return Arrays.equals(a.toASN1Primitive().getEncoded(), b.toASN1Primitive().getEncoded());
+        } catch (IOException | RuntimeException e) {
+            return false;
+        }
+    }
+
+    /** The subject of a certificate, read from its DER. */
+    static X500Name subject(X509Certificate certificate) {
+        return Parsed.certificate(certificate).subject();
+    }
+
+    /** The issuer of a certificate, read from its DER. */
+    static X500Name issuer(X509Certificate certificate) {
+        return Parsed.certificate(certificate).issuer();
     }
 
     // ----------------------------------------------------------- extensions
 
-    /** The DER value of an extension, or {@code null} when the certificate does not carry it. */
+    /** The DER value inside an extension's OCTET STRING, or {@code null} when the certificate does not carry it. */
+    static byte[] extension(Parsed.Cert certificate, ASN1ObjectIdentifier oid) {
+        Extension extension = certificate.extension(oid);
+        return extension == null ? null : extension.getExtnValue().getOctets();
+    }
+
     static byte[] extension(X509Certificate certificate, ASN1ObjectIdentifier oid) {
-        byte[] encoded = certificate.getExtensionValue(oid.getId());
-        return encoded == null ? null : ASN1OctetString.getInstance(encoded).getOctets();
+        return extension(Parsed.certificate(certificate), oid);
     }
 
-    /** Whether the certificate carries the extension and marks it critical. */
-    static boolean critical(X509Certificate certificate, ASN1ObjectIdentifier oid) {
-        return certificate.getCriticalExtensionOIDs() != null
-                && certificate.getCriticalExtensionOIDs().contains(oid.getId());
+    /**
+     * The SKI a certificate declares, and the RFC 5280 method 1 value of its key when it declares none. A declared SKI
+     * that is not exactly one OCTET STRING is refused with {@link PkiException}.
+     */
+    static byte[] keyIdentifier(Parsed.Cert certificate) {
+        byte[] declared = extension(certificate, Extension.subjectKeyIdentifier);
+        if (declared == null) {
+            return keyIdentifier(certificate.spki());
+        }
+        try {
+            return ASN1OctetString.getInstance(Parsed.strict(declared)).getOctets();
+        } catch (IOException | RuntimeException e) {
+            throw new PkiException("the subject key identifier cannot be read: " + Parsed.describe(e), e);
+        }
     }
 
-    /** Whether the CRL carries the extension and marks it critical. */
-    static boolean critical(X509CRL crl, ASN1ObjectIdentifier oid) {
-        return crl.getCriticalExtensionOIDs() != null && crl.getCriticalExtensionOIDs().contains(oid.getId());
-    }
-
-    /** The SubjectKeyIdentifier extension value, or {@code null} when absent. */
-    static byte[] subjectKeyIdentifier(X509Certificate certificate) {
-        byte[] extension = extension(certificate, Extension.subjectKeyIdentifier);
-        return extension == null ? null : SubjectKeyIdentifier.getInstance(extension).getKeyIdentifier();
+    static byte[] keyIdentifier(X509Certificate certificate) {
+        return keyIdentifier(Parsed.certificate(certificate));
     }
 
     /** The AuthorityKeyIdentifier keyIdentifier of a certificate, or {@code null} when absent. */
@@ -170,15 +216,31 @@ final class Certificates {
         return extension == null ? null : AuthorityKeyIdentifier.getInstance(extension).getKeyIdentifier();
     }
 
-    /** The SKI of a certificate when it declares one, and the RFC 5280 method 1 value of its key otherwise. */
-    static byte[] keyIdentifier(X509Certificate certificate) {
-        byte[] declared = subjectKeyIdentifier(certificate);
-        return declared != null ? declared : keyIdentifier(subjectPublicKeyInfo(certificate));
+    /** The subjectPublicKeyInfo a JCA key encodes to; a key that cannot be encoded is refused with {@code rule}. */
+    static SubjectPublicKeyInfo spki(PublicKey key, String rule) {
+        try {
+            SubjectPublicKeyInfo spki = SubjectPublicKeyInfo.getInstance(key.getEncoded());
+            if (spki == null) {
+                throw new IllegalArgumentException("the key has no X.509 encoding");
+            }
+            return spki;
+        } catch (RuntimeException e) {
+            throw new PkiException(rule + ": the public key cannot be read: " + Parsed.describe(e), e);
+        }
     }
 
-    /** The subjectPublicKeyInfo a JCA key encodes to. */
     static SubjectPublicKeyInfo spki(PublicKey key) {
-        return SubjectPublicKeyInfo.getInstance(key.getEncoded());
+        return spki(key, "KEY_INVALID");
+    }
+
+    /** Whether a JCA public key encodes to exactly the given subjectPublicKeyInfo. */
+    static boolean sameKey(SubjectPublicKeyInfo expected, PublicKey key) {
+        try {
+            return Arrays.equals(expected.getEncoded(ASN1Encoding.DER),
+                    SubjectPublicKeyInfo.getInstance(key.getEncoded()).getEncoded(ASN1Encoding.DER));
+        } catch (IOException | RuntimeException e) {
+            return false;
+        }
     }
 
     /** The RFC 5280 section 4.2.1.2 method 1 key identifier: SHA-1 over the subjectPublicKey BIT STRING contents. */
@@ -199,42 +261,46 @@ final class Certificates {
         }
     }
 
-    /** The issuerAltName extension values with their GeneralName tags, empty when absent. */
-    static List<GeneralName> issuerAltNameNames(X509Certificate certificate) {
-        byte[] extension = extension(certificate, Extension.issuerAlternativeName);
-        return extension == null ? List.of() : List.of(GeneralNames.getInstance(extension).getNames());
-    }
-
     /** The issuerAltName values as {@code tag:value} pairs, so a URI never compares equal to an email of the same text. */
     static List<String> issuerAltNames(X509Certificate certificate) {
+        byte[] extension = extension(certificate, Extension.issuerAlternativeName);
         List<String> values = new ArrayList<>();
-        for (GeneralName name : issuerAltNameNames(certificate)) {
-            values.add(name.getTagNo() + ":" + generalNameValue(name));
+        if (extension != null) {
+            for (GeneralName name : GeneralNames.getInstance(extension).getNames()) {
+                values.add(name.getTagNo() + ":" + generalNameValue(name));
+            }
         }
         return values;
     }
 
+    /**
+     * The text of a GeneralName: the IA5String of a URI, rfc822Name or dNSName, the RFC 4514 form of a directoryName.
+     * Decoding a directoryName can fail on an undecodable string inside it; callers decode inside their own guard.
+     */
     static String generalNameValue(GeneralName name) {
         ASN1Encodable value = name.getName();
         return value instanceof ASN1String string ? string.getString() : value.toString();
     }
 
     /**
-     * An issuerAltName value with an optional URI and an optional rfc822 email. The URI may use any scheme (an
-     * {@code https:} page or a {@code mailto:} address) as long as it is absolute; the email must be a mailbox. The
-     * validator applies the same two checks.
+     * An issuerAltName value with an optional URI and an optional rfc822 email, refusing what a verifier could not use:
+     * the URI must pass {@link #isIssuerAltUri} and the email {@link #isMailbox} with a domain of at least two labels
+     * and a non-numeric last one ({@link #isRoutableMailbox}). The validator applies the URI check and the plain
+     * mailbox syntax.
      */
     static GeneralNames issuerAltNames(String uri, String email) {
         List<GeneralName> names = new ArrayList<>(2);
         if (uri != null) {
-            if (!isAbsoluteUri(uri)) {
-                throw new PkiException("IACA_ISSUER_ALT_NAME_INVALID: " + uri + " is not an absolute URI");
+            if (!isIssuerAltUri(uri)) {
+                throw new PkiException("IACA_ISSUER_ALT_NAME_INVALID: " + uri
+                        + " is not an absolute https, http, mailto or urn URI");
             }
             names.add(new GeneralName(GeneralName.uniformResourceIdentifier, uri));
         }
         if (email != null) {
-            if (!isMailbox(email)) {
-                throw new PkiException("IACA_ISSUER_ALT_NAME_INVALID: " + email + " is not an rfc822 mailbox");
+            if (!isRoutableMailbox(email)) {
+                throw new PkiException("IACA_ISSUER_ALT_NAME_INVALID: " + email + " is not an rfc822 mailbox with a"
+                        + " dotted domain whose last label is not numeric");
             }
             names.add(new GeneralName(GeneralName.rfc822Name, email));
         }
@@ -246,8 +312,7 @@ final class Certificates {
 
     /**
      * Whether the value is an absolute URI (RFC 3986 section 4.3: a scheme and a non-empty scheme-specific part) made
-     * of printable ASCII, which is what an IA5String GeneralName can carry. Any scheme is accepted; callers that need a
-     * fetchable location use {@link #isHttpUri}.
+     * of printable ASCII, which is what an IA5String GeneralName can carry.
      */
     static boolean isAbsoluteUri(String value) {
         if (value == null || value.isEmpty()) {
@@ -268,7 +333,27 @@ final class Certificates {
         }
     }
 
-    /** Whether the value is an absolute {@code http} or {@code https} URI with a host: a location a verifier can fetch. */
+    /**
+     * Whether the value is an issuerAltName URI this module accepts (decision log, 2026-11-13): an {@code https} or
+     * {@code http} URI that passes {@link #isHttpUri}, or an absolute {@code mailto} or {@code urn} URI. Builder and
+     * validator apply the same check.
+     */
+    static boolean isIssuerAltUri(String value) {
+        if (!isAbsoluteUri(value)) {
+            return false;
+        }
+        String scheme = value.substring(0, value.indexOf(':')).toLowerCase(Locale.ROOT);
+        return switch (scheme) {
+            case "https", "http" -> isHttpUri(value);
+            case "mailto", "urn" -> true;
+            default -> false;
+        };
+    }
+
+    /**
+     * Whether the value is an absolute {@code http} or {@code https} URI with a host, no userinfo and a port, if any,
+     * no greater than 65535: a location a verifier can fetch.
+     */
     static boolean isHttpUri(String value) {
         if (!isAbsoluteUri(value)) {
             return false;
@@ -277,6 +362,8 @@ final class Certificates {
             URI uri = new URI(value);
             String scheme = uri.getScheme();
             return uri.getHost() != null && !uri.getHost().isEmpty()
+                    && uri.getRawUserInfo() == null
+                    && uri.getPort() <= 65_535
                     && ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme));
         } catch (URISyntaxException e) {
             return false;
@@ -286,7 +373,8 @@ final class Certificates {
     /**
      * Whether the value is an RFC 5280 rfc822Name mailbox (RFC 5321 section 4.1.2): a dot-atom local part of at most 64
      * octets, {@code @}, and a domain of letter-digit-hyphen labels of at most 255 octets. Quoted local parts and address
-     * literals are not accepted (decision log, 2026-11-13).
+     * literals are not accepted (decision log, 2026-11-13). The validator applies this syntax only; the builders also
+     * require {@link #isRoutableMailbox}.
      */
     static boolean isMailbox(String value) {
         if (value == null) {
@@ -314,6 +402,19 @@ final class Certificates {
         return true;
     }
 
+    /**
+     * A {@link #isMailbox mailbox} whose domain has at least two labels and a last label that is not all digits, so
+     * {@code pki@localhost} and {@code pki@123.456} are refused: what a builder writes must be deliverable.
+     */
+    static boolean isRoutableMailbox(String value) {
+        if (!isMailbox(value)) {
+            return false;
+        }
+        String domain = value.substring(value.indexOf('@') + 1);
+        int dot = domain.lastIndexOf('.');
+        return dot > 0 && !domain.substring(dot + 1).chars().allMatch(Character::isDigit);
+    }
+
     // ------------------------------------------------------- distribution point
 
     /** A CRL distribution point extension with one http(s) URI, refusing anything a verifier could not fetch. */
@@ -327,16 +428,14 @@ final class Certificates {
                         null, null)});
     }
 
-    /** The distribution points of the CRL distribution point extension, empty when absent. */
-    static List<DistributionPoint> distributionPoints(X509Certificate certificate) {
-        byte[] extension = extension(certificate, Extension.cRLDistributionPoints);
-        return extension == null ? List.of() : List.of(CRLDistPoint.getInstance(extension).getDistributionPoints());
-    }
-
     /** The URI distribution points of the CRL distribution point extension, empty when absent. */
-    static List<String> crlDistributionPointUris(X509Certificate certificate) {
+    static List<String> crlDistributionPointUris(Parsed.Cert certificate) {
+        byte[] extension = extension(certificate, Extension.cRLDistributionPoints);
         List<String> uris = new ArrayList<>();
-        for (DistributionPoint point : distributionPoints(certificate)) {
+        if (extension == null) {
+            return uris;
+        }
+        for (DistributionPoint point : CRLDistPoint.getInstance(extension).getDistributionPoints()) {
             DistributionPointName name = point.getDistributionPoint();
             if (name != null && name.getType() == DistributionPointName.FULL_NAME) {
                 for (GeneralName generalName : GeneralNames.getInstance(name.getName()).getNames()) {
@@ -349,16 +448,11 @@ final class Certificates {
         return uris;
     }
 
-    // ---------------------------------------------------------------- keys
-
-    /** The subjectPublicKeyInfo of a certificate, read from its DER so an unusable key cannot fail the read. */
-    static SubjectPublicKeyInfo subjectPublicKeyInfo(X509Certificate certificate) {
-        try {
-            return new X509CertificateHolder(certificate.getEncoded()).getSubjectPublicKeyInfo();
-        } catch (Exception e) {
-            throw new PkiException("Cannot read the certificate DER", e);
-        }
+    static List<String> crlDistributionPointUris(X509Certificate certificate) {
+        return crlDistributionPointUris(Parsed.certificate(certificate));
     }
+
+    // ---------------------------------------------------------------- keys
 
     /**
      * Why the subjectPublicKeyInfo is outside the key profile of this module, or {@code null} when it conforms: EC only,
@@ -406,7 +500,7 @@ final class Certificates {
 
     /** The named-curve OID of the key, refusing anything outside the allowlist with {@code profile + "_KEY_INVALID"}. */
     static ASN1ObjectIdentifier curve(PublicKey key, String profile) {
-        SubjectPublicKeyInfo spki = spki(key);
+        SubjectPublicKeyInfo spki = spki(key, profile + "_KEY_INVALID");
         String problem = keyProblem(spki);
         if (problem != null) {
             throw new PkiException(profile + "_KEY_INVALID: " + problem);
@@ -499,11 +593,16 @@ final class Certificates {
 
     // ------------------------------------------------------------ signing
 
-    static ContentSigner signer(PrivateKey key, String signatureAlgorithm) {
+    /**
+     * A signer for the private key; a key the algorithm cannot sign with (an RSA key for {@code SHA256withECDSA}, for
+     * one) is refused with {@code rule}, the builder's key-pair consistency rule.
+     */
+    static ContentSigner signer(PrivateKey key, String signatureAlgorithm, String rule) {
         try {
             return new JcaContentSignerBuilder(signatureAlgorithm).setProvider(BC).build(key);
-        } catch (OperatorCreationException e) {
-            throw new PkiException("Cannot sign with " + signatureAlgorithm, e);
+        } catch (OperatorCreationException | RuntimeException e) {
+            throw new PkiException(rule + ": the private key cannot sign with " + signatureAlgorithm + ": "
+                    + Parsed.describe(e), e);
         }
     }
 
@@ -523,12 +622,20 @@ final class Certificates {
         }
     }
 
-    /** Whether the certificate is signed by the given key. */
-    static boolean signedBy(X509Certificate certificate, PublicKey key) {
+    /** Whether a certificate a builder just signed verifies under the expected public key. */
+    static boolean verifies(X509CertificateHolder holder, SubjectPublicKeyInfo key) {
         try {
-            certificate.verify(key);
-            return true;
-        } catch (GeneralSecurityException e) {
+            return holder.isSignatureValid(new JcaContentVerifierProviderBuilder().setProvider(BC).build(key));
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** Whether a CRL a builder just signed verifies under the expected public key. */
+    static boolean verifies(X509CRLHolder holder, SubjectPublicKeyInfo key) {
+        try {
+            return holder.isSignatureValid(new JcaContentVerifierProviderBuilder().setProvider(BC).build(key));
+        } catch (Exception e) {
             return false;
         }
     }
