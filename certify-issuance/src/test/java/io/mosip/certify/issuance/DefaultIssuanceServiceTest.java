@@ -320,7 +320,28 @@ class DefaultIssuanceServiceTest {
         IssuanceException e = assertThrows(IssuanceException.class, () -> multi.issue(command("farmer").build()));
 
         assertEquals(IssuanceException.ISSUANCE_FAILED, e.getErrorCode());
-        assertTrue(e.getMessage().contains("must name one"), e.getMessage());
+        // the message design/extensibility produced, byte for byte: it reaches error_description on two surfaces
+        assertEquals("Several data sources registered; the configuration must name one", e.getMessage());
+    }
+
+    @Test
+    void noRegisteredSourceKeepsTheHistoricalMessage() {
+        DefaultIssuanceService none = service(List.of(), null);
+
+        IssuanceException e = assertThrows(IssuanceException.class, () -> none.issue(command("farmer").build()));
+
+        assertEquals(IssuanceException.ISSUANCE_FAILED, e.getErrorCode());
+        assertEquals("No data source registered", e.getMessage(), "unchanged from design/extensibility");
+    }
+
+    @Test
+    void anUnregisteredSourceIdKeepsTheHistoricalMessage() {
+        registry.register(templated("mdl", "no-such-source"));
+
+        IssuanceException e = assertThrows(IssuanceException.class, () -> service.issue(command("mdl").build()));
+
+        assertEquals(IssuanceException.ISSUANCE_FAILED, e.getErrorCode());
+        assertEquals("No data source with id 'no-such-source'", e.getMessage(), "unchanged from design/extensibility");
     }
 
     @Test

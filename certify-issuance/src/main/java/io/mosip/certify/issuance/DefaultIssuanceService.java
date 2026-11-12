@@ -191,7 +191,7 @@ public class DefaultIssuanceService implements IssuanceService {
                 claims = new ClaimSet(supplied, Map.of(PROVENANCE_SUPPLIED, Boolean.TRUE));
             }
             default -> {
-                CredentialDataSource source = dataSource(configuration.dataSourceId(), configuration.id());
+                CredentialDataSource source = dataSource(configuration.dataSourceId());
                 ClaimSet fetched;
                 try {
                     fetched = source.fetch(context, configuration);
@@ -253,15 +253,20 @@ public class DefaultIssuanceService implements IssuanceService {
 
     /**
      * The configuration's source: the id it names, else {@link #defaultDataSourceId}, else the only registered source.
-     * A default id that no provider registered (a deployment without the data-provider plugin, say) falls through so a
-     * single-source deployment keeps issuing as it did before several sources could coexist.
+     * The default id is the data-provider plugin's source, which the service always registers
+     * ({@code DataProviderPluginDataSource} is a component and resolves the plugin lazily), so a default id no
+     * provider registered only happens outside the service, with a bare core; it falls through so a single-source
+     * deployment keeps issuing as it did before several sources could coexist.
+     *
+     * <p>The messages are the ones this method has always produced: they reach a client's
+     * {@code error_description} through the compatibility and draft-13 surfaces, so changing them would change bytes
+     * on the wire (CLAUDE.md rule 1).</p>
      */
-    private CredentialDataSource dataSource(String configuredId, String configurationId) {
+    private CredentialDataSource dataSource(String configuredId) {
         if (configuredId != null) {
             CredentialDataSource found = dataSources.get(configuredId);
             if (found == null) {
-                throw new IssuanceException(IssuanceException.ISSUANCE_FAILED,
-                        "No data source with id '" + configuredId + "' for configuration " + configurationId);
+                throw new IssuanceException(IssuanceException.ISSUANCE_FAILED, "No data source with id '" + configuredId + "'");
             }
             return found;
         }
@@ -275,9 +280,7 @@ public class DefaultIssuanceService implements IssuanceService {
             return dataSources.values().iterator().next();
         }
         throw new IssuanceException(IssuanceException.ISSUANCE_FAILED,
-                dataSources.isEmpty()
-                        ? "No data source registered for configuration " + configurationId
-                        : "Several data sources registered; configuration " + configurationId + " must name one");
+                dataSources.isEmpty() ? "No data source registered" : "Several data sources registered; the configuration must name one");
     }
 
     private static <T> T required(Map<String, T> byId, String id, String what) {

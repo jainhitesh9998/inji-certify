@@ -30,8 +30,9 @@ become the template data map (deeply immutable), and a missing claim or no match
 `invalid_credential_request`). Fields in `binary-fields` name a path relative to the JSON file's directory; their bytes
 are read once at startup and served as base64url without padding, the shape an mDoc `bstr` element such as `portrait`
 takes from the template. Absolute paths and paths escaping the JSON directory (checked after resolving symlinks, so a
-Kubernetes ConfigMap's `..data/` links are fine) are refused at startup, as are a missing file, malformed JSON, a JSON
-file above 5 MiB and a binary file above 1 MiB. With no `sources.<id>` entry the feature is off.
+Kubernetes ConfigMap's `..data/` links are fine) are refused at startup, as are a missing or non-regular file,
+malformed JSON (a duplicate record key and trailing content included), a JSON file above 5 MiB, a binary file above
+1 MiB and more than 50 MiB read in total for one source. With no `sources.<id>` entry the feature is off.
 
 Ids with a `-` (`mdl-demo`) work in properties and YAML files. They cannot be expressed as environment variables:
 `CERTIFY_DATASOURCE_FILE_SOURCES_MDL_DEMO_PATH` binds the id `mdl.demo`, not `mdl-demo`, so an environment-only
@@ -44,3 +45,12 @@ the token to name the holder. It authenticates nobody itself. On the public demo
 `/pre-authorized-data` are public, so anyone who can mint an offer for `mdl-demo-1` receives that synthetic holder's
 mDL. That is acceptable **only** because this data is synthetic. With real data, `/pre-authorized-data` must not be
 public, or the authorization server must authenticate the holder before it issues the token whose `sub` lands here.
+
+### The directory is trusted too
+
+Containment is checked before the read: a field's path is resolved, compared with the JSON file's directory, and only
+then read. These are two steps, so the directory is trusted to be writable **only by the deployment** that configures
+the source. A writer that can replace a link or a file between the check and the read can make the read follow a path
+that was not checked, and a hard link gives a file outside the directory a name inside it that passes the check. Both
+are out of scope: closing them needs a descriptor-relative open (`openat` with `O_NOFOLLOW`), not a path check. Mount
+the directory read-only, from a volume only the deployment writes.

@@ -48,7 +48,7 @@ public class D13ErrorAdvice {
                 body.put("error_description", e.getMessage());
                 return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(body);
             }
-            // draft 13 (OpenID4VCI draft-13 section 6.3) has no credential_request_denied: answer the code it does have
+            // draft 13 (OpenID4VCI draft-13 section 7.3.1) has no credential_request_denied: answer the code it does have
             case IssuanceException.CREDENTIAL_REQUEST_DENIED -> {
                 body.put("error", IssuanceException.INVALID_CREDENTIAL_REQUEST);
                 body.put("error_description", e.getMessage());

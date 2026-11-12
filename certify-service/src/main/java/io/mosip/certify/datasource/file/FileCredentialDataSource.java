@@ -1,8 +1,11 @@
 package io.mosip.certify.datasource.file;
 
+import com.fasterxml.jackson.core.StreamReadFeature;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.json.JsonMapper;
 import io.mosip.certify.issuance.IssuanceException;
 import io.mosip.certify.oid4vci.DataProviderPluginDataSource;
 import io.mosip.certify.spi.ClaimSet;
@@ -45,6 +48,14 @@ import java.util.Objects;
  * points outside the directory is refused while a Kubernetes ConfigMap's layout (files linked into {@code ..data/}
  * in the same directory) is accepted.</p>
  *
+ * <p><b>The directory is trusted.</b> Containment is checked before the read: the path is resolved, compared with the
+ * JSON file's directory and only then read. Those are two steps, so a writer that can replace a link or a file between
+ * the check and the read can still make the read follow a path that was not checked, and a hard link is a name rather
+ * than a path, so a file outside the directory reached through one passes the check. Both are out of scope: this source
+ * assumes the directory is writable only by the deployment that configures it (a mounted ConfigMap or a data volume),
+ * and closing the gap needs a descriptor-relative open ({@code openat} with {@code O_NOFOLLOW}), which Java's file API
+ * does not expose portably.</p>
+ *
  * <p><b>Trust.</b> The record is selected by a claim of the token the authorization server issued; this source trusts
  * that issuer's {@code sub} to name the holder. It therefore does not authenticate anyone itself: with a synthetic
  * demo deployment (D12) anyone who can mint an offer for a demo holder receives that holder's credential, which is
@@ -74,7 +85,15 @@ public final class FileCredentialDataSource implements CredentialDataSource {
     /** The most one source may read across its JSON file and all binary files (50 MiB). */
     static final long MAX_TOTAL_BYTES = 50L * 1024 * 1024;
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    /**
+     * Strict on purpose: a repeated record key would keep the last value, so which subject's data is served would depend
+     * on where in the file the duplicate sits, and a second document after the first object is a deployment mistake
+     * rather than data to ignore. Both are refused at startup with the file named.
+     */
+    private static final ObjectMapper MAPPER = JsonMapper.builder()
+            .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
+            .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+            .build();
     private static final Logger log = LoggerFactory.getLogger(FileCredentialDataSource.class);
     private static final TypeReference<LinkedHashMap<String, Object>> RECORD = new TypeReference<>() {};
 
@@ -207,7 +226,7 @@ public final class FileCredentialDataSource implements CredentialDataSource {
             throw new IllegalStateException(what + " escapes " + directory + ": '" + value + "'");
         }
         if (!Files.isRegularFile(resolved)) {
-            throw new IllegalStateException(what + " names a missing file: '" + resolved + "'");
+            throw new IllegalStateException(what + " names a missing or non-regular file: '" + resolved + "'");
         }
         // a symlink is followed before it is trusted: a ConfigMap links into ..data/ inside the directory, an attacker
         // would link outside it, where a file's bytes are none of this source's business

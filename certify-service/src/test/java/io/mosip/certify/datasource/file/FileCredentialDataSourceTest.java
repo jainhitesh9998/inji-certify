@@ -301,7 +301,25 @@ class FileCredentialDataSourceTest {
                 new FileDataSourceProperties.Source(write("portrait.json", """
                         {"alice": {"portrait": "absent.jpg"}}
                         """), "sub", List.of("portrait"))));
-        assertTrue(missingPortrait.getMessage().contains("missing file"), missingPortrait.getMessage());
+        assertTrue(missingPortrait.getMessage().contains("missing or non-regular file"), missingPortrait.getMessage());
+
+        // a repeated record key would leave one subject's data dependent on where the duplicate sits: refused, not
+        // resolved last-wins
+        IllegalStateException duplicate = assertThrows(IllegalStateException.class, () -> new FileCredentialDataSource("demo",
+                new FileDataSourceProperties.Source(write("duplicate.json", """
+                        {"alice": {"given_name": "Asha"}, "alice": {"given_name": "Mallory"}}
+                        """), "sub", List.of())));
+        assertTrue(duplicate.getMessage().contains("not readable JSON") && duplicate.getMessage().toLowerCase().contains("duplicate"),
+                duplicate.getMessage());
+
+        // a second document after the first object is a deployment mistake, not data to ignore
+        IllegalStateException trailing = assertThrows(IllegalStateException.class, () -> new FileCredentialDataSource("demo",
+                new FileDataSourceProperties.Source(write("trailing.json", """
+                        {"alice": {"given_name": "Asha"}}
+                        {"bob": {"given_name": "Ravi"}}
+                        """), "sub", List.of())));
+        assertTrue(trailing.getMessage().contains("not readable JSON") && trailing.getMessage().toLowerCase().contains("trailing"),
+                trailing.getMessage());
 
         IllegalStateException noPath = assertThrows(IllegalStateException.class, () -> new FileCredentialDataSource("demo",
                 new FileDataSourceProperties.Source(null, "sub", List.of())));
