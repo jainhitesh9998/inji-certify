@@ -194,6 +194,32 @@ class MdocWireTest {
     }
 
     @Test
+    void elementValuesAreTypedByTable5() {
+        CBORObject issuerSigned = issuerSigned(issue(MdlFixtures.mdl()));
+        Map<Integer, CBORObject> items = itemsById(issuerSigned, MdlFixtures.MDL_NAMESPACE);
+        Map<String, CBORObject> byIdentifier = new LinkedHashMap<>();
+        items.forEach((id, item) -> byIdentifier.put(item.get("elementIdentifier").AsString(), item.get("elementValue")));
+
+        CBORObject portrait = byIdentifier.get("portrait");
+        assertEquals(CBORType.ByteString, portrait.getType(), "portrait is a bstr (7.2.1 Table 5)");
+        assertEquals(2, portrait.EncodeToBytes()[0] >> 5, "major type 2 on the wire");
+        assertArrayEquals(MdlFixtures.JPEG, portrait.GetByteString());
+
+        CBORObject birthDate = byIdentifier.get("birth_date");
+        assertTrue(birthDate.HasMostOuterTag(1004), "birth_date is a full-date (#6.1004)");
+        assertEquals("1990-01-01", birthDate.Untag().AsString());
+
+        CBORObject privileges = byIdentifier.get("driving_privileges");
+        assertEquals(CBORType.Array, privileges.getType());
+        assertEquals("B", privileges.get(0).get("vehicle_category_code").AsString());
+        assertEquals(1004, privileges.get(0).get("issue_date").getMostOuterTag().ToInt32Checked());
+        assertEquals("01", privileges.get(0).get("codes").get(0).get("code").AsString());
+
+        assertEquals(CBORType.TextString, byIdentifier.get("family_name").getType());
+        assertEquals(CBORType.TextString, byIdentifier.get("un_distinguishing_sign").getType());
+    }
+
+    @Test
     void deviceKeyIsACoseKeyWithoutAlgLabel() {
         CBORObject deviceKey = mso(issuerSigned(issue(MdlFixtures.mdl()))).get("deviceKeyInfo").get("deviceKey");
         assertEquals(2, deviceKey.get(CBORObject.FromObject(1)).AsInt32(), "kty EC2");
@@ -286,6 +312,33 @@ class MdocWireTest {
     }
 
     @Test
+    void invalidMdlDocumentsAreRefused() {
+        FormatException missing = assertThrows(FormatException.class, () -> formatter().build(ClaimSet.of(MdlFixtures.without("given_name")),
+                MdlFixtures.configuration(formatter()), MdlFixtures.context(), MdlFixtures.holder()));
+        assertEquals("mdoc_data_model_invalid", missing.getErrorCode());
+        assertTrue(missing.getMessage().contains("given_name"), missing.getMessage());
+
+        FormatException portrait = assertThrows(FormatException.class, () -> formatter().build(
+                ClaimSet.of(MdlFixtures.with("portrait", Base64.getEncoder().encodeToString("not a jpeg".getBytes()))),
+                MdlFixtures.configuration(formatter()), MdlFixtures.context(), MdlFixtures.holder()));
+        assertEquals("mdoc_data_model_invalid", portrait.getErrorCode());
+        assertTrue(portrait.getMessage().contains("JPEG"), portrait.getMessage());
+
+        FormatException country = assertThrows(FormatException.class, () -> formatter().build(
+                ClaimSet.of(MdlFixtures.with("issuing_country", "in")), MdlFixtures.configuration(formatter()),
+                MdlFixtures.context(), MdlFixtures.holder()));
+        assertEquals("mdoc_data_model_invalid", country.getErrorCode());
+
+        // the DSC belongs to IN, the document claims US: refused at signing time, where the certificate is known
+        UnsignedCredential unsigned = formatter().build(ClaimSet.of(MdlFixtures.with("issuing_country", "US")),
+                MdlFixtures.configuration(formatter()), MdlFixtures.context(), MdlFixtures.holder());
+        FormatException mismatch = assertThrows(FormatException.class,
+                () -> formatter().sign(unsigned, MdlFixtures.signing(MdlFixtures.dsc()), MdlFixtures.context()));
+        assertEquals("mdoc_data_model_invalid", mismatch.getErrorCode());
+        assertTrue(mismatch.getMessage().contains("US") && mismatch.getMessage().contains("IN"), mismatch.getMessage());
+    }
+
+    @Test
     void aTemplateDocTypeMustMatchTheConfiguration() {
         Map<String, Object> document = new LinkedHashMap<>(MdlFixtures.mdl());
         document.put("docType", "org.iso.18013.5.1.mDL.other");
@@ -295,4 +348,45 @@ class MdocWireTest {
         assertTrue(mismatch.getMessage().contains("org.iso.18013.5.1.mDL.other"), mismatch.getMessage());
     }
 
+    @Test
+    void untypedNamespacesKeepTheDateHeuristicAndTakeOverrides() {
+        Map<String, Object> document = MdlFixtures.mdl();
+        List<Map<String, Object>> custom = new ArrayList<>();
+        custom.add(MdlFixtures.item("issued_on", "2020-05-05"));
+        custom.add(MdlFixtures.item("photo", Base64.getEncoder().encodeToString(MdlFixtures.JPEG)));
+        custom.add(MdlFixtures.item("level", "3"));
+        ((Map<String, Object>) document.get("nameSpaces")).put("org.example.custom", custom);
+
+        // without a type table the date heuristic and plain strings still apply
+        CBORObject heuristic = issuerSigned(issue(document));
+        Map<String, CBORObject> values = valuesByIdentifier(heuristic, "org.example.custom");
+        assertTrue(values.get("issued_on").HasMostOuterTag(1004), "untyped YYYY-MM-DD keeps the tag-1004 heuristic");
+        assertEquals(CBORType.TextString, values.get("photo").getType(), "untyped values stay as the template wrote them");
+
+        // with formatConfig.elementTypes the same namespace is typed
+        Map<String, Object> typedConfig = Map.of("docType", MdlFixtures.MDL_DOCTYPE,
+                "elementTypes", Map.of("org.example.custom", Map.of("photo", "bstr", "level", "uint")));
+        MdocFormatter formatter = formatter();
+        UnsignedCredential unsigned = formatter.build(ClaimSet.of(document), MdlFixtures.configuration(formatter, typedConfig),
+                MdlFixtures.context(), MdlFixtures.holder());
+        IssuedCredential issued = formatter.sign(unsigned, MdlFixtures.signing(MdlFixtures.dsc()), MdlFixtures.context());
+        Map<String, CBORObject> typed = valuesByIdentifier(issuerSigned((String) issued.credential()), "org.example.custom");
+        assertEquals(CBORType.ByteString, typed.get("photo").getType());
+        assertEquals(CBORType.Integer, typed.get("level").getType());
+    }
+
+    private static Map<String, CBORObject> valuesByIdentifier(CBORObject issuerSigned, String namespace) {
+        Map<String, CBORObject> values = new LinkedHashMap<>();
+        itemsById(issuerSigned, namespace).forEach((id, item) ->
+                values.put(item.get("elementIdentifier").AsString(), item.get("elementValue")));
+        return values;
+    }
+
+    @Test
+    void anUnknownConfiguredElementTypeIsATemplateError() {
+        FormatException unknown = assertThrows(FormatException.class, () -> formatter().parseConfig(
+                Map.of("docType", MdlFixtures.MDL_DOCTYPE, "elementTypes", Map.of("org.example.custom", Map.of("photo", "jpeg")))));
+        assertEquals(MdocConstants.ERROR_TEMPLATE, unknown.getErrorCode());
+        assertTrue(unknown.getMessage().contains("jpeg"), unknown.getMessage());
+    }
 }

@@ -154,6 +154,25 @@ final class MdlFixtures {
         return privilege;
     }
 
+    /** The document with one element removed, for the mandatory-element tests. */
+    static Map<String, Object> without(String identifier) {
+        Map<String, Object> document = mdl();
+        List<Map<String, Object>> items = items(document, MDL_NAMESPACE);
+        items.removeIf(item -> identifier.equals(item.get("elementIdentifier")));
+        return document;
+    }
+
+    /** The document with one element's value replaced. */
+    static Map<String, Object> with(String identifier, Object value) {
+        Map<String, Object> document = mdl();
+        for (Map<String, Object> item : items(document, MDL_NAMESPACE)) {
+            if (identifier.equals(item.get("elementIdentifier"))) {
+                item.put("elementValue", value);
+            }
+        }
+        return document;
+    }
+
     @SuppressWarnings("unchecked")
     static List<Map<String, Object>> items(Map<String, Object> document, String namespace) {
         return (List<Map<String, Object>>) ((Map<String, Object>) document.get("nameSpaces")).get(namespace);

@@ -20,6 +20,7 @@ import java.time.Instant;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -28,19 +29,22 @@ import java.util.Map;
  * IssuerAuth COSE_Sign1 (alg protected, x5chain unprotected, untagged) through the {@link SigningContext} and returns
  * the base64url CBOR IssuerSigned structure, exactly as the legacy path does.
  *
- * <p>The document type is checked here, before anything is signed: a template whose {@code docType} differs from the
- * configuration's {@code doctype} is a template error (ISO/IEC 18013-5 9.1.2.4). {@code validityInfo} is finalised at
- * signing time (decision D7): the build step only prepares it for a preview.
+ * <p>The document type and the data model are checked here, before anything is signed: a template whose {@code docType}
+ * differs from the configuration's {@code doctype} is a template error, and an {@code org.iso.18013.5.1.mDL} that
+ * breaks ISO/IEC 18013-5 7.2.1 Table 5 is {@code mdoc_data_model_invalid}. {@code validityInfo} is finalised at signing
+ * time (D7): the build step only prepares it for a preview.
  */
 public class MdocFormatter implements CredentialFormatter {
 
     public static final String FORMAT = "mso_mdoc";
     static final String ATTRIBUTE_NAMESPACES = "taggedNamespaces";
+    static final String ATTRIBUTE_ELEMENTS = "elementValues";
     static final String RAW_DOCTYPE = "docType";
 
     private final MdocProcessor processor;
     private final MdocProperties properties;
     private final ObjectMapper objectMapper;
+    private final MdocDataModelValidator validator = new MdocDataModelValidator();
 
     public MdocFormatter(ObjectMapper objectMapper, MdocProperties properties) {
         this.objectMapper = objectMapper;
@@ -56,6 +60,9 @@ public class MdocFormatter implements CredentialFormatter {
     @Override
     public FormatConfig parseConfig(Map<String, Object> raw) {
         Map<String, Object> copy = raw == null ? Map.of() : raw;
+        if (copy.get(MdocConstants.ELEMENT_TYPES) != null) {
+            MdocElementTypes.of(copy.get(MdocConstants.ELEMENT_TYPES)); // refuse a malformed table when the row is saved
+        }
         MdocProcessor.digestAlgorithmName(properties.digestAlgorithm());
         return new FormatConfig.Generic(copy, String.valueOf(copy.get(RAW_DOCTYPE)));
     }
@@ -78,23 +85,28 @@ public class MdocFormatter implements CredentialFormatter {
             params.put(MdocConstants._HOLDER_ID, holder.value());
         }
         String configuredDocType = configuredDocType(configuration);
+        MdocElementTypes elementTypes = MdocElementTypes.forConfig(configuration.formatConfig());
         Instant now = context == null ? Instant.now() : context.now();
         try {
-            Map<String, Object> mDocJson = processor.processTemplatedJson(objectMapper.writeValueAsString(claims.claims()), params, now);
+            Map<String, Object> mDocJson = processor.processTemplatedJson(objectMapper.writeValueAsString(claims.claims()), params,
+                    elementTypes, now);
             String templateDocType = String.valueOf(mDocJson.get("_docType"));
             if (!configuredDocType.equals(templateDocType)) {
                 throw new FormatException(MdocConstants.ERROR_TEMPLATE, "The template's docType " + templateDocType
                         + " differs from the configuration's doctype " + configuredDocType);
             }
+            Map<String, Map<String, Object>> elementValues = elementValues(mDocJson);
+            validator.validate(configuredDocType, elementValues);
             // a preview has no signing key yet: the signing step replaces this with the finalised validity
             mDocJson.put(MdocConstants.VALIDITY_INFO, MdocProcessor.validityInfo(now, properties.validity(), null));
 
             Map<Object, Object> deviceKey = MdocCoseKey.fromHolder(holder == null ? null : holder.value(), objectMapper);
             Map<String, Object> salted = MdocProcessor.addRandomSalts(mDocJson);
             Map<String, Map<Integer, byte[]>> digests = new HashMap<>();
-            Map<String, Object> taggedNamespaces = MdocProcessor.calculateDigests(salted, digests, properties.digestAlgorithm());
+            // the encoded items, not COSE DataItems: the preview returns the attributes as JSON
+            Map<String, List<byte[]>> encodedNamespaces = MdocProcessor.calculateDigests(salted, digests, properties.digestAlgorithm());
             Map<String, Object> mso = processor.createMobileSecurityObject(mDocJson, digests, deviceKey);
-            return new UnsignedCredential(FORMAT, mso, Map.of(ATTRIBUTE_NAMESPACES, taggedNamespaces));
+            return new UnsignedCredential(FORMAT, mso, Map.of(ATTRIBUTE_NAMESPACES, encodedNamespaces, ATTRIBUTE_ELEMENTS, elementValues));
         } catch (FormatException e) {
             throw e;
         } catch (Exception e) {
@@ -110,6 +122,9 @@ public class MdocFormatter implements CredentialFormatter {
             X509Certificate leaf = signing.key().chain() == null ? null : signing.key().chain().leaf().orElse(null);
             // 9.1.2.4: validityInfo is decided when the document is signed, and never outlives the DSC
             Map<String, Object> mso = new HashMap<>(credential.asMap());
+            Map<String, Map<String, Object>> elementValues = (Map<String, Map<String, Object>>) credential.attributes()
+                    .getOrDefault(ATTRIBUTE_ELEMENTS, Map.of());
+            validator.validateAgainstCertificate(String.valueOf(mso.get(MdocConstants.DOCTYPE)), elementValues, leaf);
             mso.put(MdocConstants.VALIDITY_INFO,
                     MdocProcessor.validityInfo(now, properties.validity(), leaf == null ? null : leaf.getNotAfter().toInstant()));
 
@@ -122,8 +137,10 @@ public class MdocFormatter implements CredentialFormatter {
                 throw new FormatException("certificate_chain_invalid", e.getMessage(), e);
             }
             byte[] issuerAuth = CoseEnvelope.sign1(msoCbor, policy, signing.key(), signing.signer());
-            Map<String, Object> namespaces = (Map<String, Object>) credential.attributes().getOrDefault(ATTRIBUTE_NAMESPACES, Map.of());
-            Map<String, Object> issuerSigned = MdocProcessor.createIssuerSignedStructure(namespaces, issuerAuth);
+            Map<String, List<byte[]>> encodedNamespaces = (Map<String, List<byte[]>>) credential.attributes()
+                    .getOrDefault(ATTRIBUTE_NAMESPACES, Map.of());
+            Map<String, Object> issuerSigned = MdocProcessor.createIssuerSignedStructure(
+                    MdocProcessor.taggedNamespaces(encodedNamespaces), issuerAuth);
             String encoded = Base64.getUrlEncoder().withoutPadding().encodeToString(MdocProcessor.encodeToCBOR(issuerSigned));
             return new IssuedCredential(FORMAT, encoded, null, Map.of("docType", String.valueOf(mso.get(MdocConstants.DOCTYPE))));
         } catch (FormatException e) {
@@ -140,5 +157,11 @@ public class MdocFormatter implements CredentialFormatter {
                     "the configuration carries no doctype for format " + FORMAT);
         }
         return String.valueOf(doctype);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Map<String, Object>> elementValues(Map<String, Object> mDocJson) {
+        Object values = mDocJson.get(MdocProcessor.ELEMENT_VALUES);
+        return values instanceof Map<?, ?> map ? (Map<String, Map<String, Object>>) map : Map.of();
     }
 }

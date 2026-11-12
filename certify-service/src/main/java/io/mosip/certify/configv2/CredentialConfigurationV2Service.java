@@ -52,6 +52,14 @@ import java.util.stream.Collectors;
 public class CredentialConfigurationV2Service {
 
     static final HolderBinding PREVIEW_HOLDER = HolderBinding.did("did:example:preview-holder", "jwt");
+    /**
+     * An mDoc preview needs a device key the MSO can carry; a placeholder DID cannot be turned into a COSE_Key, so the
+     * dry run uses a fixed P-256 {@code did:jwk} (the value is public and never signs anything).
+     */
+    static final HolderBinding PREVIEW_MDOC_HOLDER = HolderBinding.did("did:jwk:" + java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(
+            ("{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\",\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"}")
+                    .getBytes(java.nio.charset.StandardCharsets.UTF_8)), "jwt");
+    static final String FORMAT_MSO_MDOC = "mso_mdoc";
 
     private final CredentialConfigRepository configurations;
     private final CredentialTemplateRepository templates;
@@ -157,10 +165,14 @@ public class CredentialConfigurationV2Service {
     public CredentialConfigurationV2.PreviewResponse preview(String id, CredentialConfigurationV2.PreviewRequest request) {
         CredentialConfig row = find(tenant(), id);
         CredentialConfiguration configuration = registry.toConfiguration(row);
-        HolderBinding holder = request == null || request.holder() == null ? PREVIEW_HOLDER : holderOf(request.holder());
+        HolderBinding holder = request == null || request.holder() == null ? previewHolder(configuration) : holderOf(request.holder());
         Map<String, Object> claims = request == null || request.claims() == null ? Map.of() : request.claims();
         UnsignedCredential unsigned = render(configuration, ClaimSet.of(claims), holder);
         return new CredentialConfigurationV2.PreviewResponse(unsigned.format(), unsigned.document(), unsigned.attributes());
+    }
+
+    private static HolderBinding previewHolder(CredentialConfiguration configuration) {
+        return FORMAT_MSO_MDOC.equals(configuration.format()) ? PREVIEW_MDOC_HOLDER : PREVIEW_HOLDER;
     }
 
     private void validate(CredentialConfigurationV2 body, String tenant, CredentialConfig existing) {
@@ -301,7 +313,8 @@ public class CredentialConfigurationV2Service {
         if (sampleClaims == null) {
             return;
         }
-        render(registry.toConfiguration(row), ClaimSet.of(sampleClaims), PREVIEW_HOLDER);
+        CredentialConfiguration configuration = registry.toConfiguration(row);
+        render(configuration, ClaimSet.of(sampleClaims), previewHolder(configuration));
     }
 
     private UnsignedCredential render(CredentialConfiguration configuration, ClaimSet claims, HolderBinding holder) {
@@ -309,6 +322,10 @@ public class CredentialConfigurationV2Service {
                 Authorization.NONE, List.of(holder), ProtocolVersion.OID4VCI_1_0, "preview-" + UUID.randomUUID(), Instant.now(), Map.of());
         try {
             return issuanceService.preview(configuration, claims, context, holder);
+        } catch (io.mosip.certify.spi.FormatException e) {
+            // surfaces the format's own rule (e.g. mdoc_data_model_invalid) instead of a generic render failure
+            log.warn("Configuration {} did not render: {} {}", configuration.id(), e.getErrorCode(), e.getMessage());
+            throw new ConfigV2Exception(400, ConfigV2Exception.TEMPLATE_RENDER_FAILED, e.getErrorCode() + ": " + e.getMessage());
         } catch (RuntimeException e) {
             log.warn("Configuration {} did not render: {}", configuration.id(), e.getMessage());
             throw new ConfigV2Exception(400, ConfigV2Exception.TEMPLATE_RENDER_FAILED, e.getMessage());

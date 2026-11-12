@@ -39,7 +39,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * <p>The wire rules of ISO/IEC 18013-5 that this class owns: {@code tdate} is tag 0 around a 20-character RFC 3339
  * string without fractional seconds (9.1.2.4); an IssuerSignedItem is digested over its tag-24 encoding with the
  * algorithm the MSO declares (9.1.2.5); {@code digestID} is a per-namespace random permutation of {@code 0..n-1} so
- * that identifiers reveal neither element order nor count across issuances (9.1.2.5).
+ * that identifiers reveal neither element order nor count across issuances (9.1.2.5); element values are encoded by
+ * the {@link MdocElementTypes} table rather than by guessing (7.2.1).
  */
 public class MdocProcessor {
 
@@ -63,10 +64,11 @@ public class MdocProcessor {
     }
 
     /**
-     * Process templated JSON to create final mDoc structure: validityInfo prepared from the request clock, and
-     * {@code digestID}s assigned as a random permutation per namespace.
+     * Process templated JSON to create final mDoc structure: validityInfo from the request clock, element values typed
+     * by the namespace's table, and {@code digestID}s assigned as a random permutation per namespace.
      */
-    public Map<String, Object> processTemplatedJson(String templatedJSON, Map<String, Object> templateParams, Instant now) {
+    public Map<String, Object> processTemplatedJson(String templatedJSON, Map<String, Object> templateParams,
+                                                    MdocElementTypes elementTypes, Instant now) {
         try {
             JsonNode templateNode = objectMapper.readTree(templatedJSON);
             Map<String, Object> finalMDoc = new HashMap<>();
@@ -88,15 +90,23 @@ public class MdocProcessor {
 
             // Process namespaces
             Map<String, Object> nameSpaces = new HashMap<>();
+            Map<String, Map<String, Object>> elementValues = new HashMap<>();
 
             if (templateNode.has(MdocConstants.NAMESPACES)) {
                 JsonNode nameSpacesNode = templateNode.get(MdocConstants.NAMESPACES);
                 nameSpacesNode.fieldNames().forEachRemaining(namespaceName -> {
                     JsonNode namespaceItems = nameSpacesNode.get(namespaceName);
-                    nameSpaces.put(namespaceName, processNamespaceItems(namespaceName, namespaceItems));
+                    List<Map<String, Object>> processedItems = processNamespaceItems(namespaceName, namespaceItems, elementTypes);
+                    nameSpaces.put(namespaceName, processedItems);
+                    Map<String, Object> values = new LinkedHashMap<>();
+                    for (Map<String, Object> item : processedItems) {
+                        values.put((String) item.get(MdocConstants.ELEMENT_IDENTIFIER), item.get(MdocConstants.ELEMENT_VALUE));
+                    }
+                    elementValues.put(namespaceName, values);
                 });
             }
             finalMDoc.put(MdocConstants.NAMESPACES, nameSpaces);
+            finalMDoc.put(MdocProcessor.ELEMENT_VALUES, elementValues);
 
             return finalMDoc;
 
@@ -108,12 +118,15 @@ public class MdocProcessor {
         }
     }
 
+    /** Internal key of the processed document: namespace to element identifier to typed value, for the validator. */
+    static final String ELEMENT_VALUES = "_elementValues";
+
     /**
-     * Process items within a namespace and give each element a {@code digestID} drawn from a random permutation of
-     * {@code 0..n-1}. A {@code digestID} the template carries is ignored (18013-5 9.1.2.5: identifiers must not reveal
-     * information) and the first such template is reported once.
+     * Process items within a namespace: type the value, then give each element a {@code digestID} drawn from a random
+     * permutation of {@code 0..n-1}. A {@code digestID} the template carries is ignored (18013-5 9.1.2.5: identifiers
+     * must not reveal information) and the first such template is reported once.
      */
-    private List<Map<String, Object>> processNamespaceItems(String namespaceName, JsonNode namespaceItems) {
+    private List<Map<String, Object>> processNamespaceItems(String namespaceName, JsonNode namespaceItems, MdocElementTypes elementTypes) {
         List<Map<String, Object>> processedItems = new ArrayList<>();
         List<Integer> digestIds = new ArrayList<>();
         boolean templateCarriedIds = false;
@@ -123,8 +136,10 @@ public class MdocProcessor {
             if (item.has(MdocConstants.DIGEST_ID)) {
                 templateCarriedIds = true;
             }
-            itemMap.put(MdocConstants.ELEMENT_IDENTIFIER, item.get(MdocConstants.ELEMENT_IDENTIFIER).asText());
-            itemMap.put(MdocConstants.ELEMENT_VALUE, plain(item.get(MdocConstants.ELEMENT_VALUE)));
+            String identifier = item.get(MdocConstants.ELEMENT_IDENTIFIER).asText();
+            Object value = convertValue(namespaceName, identifier, item.get(MdocConstants.ELEMENT_VALUE), elementTypes);
+            itemMap.put(MdocConstants.ELEMENT_IDENTIFIER, identifier);
+            itemMap.put(MdocConstants.ELEMENT_VALUE, value);
             processedItems.add(itemMap);
             digestIds.add(processedItems.size() - 1);
         }
@@ -141,11 +156,159 @@ public class MdocProcessor {
         return processedItems;
     }
 
+    /** Encodes one element value in the type its namespace's table declares (7.2.1 Table 5). */
+    private Object convertValue(String namespaceName, String identifier, JsonNode value, MdocElementTypes elementTypes) {
+        Optional<MdocElementTypes.Type> type = elementTypes == null ? Optional.empty() : elementTypes.type(namespaceName, identifier);
+        if (type.isEmpty()) {
+            // an untyped namespace keeps the pre-M-03 behaviour: strings stay strings, and preprocessForCBOR tags YYYY-MM-DD
+            return plain(value);
+        }
+        if (value == null || value.isNull()) {
+            throw dataModelError(identifier, "has no value; the signed document must carry one");
+        }
+        return switch (type.get()) {
+            case TSTR -> text(identifier, value);
+            case UINT -> unsigned(identifier, value);
+            case BOOL -> bool(identifier, value);
+            case BSTR -> bytes(identifier, value);
+            case FULL_DATE -> tagged(MdocConstants.CBOR_TAG_FULL_DATE, fullDate(identifier, text(identifier, value)));
+            case TDATE -> tagged(MdocConstants.CBOR_TAG_TDATE, tdate(identifier, text(identifier, value)));
+            case DRIVING_PRIVILEGES -> drivingPrivileges(identifier, value);
+        };
+    }
+
     private Object plain(JsonNode value) {
         if (value == null || value.isNull()) {
             return null;
         }
         return value.isTextual() ? value.asText() : objectMapper.convertValue(value, Object.class);
+    }
+
+    private static String text(String identifier, JsonNode value) {
+        if (!value.isTextual()) {
+            throw dataModelError(identifier, "must be a text string (tstr), was " + value.getNodeType().toString().toLowerCase(Locale.ROOT));
+        }
+        return value.asText();
+    }
+
+    private static Object unsigned(String identifier, JsonNode value) {
+        long number;
+        if (value.isIntegralNumber()) {
+            number = value.asLong();
+        } else if (value.isTextual() && value.asText().trim().matches("\\d{1,19}")) {
+            number = Long.parseLong(value.asText().trim());
+        } else {
+            throw dataModelError(identifier, "must be an unsigned integer (uint), was " + value);
+        }
+        if (number < 0) {
+            throw dataModelError(identifier, "must be an unsigned integer (uint), was " + number);
+        }
+        return number <= Integer.MAX_VALUE ? (Object) (int) number : (Object) number;
+    }
+
+    private static Object bool(String identifier, JsonNode value) {
+        if (value.isBoolean()) {
+            return value.asBoolean();
+        }
+        if (value.isTextual() && ("true".equalsIgnoreCase(value.asText()) || "false".equalsIgnoreCase(value.asText()))) {
+            return Boolean.parseBoolean(value.asText());
+        }
+        throw dataModelError(identifier, "must be a boolean (bool), was " + value);
+    }
+
+    private static byte[] bytes(String identifier, JsonNode value) {
+        if (!value.isTextual()) {
+            throw dataModelError(identifier, "must be a base64 or base64url string that decodes to a byte string (bstr), was "
+                    + value.getNodeType().toString().toLowerCase(Locale.ROOT));
+        }
+        String encoded = value.asText().trim();
+        if (encoded.isEmpty()) {
+            throw dataModelError(identifier, "is an empty byte string; a portrait or template cannot be empty");
+        }
+        try {
+            return Base64.getDecoder().decode(encoded);
+        } catch (IllegalArgumentException notStandard) {
+            try {
+                String url = encoded.replace('-', '+').replace('_', '/');
+                return Base64.getDecoder().decode(url + "=".repeat((4 - url.length() % 4) % 4));
+            } catch (IllegalArgumentException e) {
+                throw dataModelError(identifier, "is not base64 or base64url: " + e.getMessage());
+            }
+        }
+    }
+
+    private static String fullDate(String identifier, String value) {
+        if (!value.matches("\\d{4}-\\d{2}-\\d{2}")) {
+            throw dataModelError(identifier, "must be a full-date (YYYY-MM-DD), was " + value);
+        }
+        try {
+            LocalDate.parse(value, DateTimeFormatter.ofPattern(MdocConstants.FULL_DATE_PATTERN));
+        } catch (DateTimeParseException e) {
+            throw dataModelError(identifier, "must be a full-date (YYYY-MM-DD), was " + value);
+        }
+        return value;
+    }
+
+    /** RFC 3339 without fractional seconds, as {@code tdate} requires (18013-5 9.1.2.4). */
+    private static String tdate(String identifier, String value) {
+        try {
+            return TDATE.format(Instant.parse(value));
+        } catch (DateTimeParseException e) {
+            throw dataModelError(identifier, "must be an RFC 3339 date-time such as 2024-01-31T10:15:30Z, was " + value);
+        }
+    }
+
+    /** {@code driving_privileges}: an array of {vehicle_category_code, issue_date, expiry_date, codes[]} maps. */
+    private List<Object> drivingPrivileges(String identifier, JsonNode value) {
+        if (!value.isArray()) {
+            throw dataModelError(identifier, "must be an array of driving privileges, was " + value);
+        }
+        List<Object> privileges = new ArrayList<>();
+        for (JsonNode privilege : value) {
+            if (!privilege.isObject()) {
+                throw dataModelError(identifier, "must contain driving privilege maps, found " + privilege);
+            }
+            Map<String, Object> map = new LinkedHashMap<>();
+            JsonNode category = privilege.get("vehicle_category_code");
+            if (category == null || !category.isTextual()) {
+                throw dataModelError(identifier, "carries a driving privilege without a vehicle_category_code (tstr)");
+            }
+            map.put("vehicle_category_code", category.asText());
+            for (String date : new String[] {"issue_date", "expiry_date"}) {
+                JsonNode node = privilege.get(date);
+                if (node != null && !node.isNull()) {
+                    map.put(date, tagged(MdocConstants.CBOR_TAG_FULL_DATE, fullDate(identifier + "." + date, text(identifier + "." + date, node))));
+                }
+            }
+            JsonNode codes = privilege.get("codes");
+            if (codes != null && !codes.isNull()) {
+                if (!codes.isArray()) {
+                    throw dataModelError(identifier + ".codes", "must be an array of {code, sign, value} maps");
+                }
+                List<Object> codeList = new ArrayList<>();
+                for (JsonNode code : codes) {
+                    if (!code.isObject() || code.get("code") == null || !code.get("code").isTextual()) {
+                        throw dataModelError(identifier + ".codes", "must contain maps with a code (tstr)");
+                    }
+                    Map<String, Object> codeMap = new LinkedHashMap<>();
+                    codeMap.put("code", code.get("code").asText());
+                    for (String optional : new String[] {"sign", "value"}) {
+                        JsonNode node = code.get(optional);
+                        if (node != null && !node.isNull()) {
+                            codeMap.put(optional, text(identifier + ".codes." + optional, node));
+                        }
+                    }
+                    codeList.add(codeMap);
+                }
+                map.put("codes", codeList);
+            }
+            privileges.add(map);
+        }
+        return privileges;
+    }
+
+    private static FormatException dataModelError(String identifier, String problem) {
+        return new FormatException(MdocConstants.ERROR_DATA_MODEL, identifier + " " + problem);
     }
 
     /**
@@ -180,21 +343,22 @@ public class MdocProcessor {
     }
 
     /**
-     * Calculates the digests of the salted elements and the tag-24 IssuerSignedItems the IssuerSigned carries. The digest
+     * Calculates the digests of the salted elements and the encoded IssuerSignedItems the IssuerSigned carries. The digest
      * algorithm must be the one the MSO declares (18013-5 9.1.2.5); {@code namespaceDigests} receives
-     * {@code namespace -> digestID -> digest}.
+     * {@code namespace -> digestID -> digest}. The items are returned as their CBOR bytes, so the unsigned credential
+     * stays JSON-serialisable (a preview returns it); {@link #taggedNamespaces} wraps them for the wire.
      */
-    public static Map<String, Object> calculateDigests
+    public static Map<String, List<byte[]>> calculateDigests
     (Map<String, Object> saltedNamespaces, Map<String, Map<Integer, byte[]>> namespaceDigests, String digestAlgorithm) throws Exception {
 
-        Map<String, Object> taggedNamespaces = new HashMap<>();
+        Map<String, List<byte[]>> encodedNamespaces = new HashMap<>();
         String algorithm = digestAlgorithmName(digestAlgorithm);
 
         for (Map.Entry<String, Object> namespaceEntry : saltedNamespaces.entrySet()) {
             String namespaceName = namespaceEntry.getKey();
             List<Map<String, Object>> elements = (List<Map<String, Object>>) namespaceEntry.getValue();
 
-            List<Object> taggedElements = new ArrayList<>();
+            List<byte[]> encodedElements = new ArrayList<>();
             Map<Integer, byte[]> digestMap = new HashMap<>();
 
             for (Map<String, Object> element : elements) {
@@ -202,25 +366,40 @@ public class MdocProcessor {
                 ByteArrayOutputStream innerBaos = new ByteArrayOutputStream();
                 new CborEncoder(innerBaos).encode(convertToDataItem(preprocessForCBOR(element)));
                 byte[] elementCbor = innerBaos.toByteArray();
+                encodedElements.add(elementCbor);
 
-                // 2) Build Tag(24) DataItem for final structure
-                ByteString tag24Value = new ByteString(elementCbor);
-                tag24Value.setTag(24);
-                taggedElements.add(tag24Value);
-
-                // 3) Calculate digest over Tag(24) encoded bytes
+                // 2) Calculate the digest over the Tag(24) encoded bytes
                 ByteArrayOutputStream outerBaos = new ByteArrayOutputStream();
-                new CborEncoder(outerBaos).encode(tag24Value);
+                new CborEncoder(outerBaos).encode(tag24(elementCbor));
                 byte[] taggedCbor = outerBaos.toByteArray();
                 byte[] digest = MessageDigest.getInstance(algorithm).digest(taggedCbor);
                 digestMap.put((Integer) element.get(MdocConstants.DIGEST_ID), digest);
             }
 
-            taggedNamespaces.put(namespaceName, taggedElements);
+            encodedNamespaces.put(namespaceName, encodedElements);
             namespaceDigests.put(namespaceName, digestMap);
         }
 
-        return taggedNamespaces;
+        return encodedNamespaces;
+    }
+
+    /** {@code #6.24(bstr .cbor IssuerSignedItem)}: the tag-24 items the IssuerSigned carries (9.1.2.5). */
+    public static Map<String, Object> taggedNamespaces(Map<String, List<byte[]>> encodedNamespaces) {
+        Map<String, Object> tagged = new HashMap<>();
+        encodedNamespaces.forEach((namespaceName, items) -> {
+            List<Object> taggedItems = new ArrayList<>(items.size());
+            for (byte[] item : items) {
+                taggedItems.add(tag24(item));
+            }
+            tagged.put(namespaceName, taggedItems);
+        });
+        return tagged;
+    }
+
+    private static ByteString tag24(byte[] innerCbor) {
+        ByteString tagged = new ByteString(innerCbor);
+        tagged.setTag(24);
+        return tagged;
     }
 
     /** The canonical MSO name of a digest algorithm, refusing anything 18013-5 9.1.2.4 does not allow. */
@@ -287,6 +466,9 @@ public class MdocProcessor {
 
         if (obj instanceof Map) {
             Map<Object, Object> map = (Map<Object, Object>) obj;
+            if (map.containsKey(MdocConstants.__CBOR_TAG)) {
+                return obj; // already typed by the element table: a tag around its value
+            }
             Map<Object, Object> processedMap = new HashMap<>();
 
             for (Map.Entry<Object, Object> entry : map.entrySet()) {
