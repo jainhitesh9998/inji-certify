@@ -28,8 +28,10 @@ import java.security.interfaces.ECPublicKey;
 import java.security.interfaces.RSAPublicKey;
 import java.security.spec.PSSParameterSpec;
 import java.security.spec.MGF1ParameterSpec;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.Enumeration;
 import java.util.LinkedHashMap;
@@ -156,6 +158,36 @@ public class JcaKeyProvider implements KeyProvider {
     }
 
     /**
+     * Generates an ISO/IEC 18013-5:2021 Annex B IACA under the alias (dev mode only): self-signed, with the CRL
+     * distribution point, issuerAltName, key usage and CA basic constraints of the profile. The purpose recorded on the
+     * descriptor is {@code mdoc-iaca}.
+     */
+    public SigningKey generateIaca(String alias, MdocIacaSpec spec) {
+        DevKeys.Generated generated = DevKeys.generateIaca(spec);
+        add(alias, generated.privateKey(), CertificateChain.of(generated.certificate()), spec.algorithm(), "mdoc-iaca");
+        return resolve(new KeyRef(id, alias));
+    }
+
+    /**
+     * Generates an Annex B Document Signer under {@code iacaAlias} (dev mode only); the chain is [DSC, IACA], which is
+     * what an mDL verifier needs to build a path to the IACA. The purpose is {@code mdoc-dsc}.
+     */
+    public SigningKey generateMdocDsc(String alias, SignatureAlgorithm algorithm, String commonName,
+                                      Integer validityDays, String iacaAlias) {
+        Entry iaca = entries.get(iacaAlias);
+        if (iaca == null) {
+            throw new SigningException("No IACA under alias " + iacaAlias);
+        }
+        X509Certificate iacaCertificate = iaca.descriptor().chain().leaf()
+                .orElseThrow(() -> new SigningException("IACA " + iacaAlias + " has no certificate"));
+        DevKeys.Generated generated = DevKeys.generateDsc(algorithm, commonName, validityDays, iaca.privateKey(),
+                iacaCertificate);
+        add(alias, generated.privateKey(), CertificateChain.of(generated.certificate(), iacaCertificate), algorithm,
+                "mdoc-dsc");
+        return resolve(new KeyRef(id, alias));
+    }
+
+    /**
      * Adds a key with its chain. The algorithm is derived from the key when {@code algorithm} is null:
      * RSA keys default to RS256, EC keys to the curve's ES algorithm, Ed25519 keys to EdDSA.
      */
@@ -190,22 +222,82 @@ public class JcaKeyProvider implements KeyProvider {
         return id;
     }
 
+    /**
+     * Resolves a reference, applying the rotation rule of docs/design/20-mdl-issuer.md M-05: a reference without a
+     * version resolves to the newest of the alias's entries whose certificate is valid now ({@code notBefore <= now <
+     * notAfter}); a versioned reference resolves to that version exactly. An alias with one entry and no versioned
+     * siblings resolves to that entry whatever its dates, so existing keystores behave as before.
+     */
     @Override
     public SigningKey resolve(KeyRef ref) {
         if (!id.equals(ref.provider())) {
             throw new SigningException("KeyRef " + ref + " is not for provider " + id);
         }
-        Entry entry = entries.get(ref.alias());
+        Entry entry = ref.versionOpt().isPresent()
+                ? entries.get(ref.alias() + "@" + ref.version())
+                : current(ref.alias());
         if (entry == null) {
-            throw new SigningException("No key with alias '" + ref.alias() + "' in provider " + id);
+            String message = "No key with alias '" + ref.alias() + "'"
+                    + ref.versionOpt().map(version -> " version '" + version + "'").orElse("")
+                    + " in provider " + id;
+            List<String> versions = ref.versionOpt().isPresent() ? List.of() : versions(ref.alias());
+            if (!versions.isEmpty()) {
+                message += "; no version has a certificate valid now (versions: " + String.join(", ", versions) + ")";
+            }
+            throw new SigningException(message);
         }
         return new SigningKey(ref, entry.descriptor(), entry.privateKey());
+    }
+
+    /** The entry a bare alias names: the newest one valid now, or the only entry when the alias has no versions. */
+    private Entry current(String alias) {
+        List<Entry> candidates = entries.values().stream()
+                .filter(e -> e.alias().equals(alias) || e.alias().startsWith(alias + "@"))
+                .toList();
+        if (candidates.size() == 1 && candidates.get(0).alias().equals(alias)) {
+            return candidates.get(0);
+        }
+        Instant now = Instant.now();
+        return candidates.stream()
+                .filter(e -> e.descriptor().isValidAt(now))
+                .max(Comparator.comparing((Entry e) -> e.descriptor().notBefore(),
+                                Comparator.nullsFirst(Comparator.naturalOrder()))
+                        .thenComparing(Entry::alias))
+                .orElse(null);
+    }
+
+    /** The version labels of an alias, oldest first: what the error message lists when none is valid now. */
+    private List<String> versions(String alias) {
+        return entries.keySet().stream()
+                .filter(aliasAndVersion -> aliasAndVersion.startsWith(alias + "@"))
+                .sorted()
+                .toList();
     }
 
     @Override
     public List<PublicKeyDescriptor> publicKeys(KeyFilter filter) {
         KeyFilter f = filter == null ? KeyFilter.ALL : filter;
         return entries.values().stream().map(Entry::descriptor).filter(f::matches).toList();
+    }
+
+    /**
+     * Every version of the alias, current and rotated, oldest first: a JWKS or DID document lists them all so a
+     * credential signed before a rotation still verifies. A versioned reference names that version only.
+     */
+    @Override
+    public List<PublicKeyDescriptor> publicKeys(KeyRef ref) {
+        if (!id.equals(ref.provider())) {
+            throw new SigningException("KeyRef " + ref + " is not for provider " + id);
+        }
+        if (ref.versionOpt().isPresent()) {
+            Entry entry = entries.get(ref.alias() + "@" + ref.version());
+            return entry == null ? List.of() : List.of(entry.descriptor());
+        }
+        return entries.values().stream()
+                .filter(e -> e.alias().equals(ref.alias()) || e.alias().startsWith(ref.alias() + "@"))
+                .sorted(Comparator.comparing(Entry::alias))
+                .map(Entry::descriptor)
+                .toList();
     }
 
     @Override
