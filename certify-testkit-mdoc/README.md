@@ -71,11 +71,14 @@ Each sample carries the problems it is known to have, one problem code per line 
 that fixes it:
 
 ```
-mso.validityInfo:signedAfterValidFrom # G8: through the core validFrom is the request instant and signed the formatter's wall clock; fixed by M-02/M-03
-mso.validityInfo.tdateTags:fractionalSeconds:signed # G1: signed/validFrom/validUntil carry milliseconds (UTC_DATETIME_PATTERN); fixed by M-02
-mdl.elementTypes:missing:given_name # G3: the golden template lacks this Table 5 mandatory element; fixed by M-03
+x5chain.iaca:noAnchorSupplied # G13: the keymanager x5chain is the master-signed leaf alone, there is no IACA to anchor it; M-06
 x5chain.serialNumber:nonPositive # G27: keymanager drew this serial from SecureRandom.nextLong(); M-06/keymanager provider
+mso.validityInfo.tdateTags:fractionalSeconds:signed # G1: the legacy utils.MDocProcessor writes milliseconds; legacy path only
+mdl.elementTypes:untyped:portrait # G2: the legacy utils.MDocProcessor writes the base64 portrait as a tstr; legacy path only
 ```
+
+The lines M-02/M-03 removed (G1 and G8 on the core path, G3's `missing:*`, G9's `selfSigned:0`) are listed per sample in
+[`docs/design/20-mdl-issuer.md`](../docs/design/20-mdl-issuer.md) M-01.
 
 `AcceptedGaps.assertMatches(report, sample)` fails on a reported problem whose `<check>:<code>` is not listed, on a
 listed code the check no longer reports ("gap no longer present, remove ... from <sample>.gaps"), and on any skipped
@@ -102,8 +105,8 @@ the same files with its own `golden/MdocSampleWriter`, because it must not depen
 | `<name>.iaca.pem` | the IACA, written only when the chain carries a self-signed anchor behind the leaf |
 
 The first write of a producer in a JVM deletes that producer's earlier samples. The producers are
-`certify-format-mdoc`'s `MdocIndependentVerificationTest` (`formatter`, and `ed25519-fixture`: today's output re-signed
-with an Ed25519 deviceKey, until M-02 lets the formatter bind one, gap G6) and `certify-service`'s
+`certify-format-mdoc`'s `MdocIndependentVerificationTest` (`formatter` and `ed25519`: the formatter's own output for a
+P-256 and an Ed25519 holder, signed by a DSC whose IACA stays out of the x5chain) and `certify-service`'s
 `IssuanceGoldenTest`/`IssuanceGoldenCoreTest` (`legacy`, `oid4vci`) and `D13GoldenReplayTest` (`d13`). Two consumers
 read them:
 
