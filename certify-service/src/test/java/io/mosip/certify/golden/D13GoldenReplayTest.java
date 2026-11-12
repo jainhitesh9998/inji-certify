@@ -176,7 +176,7 @@ class D13GoldenReplayTest {
         // the draft-13 Document {docType, issuerSigned} exactly as received; certify-conformance-mdoc and the CI python
         // verifier slice the IssuerSigned out of it and re-verify it with libraries Certify does not maintain (M-01)
         MdocSampleWriter.write(getClass(), "d13", body.get("credential").asText(), holder, "org.iso.18013.5.1.mDL",
-                MdocSampleWriter.CORE_GAPS);
+                MdocSampleWriter.D13_GAPS);
         CBORObject decoded = CBORObject.DecodeFromBytes(Base64.getUrlDecoder().decode(body.get("credential").asText()));
         CBORObject issuerSigned = decoded.get("issuerSigned");
         CBORObject issuerAuth = issuerSigned.get("issuerAuth");

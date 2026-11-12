@@ -40,7 +40,8 @@ import java.util.stream.Stream;
  *     draft-13 {@code Document} {@code {docType, issuerSigned}} the 0.14.0 surface returns;</li>
  *     <li>{@code <name>.holder.jwk} — the holder public JWK the proof carried, expected to equal the MSO deviceKey;</li>
  *     <li>{@code <name>.doctype} — the docType the credential configuration asked for;</li>
- *     <li>{@code <name>.gaps} — the checks this sample is known not to pass yet ({@link AcceptedGaps});</li>
+ *     <li>{@code <name>.gaps} — the problems this sample is known to have, one {@code <check>:<code>} each
+ *     ({@link AcceptedGaps});</li>
  *     <li>{@code <name>.iaca.pem} — the IACA, present only when the chain carries one (M-06 completes this).</li>
  * </ul>
  *

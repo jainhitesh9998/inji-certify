@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -37,7 +38,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * The rules the harness applies itself, each with the value that must pass and the mutations that must fail:
  * ISO/IEC 18013-5 element dates (Table 5, 7.2.4), RFC 5280 serial numbers, the check runner's error handling and the
- * {@code .gaps} sidecar.
+ * {@code .gaps} sidecar with its problem codes.
  */
 class MdocVerifierRulesTest {
 
@@ -52,6 +53,39 @@ class MdocVerifierRulesTest {
         assertNotNull(IndependentMdocVerifier.tdateProblem(tdate("2026-11-13T25:15:30Z")), "no hour 25");
         assertNotNull(IndependentMdocVerifier.tdateProblem(new Tstr("2026-11-13T10:15:30Z")), "untagged");
         assertNotNull(IndependentMdocVerifier.tdateProblem(fullDate("2026-11-13")), "tag 1004 is not a tdate");
+    }
+
+    @Test
+    void everyWayADateMissesTdateIsItsOwnCode() {
+        assertEquals(List.of(), codes(tdate("2026-11-13T10:15:30Z")));
+        assertEquals(List.of("fractionalSeconds"), codes(tdate("2026-11-13T10:15:30.123Z")));
+        assertEquals(List.of("untagged", "fractionalSeconds"), codes(new Tstr("2026-11-13T10:15:30.123Z")),
+                "untagged and milliseconds are two defects: fixing one must not hide the other");
+        assertEquals(List.of("fractionalSeconds", "notZulu"), codes(tdate("2026-11-13T10:15:30.5+05:30")));
+        assertEquals(List.of("notCalendar"), codes(tdate("2026-02-30T10:15:30Z")));
+        assertEquals(List.of("notRfc3339"), codes(tdate("2026-11-13 10:15:30Z")));
+        assertEquals(List.of("notTdate", "notRfc3339"), codes(fullDate("2026-11-13")));
+        assertEquals(List.of("notTdate"), codes(new Bstr(new byte[] {1})));
+    }
+
+    static List<String> codes(DataItem value) {
+        return IndependentMdocVerifier.tdateProblems(value).stream().map(VerificationReport.Problem::code).toList();
+    }
+
+    @Test
+    void multipazValidityFindingsMapOntoTheWireCodes() {
+        assertEquals("signedAfterValidFrom", IndependentMdocVerifier.multipazValidityCode(
+                "MSO validFrom (2026-01-01T00:00:00Z) must be equal to or later than signed (2026-01-01T00:00:01Z)"));
+        assertEquals("expired", IndependentMdocVerifier.multipazValidityCode(
+                "MSO is expired (validUntil: 2021-01-01T00:00:00Z, current time: 2026-11-13T00:00:00Z)"));
+        assertEquals("notYetValid", IndependentMdocVerifier.multipazValidityCode(
+                "MSO is not yet valid (validFrom: 2030-01-01T00:00:00Z, current time: 2026-11-13T00:00:00Z)"));
+        assertEquals("expectedUpdateNotBeforeValidUntil", IndependentMdocVerifier.multipazValidityCode(
+                "MSO expectedUpdate (2031-01-01T00:00:00Z) is later than validUntil (2030-01-01T00:00:00Z)"));
+        assertEquals("validFromNotBeforeValidUntil", IndependentMdocVerifier.multipazValidityCode(
+                "MSO validUntil (2020-01-01T00:00:00Z) must be later than validFrom (2021-01-01T00:00:00Z)"));
+        assertNull(IndependentMdocVerifier.multipazValidityCode("MSO signed timestamp must not have fractional seconds"));
+        assertEquals("multipazRejects", IndependentMdocVerifier.multipazValidityCode("MSO version cannot be empty"));
     }
 
     @Test
@@ -103,16 +137,18 @@ class MdocVerifierRulesTest {
     }
 
     @Test
-    void everyProblemIsReportedNotTheFirst() {
+    void everyProblemIsReportedNotTheFirstEachUnderItsOwnCode() {
         Map<String, DataItem> mdl = mdl();
         mdl.remove("portrait");
         mdl.put("birth_date", new Tstr("1990-01-01"));
         mdl.put("not_an_mdl_element", new Tstr("x"));
-        List<String> problems = IndependentMdocVerifier.mdlElementProblems(mdl);
-        assertEquals(3, problems.size(), problems.toString());
-        assertTrue(problems.stream().anyMatch(p -> p.contains("mandatory mDL element portrait is missing")), problems.toString());
-        assertTrue(problems.stream().anyMatch(p -> p.contains("birth_date must be full-date")), problems.toString());
-        assertTrue(problems.stream().anyMatch(p -> p.contains("not_an_mdl_element is not in")), problems.toString());
+        List<VerificationReport.Problem> problems = IndependentMdocVerifier.mdlElementProblems(mdl);
+        // in the order of Multipaz's DrivingLicense table, then the elements it does not know
+        assertEquals(List.of("untyped:birth_date", "missing:portrait", "notInDocType:not_an_mdl_element"),
+                problems.stream().map(VerificationReport.Problem::code).toList(), problems.toString());
+        assertTrue(problems.get(0).message().contains("birth_date must be full-date"), problems.toString());
+        assertTrue(problems.get(1).message().contains("mandatory mDL element portrait is missing"), problems.toString());
+        assertTrue(problems.get(2).message().contains("not_an_mdl_element is not in"), problems.toString());
     }
 
     // ---- RFC 5280 serial numbers ---------------------------------------------------------------------------------
@@ -121,62 +157,173 @@ class MdocVerifierRulesTest {
     void serialNumbersArePositiveAndAtMostTwentyOctets() throws Exception {
         assertEquals(List.of(), IndependentMdocVerifier.serialNumberProblems(List.of(certificate(BigInteger.ONE),
                 certificate(BigInteger.TWO.pow(158)))), "2^158 takes 20 octets");
+        assertEquals(List.of("nonPositive"), serialCodes(BigInteger.valueOf(-5)));
+        assertEquals(List.of("nonPositive", "zero"), serialCodes(BigInteger.ZERO));
+        assertEquals(List.of("tooLong"), serialCodes(BigInteger.TWO.pow(159)), "2^159 needs a sign octet: 21");
         assertTrue(IndependentMdocVerifier.serialNumberProblems(List.of(certificate(BigInteger.valueOf(-5)))).get(0)
-                .contains("non-positive serial -5"));
-        assertTrue(IndependentMdocVerifier.serialNumberProblems(List.of(certificate(BigInteger.TWO.pow(159)))).get(0)
-                .contains("21 octets"), "2^159 needs a sign octet: 21");
+                .message().contains("non-positive serial -5"));
+    }
+
+    @Test
+    void theKeymanagerSerialGapCoversANegativeSerialAndNothingElse() throws Exception {
+        // G27: a .gaps file declares x5chain.serialNumber:nonPositive exactly when the received leaf serial is <= 0
+        AcceptedGaps g27 = AcceptedGaps.none().gap(IndependentMdocVerifier.CHECK_SERIAL_NUMBER, "nonPositive",
+                "G27: keymanager draws negative serials; M-06");
+        g27.assertMatches(serialReport(BigInteger.valueOf(-5)), "negative");
+
+        AssertionError zero = assertThrows(AssertionError.class, () -> g27.assertMatches(serialReport(BigInteger.ZERO), "zero"));
+        assertTrue(zero.getMessage().contains("not an accepted gap of zero: x5chain.serialNumber:zero"), zero.getMessage());
+
+        AssertionError tooLong = assertThrows(AssertionError.class,
+                () -> g27.assertMatches(serialReport(BigInteger.TWO.pow(159)), "long"));
+        assertTrue(tooLong.getMessage().contains("not an accepted gap of long: x5chain.serialNumber:tooLong"), tooLong.getMessage());
+        assertTrue(tooLong.getMessage().contains("gap no longer present, remove x5chain.serialNumber:nonPositive"),
+                tooLong.getMessage());
+
+        AssertionError positive = assertThrows(AssertionError.class,
+                () -> g27.assertMatches(serialReport(BigInteger.valueOf(7)), "positive"));
+        assertTrue(positive.getMessage().contains("gap no longer present, remove x5chain.serialNumber:nonPositive from "
+                + "positive.gaps: x5chain.serialNumber passes now"), positive.getMessage());
+    }
+
+    static List<String> serialCodes(BigInteger serial) throws Exception {
+        return IndependentMdocVerifier.serialNumberProblems(List.of(certificate(serial))).stream()
+                .map(VerificationReport.Problem::code).toList();
+    }
+
+    static VerificationReport serialReport(BigInteger serial) throws Exception {
+        List<VerificationReport.Problem> problems = IndependentMdocVerifier.serialNumberProblems(List.of(certificate(serial)));
+        return new VerificationReport(List.of(problems.isEmpty()
+                ? VerificationReport.Check.pass(IndependentMdocVerifier.CHECK_SERIAL_NUMBER, "positive")
+                : VerificationReport.Check.fail(IndependentMdocVerifier.CHECK_SERIAL_NUMBER, problems)));
     }
 
     // ---- the check runner ----------------------------------------------------------------------------------------
 
     @Test
     void anErrorInACheckIsThatChecksFailure() {
-        VerificationReport.Check kotlinTodo = IndependentMdocVerifier.run("x", () -> {
+        VerificationReport.Check kotlinTodo = IndependentMdocVerifier.run("x", problems -> {
             throw new kotlin.NotImplementedError("An operation is not implemented.");
         });
         assertEquals(VerificationReport.State.FAIL, kotlinTodo.state());
         assertTrue(kotlinTodo.message().contains("NotImplementedError"));
-        VerificationReport.Check overflow = IndependentMdocVerifier.run("x", () -> {
+        assertEquals(List.of(IndependentMdocVerifier.ERROR), kotlinTodo.codes());
+        VerificationReport.Check overflow = IndependentMdocVerifier.run("x", problems -> {
             throw new StackOverflowError();
         });
         assertEquals(VerificationReport.State.FAIL, overflow.state());
-        assertThrows(OutOfMemoryError.class, () -> IndependentMdocVerifier.run("x", () -> {
+        assertThrows(OutOfMemoryError.class, () -> IndependentMdocVerifier.run("x", problems -> {
             throw new OutOfMemoryError("no heap left");
         }), "a VM failure leaves nothing to report on and propagates");
+    }
+
+    @Test
+    void aCheckKeepsWhatItFoundBeforeItThrew() {
+        VerificationReport.Check check = IndependentMdocVerifier.run(IndependentMdocVerifier.CHECK_VALIDITY_INFO, problems -> {
+            problems.add("expired", "validUntil has passed");
+            throw new IllegalStateException("then something broke");
+        });
+        assertEquals(List.of("expired", IndependentMdocVerifier.ERROR), check.codes());
+    }
+
+    @Test
+    void aCheckCannotReportAnUnregisteredCode() {
+        VerificationReport.Check check = IndependentMdocVerifier.run(IndependentMdocVerifier.CHECK_VALIDITY_INFO, problems -> {
+            problems.add("tooLate", "not a registered code");
+            return "unreachable";
+        });
+        assertEquals(List.of(IndependentMdocVerifier.ERROR), check.codes());
+        assertTrue(check.message().contains("unregistered problem code mso.validityInfo:tooLate"), check.message());
     }
 
     // ---- the .gaps sidecar ---------------------------------------------------------------------------------------
 
     @Test
-    void gapsRoundTripAndRefuseLinesWithoutAReasonOrAKnownCheck() {
+    void gapsRoundTripAndRefuseLinesWithoutAReasonACodeOrAKnownCheck() {
         AcceptedGaps gaps = AcceptedGaps.none()
-                .gap(IndependentMdocVerifier.CHECK_TDATE_TAGS, "G1: milliseconds; M-02")
-                .intermittent(IndependentMdocVerifier.CHECK_SERIAL_NUMBER, "G27: random serial sign; M-06");
+                .gap(IndependentMdocVerifier.CHECK_TDATE_TAGS, "fractionalSeconds:signed", "G1: milliseconds; M-02")
+                .gap(IndependentMdocVerifier.CHECK_ELEMENT_TYPES, "untyped:birth_date", "G2: untyped; M-03")
+                .gap(IndependentMdocVerifier.CHECK_SERIAL_NUMBER, "nonPositive", "G27: random serial sign; M-06");
         AcceptedGaps parsed = AcceptedGaps.parse(gaps.format("s"), "s.gaps");
         assertEquals(gaps.gaps(), parsed.gaps());
-        assertTrue(parsed.gaps().get(IndependentMdocVerifier.CHECK_SERIAL_NUMBER).intermittent());
-        assertThrows(IllegalArgumentException.class, () -> AcceptedGaps.parse("mso.validityInfo\n", "s.gaps"), "no reason");
-        assertThrows(IllegalArgumentException.class, () -> AcceptedGaps.parse("mso.validityInfo #   \n", "s.gaps"), "blank reason");
-        assertThrows(IllegalArgumentException.class, () -> AcceptedGaps.parse("mso.noSuchCheck # x\n", "s.gaps"), "unknown check");
-        assertThrows(IllegalArgumentException.class, () -> AcceptedGaps.parse("mso.docType # a\nmso.docType # b\n", "s.gaps"), "twice");
+        assertTrue(parsed.gaps().containsKey("mdl.elementTypes:untyped:birth_date"));
+        assertRefused("mso.validityInfo:expired\n", "no reason");
+        assertRefused("mso.validityInfo:expired #   \n", "blank reason");
+        assertRefused("mso.noSuchCheck:expired # x\n", "unknown check");
+        assertRefused("mso.validityInfo:tooLate # x\n", "unknown code");
+        assertRefused("mso.validityInfo:expired:now # x\n", "a code that takes no parameter");
+        assertRefused("mdl.elementTypes:untyped # x\n", "a parameterised code without its parameter");
+        assertRefused("mso.validityInfo:error # x\n", "an unexpected error is never an accepted gap");
+        assertRefused("mso.validityInfo:notRun # x\n", "a check that did not run is never an accepted gap");
+        assertRefused("mso.docType:mismatch # a\nmso.docType:mismatch # b\n", "twice");
+        IllegalArgumentException bare = assertThrows(IllegalArgumentException.class,
+                () -> AcceptedGaps.parse("mso.validityInfo # G8\n", "s.gaps"));
+        assertTrue(bare.getMessage().contains("names a whole check"), bare.getMessage());
+        IllegalArgumentException optional = assertThrows(IllegalArgumentException.class,
+                () -> AcceptedGaps.parse("x5chain.serialNumber? # G27\n", "s.gaps"));
+        assertTrue(optional.getMessage().contains("'?' is gone"), optional.getMessage());
+    }
+
+    static void assertRefused(String text, String why) {
+        assertThrows(IllegalArgumentException.class, () -> AcceptedGaps.parse(text, "s.gaps"), why);
     }
 
     @Test
-    void theReportMustMatchTheDeclaredGapsExactly() {
+    void theReportMustMatchTheDeclaredCodesExactly() {
         VerificationReport report = new VerificationReport(List.of(
                 VerificationReport.Check.pass(IndependentMdocVerifier.CHECK_DOC_TYPE, "ok"),
-                VerificationReport.Check.fail(IndependentMdocVerifier.CHECK_TDATE_TAGS, "milliseconds"),
-                VerificationReport.Check.pass(IndependentMdocVerifier.CHECK_SERIAL_NUMBER, "positive this run")));
-        AcceptedGaps exact = AcceptedGaps.none().gap(IndependentMdocVerifier.CHECK_TDATE_TAGS, "G1")
-                .intermittent(IndependentMdocVerifier.CHECK_SERIAL_NUMBER, "G27");
+                VerificationReport.Check.fail(IndependentMdocVerifier.CHECK_TDATE_TAGS, "fractionalSeconds:signed", "milliseconds")));
+        AcceptedGaps exact = AcceptedGaps.none().gap(IndependentMdocVerifier.CHECK_TDATE_TAGS, "fractionalSeconds:signed", "G1");
         exact.assertMatches(report, "s");
 
-        AssertionError stale = assertThrows(AssertionError.class, () -> exact.gap(IndependentMdocVerifier.CHECK_DOC_TYPE, "old")
-                .assertMatches(report, "s"));
-        assertTrue(stale.getMessage().contains("gap no longer present, remove it from s.gaps: mso.docType"), stale.getMessage());
+        AssertionError stale = assertThrows(AssertionError.class, () -> exact
+                .gap(IndependentMdocVerifier.CHECK_DOC_TYPE, "mismatch", "old").assertMatches(report, "s"));
+        assertTrue(stale.getMessage().contains("gap no longer present, remove mso.docType:mismatch from s.gaps: "
+                + "mso.docType passes now"), stale.getMessage());
 
         AssertionError unlisted = assertThrows(AssertionError.class, () -> AcceptedGaps.none().assertMatches(report, "s"));
-        assertTrue(unlisted.getMessage().contains("not an accepted gap of s: FAIL mso.validityInfo.tdateTags"), unlisted.getMessage());
+        assertTrue(unlisted.getMessage().contains("not an accepted gap of s: mso.validityInfo.tdateTags:fractionalSeconds:signed"),
+                unlisted.getMessage());
+    }
+
+    @Test
+    void aDeclaredCodeCannotHideAnotherProblemOfTheSameCheck() {
+        // the review's finding: with "mso.validityInfo" accepted as a whole, an expired re-signed credential passed
+        VerificationReport report = new VerificationReport(List.of(VerificationReport.Check.fail(
+                IndependentMdocVerifier.CHECK_VALIDITY_INFO, List.of(
+                        new VerificationReport.Problem("signedAfterValidFrom", "signed after validFrom"),
+                        new VerificationReport.Problem("expired", "validUntil has passed")))));
+        AcceptedGaps g8 = AcceptedGaps.none().gap(IndependentMdocVerifier.CHECK_VALIDITY_INFO, "signedAfterValidFrom", "G8");
+        AssertionError expired = assertThrows(AssertionError.class, () -> g8.assertMatches(report, "s"));
+        assertTrue(expired.getMessage().contains("not an accepted gap of s: mso.validityInfo:expired"), expired.getMessage());
+
+        AssertionError other = assertThrows(AssertionError.class, () -> AcceptedGaps.none()
+                .gap(IndependentMdocVerifier.CHECK_VALIDITY_INFO, "expired", "x")
+                .gap(IndependentMdocVerifier.CHECK_VALIDITY_INFO, "notYetValid", "y").assertMatches(report, "s"));
+        assertTrue(other.getMessage().contains("gap no longer present, remove mso.validityInfo:notYetValid from s.gaps: "
+                + "mso.validityInfo reports [signedAfterValidFrom, expired]"), other.getMessage());
+    }
+
+    @Test
+    void aSkippedCheckIsNeverCoveredByAGap() {
+        VerificationReport report = new VerificationReport(List.of(
+                VerificationReport.Check.skipped(IndependentMdocVerifier.CHECK_ELEMENT_TYPES, "not an mDL")));
+        AssertionError skipped = assertThrows(AssertionError.class, () -> AcceptedGaps.none().assertMatches(report, "s"));
+        assertTrue(skipped.getMessage().contains("a gap cannot cover a check that did not run"), skipped.getMessage());
+    }
+
+    @Test
+    void everyRegisteredCodeIsAValidGapAndEveryCheckHasCodes() {
+        assertEquals(IndependentMdocVerifier.CHECKS, List.copyOf(IndependentMdocVerifier.PROBLEM_CODES.keySet()));
+        IndependentMdocVerifier.PROBLEM_CODES.forEach((check, codes) -> {
+            assertFalse(codes.isEmpty(), check);
+            for (String code : codes) {
+                String example = code.endsWith(":*") ? code.substring(0, code.length() - 1) + "x" : code;
+                assertTrue(IndependentMdocVerifier.isProblemCode(check, example), check + ":" + example);
+            }
+        });
+        assertEquals("org.iso.18013.5.1/family_name", IndependentMdocVerifier.parameter("org.iso.18013.5.1/family_name"));
+        assertEquals("a_b_", IndependentMdocVerifier.parameter("a b\u00e9"));
     }
 
     // ---- fixtures ------------------------------------------------------------------------------------------------
@@ -184,9 +331,10 @@ class MdocVerifierRulesTest {
     static void assertProblem(String identifier, DataItem value, String expected) {
         Map<String, DataItem> mdl = mdl();
         mdl.put(identifier, value);
-        List<String> problems = IndependentMdocVerifier.mdlElementProblems(mdl);
+        List<VerificationReport.Problem> problems = IndependentMdocVerifier.mdlElementProblems(mdl);
         assertEquals(1, problems.size(), identifier + " -> " + problems);
-        assertTrue(problems.get(0).contains(expected), "expected \"" + expected + "\" in " + problems);
+        assertEquals("untyped:" + identifier, problems.get(0).code(), problems.toString());
+        assertTrue(problems.get(0).message().contains(expected), "expected \"" + expected + "\" in " + problems);
     }
 
     /** Every Table 5 mandatory element of org.iso.18013.5.1, correctly typed. */

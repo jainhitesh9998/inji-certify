@@ -37,9 +37,10 @@ import static org.junit.jupiter.api.Assertions.fail;
  * trust decision. Nothing in this module knows how a credential is written, so a formatter change cannot make the
  * check agree with itself.
  *
- * <p>Every check runs ({@link Options#strict}); each sample is held to exactly the gaps its producer declared in the
- * {@code .gaps} sidecar: a check outside them that does not pass fails, and a declared gap that passes fails too, so
- * the fix that closes a gap removes its line in the same change.
+ * <p>Every check runs ({@link Options#strict}) on the bytes as received; each sample is held to exactly the problem
+ * codes its producer declared in the {@code .gaps} sidecar: a reported problem whose {@code <check>:<code>} is not
+ * declared fails, and a declared code that is no longer reported fails too, so the fix that closes a gap removes its
+ * line in the same change and one accepted problem cannot hide another one in the same check.
  *
  * <p>The samples are produced by tests in other modules and read from their {@code target/} directories (see
  * {@link #EXPECTED_SAMPLES}). This module is listed after {@code certify-service} in the parent POM, so a reactor
@@ -108,16 +109,16 @@ class MdocSampleConformanceTest {
 
     static void verify(Found found) {
         MdocSamples.Sample sample = MdocSamples.read(found.mdoc());
-        sample.documentDocType().ifPresent(documentDocType -> assertEquals(sample.docType(), documentDocType,
-                found.id() + ": the draft-13 Document's docType is not the configured one"));
-        VerificationReport report = new IndependentMdocVerifier().verify(sample.issuerSigned(), sample.holder(),
+        // the bytes as the wallet received them: a draft-13 Document is the verifier's credential.shape problem, and
+        // its docType is held to the MSO's by mso.docType, so neither is decided here
+        VerificationReport report = new IndependentMdocVerifier().verify(sample.received(), sample.holder(),
                 sample.iaca(), Instant.now(), Options.strict(sample.docType()));
         assertEquals(IndependentMdocVerifier.CHECKS, report.checks().stream().map(VerificationReport.Check::name).toList(),
                 found.id() + ": the verifier did not run every check");
         assertFalse(report.check(IndependentMdocVerifier.CHECK_SIGNATURE_MULTIPAZ).message().isBlank());
         sample.gaps().assertMatches(report, found.id());
-        System.out.println("[mdoc-conformance] " + found.id() + " " + report.checks().stream()
-                .filter(check -> !check.passed()).map(VerificationReport.Check::name).toList() + " accepted; " + report);
+        System.out.println("[mdoc-conformance] " + found.id() + " accepted " + report.checks().stream()
+                .flatMap(check -> check.codes().stream().map(code -> check.name() + ":" + code)).toList() + "; " + report);
     }
 
     static List<Found> found(Optional<Instant> buildStart) {

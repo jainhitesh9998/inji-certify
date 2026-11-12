@@ -16,7 +16,9 @@ import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * The {@code IssuerSignedItem} entries of an {@code IssuerSigned} <b>as they arrived</b>, one raw byte slice each.
@@ -73,6 +75,7 @@ final class WireIssuerSignedItems {
         Cursor top = header(cbor, 0);
         require(top.major == MAJOR_MAP, what + " is not a CBOR map");
         long[] found = null;
+        Set<String> keys = new HashSet<>();
         long position = top.next;
         for (long i = 0; top.indefinite() || i < top.count(cbor, 0); i++) {
             if (top.indefinite() && isBreak(cbor, position)) {
@@ -81,9 +84,13 @@ final class WireIssuerSignedItems {
             }
             long valueOffset = skip(cbor, position, 1);
             long end = skip(cbor, valueOffset, 1);
-            if (header(cbor, position).major == MAJOR_TEXT && key.equals(text(cbor, position, what + " key"))) {
-                require(found == null, what + " carries the key " + key + " twice");
-                found = new long[] {valueOffset, end};
+            if (header(cbor, position).major == MAJOR_TEXT) {
+                // a map with a key twice is ambiguous: two decoders may keep different values (RFC 8949 5.6)
+                String name = text(cbor, position, what + " key");
+                require(keys.add(name), what + " carries the key " + name + " twice");
+                if (key.equals(name)) {
+                    found = new long[] {valueOffset, end};
+                }
             }
             position = end;
         }
@@ -95,11 +102,14 @@ final class WireIssuerSignedItems {
         Cursor namespaces = header(cbor, offset);
         require(namespaces.major == MAJOR_MAP, "IssuerSigned.nameSpaces is not a CBOR map");
         long position = namespaces.next;
+        Set<String> seen = new HashSet<>();
         for (long i = 0; namespaces.indefinite() || i < namespaces.count(cbor, offset); i++) {
             if (namespaces.indefinite() && isBreak(cbor, position)) {
                 return;
             }
             String namespace = text(cbor, position, "namespace key");
+            // a namespace twice would let a decoder that keeps the last one drop items the first one signed
+            require(seen.add(namespace), "IssuerSigned.nameSpaces carries the namespace " + namespace + " twice");
             long arrayOffset = skip(cbor, position, 2);
             Cursor array = header(cbor, arrayOffset);
             require(array.major == MAJOR_ARRAY, "namespace " + namespace + " is not a CBOR array");

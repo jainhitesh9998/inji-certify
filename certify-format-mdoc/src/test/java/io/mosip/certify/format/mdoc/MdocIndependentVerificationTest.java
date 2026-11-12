@@ -91,19 +91,41 @@ class MdocIndependentVerificationTest {
 
     static final Path SAMPLES = Path.of("target", "mdoc-samples");
 
+    static final Path MUTATIONS = Path.of("target", "mdoc-mutations");
+
+    /** ISO/IEC 18013-5 7.2.1 Table 5: the mandatory elements of org.iso.18013.5.1. */
+    static final List<String> MANDATORY = List.of("family_name", "given_name", "birth_date", "issue_date", "expiry_date",
+            "issuing_country", "issuing_authority", "document_number", "portrait", "driving_privileges",
+            "un_distinguishing_sign");
+
+    static final String G1 = "G1: signed/validFrom/validUntil carry milliseconds (UTC_DATETIME_PATTERN); fixed by M-02";
+
     /**
-     * What the formatter's own output cannot pass yet, by check, with the gap and the work package that closes it.
-     * Written next to each sample as its {@code .gaps} sidecar; the work package that fixes one deletes its line.
+     * What the formatter's own output cannot pass yet, one problem code per line, with the gap and the work package
+     * that closes it. Written next to each sample as its {@code .gaps} sidecar; the work package that fixes one
+     * deletes its line, and a problem not listed here (an expired window, a new element-type regression) fails.
      */
-    static final AcceptedGaps FORMATTER_GAPS = AcceptedGaps.none()
-            .gap(IndependentMdocVerifier.CHECK_TDATE_TAGS,
-                    "G1: signed/validFrom/validUntil carry milliseconds (UTC_DATETIME_PATTERN); fixed by M-02")
-            .gap(IndependentMdocVerifier.CHECK_CHAIN_TO_IACA,
+    static final AcceptedGaps FORMATTER_GAPS = missingMandatory(AcceptedGaps.none()
+            .gap(IndependentMdocVerifier.CHECK_TDATE_TAGS, "fractionalSeconds:signed", G1)
+            .gap(IndependentMdocVerifier.CHECK_TDATE_TAGS, "fractionalSeconds:validFrom", G1)
+            .gap(IndependentMdocVerifier.CHECK_TDATE_TAGS, "fractionalSeconds:validUntil", G1)
+            .gap(IndependentMdocVerifier.CHECK_CHAIN_TO_IACA, "noAnchorSupplied",
                     "the JCA dev key is a lone self-signed certificate, there is no IACA to anchor it; M-05/M-06")
-            .gap(IndependentMdocVerifier.CHECK_NO_SELF_SIGNED,
-                    "G9/G10: the self-signed dev certificate is the whole x5chain (HAIP); M-02 and M-05")
-            .gap(IndependentMdocVerifier.CHECK_ELEMENT_TYPES,
-                    "G2/G3: the fixture's two elements are untyped strings and Table 5 mandatory elements are missing; M-03");
+            .gap(IndependentMdocVerifier.CHECK_NO_SELF_SIGNED, "selfSigned:0",
+                    "G9/G10: the self-signed dev certificate is the whole x5chain (HAIP); M-02 and M-05"),
+            "family_name", "birth_date");
+
+    /** {@code gaps} plus {@code mdl.elementTypes:missing:<id>} for every Table 5 mandatory element not in {@code present}. */
+    static AcceptedGaps missingMandatory(AcceptedGaps gaps, String... present) {
+        AcceptedGaps result = gaps;
+        for (String identifier : MANDATORY) {
+            if (!List.of(present).contains(identifier)) {
+                result = result.gap(IndependentMdocVerifier.CHECK_ELEMENT_TYPES, "missing:" + identifier,
+                        "G3: the two-element fixture lacks this Table 5 mandatory element; M-03");
+            }
+        }
+        return result;
+    }
 
     final IndependentMdocVerifier verifier = new IndependentMdocVerifier();
     final MdocFormatter formatter = new MdocFormatter(new ObjectMapper(), new MdocProperties("SHA-256", "1.0", 2));
@@ -382,6 +404,74 @@ class MdocIndependentVerificationTest {
             formatter.sign(unsigned, signing(), CONTEXT);
         });
         assertTrue(refused.getMessage().contains("Ed25519"), refused.getMessage());
+    }
+
+    // ---- one accepted problem cannot hide another one in the same check ----------------------------------------
+
+    @Test
+    void anExpiredResignedCredentialFailsEvenWithTheG8GapDeclared() throws Exception {
+        // the review's mutation: with G8 accepted as a whole check, an expired, re-signed credential passed both gates.
+        // Whole-second tag-0 dates, signed after validFrom (G8) and validUntil in 2021: only expired is new.
+        byte[] expired = resignValidity(issue(document()), Map.of("signed", "2020-01-01T00:00:05Z",
+                "validFrom", "2020-01-01T00:00:00Z", "validUntil", "2021-01-01T00:00:00Z"), Set.of());
+        AcceptedGaps g8 = FORMATTER_GAPS.without(IndependentMdocVerifier.CHECK_TDATE_TAGS)
+                .gap(IndependentMdocVerifier.CHECK_VALIDITY_INFO, "signedAfterValidFrom",
+                        "G8: signed after validFrom, as the core path signs today; fixed by M-02");
+        String name = MdocSamples.name(getClass(), "expired-g8");
+        // for the CI python step, which must fail on it for the same reason (the .expect sidecar names the problem)
+        Path written = MdocSamples.write(MUTATIONS, getClass(), "expired-g8", expired, JWK.parse(HOLDER_JWK), DOCTYPE, g8);
+        java.nio.file.Files.writeString(written.resolveSibling(name + ".expect"), "mso.validityInfo:expired\n");
+
+        VerificationReport report = verify(expired, Optional.empty(), Options.strict(DOCTYPE));
+        assertTrue(report.check(IndependentMdocVerifier.CHECK_SIGNATURE_MULTIPAZ).passed(), report.toString());
+        AssertionError refused = assertThrows(AssertionError.class, () -> g8.assertMatches(report, name));
+        assertTrue(refused.getMessage().contains("not an accepted gap of " + name + ": mso.validityInfo:expired"),
+                refused.getMessage());
+        // and expired is the only difference: accept it too and the same report matches
+        g8.gap(IndependentMdocVerifier.CHECK_VALIDITY_INFO, "expired", "the mutation").assertMatches(report, name);
+    }
+
+    @Test
+    void aNewElementTypeRegressionFailsWithTheOtherElementGapsDeclared() throws Exception {
+        // family_name as a uint: every element gap of today's output stays declared, the new one is not
+        Map<String, Object> regressed = Map.of("docType", DOCTYPE, "validityInfo", validity(),
+                "nameSpaces", Map.of(NAMESPACE, List.of(element(0, "family_name", 42), element(1, "birth_date", "1990-01-01"))));
+        VerificationReport report = verify(issue(regressed), Optional.empty(), Options.strict(DOCTYPE));
+        AssertionError refused = assertThrows(AssertionError.class, () -> FORMATTER_GAPS.assertMatches(report, "regression"));
+        assertTrue(refused.getMessage().contains("not an accepted gap of regression: mdl.elementTypes:untyped:family_name"),
+                refused.getMessage());
+        FORMATTER_GAPS.gap(IndependentMdocVerifier.CHECK_ELEMENT_TYPES, "untyped:family_name", "the mutation")
+                .assertMatches(report, "regression");
+    }
+
+    @Test
+    void theDraft13DocumentShapeAndTaggedIssuerAuthAreTheirOwnProblems() throws Exception {
+        // the 0.14.0 wire shape: Document {docType, issuerSigned} around today's output, IssuerAuth under tag 18; both
+        // signature oracles still verify after unwrapping, and nothing but the two shape codes is new
+        co.nstant.in.cbor.model.Map issuerSigned = (co.nstant.in.cbor.model.Map) decode(issue(document()));
+        Array issuerAuth = (Array) issuerSigned.get(new UnicodeString("issuerAuth"));
+        issuerAuth.setTag(18);
+        co.nstant.in.cbor.model.Map documentWrapper = new co.nstant.in.cbor.model.Map();
+        documentWrapper.put(new UnicodeString("docType"), new UnicodeString(DOCTYPE));
+        documentWrapper.put(new UnicodeString("issuerSigned"), issuerSigned);
+        VerificationReport report = verify(encode(documentWrapper), Optional.empty(), Options.strict(DOCTYPE));
+        assertEquals(List.of("documentWrapper"), report.check(IndependentMdocVerifier.CHECK_SHAPE).codes(), report.toString());
+        assertEquals(List.of("tagged"), report.check(IndependentMdocVerifier.CHECK_UNTAGGED).codes(), report.toString());
+        assertTrue(report.check(IndependentMdocVerifier.CHECK_SIGNATURE_MULTIPAZ).passed(), report.toString());
+        assertTrue(report.check(IndependentMdocVerifier.CHECK_SIGNATURE_AUTHLETE).passed(), report.toString());
+        FORMATTER_GAPS.gap(IndependentMdocVerifier.CHECK_SHAPE, "documentWrapper", "0.14.0")
+                .gap(IndependentMdocVerifier.CHECK_UNTAGGED, "tagged", "0.14.0").assertMatches(report, "d13-shape");
+        // a Document whose docType disagrees with the MSO is its own problem
+        documentWrapper.put(new UnicodeString("docType"), new UnicodeString(DOCTYPE + ".other"));
+        assertEquals(List.of("documentMismatch"), verify(encode(documentWrapper), Optional.empty(), Options.strict(DOCTYPE))
+                .check(IndependentMdocVerifier.CHECK_DOC_TYPE).codes());
+    }
+
+    @Test
+    void todayOutputIsABareUntaggedIssuerSigned() throws Exception {
+        VerificationReport report = verify(issue(document()), Optional.empty(), Options.strict(DOCTYPE));
+        assertTrue(report.check(IndependentMdocVerifier.CHECK_SHAPE).passed(), report.toString());
+        assertTrue(report.check(IndependentMdocVerifier.CHECK_UNTAGGED).passed(), report.toString());
     }
 
     // ---- strict mode today: each check fails, and M-02/M-03/M-06 flip these tests ------------------------------

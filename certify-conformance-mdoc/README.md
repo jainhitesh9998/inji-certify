@@ -18,7 +18,7 @@ classpath of `certify-service`.
 | `certify-service/IssuanceGoldenTest-legacy` | `POST /issuance/credential` on the legacy service |
 | `certify-service/IssuanceGoldenTest-oid4vci` | `POST /oid4vci/credential` |
 | `certify-service/IssuanceGoldenCoreTest-legacy`, `-oid4vci` | both paths with the compatibility path served by the core |
-| `certify-service/D13GoldenReplayTest-d13` | the draft-13 surface: a `Document {docType, issuerSigned}` with a tag-18 IssuerAuth |
+| `certify-service/D13GoldenReplayTest-d13` | the draft-13 surface: a `Document {docType, issuerSigned}` with a tag-18 IssuerAuth (0.14.0 wire compatibility, decision log 2026-09-19) |
 
 `VcIssuancePluginGoldenTest` is not a producer: its `mso_mdoc` credential is a plugin's opaque bytes, passed through.
 Each sample is `<name>.mdoc` (the credential as received) plus `<name>.holder.jwk`, `<name>.doctype`, `<name>.gaps`
@@ -31,7 +31,8 @@ producing tests first:
 
 ```bash
 mvn -B -ntp -pl certify-testkit-mdoc,certify-format-mdoc,certify-service,certify-conformance-mdoc \
-    -am test -Dtest='IssuanceGolden*,*Mdoc*,*Conformance*,D13Golden*,WireIssuerSignedItems*' -Dsurefire.failIfNoSpecifiedTests=false
+    -am test -Dtest='IssuanceGolden*,*Mdoc*,*Conformance*,D13Golden*,WireIssuerSignedItems*,*Gaps*,ProblemCodeRegistry*' \
+    -Dsurefire.failIfNoSpecifiedTests=false
 ```
 
 Surefire passes the reactor's start (`maven.build.timestamp`) as `mdoc.samples.buildStart`. A sample older than that
@@ -41,8 +42,11 @@ it fails.
 
 ## What it asserts
 
-- every current sample passes every check (`Options.strict`) except exactly the gaps its `.gaps` sidecar declares: an
-  unlisted failure fails, and a listed gap that passes fails with "gap no longer present, remove it from
-  <sample>.gaps" (a `?` gap, drawn at random by the product, may do either);
-- a draft-13 `Document`'s `docType` equals the configured one;
+- every current sample, verified as received (`Options.strict`), reports exactly the problem codes its `.gaps`
+  sidecar declares: a reported `<check>:<code>` the sidecar does not list fails, a listed one no longer reported fails
+  with "gap no longer present, remove ... from <sample>.gaps", and a skipped check fails. One accepted problem cannot
+  hide another in the same check (an expired credential fails with G8's `signedAfterValidFrom` declared);
+- a draft-13 sample declares its two 0.14.0 shape deviations, `credential.shape:documentWrapper` and
+  `issuerAuth.untagged:tagged`, and its `Document.docType` must equal the MSO's (`mso.docType:documentMismatch`
+  otherwise); the legacy and `/oid4vci` samples pass both shape checks;
 - with `CI` set: exactly the samples in `EXPECTED_SAMPLES`, all written after the build started.
