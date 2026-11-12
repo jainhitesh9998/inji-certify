@@ -11,12 +11,12 @@
     "portrait": "portrait-1.jpg",
     "driving_privileges": [
       {
-        "vehicle_category_code": "B",
+        "vehicle_category_code": "A1",
         "issue_date": "2024-01-15",
         "expiry_date": "2030-01-15"
       },
       {
-        "vehicle_category_code": "LMV",
+        "vehicle_category_code": "B",
         "issue_date": "2024-01-15",
         "expiry_date": "2030-01-15"
       }
@@ -39,12 +39,12 @@
     "portrait": "portrait-2.jpg",
     "driving_privileges": [
       {
-        "vehicle_category_code": "B",
+        "vehicle_category_code": "A",
         "issue_date": "2024-02-20",
         "expiry_date": "2030-02-20"
       },
       {
-        "vehicle_category_code": "MCWG",
+        "vehicle_category_code": "B",
         "issue_date": "2024-02-20",
         "expiry_date": "2030-02-20"
       }

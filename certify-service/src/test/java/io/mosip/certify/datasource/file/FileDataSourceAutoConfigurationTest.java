@@ -17,7 +17,6 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -43,8 +42,20 @@ class FileDataSourceAutoConfigurationTest {
             assertNull(context.getStartupFailure(), () -> "unconfigured must be safe: " + context.getStartupFailure());
             assertTrue(context.getBeansOfType(CredentialDataSource.class).isEmpty());
             assertTrue(context.getBean(FileDataSourceProperties.class).sources().isEmpty());
-            assertFalse(context.getBean(FileDataSourceProperties.class).enabled());
         });
+    }
+
+    @Test
+    void aSourceWithoutAPathFailsStartupWithTheKeyNamed() {
+        runner.withPropertyValues("certify.datasource.file.sources.broken.key-claim=sub")
+                .run(context -> {
+                    assertNotNull(context.getStartupFailure(), "path is @NotNull: binding must refuse an entry without one");
+                    StringBuilder messages = new StringBuilder();
+                    for (Throwable t = context.getStartupFailure(); t != null; t = t.getCause()) {
+                        messages.append(t.getMessage()).append(" | ");
+                    }
+                    assertTrue(messages.toString().contains("path"), messages.toString());
+                });
     }
 
     @Test
@@ -72,7 +83,6 @@ class FileDataSourceAutoConfigurationTest {
                             beans.values().stream().map(CredentialDataSource::id).collect(Collectors.toSet()));
 
                     FileDataSourceProperties properties = context.getBean(FileDataSourceProperties.class);
-                    assertTrue(properties.enabled());
                     assertEquals("sub", properties.sources().get("mdl-demo").keyClaim(), "the default key claim");
                     assertEquals(List.of("portrait"), properties.sources().get("mdl-demo").binaryFields());
                     assertEquals(List.of(), properties.sources().get("farmer").binaryFields());

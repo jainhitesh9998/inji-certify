@@ -25,7 +25,7 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** Loading, key lookup, binary fields and the startup checks of {@link FileCredentialDataSource} (M-10). */
+/** Loading, key lookup, binary fields, symlinks, size bounds and the startup checks of {@link FileCredentialDataSource} (M-10). */
 class FileCredentialDataSourceTest {
 
     @TempDir
@@ -85,7 +85,7 @@ class FileCredentialDataSourceTest {
     }
 
     @Test
-    void anUnknownOrMissingSubjectIsTheCoreNoDataErrorAndNotAServerError() throws Exception {
+    void anUnknownOrMissingSubjectIsCredentialRequestDeniedAndNotAServerError() throws Exception {
         Path file = write("holders.json", """
                 {"alice": {"given_name": "Asha"}}
                 """);
@@ -93,7 +93,8 @@ class FileCredentialDataSourceTest {
                 new FileDataSourceProperties.Source(file, "sub", List.of()));
 
         DataSourceException unknown = assertThrows(DataSourceException.class, () -> source.fetch(subject("carol"), null));
-        assertEquals(IssuanceException.INVALID_CREDENTIAL_REQUEST, unknown.getErrorCode());
+        assertEquals(IssuanceException.CREDENTIAL_REQUEST_DENIED, unknown.getErrorCode());
+        assertEquals("credential_request_denied", unknown.getErrorCode(), "OpenID4VCI 1.0 section 8.3.1.2");
         assertNotEquals(IssuanceException.ISSUANCE_FAILED, unknown.getErrorCode(),
                 "the adapters answer 500 for credential_issuance_failed and 400 for every other core code");
 
@@ -125,6 +126,31 @@ class FileCredentialDataSourceTest {
     }
 
     @Test
+    void nestedValuesAreImmutableAndASecondFetchIsUnaffected() throws Exception {
+        Path file = write("holders.json", """
+                {"alice": {"given_name": "Asha",
+                           "driving_privileges": [{"vehicle_category_code": "B", "codes": [{"code": "01"}]}]}}
+                """);
+        FileCredentialDataSource source = new FileCredentialDataSource("demo",
+                new FileDataSourceProperties.Source(file, "sub", List.of()));
+
+        Map<String, Object> record = source.fetch(subject("alice"), null).claims();
+        assertThrows(UnsupportedOperationException.class, () -> record.put("given_name", "Mallory"));
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> privileges = (List<Map<String, Object>>) record.get("driving_privileges");
+        assertThrows(UnsupportedOperationException.class, () -> privileges.add(Map.of()));
+        assertThrows(UnsupportedOperationException.class, () -> privileges.get(0).put("vehicle_category_code", "C"));
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> codes = (List<Map<String, Object>>) privileges.get(0).get("codes");
+        assertThrows(UnsupportedOperationException.class, () -> codes.get(0).put("code", "99"));
+
+        Map<String, Object> again = source.fetch(subject("alice"), null).claims();
+        assertEquals("Asha", again.get("given_name"));
+        assertEquals("B", privileges.get(0).get("vehicle_category_code"));
+        assertEquals("01", codes.get(0).get("code"));
+    }
+
+    @Test
     void absolutePathsAndPathsEscapingTheJsonDirectoryAreRefused() throws Exception {
         Path absolute = write("absolute.json", """
                 {"alice": {"portrait": "%s"}}
@@ -141,6 +167,114 @@ class FileCredentialDataSourceTest {
                     new FileDataSourceProperties.Source(file, "sub", List.of("portrait"))), escaping);
             assertTrue(failure.getMessage().contains("escapes"), failure.getMessage());
         }
+    }
+
+    @Test
+    void symlinksPointingOutsideTheJsonDirectoryAreRefused() throws Exception {
+        Path outside = Files.createTempDirectory("mdl-outside");
+        try {
+            Files.writeString(outside.resolve("holders.json"), """
+                    {"alice": {"given_name": "Mallory"}}
+                    """);
+            Files.writeString(outside.resolve("face.jpg"), "outside");
+            Path linkedJson = dir.resolve("holders.json");
+            Files.createSymbolicLink(linkedJson, outside.resolve("holders.json"));
+            IllegalStateException fileLink = assertThrows(IllegalStateException.class, () -> new FileCredentialDataSource("demo",
+                    new FileDataSourceProperties.Source(linkedJson, "sub", List.of())));
+            assertTrue(fileLink.getMessage().contains("outside"), fileLink.getMessage());
+
+            Path file = write("bin.json", """
+                    {"alice": {"portrait": "face.jpg"}}
+                    """);
+            Files.createSymbolicLink(dir.resolve("face.jpg"), outside.resolve("face.jpg"));
+            IllegalStateException binaryLink = assertThrows(IllegalStateException.class, () -> new FileCredentialDataSource("demo",
+                    new FileDataSourceProperties.Source(file, "sub", List.of("portrait"))));
+            assertTrue(binaryLink.getMessage().contains("'portrait'") && binaryLink.getMessage().contains("outside"),
+                    binaryLink.getMessage());
+
+            Path directoryJson = write("dir.json", """
+                    {"alice": {"portrait": "linked/face.jpg"}}
+                    """);
+            Path linkedDirectory = dir.resolve("linked");
+            Files.createSymbolicLink(linkedDirectory, outside);
+            IllegalStateException directoryLink = assertThrows(IllegalStateException.class, () -> new FileCredentialDataSource("demo",
+                    new FileDataSourceProperties.Source(directoryJson, "sub", List.of("portrait"))));
+            assertTrue(directoryLink.getMessage().contains("outside"), directoryLink.getMessage());
+        } finally {
+            Files.deleteIfExists(outside.resolve("holders.json"));
+            Files.deleteIfExists(outside.resolve("face.jpg"));
+            Files.deleteIfExists(outside);
+        }
+    }
+
+    @Test
+    void aKubernetesConfigMapLayoutIsAccepted() throws Exception {
+        // a ConfigMap volume: every key is a link into ..data/, which links to the versioned directory in the same dir
+        Path versioned = dir.resolve("..2026_01_01_00_00_00");
+        Files.createDirectories(versioned);
+        byte[] jpeg = {(byte) 0xFF, (byte) 0xD8, 0x11, 0x22, (byte) 0xFF, (byte) 0xD9};
+        Files.write(versioned.resolve("portrait-1.jpg"), jpeg);
+        Files.writeString(versioned.resolve("holders.json"), """
+                {"alice": {"given_name": "Asha", "portrait": "portrait-1.jpg"}}
+                """);
+        Files.createSymbolicLink(dir.resolve("..data"), versioned.getFileName());
+        Path json = dir.resolve("holders.json");
+        Files.createSymbolicLink(json, Path.of("..data", "holders.json"));
+        Files.createSymbolicLink(dir.resolve("portrait-1.jpg"), Path.of("..data", "portrait-1.jpg"));
+
+        FileCredentialDataSource source = new FileCredentialDataSource("demo",
+                new FileDataSourceProperties.Source(json, "sub", List.of("portrait")));
+
+        assertEquals("Asha", source.fetch(subject("alice"), null).get("given_name"));
+        assertEquals(Base64.getUrlEncoder().withoutPadding().encodeToString(jpeg),
+                source.fetch(subject("alice"), null).get("portrait"));
+    }
+
+    @Test
+    void filesAboveTheSizeBoundsAreRefused() throws Exception {
+        String largeValue = "x".repeat((int) FileCredentialDataSource.MAX_JSON_BYTES);
+        Path large = write("large.json", "{\"alice\": {\"blob\": \"" + largeValue + "\"}}");
+        IllegalStateException json = assertThrows(IllegalStateException.class, () -> new FileCredentialDataSource("demo",
+                new FileDataSourceProperties.Source(large, "sub", List.of())));
+        assertTrue(json.getMessage().contains("demo") && json.getMessage().contains("larger than")
+                && json.getMessage().contains("large.json"), json.getMessage());
+
+        byte[] tooLarge = new byte[(int) FileCredentialDataSource.MAX_BINARY_BYTES + 1];
+        Files.write(dir.resolve("big.jpg"), tooLarge);
+        Path file = write("binary.json", """
+                {"alice": {"portrait": "big.jpg"}}
+                """);
+        IllegalStateException binary = assertThrows(IllegalStateException.class, () -> new FileCredentialDataSource("demo",
+                new FileDataSourceProperties.Source(file, "sub", List.of("portrait"))));
+        assertTrue(binary.getMessage().contains("'portrait'") && binary.getMessage().contains("'alice'")
+                && binary.getMessage().contains("big.jpg") && binary.getMessage().contains("larger than"), binary.getMessage());
+    }
+
+    @Test
+    void theAggregateBudgetIsEnforcedAcrossAllBinaryFiles() throws Exception {
+        // each file is under the 1 MiB per-file cap, so only the per-source budget can refuse this
+        Files.write(dir.resolve("face.jpg"), new byte[(int) FileCredentialDataSource.MAX_BINARY_BYTES]);
+        StringBuilder json = new StringBuilder("{");
+        for (int i = 0; i <= FileCredentialDataSource.MAX_TOTAL_BYTES / FileCredentialDataSource.MAX_BINARY_BYTES; i++) {
+            if (i > 0) json.append(',');
+            json.append("\"holder-").append(i).append("\": {\"portrait\": \"face.jpg\"}");
+        }
+        Path file = write("many.json", json.append('}').toString());
+
+        IllegalStateException budget = assertThrows(IllegalStateException.class, () -> new FileCredentialDataSource("demo",
+                new FileDataSourceProperties.Source(file, "sub", List.of("portrait"))));
+        assertTrue(budget.getMessage().contains("demo") && budget.getMessage().contains("in total")
+                && budget.getMessage().contains("'portrait'") && budget.getMessage().contains("face.jpg"), budget.getMessage());
+    }
+
+    @Test
+    void theReservedDataProviderPluginIdIsRefused() throws Exception {
+        Path file = write("holders.json", """
+                {"alice": {"given_name": "Asha"}}
+                """);
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> new FileCredentialDataSource("data-provider-plugin",
+                new FileDataSourceProperties.Source(file, "sub", List.of())));
+        assertTrue(e.getMessage().contains("reserved") && e.getMessage().contains("data-provider-plugin"), e.getMessage());
     }
 
     @Test

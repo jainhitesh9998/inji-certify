@@ -29,6 +29,13 @@ class MdlDemoDataTest {
     static final List<String> MANDATORY = List.of("family_name", "given_name", "birth_date", "issue_date", "expiry_date",
             "issuing_country", "issuing_authority", "document_number", "portrait", "driving_privileges", "un_distinguishing_sign");
 
+    /**
+     * The {@code vehicle_category_code} values ISO/IEC 18013-1 defines; a licence in India is not a reason to put the
+     * Indian marketing abbreviations ({@code LMV}, {@code MCWG}) on an ISO document.
+     */
+    static final List<String> VEHICLE_CATEGORY_CODES = List.of("AM", "A1", "A2", "A", "B1", "B", "BE", "C1", "C1E",
+            "C", "CE", "D1", "D1E", "D", "DE");
+
     private final Path holders = Path.of("..", "docker-compose", "docker-compose-injistack", "config", "mdl", "holders.json")
             .toAbsolutePath().normalize();
 
@@ -52,6 +59,7 @@ class MdlDemoDataTest {
             LocalDate birth = LocalDate.parse((String) record.get("birth_date"));
             LocalDate issued = LocalDate.parse((String) record.get("issue_date"));
             LocalDate expiry = LocalDate.parse((String) record.get("expiry_date"));
+            // a reminder, not a rule: refresh the demo data before 2030, or every demo credential is issued expired
             assertTrue(expiry.isAfter(LocalDate.now()), subject + " would be issued already expired");
             assertTrue(issued.isBefore(expiry) && birth.isBefore(issued), subject + " has inconsistent dates");
 
@@ -61,6 +69,8 @@ class MdlDemoDataTest {
             for (Map<String, Object> privilege : privileges) {
                 assertTrue(privilege.keySet().containsAll(List.of("vehicle_category_code", "issue_date", "expiry_date")),
                         subject + " privilege " + privilege);
+                assertTrue(VEHICLE_CATEGORY_CODES.contains(privilege.get("vehicle_category_code")),
+                        subject + " privilege " + privilege + " is not an ISO/IEC 18013-1 vehicle category code");
             }
 
             byte[] jpeg = Base64.getUrlDecoder().decode((String) record.get("portrait"));

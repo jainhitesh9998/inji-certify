@@ -53,6 +53,7 @@ import java.util.Set;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -89,9 +90,15 @@ class DefaultIssuanceServiceTest {
                 .register(config("farmer-status", "farmer_vc", IssuanceStrategy.TEMPLATE, new StatusConfig("token-status-list", List.of("revocation"))))
                 .register(config("supplied", "any", IssuanceStrategy.SUPPLIED, StatusConfig.NONE))
                 .register(config("external", "farmer_vc", IssuanceStrategy.EXTERNAL, StatusConfig.NONE));
-        service = new DefaultIssuanceService(registry, new FormatterRegistry(List.of(formatter)), new KeyProviderRegistry(List.of(JCA)),
-                List.of(dataSource), List.of(new FakeExternalIssuer()), List.of(proofValidator), List.of(templateEngine),
-                List.of(statusProvider), List.of(listener), AuthorizationPolicy.SCOPE, Clock.fixed(NOW, ZoneOffset.UTC), Duration.ofDays(30));
+        service = service(List.of(dataSource), null);
+    }
+
+    /** The same service over a given list of data sources and the default source id a configuration naming none uses. */
+    private DefaultIssuanceService service(List<CredentialDataSource> dataSources, String defaultDataSourceId) {
+        return new DefaultIssuanceService(registry, new FormatterRegistry(List.of(formatter)), new KeyProviderRegistry(List.of(JCA)),
+                dataSources, List.of(new FakeExternalIssuer()), List.of(proofValidator), List.of(templateEngine),
+                List.of(statusProvider), List.of(listener), AuthorizationPolicy.SCOPE, Clock.fixed(NOW, ZoneOffset.UTC), Duration.ofDays(30),
+                defaultDataSourceId);
     }
 
     /** The draft-13 selector is the configuration id in upper camel case, so each configuration stays uniquely selectable. */
@@ -291,6 +298,47 @@ class DefaultIssuanceServiceTest {
     }
 
     @Test
+    void aConfigurationNamingNoSourceUsesTheDefaultSourceEvenWhenSeveralAreRegistered() {
+        FakeDataSource plugin = new FakeDataSource("data-provider-plugin");
+        FakeDataSource file = new FakeDataSource("mdl-demo");
+        registry.register(templated("mdl", "mdl-demo"));
+        DefaultIssuanceService multi = service(List.of(plugin, file), "data-provider-plugin");
+
+        multi.issue(command("farmer").build());
+        assertNotNull(plugin.context, "a configuration without dataSourceId is a pre-M-10 configuration: the plugin source");
+        assertNull(file.context);
+
+        multi.issue(command("mdl").build());
+        assertNotNull(file.context, "a configuration naming dataSourceId uses exactly that source");
+    }
+
+    @Test
+    void withoutADefaultSourceSeveralRegisteredSourcesAreStillARefusal() {
+        FakeDataSource file = new FakeDataSource("mdl-demo");
+        DefaultIssuanceService multi = service(List.of(new FakeDataSource("data-provider-plugin"), file), null);
+
+        IssuanceException e = assertThrows(IssuanceException.class, () -> multi.issue(command("farmer").build()));
+
+        assertEquals(IssuanceException.ISSUANCE_FAILED, e.getErrorCode());
+        assertTrue(e.getMessage().contains("must name one"), e.getMessage());
+    }
+
+    @Test
+    void anUnregisteredDefaultSourceFallsBackToTheOnlyRegisteredOne() {
+        FakeDataSource file = new FakeDataSource("mdl-demo");
+        DefaultIssuanceService single = service(List.of(file), "data-provider-plugin");
+
+        single.issue(command("farmer").build());
+
+        assertNotNull(file.context, "a deployment without the plugin keeps issuing from its one source");
+    }
+
+    private static CredentialConfiguration templated(String id, String dataSourceId) {
+        return new CredentialConfiguration(null, id, "farmer_vc", "vc+jwt", new FormatConfig.Generic(Map.of(), id + "Credential"),
+                null, SigningConfig.of(KEY, SignatureAlgorithm.ES256), IssuanceStrategy.TEMPLATE, dataSourceId, null, null, null);
+    }
+
+    @Test
     void dataSourceErrorsKeepTheirCodeAndAreReported() {
         dataSource.failWith = new DataSourceException("record_not_found", "no such farmer");
 
@@ -357,10 +405,19 @@ class DefaultIssuanceServiceTest {
     void clearTrace() { Trace.STEPS.clear(); }
 
     static final class FakeDataSource implements CredentialDataSource {
+        final String id;
         IssuanceContext context;
         DataSourceException failWith;
 
-        public String id() { return "fake"; }
+        FakeDataSource() {
+            this("fake");
+        }
+
+        FakeDataSource(String id) {
+            this.id = id;
+        }
+
+        public String id() { return id; }
 
         public ClaimSet fetch(IssuanceContext context, CredentialConfiguration configuration) throws DataSourceException {
             Trace.step("fetch");
