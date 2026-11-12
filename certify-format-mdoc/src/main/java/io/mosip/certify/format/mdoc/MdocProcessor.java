@@ -16,11 +16,13 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
+import java.time.Duration;
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneOffset;
-import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
+import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.Map;
 
@@ -33,10 +35,25 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 /**
  * Utility class for mDoc (Mobile Document) specific operations.
  * Provides helper methods for mDoc structure creation and manipulation.
+ *
+ * <p>The wire rules of ISO/IEC 18013-5 that this class owns: {@code tdate} is tag 0 around a 20-character RFC 3339
+ * string without fractional seconds (9.1.2.4); an IssuerSignedItem is digested over its tag-24 encoding with the
+ * algorithm the MSO declares (9.1.2.5); {@code digestID} is a per-namespace random permutation of {@code 0..n-1} so
+ * that identifiers reveal neither element order nor count across issuances (9.1.2.5).
  */
 public class MdocProcessor {
 
     private static final Logger log = LoggerFactory.getLogger(MdocProcessor.class);
+    /** The digest algorithms 18013-5 9.1.2.4 allows the MSO to declare. */
+    private static final Map<String, String> DIGEST_ALGORITHMS = Map.of(
+            "SHA256", "SHA-256", "SHA-256", "SHA-256",
+            "SHA384", "SHA-384", "SHA-384", "SHA-384",
+            "SHA512", "SHA-512", "SHA-512", "SHA-512");
+    private static final DateTimeFormatter TDATE =
+            DateTimeFormatter.ofPattern(MdocConstants.TDATE_PATTERN).withZone(ZoneOffset.UTC);
+    private static final SecureRandom RANDOM = new SecureRandom();
+    private static final java.util.concurrent.atomic.AtomicBoolean DIGEST_ID_WARNING = new java.util.concurrent.atomic.AtomicBoolean();
+
     private final ObjectMapper objectMapper;
     private final MdocProperties mDocConfig;
 
@@ -46,49 +63,19 @@ public class MdocProcessor {
     }
 
     /**
-     * Process templated JSON to create final mDoc structure
+     * Process templated JSON to create final mDoc structure: validityInfo prepared from the request clock, and
+     * {@code digestID}s assigned as a random permutation per namespace.
      */
-    public Map<String, Object> processTemplatedJson(String templatedJSON, Map<String, Object> templateParams) {
+    public Map<String, Object> processTemplatedJson(String templatedJSON, Map<String, Object> templateParams, Instant now) {
         try {
             JsonNode templateNode = objectMapper.readTree(templatedJSON);
             Map<String, Object> finalMDoc = new HashMap<>();
 
-            JsonNode validityInfo = Objects.requireNonNull(
-                    templateNode.get(MdocConstants.VALIDITY_INFO),
-                    "Missing validity info"
-            );
-
-            Map<String, Object> validity = objectMapper.convertValue(validityInfo, Map.class);
-
-            String validFromValue = Objects.requireNonNull(
-                    (String) validity.get(MdocConstants.VALID_FROM),
-                    "Missing validFrom"
-            );
-            String signedValue = Objects.requireNonNull(
-                    (String) validity.get(MdocConstants.SIGNED),
-                    "Missing signed"
-            );
-            String validUntilValue = Objects.requireNonNull(
-                    (String) validity.get(MdocConstants.VALID_UNTIL),
-                    "Missing validUntil"
-            );
-
-            ZonedDateTime currentTime = ZonedDateTime.now(ZoneOffset.UTC);
-            String formattedCurrentTime = currentTime.format(DateTimeFormatter.ofPattern(MdocConstants.UTC_DATETIME_PATTERN));
-
-            if ("${_validFrom}".equals(validFromValue)) {
-                validity.put(MdocConstants.VALID_FROM, createCBORTaggedDateTime(formattedCurrentTime));
+            JsonNode validityInfo = templateNode.get(MdocConstants.VALIDITY_INFO);
+            if (validityInfo != null && !validityInfo.isNull()) {
+                // the values are finalised again at signing time; here they only have to be present and well-formed
+                finalMDoc.put(MdocConstants.VALIDITY_INFO, objectMapper.convertValue(validityInfo, Map.class));
             }
-            if ("${_signed}".equals(signedValue)) {
-                validity.put(MdocConstants.SIGNED, createCBORTaggedDateTime(formattedCurrentTime));
-            }
-            if ("${_validUntil}".equals(validUntilValue)) {
-                String futureTime = currentTime.plusYears(mDocConfig.validityPeriodYears())
-                        .format(DateTimeFormatter.ofPattern(MdocConstants.UTC_DATETIME_PATTERN));
-                validity.put(MdocConstants.VALID_UNTIL, createCBORTaggedDateTime(futureTime));
-            }
-
-            finalMDoc.put(MdocConstants.VALIDITY_INFO, validity);
 
             if (templateParams.containsKey(MdocConstants.DID_URL)) {
                 finalMDoc.put("_issuer", templateParams.get(MdocConstants.DID_URL));
@@ -106,14 +93,15 @@ public class MdocProcessor {
                 JsonNode nameSpacesNode = templateNode.get(MdocConstants.NAMESPACES);
                 nameSpacesNode.fieldNames().forEachRemaining(namespaceName -> {
                     JsonNode namespaceItems = nameSpacesNode.get(namespaceName);
-                    List<Map<String, Object>> processedItems = processNamespaceItems(namespaceItems);
-                    nameSpaces.put(namespaceName, processedItems);
+                    nameSpaces.put(namespaceName, processNamespaceItems(namespaceName, namespaceItems));
                 });
             }
             finalMDoc.put(MdocConstants.NAMESPACES, nameSpaces);
 
             return finalMDoc;
 
+        } catch (FormatException e) {
+            throw e;
         } catch (Exception e) {
             log.error("Error processing templated JSON: {}", e.getMessage(), e);
             throw new FormatException(MdocConstants.ERROR_TEMPLATE, "Error processing templated JSON: " + e.getMessage());
@@ -121,31 +109,43 @@ public class MdocProcessor {
     }
 
     /**
-     * Process items within a namespace
+     * Process items within a namespace and give each element a {@code digestID} drawn from a random permutation of
+     * {@code 0..n-1}. A {@code digestID} the template carries is ignored (18013-5 9.1.2.5: identifiers must not reveal
+     * information) and the first such template is reported once.
      */
-    private List<Map<String, Object>> processNamespaceItems(JsonNode namespaceItems) {
+    private List<Map<String, Object>> processNamespaceItems(String namespaceName, JsonNode namespaceItems) {
         List<Map<String, Object>> processedItems = new ArrayList<>();
+        List<Integer> digestIds = new ArrayList<>();
+        boolean templateCarriedIds = false;
 
-        // First, add all items from template
         for (JsonNode item : namespaceItems) {
             Map<String, Object> itemMap = new HashMap<>();
-            itemMap.put(MdocConstants.DIGEST_ID, item.get(MdocConstants.DIGEST_ID).asInt());
-            itemMap.put(MdocConstants.ELEMENT_IDENTIFIER, item.get(MdocConstants.ELEMENT_IDENTIFIER).asText());
-
-            // Handle elementValue which could be string or complex object
-            JsonNode elementValue = item.get(MdocConstants.ELEMENT_VALUE);
-            if (elementValue.isTextual()) {
-                itemMap.put(MdocConstants.ELEMENT_VALUE, elementValue.asText());
-            } else {
-                // Convert complex objects (like driving_privileges)
-                Object value = objectMapper.convertValue(elementValue, Object.class);
-                itemMap.put(MdocConstants.ELEMENT_VALUE, value);
+            if (item.has(MdocConstants.DIGEST_ID)) {
+                templateCarriedIds = true;
             }
-
+            itemMap.put(MdocConstants.ELEMENT_IDENTIFIER, item.get(MdocConstants.ELEMENT_IDENTIFIER).asText());
+            itemMap.put(MdocConstants.ELEMENT_VALUE, plain(item.get(MdocConstants.ELEMENT_VALUE)));
             processedItems.add(itemMap);
+            digestIds.add(processedItems.size() - 1);
         }
-
+        if (templateCarriedIds && DIGEST_ID_WARNING.compareAndSet(false, true)) {
+            log.warn("Template namespace {} carries digestID values; they are ignored and replaced by a random permutation "
+                    + "of 0..n-1 so the identifiers reveal nothing (ISO/IEC 18013-5 9.1.2.5)", namespaceName);
+        }
+        if (digestIds.size() != 1) {
+            Collections.shuffle(digestIds, RANDOM);
+        }
+        for (int i = 0; i < processedItems.size(); i++) {
+            processedItems.get(i).put(MdocConstants.DIGEST_ID, digestIds.get(i));
+        }
         return processedItems;
+    }
+
+    private Object plain(JsonNode value) {
+        if (value == null || value.isNull()) {
+            return null;
+        }
+        return value.isTextual() ? value.asText() : objectMapper.convertValue(value, Object.class);
     }
 
     /**
@@ -161,11 +161,10 @@ public class MdocProcessor {
 
             List<Map<String, Object>> saltedElements = new ArrayList<>();
 
-            SecureRandom sr = new SecureRandom();
             for (Map<String, Object> element : elements) {
                 // Generate 24-byte random salt
                 byte[] randomSalt = new byte[24];
-                sr.nextBytes(randomSalt);
+                RANDOM.nextBytes(randomSalt);
 
                 // Clone element with random salt as hex string
                 Map<String, Object> saltedElement = new HashMap<>(element);
@@ -181,12 +180,15 @@ public class MdocProcessor {
     }
 
     /**
-     * Calculates SHA-256 digests for salted elements
+     * Calculates the digests of the salted elements and the tag-24 IssuerSignedItems the IssuerSigned carries. The digest
+     * algorithm must be the one the MSO declares (18013-5 9.1.2.5); {@code namespaceDigests} receives
+     * {@code namespace -> digestID -> digest}.
      */
     public static Map<String, Object> calculateDigests
-    (Map<String, Object> saltedNamespaces, Map<String, Map<Integer, byte[]>> namespaceDigests) throws Exception {
+    (Map<String, Object> saltedNamespaces, Map<String, Map<Integer, byte[]>> namespaceDigests, String digestAlgorithm) throws Exception {
 
         Map<String, Object> taggedNamespaces = new HashMap<>();
+        String algorithm = digestAlgorithmName(digestAlgorithm);
 
         for (Map.Entry<String, Object> namespaceEntry : saltedNamespaces.entrySet()) {
             String namespaceName = namespaceEntry.getKey();
@@ -210,7 +212,7 @@ public class MdocProcessor {
                 ByteArrayOutputStream outerBaos = new ByteArrayOutputStream();
                 new CborEncoder(outerBaos).encode(tag24Value);
                 byte[] taggedCbor = outerBaos.toByteArray();
-                byte[] digest = MessageDigest.getInstance("SHA-256").digest(taggedCbor);
+                byte[] digest = MessageDigest.getInstance(algorithm).digest(taggedCbor);
                 digestMap.put((Integer) element.get(MdocConstants.DIGEST_ID), digest);
             }
 
@@ -219,6 +221,16 @@ public class MdocProcessor {
         }
 
         return taggedNamespaces;
+    }
+
+    /** The canonical MSO name of a digest algorithm, refusing anything 18013-5 9.1.2.4 does not allow. */
+    public static String digestAlgorithmName(String configured) {
+        String canonical = configured == null ? null : DIGEST_ALGORITHMS.get(configured.trim().toUpperCase(Locale.ROOT));
+        if (canonical == null) {
+            throw new FormatException(MdocConstants.ERROR_TEMPLATE,
+                    "digestAlgorithm " + configured + " is not one of SHA-256, SHA-384, SHA-512 (ISO/IEC 18013-5 9.1.2.4)");
+        }
+        return canonical;
     }
 
     public static byte[] encodeToCBOR(Object obj) throws Exception {
@@ -381,33 +393,43 @@ public class MdocProcessor {
      * Creates a CBOR tagged date (tag 1004) for date-only strings
      */
     private static Map<String, Object> createCBORTaggedDate(String dateStr) {
-        Map<String, Object> taggedDate = new HashMap<>();
-        taggedDate.put(MdocConstants.__CBOR_TAG, 1004);
-        taggedDate.put(MdocConstants.__CBOR_VALUE, dateStr);
-        return taggedDate;
+        return tagged(MdocConstants.CBOR_TAG_FULL_DATE, dateStr);
+    }
+
+    private static Map<String, Object> tagged(int tag, String value) {
+        Map<String, Object> taggedValue = new LinkedHashMap<>();
+        taggedValue.put(MdocConstants.__CBOR_TAG, tag);
+        taggedValue.put(MdocConstants.__CBOR_VALUE, value);
+        return taggedValue;
     }
 
     /**
-     * Creates a CBOR tagged datetime (tag 0) for datetime strings (RFC 3339 format)
-     * RFC 8610: tdate = #6.0(tstr) where tstr = #3
-     * This wraps full datetime timestamps in Tag 0 as per mso_mdoc specification
+     * The MSO's {@code validityInfo} (18013-5 9.1.2.4): {@code signed} and {@code validFrom} are the instant of signing
+     * truncated to seconds, {@code validUntil} is that instant plus the configured validity, capped at the document
+     * signer certificate's {@code notAfter} so the credential never outlives the key that signed it.
      */
-    private static Map<String, Object> createCBORTaggedDateTime(String dateTimeStr) {
-        Map<String, Object> taggedDate = new HashMap<>();
-        taggedDate.put(MdocConstants.__CBOR_TAG, 0);
-        taggedDate.put(MdocConstants.__CBOR_VALUE, dateTimeStr);
-        return taggedDate;
+    public static Map<String, Object> validityInfo(Instant signedAt, Duration validity, Instant notAfter) {
+        Instant signed = (signedAt == null ? Instant.now() : signedAt).truncatedTo(ChronoUnit.SECONDS);
+        Instant until = signed.plus(validity == null ? Duration.ofDays(90) : validity);
+        if (notAfter != null && notAfter.isBefore(until)) {
+            until = notAfter.truncatedTo(ChronoUnit.SECONDS);
+        }
+        Map<String, Object> validityInfo = new HashMap<>();
+        validityInfo.put(MdocConstants.VALID_FROM, tagged(MdocConstants.CBOR_TAG_TDATE, TDATE.format(signed)));
+        validityInfo.put(MdocConstants.VALID_UNTIL, tagged(MdocConstants.CBOR_TAG_TDATE, TDATE.format(until)));
+        validityInfo.put(MdocConstants.SIGNED, tagged(MdocConstants.CBOR_TAG_TDATE, TDATE.format(signed)));
+        return validityInfo;
     }
 
     /**
      * Creates the Mobile Security Object (MSO) structure
      */
     public Map<String, Object> createMobileSecurityObject
-    (Map<String, Object> mDocJson, Map<String, Map<Integer, byte[]>> namespaceDigests) throws Exception {
+    (Map<String, Object> mDocJson, Map<String, Map<Integer, byte[]>> namespaceDigests, Map<Object, Object> deviceKey) throws Exception {
 
         Map<String, Object> mso = new HashMap<>();
         mso.put("version", mDocConfig.msoVersion());
-        mso.put("digestAlgorithm", mDocConfig.digestAlgorithm());
+        mso.put("digestAlgorithm", digestAlgorithmName(mDocConfig.digestAlgorithm()));
 
         // Create valueDigests structure
         Map<String, Object> nameSpacesDigests = new HashMap<>();
@@ -416,83 +438,16 @@ public class MdocProcessor {
         mso.put("valueDigests", nameSpacesDigests);
         mso.put(MdocConstants.DOCTYPE, mDocJson.get("_docType"));
 
-        // Create validity info with current timestamp
-        Map<String, Object> validityInfo = new HashMap<>();
-
-        if (mDocJson.containsKey(MdocConstants.VALIDITY_INFO)) {
-            Map<String, Object> originalValidity = (Map<String, Object>) mDocJson.get(MdocConstants.VALIDITY_INFO);
-            validityInfo.put(MdocConstants.VALID_FROM, originalValidity.get(MdocConstants.VALID_FROM));
-            validityInfo.put(MdocConstants.VALID_UNTIL, originalValidity.get(MdocConstants.VALID_UNTIL));
-            validityInfo.put(MdocConstants.SIGNED, originalValidity.get(MdocConstants.SIGNED));
-        }
+        Map<String, Object> validityInfo = mDocJson.containsKey(MdocConstants.VALIDITY_INFO)
+                ? (Map<String, Object>) mDocJson.get(MdocConstants.VALIDITY_INFO)
+                : validityInfo(Instant.now(), mDocConfig.validity(), null);
         mso.put(MdocConstants.VALIDITY_INFO, validityInfo);
 
-        // Add device key info (placeholder - should be from wallet's PoP)
-        Map<String, Object> deviceKeyInfo = createDeviceKeyInfo(mDocJson.get(MdocConstants._HOLDER_ID));
+        Map<String, Object> deviceKeyInfo = new HashMap<>();
+        deviceKeyInfo.put("deviceKey", deviceKey);
         mso.put("deviceKeyInfo", deviceKeyInfo);
 
         return mso;
-    }
-
-    /**
-     * Creates device key info structure (placeholder implementation)
-     */
-    private static Map<String, Object> createDeviceKeyInfo(Object deviceInfo) throws Exception {
-        if (deviceInfo == null) {
-            throw new IllegalArgumentException("Device info (holder ID) is required for mDoc credential");
-        }
-        String deviceKeyEncoded = deviceInfo.toString();
-        if (deviceKeyEncoded.startsWith(MdocConstants.DID_JWK_PREFIX)) {
-            deviceKeyEncoded = deviceKeyEncoded.substring(MdocConstants.DID_JWK_PREFIX.length());
-            deviceKeyEncoded = deviceKeyEncoded.replace("#0","");
-        }
-
-        byte[] decodedBytes = Base64.getUrlDecoder().decode(deviceKeyEncoded);
-        String decodedJson = new String(decodedBytes);
-
-        ObjectMapper mapper = new ObjectMapper();
-        Map<String, Object> jwk = mapper.readValue(decodedJson, Map.class);
-
-        Map<Object, Object> coseKey = new HashMap<>();
-        coseKey.put(1, 2);  // kty: EC2
-        coseKey.put(3, -7); // alg: ES256 (ECDSA with SHA-256)
-
-        if (jwk.containsKey("kid")) {
-            // Pass through the key ID if it exists in the source JWK
-            coseKey.put(2, ((String) jwk.get("kid")).getBytes(java.nio.charset.StandardCharsets.UTF_8));
-        }
-
-
-        // Map curve
-        String crv = (String) jwk.get("crv");
-        switch (crv) {
-            case "P-256" -> coseKey.put(-1, 1);
-            case "P-384" -> coseKey.put(-1, 2);
-            case "P-521" -> coseKey.put(-1, 3);
-            case null, default -> throw new IllegalArgumentException("Unsupported curve for EC2 key type: " + crv);
-        }
-
-        coseKey.put(-2, Base64.getUrlDecoder().decode((String) jwk.get("x")));
-        if (jwk.containsKey("y")) {
-            coseKey.put(-3, Base64.getUrlDecoder().decode((String) jwk.get("y")));
-        }
-
-        Map<String, Object> deviceKeyInfo = new HashMap<>();
-        deviceKeyInfo.put("deviceKey", coseKey);
-        return deviceKeyInfo;
-    }
-
-
-    /**
-     * Converts hex string to byte array
-     */
-    private static byte[] hexStringToByteArray(String hexStr) {
-        int len = hexStr.length();
-        byte[] data = new byte[len / 2];
-        for (int i = 0; i < len; i += 2) {
-            data[i / 2] = (byte) ((Character.digit(hexStr.charAt(i), 16) << 4) + Character.digit(hexStr.charAt(i + 1), 16));
-        }
-        return data;
     }
 
     /**

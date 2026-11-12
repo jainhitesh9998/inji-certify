@@ -6,6 +6,7 @@ import io.mosip.certify.spi.CredentialDataSource;
 import io.mosip.certify.spi.CredentialFormatter;
 import io.mosip.certify.spi.DataSourceException;
 import io.mosip.certify.spi.ExternalIssuer;
+import io.mosip.certify.spi.FormatException;
 import io.mosip.certify.spi.HolderBinding;
 import io.mosip.certify.spi.IssuanceContext;
 import io.mosip.certify.spi.IssuanceListener;
@@ -182,7 +183,7 @@ public class DefaultIssuanceService implements IssuanceService {
                 claims = render(fetched, configuration, context, holder);
             }
         }
-        UnsignedCredential unsigned = formatter.build(claims, configuration, context, holder);
+        UnsignedCredential unsigned = build(formatter, claims, configuration, context, holder);
         if (configuration.status().isEnabled()) {
             StatusProvider status = statusProviders.stream()
                     .filter(p -> p.mechanism().equals(configuration.status().mechanism()) && p.supports(configuration.format()))
@@ -198,7 +199,32 @@ public class DefaultIssuanceService implements IssuanceService {
         SigningConfig signingConfig = tenantDid == null || tenantDid.isBlank() || tenantDid.equals(configuration.signing().issuerDid())
                 ? configuration.signing() : configuration.signing().withIssuerDid(tenantDid);
         SigningContext signing = keyProviders.signingContext(signingConfig);
-        return new Issued(formatter.sign(unsigned, signing, context), claims);
+        try {
+            return new Issued(formatter.sign(unsigned, signing, context), claims);
+        } catch (FormatException e) {
+            throw callerError(e);
+        }
+    }
+
+    private static UnsignedCredential build(CredentialFormatter formatter, ClaimSet claims, CredentialConfiguration configuration,
+                                            IssuanceContext context, HolderBinding holder) {
+        try {
+            return formatter.build(claims, configuration, context, holder);
+        } catch (FormatException e) {
+            throw callerError(e);
+        }
+    }
+
+    /**
+     * A formatter may find the caller's own input unusable — an mDoc device key it cannot encode, for instance. The
+     * format names that with OpenID4VCI's {@code invalid_proof}, and this is where it becomes a protocol error instead of
+     * a 500 (docs/design/20-mdl-issuer.md G6, OID4VCI 8.3.1).
+     */
+    private static RuntimeException callerError(FormatException e) {
+        if (IssuanceException.INVALID_PROOF.equals(e.getErrorCode())) {
+            return new IssuanceException(IssuanceException.INVALID_PROOF, e.getMessage(), e);
+        }
+        return e;
     }
 
     @Override

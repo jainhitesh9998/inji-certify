@@ -99,6 +99,8 @@ class IssuanceGoldenTest {
     static final String EC_K1_ID = "GoldenEcK1Credential";
     static final String ED_2018_ID = "GoldenEd2018Credential";
     static final String MDOC_ID = "GoldenMdlCredential";
+    /** The elements of goldens/templates/golden-mdoc.vm: every mandatory ISO/IEC 18013-5 Table 5 element plus one optional. */
+    static final int MDL_ELEMENT_COUNT = 12;
     static final String QR_ID = "GoldenQrCredential";
     static final String STATUS_ID = "GoldenStatusCredential";
     static final String SCOPE = "sample_vc_ldp"; // the scope LocalAccessTokenValidationFilter injects
@@ -437,7 +439,7 @@ class IssuanceGoldenTest {
         assertEquals("org.iso.18013.5.1.mDL", mso.get("docType").AsString());
         assertEquals("SHA-256", mso.get("digestAlgorithm").AsString());
         com.upokecenter.cbor.CBORObject digests = mso.get("valueDigests").get("org.iso.18013.5.1");
-        assertEquals(3, digests.size(), "one digest per namespace element");
+        assertEquals(MDL_ELEMENT_COUNT, digests.size(), "one digest per namespace element");
         com.upokecenter.cbor.CBORObject deviceKey = mso.get("deviceKeyInfo").get("deviceKey");
         assertEquals(2, deviceKey.get(com.upokecenter.cbor.CBORObject.FromObject(1)).AsInt32(), "kty EC2");
         assertEquals(1, deviceKey.get(com.upokecenter.cbor.CBORObject.FromObject(-1)).AsInt32(), "crv P-256");
@@ -447,7 +449,7 @@ class IssuanceGoldenTest {
             assertTrue(mso.get("validityInfo").ContainsKey(field), "validityInfo." + field);
         }
         com.upokecenter.cbor.CBORObject items = issuerSigned.get("nameSpaces").get("org.iso.18013.5.1");
-        assertEquals(3, items.size(), "three IssuerSignedItems");
+        assertEquals(MDL_ELEMENT_COUNT, items.size(), "one IssuerSignedItem per element");
 
         com.fasterxml.jackson.databind.node.ObjectNode summary = objectMapper.createObjectNode();
         summary.put("docType", mso.get("docType").AsString());
@@ -601,13 +603,32 @@ class IssuanceGoldenTest {
         assertEquals("org.iso.18013.5.1.mDL", mso.get("docType").AsString());
         com.upokecenter.cbor.CBORObject deviceKey = mso.get("deviceKeyInfo").get("deviceKey");
         assertArrayEquals(holder.getX().decode(), deviceKey.get(com.upokecenter.cbor.CBORObject.FromObject(-2)).GetByteString(), "device key is the holder's");
+        // ISO/IEC 18013-5 9.1.2.4: the validity timestamps are tag-0 tdate strings without fractional seconds
+        com.upokecenter.cbor.CBORObject signedAt = mso.get("validityInfo").get("signed");
+        assertTrue(signedAt.HasMostOuterTag(0), "validityInfo.signed is #6.0(tstr)");
+        assertEquals(20, signedAt.Untag().AsString().length(), "20-character RFC 3339: " + signedAt.Untag().AsString());
+        assertEquals(mso.get("validityInfo").get("validFrom").Untag().AsString(), signedAt.Untag().AsString(), "validFrom is the signing instant");
+        // 9.1.2.5: digestIDs are a permutation of 0..n-1 and reveal nothing about the template's order
+        java.util.TreeSet<Integer> digestIds = new java.util.TreeSet<>();
+        com.upokecenter.cbor.CBORObject namespaceItems = issuerSigned.get("nameSpaces").get("org.iso.18013.5.1");
+        for (int i = 0; i < namespaceItems.size(); i++) {
+            com.upokecenter.cbor.CBORObject item = com.upokecenter.cbor.CBORObject.DecodeFromBytes(namespaceItems.get(i).Untag().GetByteString());
+            digestIds.add(item.get("digestID").AsInt32());
+            assertTrue(namespaceItems.get(i).HasMostOuterTag(24), "IssuerSignedItem is #6.24(bstr .cbor)");
+        }
+        assertEquals(MDL_ELEMENT_COUNT, digestIds.size(), "digestIDs are unique within the namespace");
+        assertEquals(0, digestIds.first());
+        assertEquals(MDL_ELEMENT_COUNT - 1, digestIds.last());
+
         com.fasterxml.jackson.databind.node.ObjectNode summary = objectMapper.createObjectNode();
         summary.put("docType", mso.get("docType").AsString());
         summary.put("digests", mso.get("valueDigests").get("org.iso.18013.5.1").size());
         summary.put("issuerSignedItems", issuerSigned.get("nameSpaces").get("org.iso.18013.5.1").size());
+        summary.put("digestIds", digestIds.toString());
+        summary.put("validityInfoKeys", mso.get("validityInfo").getKeys().toString());
+        summary.put("validityInfoSignedLength", signedAt.Untag().AsString().length());
         summary.put("protectedLabels", protectedHeader.getKeys().toString());
         summary.put("unprotectedLabels", issuerAuth.get(1).getKeys().toString());
-        summary.put("validityInfoKeys", mso.get("validityInfo").getKeys().toString());
         Goldens.assertGolden("oid4vci-1.0/oid4vci/mso_mdoc-summary", summary);
     }
 

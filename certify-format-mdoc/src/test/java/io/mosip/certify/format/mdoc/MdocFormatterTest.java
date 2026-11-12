@@ -3,10 +3,6 @@ package io.mosip.certify.format.mdoc;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.upokecenter.cbor.CBORObject;
 import com.upokecenter.cbor.CBORType;
-import io.mosip.certify.keyprovider.jca.JcaKeyProvider;
-import io.mosip.certify.signing.KeyRef;
-import io.mosip.certify.signing.SignatureAlgorithm;
-import io.mosip.certify.signing.SigningKey;
 import io.mosip.certify.spi.ClaimSet;
 import io.mosip.certify.spi.CredentialConfiguration;
 import io.mosip.certify.spi.FormatException;
@@ -14,9 +10,7 @@ import io.mosip.certify.spi.HolderBinding;
 import io.mosip.certify.spi.IssuanceContext;
 import io.mosip.certify.spi.IssuedCredential;
 import io.mosip.certify.spi.ProtocolVersion;
-import io.mosip.certify.spi.SigningConfig;
 import io.mosip.certify.spi.SigningContext;
-import io.mosip.certify.spi.TenantContext;
 import io.mosip.certify.spi.UnsignedCredential;
 import org.junit.jupiter.api.Test;
 
@@ -24,7 +18,7 @@ import java.io.ByteArrayInputStream;
 import java.security.Signature;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
-import java.time.Instant;
+import java.time.Duration;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
@@ -38,41 +32,27 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /** The IssuerAuth is verified with plain JCA against the x5chain leaf; the MSO is decoded with the CBOR library. */
 class MdocFormatterTest {
 
-    static final JcaKeyProvider KEYS = JcaKeyProvider.devMode();
-    static final IssuanceContext CONTEXT = new IssuanceContext(TenantContext.DEFAULT, null, List.of(), ProtocolVersion.OID4VCI_1_0, "c",
-            Instant.now() /* the dev certificates are valid from two days before the run */, Map.of());
-    // the holder key as the proof carries it: did:jwk of a P-256 public JWK
-    static final String HOLDER_JWK = "{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\",\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"}";
-    static final String HOLDER = "did:jwk:" + Base64.getUrlEncoder().withoutPadding().encodeToString(HOLDER_JWK.getBytes());
+    static final IssuanceContext CONTEXT = MdlFixtures.context();
+    static final String HOLDER = MdlFixtures.HOLDER;
 
-    final MdocFormatter formatter = new MdocFormatter(new ObjectMapper(), new MdocProperties("SHA-256", "1.0", 2));
-
-    static Map<String, Object> document() {
-        return Map.of("docType", "org.iso.18013.5.1.mDL",
-                "validityInfo", Map.of("validFrom", "${_validFrom}", "validUntil", "${_validUntil}", "signed", "${_signed}"),
-                "nameSpaces", Map.of("org.iso.18013.5.1", List.of(
-                        Map.of("digestID", 0, "elementIdentifier", "family_name", "elementValue", "Farmer"),
-                        Map.of("digestID", 1, "elementIdentifier", "birth_date", "elementValue", "1990-01-01"))));
-    }
+    final MdocFormatter formatter = new MdocFormatter(new ObjectMapper(), MdlFixtures.properties(Duration.ofDays(90)));
 
     SigningContext signing() {
-        SigningKey key = KEYS.resolve(KeyRef.parse("jca:dev-es256"));
-        return new SigningContext(new SigningConfig(key.ref(), SignatureAlgorithm.ES256, null, null, null, "did:web:issuer.example"), key, KEYS);
+        return MdlFixtures.signing(MdlFixtures.dsc());
     }
 
     CredentialConfiguration configuration() {
-        return new CredentialConfiguration(null, "mdl", "mdl_scope", "mso_mdoc", formatter.parseConfig(Map.of("docType", "org.iso.18013.5.1.mDL")), null,
-                signing().config(), null, null, null, null, null);
+        return MdlFixtures.configuration(formatter);
     }
 
     @Test
     void issuerSignedVerifiesWithJcaAndCarriesTheHolderKey() throws Exception {
-        UnsignedCredential unsigned = formatter.build(ClaimSet.of(document()), configuration(), CONTEXT, HolderBinding.did(HOLDER, "jwt"));
+        UnsignedCredential unsigned = formatter.build(ClaimSet.of(MdlFixtures.mdl()), configuration(), CONTEXT, HolderBinding.did(HOLDER, "jwt"));
         IssuedCredential issued = formatter.sign(unsigned, signing(), CONTEXT);
 
         CBORObject issuerSigned = CBORObject.DecodeFromBytes(Base64.getUrlDecoder().decode((String) issued.credential()));
-        CBORObject items = issuerSigned.get("nameSpaces").get("org.iso.18013.5.1");
-        assertEquals(2, items.size());
+        CBORObject items = issuerSigned.get("nameSpaces").get(MdlFixtures.MDL_NAMESPACE);
+        assertEquals(12, items.size());
         CBORObject issuerAuth = issuerSigned.get("issuerAuth");
         assertEquals(4, issuerAuth.size());
         assertFalse(issuerAuth.isTagged());
@@ -93,7 +73,7 @@ class MdocFormatterTest {
         assertEquals("org.iso.18013.5.1.mDL", mso.get("docType").AsString());
         assertEquals("1.0", mso.get("version").AsString());
         assertEquals("SHA-256", mso.get("digestAlgorithm").AsString());
-        assertEquals(2, mso.get("valueDigests").get("org.iso.18013.5.1").size());
+        assertEquals(12, mso.get("valueDigests").get(MdlFixtures.MDL_NAMESPACE).size());
         CBORObject deviceKey = mso.get("deviceKeyInfo").get("deviceKey");
         assertEquals(2, deviceKey.get(CBORObject.FromObject(1)).AsInt32());
         assertArrayEquals(Base64.getUrlDecoder().decode("f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU"), deviceKey.get(CBORObject.FromObject(-2)).GetByteString());
@@ -109,7 +89,25 @@ class MdocFormatterTest {
         assertEquals("org.iso.18013.5.1.mDL", formatter.metadataFragment(configuration(), ProtocolVersion.OID4VCI_1_0).get("doctype"));
         assertEquals("mso_mdoc", formatter.metadataFragment(configuration(), ProtocolVersion.OID4VCI_1_0).get("format"));
         FormatException e = assertThrows(FormatException.class, () -> formatter.build(ClaimSet.of(Map.of("docType", "x")), configuration(), CONTEXT, HolderBinding.did(HOLDER, "jwt")));
-        assertEquals(MdocConstants.ERROR_TEMPLATE, e.getErrorCode(), "validityInfo is mandatory");
-        assertThrows(FormatException.class, () -> formatter.build(ClaimSet.of(document()), configuration(), CONTEXT, HolderBinding.NONE), "the device key needs a holder");
+        assertEquals(MdocConstants.ERROR_TEMPLATE, e.getErrorCode(), "the template's docType differs from the configuration's");
+        assertThrows(FormatException.class, () -> formatter.build(ClaimSet.of(MdlFixtures.mdl()), configuration(), CONTEXT, HolderBinding.NONE), "the device key needs a holder");
+    }
+
+    @Test
+    void aConfigurationWithoutADoctypeIsATemplateError() {
+        CredentialConfiguration configuration = new CredentialConfiguration(null, "mdl", "mdl_scope", MdocFormatter.FORMAT,
+                formatter.parseConfig(Map.of()), null, signing().config(), null, null, null, null, null);
+        FormatException e = assertThrows(FormatException.class, () -> formatter.build(ClaimSet.of(MdlFixtures.mdl()),
+                configuration, CONTEXT, HolderBinding.did(HOLDER, "jwt")));
+        assertEquals(MdocConstants.ERROR_TEMPLATE, e.getErrorCode());
+    }
+
+    @Test
+    void theLegacyValidityPeriodStillApplies() {
+        // certify.format.mdoc.validity-period-years is the alias of mso-validity (decision D7)
+        MdocProperties legacy = new MdocProperties("SHA-256", "1.0", Duration.ofDays(90), 2);
+        assertEquals(Duration.ofDays(730), legacy.validity());
+        assertEquals(Duration.ofDays(90), new MdocProperties("SHA-256", "1.0", Duration.ofDays(90), null).validity());
+        assertEquals(Duration.ofDays(90), new MdocProperties("SHA-256", "1.0", null, null).validity());
     }
 }

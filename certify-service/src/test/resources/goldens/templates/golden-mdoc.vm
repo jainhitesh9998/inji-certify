@@ -8,8 +8,20 @@
     "nameSpaces": {
         "org.iso.18013.5.1": [
             {"digestID": 0, "elementIdentifier": "family_name", "elementValue": "${fullName}"},
-            {"digestID": 1, "elementIdentifier": "birth_date", "elementValue": "${dateOfBirth}"},
-            {"digestID": 2, "elementIdentifier": "resident_city", "elementValue": "${city}"}
+            {"digestID": 1, "elementIdentifier": "given_name", "elementValue": "Jane"},
+            {"digestID": 2, "elementIdentifier": "birth_date", "elementValue": "${dateOfBirth}"},
+            {"digestID": 3, "elementIdentifier": "issue_date", "elementValue": "2024-01-01"},
+            {"digestID": 4, "elementIdentifier": "expiry_date", "elementValue": "2034-01-01"},
+            {"digestID": 5, "elementIdentifier": "issuing_country", "elementValue": "IN"},
+            {"digestID": 6, "elementIdentifier": "issuing_authority", "elementValue": "Lorem Ipsum Demo Issuing Authority"},
+            {"digestID": 7, "elementIdentifier": "document_number", "elementValue": "DL-0420110149646"},
+            {"digestID": 8, "elementIdentifier": "portrait", "elementValue": "/9j/4AAQSkZJRgABAQAAAQABAAD/2Q=="},
+            {"digestID": 9, "elementIdentifier": "driving_privileges", "elementValue": [
+                {"vehicle_category_code": "B", "issue_date": "2020-01-01", "expiry_date": "2030-01-01",
+                 "codes": [{"code": "01", "sign": "IN", "value": "B"}]}
+            ]},
+            {"digestID": 10, "elementIdentifier": "un_distinguishing_sign", "elementValue": "IN"},
+            {"digestID": 11, "elementIdentifier": "resident_city", "elementValue": "${city}"}
         ]
     }
 }
