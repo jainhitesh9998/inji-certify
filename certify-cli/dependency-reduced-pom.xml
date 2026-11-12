@@ -67,6 +67,12 @@
       <scope>provided</scope>
     </dependency>
     <dependency>
+      <groupId>io.inji.certify</groupId>
+      <artifactId>certify-pki</artifactId>
+      <version>1.0.0-beta.1-SNAPSHOT</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
       <groupId>info.picocli</groupId>
       <artifactId>picocli</artifactId>
       <version>4.7.6</version>

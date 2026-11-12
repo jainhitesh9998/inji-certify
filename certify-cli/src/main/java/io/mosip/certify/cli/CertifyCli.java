@@ -12,11 +12,15 @@ import picocli.CommandLine.Command;
  *   certify keys jwks     --keystore keys.p12 --password s3cret
  *   certify sign jws      --keystore keys.p12 --password s3cret --key issuer-es256 --typ JWT --in claims.json
  *   certify sign cose     --keystore keys.p12 --password s3cret --key issuer-es256 --in payload.cbor --out issuer-auth.cbor
+ *   certify pki iaca create -k iaca.p12 -p s3cret --country IN --cn "Lorem Ipsum Demo IACA" \
+ *       --issuer-alt-uri https://credentials.example.test --crl-uri https://credentials.example.test/iaca.crl
+ *   certify pki dsc issue --iaca iaca.p12 -p s3cret --generate -k issuer.p12 -P s3cret --alias mdl-dsc@2026-11 \
+ *       --out dsc-chain.pem
  * </pre>
  */
 @Command(name = "certify", mixinStandardHelpOptions = true, version = "certify-cli 1.0.0-beta.1",
         description = "Sign credentials and manage issuer keys with Inji Certify's signing library.",
-        subcommands = {KeysCommand.class, SignCommand.class})
+        subcommands = {KeysCommand.class, SignCommand.class, PkiCommand.class})
 public class CertifyCli implements Runnable {
 
     public static void main(String[] args) {

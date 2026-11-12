@@ -9,7 +9,7 @@
     </parent>
     <artifactId>certify-cli</artifactId>
     <name>certify-cli</name>
-    <description>Command-line signing over the same certify-signing library and key providers the service uses: keys in a PKCS#12 file, JWS and COSE_Sign1 envelopes, JWKS export (docs/design/05-target-architecture.md, certify-cli).</description>
+    <description>Command-line signing over the same certify-signing library and key providers the service uses: keys in a PKCS#12 file, JWS and COSE_Sign1 envelopes, JWKS export, and the offline ISO/IEC 18013-5 Annex B PKI (IACA, Document Signer, CRL) through certify-pki (docs/design/20-mdl-issuer.md M-07).</description>
 
     <repositories>
         <repository>
@@ -31,6 +31,11 @@
         <dependency>
             <groupId>io.inji.certify</groupId>
             <artifactId>certify-keyprovider-jca</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.inji.certify</groupId>
+            <artifactId>certify-pki</artifactId>
             <version>${project.version}</version>
         </dependency>
         <dependency>
