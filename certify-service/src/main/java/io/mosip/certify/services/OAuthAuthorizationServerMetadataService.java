@@ -74,7 +74,10 @@ public class OAuthAuthorizationServerMetadataService {
             metadata.setDpopSigningAlgValuesSupported(dpop.getAllowedAlgorithms()); // RFC 9449 section 5.1
         }
         io.mosip.certify.as.AsProperties as = asProperties == null ? null : asProperties.getIfAvailable(); // null when built outside Spring (unit tests)
-        if (as != null && as.enabled() && tokenEndpoint != null && tokenEndpoint.endsWith("/oauth/token")) {
+        // Certify's own token endpoint serves the pre-authorized grant whether or not an authorization-code client is
+        // registered, so the two features are advertised independently of each other.
+        boolean ownTokenEndpoint = as != null && tokenEndpoint != null && tokenEndpoint.endsWith("/oauth/token");
+        if (ownTokenEndpoint && as.enabled()) {
             String base = tokenEndpoint.substring(0, tokenEndpoint.length() - "/oauth/token".length());
             metadata.setAuthorizationEndpoint(base + "/oauth/authorize");
             metadata.setPushedAuthorizationRequestEndpoint(base + "/oauth/par");
@@ -83,9 +86,39 @@ public class OAuthAuthorizationServerMetadataService {
                 metadata.setTokenEndpointAuthMethodsSupported(java.util.List.of(io.mosip.certify.as.ClientAttestationValidator.AUTH_METHOD));
             }
         }
+        // OID4VCI 1.0 section 12.3: a Token Request with a pre-authorized code and no client_id is answered here, so an
+        // offer can be followed without interacting with the issuer. Opt-in per deployment
+        // (certify.as.pre-authorized-grant.advertise-anonymous-access, default off): an unchanged deployment's document
+        // keeps the exact bytes it had, and every 0.14.0 golden stays green. Never advertised once client attestation is
+        // required (the token request is authenticated then, so it is not anonymous), nor when the deployment does not
+        // list the pre-authorized code grant, nor with an external AS (eSignet), whose own metadata is authoritative.
+        if (ownTokenEndpoint && advertiseAnonymousPreAuthorizedGrant(as)) {
+            metadata.setPreAuthorizedGrantAnonymousAccessSupported(Boolean.TRUE);
+        }
 
         log.debug("OAuth Authorization Server metadata built successfully for issuer: {}", issuer);
         return metadata;
+    }
+
+    /** {@code true} when {@code certify.as.client-attestation.required} refuses unauthenticated token requests. */
+    private static boolean clientAttestationRequired(io.mosip.certify.as.AsProperties as) {
+        return as.clientAttestation() != null && as.clientAttestation().required();
+    }
+
+    /**
+     * {@code certify.as.pre-authorized-grant.advertise-anonymous-access} is on (default off), client attestation is not
+     * required and the pre-authorized code grant is in {@code grant_types_supported}: only then is the anonymous
+     * pre-authorized grant real, and only then may the document say so.
+     */
+    private boolean advertiseAnonymousPreAuthorizedGrant(io.mosip.certify.as.AsProperties as) {
+        if (as.preAuthorizedGrant() == null || !as.preAuthorizedGrant().advertiseAnonymousAccess()) {
+            return false;
+        }
+        if (clientAttestationRequired(as)) {
+            return false;
+        }
+        return parseCommaSeparatedValues(grantTypesSupported)
+                .contains(io.mosip.certify.core.constants.Constants.PRE_AUTHORIZED_CODE_GRANT_TYPE);
     }
 
     /**

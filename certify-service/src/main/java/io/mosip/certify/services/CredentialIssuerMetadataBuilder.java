@@ -1,7 +1,5 @@
 package io.mosip.certify.services;
 
-import com.authlete.cose.constants.COSEAlgorithms;
-import com.nimbusds.jose.JWSAlgorithm;
 import io.mosip.certify.core.constants.VCFormats;
 import io.mosip.certify.core.dto.ClaimsDisplayFieldsConfigDTO;
 import io.mosip.certify.core.dto.CredentialConfigurationDTO;
@@ -12,6 +10,7 @@ import io.mosip.certify.core.dto.CredentialMetadataDTO;
 import io.mosip.certify.entity.CredentialConfig;
 import io.mosip.certify.entity.attributes.Claims;
 import io.mosip.certify.utils.CredentialConfigMapper;
+import io.mosip.certify.utils.MdocSigningAlgorithms;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
@@ -34,12 +33,6 @@ import java.util.Set;
  */
 @Component
 public class CredentialIssuerMetadataBuilder {
-
-    private static final Map<String, Integer> COSE_ALGORITHMS = Map.of(
-            JWSAlgorithm.ES256.getName(), COSEAlgorithms.ES256,
-            JWSAlgorithm.EdDSA.getName(), COSEAlgorithms.EdDSA,
-            JWSAlgorithm.ES256K.getName(), COSEAlgorithms.ES256K,
-            JWSAlgorithm.RS256.getName(), COSEAlgorithms.RS256);
 
     @Autowired
     private CredentialConfigMapper credentialConfigMapper;
@@ -93,24 +86,14 @@ public class CredentialIssuerMetadataBuilder {
             return null;
         }
         if (VCFormats.MSO_MDOC.equals(credentialConfig.getCredentialFormat())) {
-            List<Object> coseAlgs = new ArrayList<>();
-            for (String alg : algs) {
-                coseAlgs.add(coseAlgorithm(alg));
-            }
-            return coseAlgs;
+            return MdocSigningAlgorithms.coseIds(algs);
         }
         return new ArrayList<>(algs);
     }
 
+    /** The COSE identifier mDoc metadata publishes for a JOSE algorithm, or {@code null} when it has none (omitted, warned). */
     static Integer coseAlgorithm(String signAlgorithm) {
-        if (signAlgorithm == null) {
-            throw new IllegalArgumentException("Missing COSE signing algorithm");
-        }
-        Integer coseAlg = COSE_ALGORITHMS.get(signAlgorithm);
-        if (coseAlg == null) {
-            throw new IllegalArgumentException("Unsupported COSE signing algorithm for mso_mdoc: " + signAlgorithm);
-        }
-        return coseAlg;
+        return MdocSigningAlgorithms.coseId(signAlgorithm);
     }
 
     /** `mosip.certify.authorization.url` (comma-separated) followed by the per-configuration mapping, without duplicates. */

@@ -22,7 +22,7 @@ Standards: ISO/IEC 18013-5:2021 (data model 7.2, MSO 9.1.2, Annex B certificate 
 | D10 | Demo data source | `FileCredentialDataSource` in `certify-service` (records keyed by `sub` from a JSON file, binary fields read from files and base64-encoded); the mDL runs on the same compose stack as the farmer profile through an overlay. | agent |
 | D11 | Annex B edition | 18013-5:2021 tables (IACA validity <= 20 years, DS validity <= 457 days, DS EKU `1.0.18013.5.1.2`, DS without basicConstraints). | agent |
 | D12 | Public host exposure | nginx refuses admin APIs from non-local sources (`system-info`, `credential-configurations`, `v2/`, `credentials/status`, `ledger-search`, `vc-api`); the offer page and `/pre-authorized-data` stay public for the demo. | agent |
-| D13 | AS metadata | advertise `pre-authorized_grant_anonymous_access_supported: true`. | agent |
+| D13 | AS metadata | advertise `pre-authorized_grant_anonymous_access_supported: true`, opt-in through `certify.as.pre-authorized-grant.advertise-anonymous-access` so an existing deployment's document keeps its bytes (refined 2026-11-13, decision log). | agent |
 | D14 | Identifier | keep `https://<host>/v1/certify/oid4vci` (12.2.2 well-known mapping already in nginx). | agent |
 | D15 | IACA publication | plain JSON list plus PEM/DER/CRL downloads; a signed VICAL later. | agent |
 | D16 | Keymanager-held DSCs for `mso_mdoc` on `/oid4vci` | fail closed when the chain does not reach a configured IACA (master-signed certificates refused); the CSR flow through `certify-cli pki dsc issue --csr` is the supported keymanager route. | agent |
@@ -96,7 +96,7 @@ Each under about 800 lines excluding goldens and binaries.
 
 ### M-03 ISO 18013-5 data model and element typing (G2, G3, G7)
 - `MdocElementTypes` (built-in table for `org.iso.18013.5.1`, types and the mandatory set of Table 5), `MdocDataModelValidator`, typed conversion in `MdocProcessor`, optional `formatConfig.elementTypes`.
-- Conversions: `bstr` from base64/base64url (portrait, `signature_usual_mark`, `biometric_template_*`), `full-date` (tag 1004), `tdate` (tag 0, seconds), `uint`, `bool`, `driving_privileges` (array of maps; `issue_date`/`expiry_date` full-date; `codes[]`). Validation for `org.iso.18013.5.1.mDL`: mandatory elements, JPEG/JPEG2000 portrait, `issuing_country` alpha-2 equal to the DSC subject C (checked at sign), `un_distinguishing_sign`. Violation -> `FormatException("mdoc_data_model_invalid")`; the v2 preview surfaces it.
+- Conversions: `bstr` from base64/base64url (portrait, `signature_usual_mark`, `biometric_template_*`), `full-date` (tag 1004), `tdate` (tag 0 over an RFC 3339 `tstr` without fractional seconds), `uint`, `bool`, `driving_privileges` (array of maps; `issue_date`/`expiry_date` full-date; `codes[]`). Validation for `org.iso.18013.5.1.mDL`: mandatory elements, JPEG/JPEG2000 portrait, `issuing_country` alpha-2 equal to the DSC subject C (checked at sign), `un_distinguishing_sign`. Violation -> `FormatException("mdoc_data_model_invalid")`; the v2 preview surfaces it.
 
 ### M-04 `certify-pki`: Annex B profiles (G10, G11)
 - New module, BouncyCastle only, no Spring/Web/JPA: `IsoMdocProfiles` (IACA and DS builders), `AnnexBValidator` (named violations for IACA, DS, CRL), `CrlBuilder`, `Csr` (PKCS#10 parse, proof-of-possession check), `Serials` (positive, up to 20 octets, at least 63 random bits).

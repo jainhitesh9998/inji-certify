@@ -260,6 +260,45 @@ class D13GoldenReplayTest {
         assertFalse(current.get("credential_configurations_supported").get(LDP_ID).has("order"));
     }
 
+    /**
+     * The authorization server metadata as 0.14.0 published it (M-09 review round 2). The point of the assertion is the
+     * field that must not appear: {@code pre-authorized_grant_anonymous_access_supported} is opt-in
+     * ({@code certify.as.pre-authorized-grant.advertise-anonymous-access}, default off), so an unchanged deployment's
+     * document keeps the bytes 0.14.0 served.
+     *
+     * <p>The recorded file is not byte-identical to today's answer, for three reasons that predate this work and are
+     * asserted one by one instead of re-recorded: {@code dpop_signing_alg_values_supported} and
+     * {@code require_interactive_authorization_request} were added to the document by the rebuild (RFC 9449 section 5.1
+     * advertises {@code mosip.certify.dpop.allowed-algorithms}; the IAE requirement is published as a boolean), and the
+     * interactive authorization endpoint 0.14.0 called {@code /oauth/iar} is served as {@code /oauth/iae} today. Every
+     * other field 0.14.0 published must still be there with the same value, and the set of added fields is pinned, so a
+     * new field cannot appear silently.
+     */
+    @Test
+    void authorizationServerMetadataReplayKeepsTheAnonymousGrantOff() throws Exception {
+        JsonNode served = getJson("/.well-known/oauth-authorization-server");
+        assertFalse(served.has("pre-authorized_grant_anonymous_access_supported"),
+                "an unchanged deployment must not advertise the anonymous pre-authorized grant: " + served);
+        JsonNode recorded = Goldens.mapper().readTree(
+                java.nio.file.Files.readString(Goldens.goldenPath("legacy-0.14.0/well-known/oauth-authorization-server")));
+        java.util.Set<String> recordedNames = new java.util.TreeSet<>();
+        recorded.fieldNames().forEachRemaining(recordedNames::add);
+        for (String name : recordedNames) {
+            if (name.equals("interactive_authorization_endpoint")) {
+                continue; // renamed after 0.14.0: /oauth/iar -> /oauth/iae, asserted below
+            }
+            assertEquals(recorded.get(name), served.get(name), name + " must replay unchanged");
+        }
+        assertEquals("http://localhost:8090/v1/certify/oauth/iae", served.get("interactive_authorization_endpoint").asText(),
+                "the endpoint move from /oauth/iar to /oauth/iae is the one documented change to a recorded value");
+        java.util.Set<String> added = new java.util.TreeSet<>();
+        served.fieldNames().forEachRemaining(added::add);
+        added.removeAll(recordedNames);
+        assertEquals(new java.util.TreeSet<>(java.util.List.of(
+                        "dpop_signing_alg_values_supported", "require_interactive_authorization_request")), added,
+                "only the two documented rebuild additions may appear next to the 0.14.0 fields: " + served);
+    }
+
     @Test
     void issuanceDidAliasServesTheCurrentDocument() throws Exception {
         MvcResult alias = mockMvc.perform(get("/issuance/.well-known/did.json")).andReturn();

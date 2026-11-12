@@ -8,6 +8,7 @@ package io.mosip.certify.filter;
 import java.io.IOException;
 import java.time.Clock;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.List;
@@ -93,19 +94,52 @@ public class AccessTokenValidationFilter extends OncePerRequestFilter {
                 algo.add(SignatureAlgorithm.RS256);
                 algo.add(SignatureAlgorithm.PS256);
             }).build();
-            nimbusJwtDecoder.setJwtValidator(new DelegatingOAuth2TokenValidator<>(
-                    new JwtTimestampValidator(),
-                    new JwtIssuerValidator(issuerUri),
-                    new JwtClaimValidator<List<String>>(JwtClaimNames.AUD,
-                            aud -> aud.stream().anyMatch(allowedAudiences::contains)),
-                    new JwtClaimValidator<String>(JwtClaimNames.SUB, Objects::nonNull),
-                    new JwtClaimValidator<String>(Constants.CLIENT_ID, Objects::nonNull),
-                    new JwtClaimValidator<Instant>(JwtClaimNames.IAT,
-                            iat -> iat != null && iat.isBefore(Instant.now(Clock.systemUTC()))),
-                    new JwtClaimValidator<Instant>(JwtClaimNames.EXP,
-                            exp -> exp != null && exp.isAfter(Instant.now(Clock.systemUTC())))));
+            nimbusJwtDecoder.setJwtValidator(tokenValidator());
         }
         return nimbusJwtDecoder;
+    }
+
+    /**
+     * The claim rules every access token has to satisfy: signature (by the decoder), lifetime, issuer, audience, subject,
+     * client, issue and expiry times. Extracted so an adapter's filter can prove the same rules, with its own audiences,
+     * without a JWK Set fetch - it is the validator production uses, not a copy of it.
+     */
+    protected DelegatingOAuth2TokenValidator<Jwt> tokenValidator() {
+        return new DelegatingOAuth2TokenValidator<>(
+                new JwtTimestampValidator(),
+                new JwtIssuerValidator(issuerUri),
+                new JwtClaimValidator<List<String>>(JwtClaimNames.AUD, aud -> {
+                    List<String> audiences = allowedAudiences();
+                    return aud != null && aud.stream().anyMatch(audiences::contains);
+                }),
+                new JwtClaimValidator<String>(JwtClaimNames.SUB, Objects::nonNull),
+                new JwtClaimValidator<String>(Constants.CLIENT_ID, Objects::nonNull),
+                new JwtClaimValidator<Instant>(JwtClaimNames.IAT,
+                        iat -> iat != null && iat.isBefore(Instant.now(Clock.systemUTC()))),
+                new JwtClaimValidator<Instant>(JwtClaimNames.EXP,
+                        exp -> exp != null && exp.isAfter(Instant.now(Clock.systemUTC()))));
+    }
+
+    /**
+     * Audiences this resource server answers to in addition to {@code mosip.certify.authn.allowed-audiences}, which an
+     * adapter that has its own identifier overrides (the OpenID4VCI 1.0 surface accepts tokens addressed to it).
+     */
+    protected List<String> additionalAudiences() {
+        return List.of();
+    }
+
+    /** The configured audiences followed by the adapter's own, without duplicates. */
+    List<String> allowedAudiences() {
+        List<String> audiences = new ArrayList<>();
+        if (allowedAudiences != null) {
+            audiences.addAll(allowedAudiences);
+        }
+        for (String audience : additionalAudiences()) {
+            if (audience != null && !audiences.contains(audience)) {
+                audiences.add(audience);
+            }
+        }
+        return audiences;
     }
 
     @Override
