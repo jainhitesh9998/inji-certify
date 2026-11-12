@@ -1,0 +1,81 @@
+{
+  "mdl-demo-1": {
+    "family_name": "Demo",
+    "given_name": "Asha",
+    "birth_date": "1990-04-12",
+    "issue_date": "2024-01-15",
+    "expiry_date": "2030-01-15",
+    "issuing_country": "IN",
+    "issuing_authority": "Lorem Ipsum Demo Issuing Authority",
+    "document_number": "DL-DEMO-0001",
+    "portrait": "portrait-1.jpg",
+    "driving_privileges": [
+      {
+        "vehicle_category_code": "B",
+        "issue_date": "2024-01-15",
+        "expiry_date": "2030-01-15"
+      },
+      {
+        "vehicle_category_code": "LMV",
+        "issue_date": "2024-01-15",
+        "expiry_date": "2030-01-15"
+      }
+    ],
+    "un_distinguishing_sign": "IND",
+    "sex": 1,
+    "age_over_18": true,
+    "nationality": "IN",
+    "resident_city": "Bengaluru"
+  },
+  "mdl-demo-2": {
+    "family_name": "Demo",
+    "given_name": "Ravi",
+    "birth_date": "1985-11-03",
+    "issue_date": "2024-02-20",
+    "expiry_date": "2030-02-20",
+    "issuing_country": "IN",
+    "issuing_authority": "Lorem Ipsum Demo Issuing Authority",
+    "document_number": "DL-DEMO-0002",
+    "portrait": "portrait-2.jpg",
+    "driving_privileges": [
+      {
+        "vehicle_category_code": "B",
+        "issue_date": "2024-02-20",
+        "expiry_date": "2030-02-20"
+      },
+      {
+        "vehicle_category_code": "MCWG",
+        "issue_date": "2024-02-20",
+        "expiry_date": "2030-02-20"
+      }
+    ],
+    "un_distinguishing_sign": "IND",
+    "sex": 2,
+    "age_over_18": true,
+    "nationality": "IN",
+    "resident_city": "Pune"
+  },
+  "mdl-demo-3": {
+    "family_name": "Test",
+    "given_name": "Meera",
+    "birth_date": "2001-07-24",
+    "issue_date": "2024-03-05",
+    "expiry_date": "2030-03-05",
+    "issuing_country": "IN",
+    "issuing_authority": "Lorem Ipsum Demo Issuing Authority",
+    "document_number": "DL-DEMO-0003",
+    "portrait": "portrait-3.jpg",
+    "driving_privileges": [
+      {
+        "vehicle_category_code": "B",
+        "issue_date": "2024-03-05",
+        "expiry_date": "2030-03-05"
+      }
+    ],
+    "un_distinguishing_sign": "IND",
+    "sex": 2,
+    "age_over_18": true,
+    "nationality": "IN",
+    "resident_city": "Kochi"
+  }
+}
