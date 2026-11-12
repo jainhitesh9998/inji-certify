@@ -40,6 +40,9 @@ public class JwksServiceImpl implements JwksService {
     public Map<String, Object> getJwks() {
         List<Map<String, Object>> jwkList = new ArrayList<>();
         for (PublicKeyDescriptor descriptor : keyPublisher.descriptors(KeyFilter.validNow())) {
+            if (!descriptor.isSigningKey()) {
+                continue; // an mDL IACA is a trust anchor, published at /mdoc/iaca (M-08), not a signing key
+            }
             try {
                 jwkList.add(toJwk(descriptor));
                 log.debug("Added JWK for keyId: {}", descriptor.kid());

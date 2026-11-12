@@ -124,6 +124,12 @@ public class KeymanagerKeyProvider implements KeyProvider {
         return knownAliases;
     }
 
+    /** The known aliases as references, {@code keymanager:APPID[/REFID]}. */
+    @Override
+    public List<KeyRef> keyRefs() {
+        return knownAliases.stream().map(KeymanagerAlias::toKeyRef).toList();
+    }
+
     @Override
     public Set<SignatureAlgorithm> supportedAlgorithms() {
         return SUPPORTED;
@@ -200,6 +206,12 @@ public class KeymanagerKeyProvider implements KeyProvider {
                     .filter(dto -> dto != null && dto.getKeyId() != null && dto.getCertificateData() != null)
                     .map(this::descriptor)
                     .forEach(descriptors::add);
+        }
+        if (descriptors.isEmpty()) {
+            // a key not provisioned yet (a read before KeymanagerKeyInitializer ran) must not stay invisible for the
+            // TTL once it is: only answers that hold certificates are cached
+            cache.remove(alias);
+            return List.of();
         }
         cache.put(alias, new CachedCertificates(List.copyOf(descriptors), now));
         return descriptors;

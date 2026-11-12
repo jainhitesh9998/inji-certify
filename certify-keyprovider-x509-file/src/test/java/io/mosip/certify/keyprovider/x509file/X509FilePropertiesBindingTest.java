@@ -1,15 +1,18 @@
 package io.mosip.certify.keyprovider.x509file;
 
 import org.junit.jupiter.api.Test;
+import org.springframework.boot.context.properties.bind.BindException;
 import org.springframework.boot.context.properties.bind.Bindable;
 import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.boot.context.properties.source.MapConfigurationPropertySource;
 
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -65,12 +68,54 @@ class X509FilePropertiesBindingTest {
         X509FileProperties properties = bind(mdl);
 
         assertEquals("iaca", properties.iaca().alias());
-        assertEquals("ES256", properties.iaca().algorithm());
+        assertNull(properties.iaca().algorithm(), "no implicit algorithm: dev mode generates ES256, and an IACA already"
+                + " in the keystore is not compared with a value nobody set");
         assertEquals(15, properties.iaca().validityYears());
         assertTrue(properties.keys().get(0).mdocDsc());
         assertEquals(400, properties.keys().get(0).validityDays());
         assertEquals(Path.of("/keys/dsc.key.pem"), properties.pemKeys().get(0).key());
         assertEquals("secret", properties.pemKeys().get(0).keyPassword());
         assertEquals(Path.of("/keys/dsc.chain.pem"), properties.pemKeys().get(0).chain());
+    }
+
+    /** The JDK PKCS#12 keystore lower-cases aliases on reload, so an upper-case alias is refused while binding. */
+    @Test
+    void upperCaseAliasesAreRefusedWhileBinding() {
+        for (String property : List.of("keys[0].alias", "pem-keys[0].alias", "iaca.alias", "ca-alias")) {
+            java.util.Map<String, String> map = new java.util.HashMap<>();
+            map.put("certify.keyprovider.x509-file.path", "/keys/issuer.p12");
+            map.put("certify.keyprovider.x509-file." + property, "Mdl-DSC@2026-11");
+            if (property.startsWith("keys")) {
+                map.put("certify.keyprovider.x509-file.keys[0].algorithm", "ES256");
+            }
+            String message = rootMessage(assertThrows(BindException.class, () -> bind(map)));
+            assertTrue(message.contains("upper-case") && message.contains("mdl-dsc@2026-11"), property + ": " + message);
+        }
+        assertEquals("mdl-dsc@2026-11", bind(Map.of("certify.keyprovider.x509-file.keys[0].alias", "mdl-dsc@2026-11",
+                "certify.keyprovider.x509-file.keys[0].algorithm", "ES256")).keys().get(0).alias());
+        String twoVersions = rootMessage(assertThrows(BindException.class, () -> bind(Map.of(
+                "certify.keyprovider.x509-file.keys[0].alias", "mdl@a@b",
+                "certify.keyprovider.x509-file.keys[0].algorithm", "ES256"))));
+        assertTrue(twoVersions.contains("name@version"), twoVersions);
+    }
+
+    /** A misspelt profile is refused instead of silently generating a plain key where a Document Signer was meant. */
+    @Test
+    void anUnknownProfileIsRefusedWhileBinding() {
+        for (String profile : List.of("mdoc_dsc", "MDOC-DSC", "dsc")) {
+            String message = rootMessage(assertThrows(BindException.class, () -> bind(Map.of(
+                    "certify.keyprovider.x509-file.keys[0].alias", "mdl-dsc",
+                    "certify.keyprovider.x509-file.keys[0].algorithm", "ES256",
+                    "certify.keyprovider.x509-file.keys[0].profile", profile))));
+            assertTrue(message.contains("[plain, mdoc-dsc]"), message);
+        }
+    }
+
+    private static String rootMessage(Throwable thrown) {
+        Throwable cause = thrown;
+        while (cause.getCause() != null) {
+            cause = cause.getCause();
+        }
+        return cause.getMessage();
     }
 }

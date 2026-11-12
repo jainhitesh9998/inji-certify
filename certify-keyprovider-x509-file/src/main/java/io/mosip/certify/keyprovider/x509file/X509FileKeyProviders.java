@@ -38,8 +38,10 @@ public final class X509FileKeyProviders {
         if (!exists && !properties.devMode() && !pemOnly) {
             throw new SigningException("Keystore " + path + " does not exist and dev mode is off");
         }
+        // purposes are derived from each certificate on load, so a generated IACA or DSC keeps its purpose on restart
         JcaKeyProvider provider = exists
-                ? JcaKeyProvider.fromPkcs12(properties.id(), path, password)
+                ? JcaKeyProvider.fromPkcs12(properties.id(), path, password,
+                        properties.purpose() == null ? JcaKeyProvider.PURPOSE_VC_SIGNING : properties.purpose())
                 : new JcaKeyProvider(properties.id());
         List<KeySpec> required = properties.keys() == null ? List.of() : properties.keys();
         for (KeySpec key : required) {
@@ -48,7 +50,6 @@ public final class X509FileKeyProviders {
         }
         boolean generated = generate(properties, provider, required, path);
         MdocKeys.validate(properties, provider);
-        MdocKeys.importPemKeys(properties, provider);
         if (generated && path != null) {
             try {
                 if (path.getParent() != null) {
@@ -59,6 +60,8 @@ public final class X509FileKeyProviders {
             }
             provider.saveAsPkcs12(path, password);
         }
+        // after the keystore is written: an operator's PEM key stays in its own file and never enters the PKCS#12
+        MdocKeys.importPemKeys(properties, provider);
         return provider;
     }
 
@@ -80,7 +83,7 @@ public final class X509FileKeyProviders {
                 provider.generateIaca(alias, MdocKeys.iacaSpec(iacaSpec));
                 generated = true;
             }
-            MdocKeys.requireIaca(provider, alias);
+            MdocKeys.requireIaca(provider, iacaSpec);
         }
         List<KeySpec> missing = required.stream().filter(k -> !provider.aliases().contains(k.alias())).toList();
         if (!missing.isEmpty() && !properties.devMode()) {

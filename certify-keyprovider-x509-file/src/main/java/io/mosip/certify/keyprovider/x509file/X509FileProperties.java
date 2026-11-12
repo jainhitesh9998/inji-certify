@@ -6,6 +6,7 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * {@code certify.keyprovider.x509-file.*} (docs/design/14-configuration.md): a PKCS#12 file as issuer key store, with
@@ -34,6 +35,7 @@ public record X509FileProperties(@DefaultValue("false") boolean enabled, @Defaul
     /** Boot binds the canonical constructor; the annotation is required because of the convenience constructor below. */
     @ConstructorBinding
     public X509FileProperties {
+        checkAlias("ca-alias", caAlias);
     }
 
     /** The pre-M-05 shape, so a caller that predates the mDL properties needs no change. */
@@ -58,8 +60,16 @@ public record X509FileProperties(@DefaultValue("false") boolean enabled, @Defaul
     public record KeySpec(String alias, String algorithm, String subject,
                           @DefaultValue("plain") String profile, Integer validityDays) {
 
+        /** The {@code profile} values; anything else (a typo such as {@code mdoc_dsc}) is refused, never read as plain. */
+        public static final List<String> PROFILES = List.of("plain", "mdoc-dsc");
+
         @ConstructorBinding
         public KeySpec {
+            checkAlias("keys[].alias", alias);
+            if (profile != null && !PROFILES.contains(profile)) {
+                throw new IllegalArgumentException("certify.keyprovider.x509-file.keys[].profile of key '" + alias
+                        + "' is '" + profile + "'; it must be one of " + PROFILES);
+            }
         }
 
         public KeySpec(String alias, String algorithm, String subject) {
@@ -67,7 +77,7 @@ public record X509FileProperties(@DefaultValue("false") boolean enabled, @Defaul
         }
 
         public boolean mdocDsc() {
-            return "mdoc-dsc".equalsIgnoreCase(profile);
+            return "mdoc-dsc".equals(profile);
         }
     }
 
@@ -83,11 +93,18 @@ public record X509FileProperties(@DefaultValue("false") boolean enabled, @Defaul
      * @param issuerAltName issuerAltName, a URI or an email address
      * @param crlUri       CRL distribution point, an absolute http(s) URI; a Document Signer copies it
      * @param validityYears requested IACA lifetime in years; {@code null} for the 20-year Annex B maximum
-     * @param algorithm    IACA signing algorithm; Annex B allows ES256, ES384 and ES512 (P-256/384/521)
+     * @param algorithm    IACA signing algorithm; Annex B allows ES256, ES384 and ES512 (P-256/384/521); {@code null}
+     *                     generates ES256 and accepts the algorithm of an IACA already in the keystore
+     *
+     * <p>Every setting given here is compared with the IACA in the keystore at each start; a difference refuses startup
+     * rather than being ignored, because the IACA is a trust anchor verifiers already hold and is never regenerated.
      */
     public record IacaSpec(@DefaultValue("iaca") String alias, String country, String state, String commonName,
-                           String issuerAltName, String crlUri, Integer validityYears,
-                           @DefaultValue("ES256") String algorithm) {
+                           String issuerAltName, String crlUri, Integer validityYears, String algorithm) {
+
+        public IacaSpec {
+            checkAlias("iaca.alias", alias);
+        }
     }
 
     /**
@@ -99,5 +116,30 @@ public record X509FileProperties(@DefaultValue("false") boolean enabled, @Defaul
      * @param chain       the certificate chain file, leaf first: {@code [DSC, IACA]} for an mDL Document Signer
      */
     public record PemKeySpec(String alias, Path key, String keyPassword, Path chain) {
+
+        public PemKeySpec {
+            checkAlias("pem-keys[].alias", alias);
+        }
+    }
+
+    /**
+     * Key aliases are lower case: the JDK PKCS#12 keystore lower-cases every alias it reads back, so {@code Mdl-DSC}
+     * written on the first start would be {@code mdl-dsc} on the next and every {@code KeyRef} naming it would break.
+     * One {@code @} at most, separating the alias from its version label.
+     */
+    static void checkAlias(String property, String alias) {
+        if (alias == null) {
+            return;
+        }
+        if (!alias.equals(alias.toLowerCase(Locale.ROOT))) {
+            throw new IllegalArgumentException("certify.keyprovider.x509-file." + property + " '" + alias
+                    + "' has upper-case letters; PKCS#12 keystores store aliases in lower case, so write '"
+                    + alias.toLowerCase(Locale.ROOT) + "' (and the same in every key reference that names it)");
+        }
+        int at = alias.indexOf('@');
+        if (alias.isBlank() || at == 0 || at == alias.length() - 1 || (at > 0 && alias.indexOf('@', at + 1) >= 0)) {
+            throw new IllegalArgumentException("certify.keyprovider.x509-file." + property + " '" + alias
+                    + "' is not an alias: write 'name' or 'name@version'");
+        }
     }
 }

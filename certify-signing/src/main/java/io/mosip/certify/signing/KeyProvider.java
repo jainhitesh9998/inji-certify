@@ -31,4 +31,14 @@ public interface KeyProvider extends Signer {
     default List<PublicKeyDescriptor> publicKeys(KeyRef ref) {
         return List.of(resolve(ref).descriptor());
     }
+
+    /**
+     * One unversioned reference per alias this provider holds, for reporting over every key such as certificate
+     * expiry: {@link #publicKeys(KeyRef)} lists an alias's versions and {@link #resolve} names its current one. The
+     * default is empty, for a provider that cannot enumerate its aliases; callers then fall back to
+     * {@link #publicKeys(KeyFilter)}.
+     */
+    default List<KeyRef> keyRefs() {
+        return List.of();
+    }
 }

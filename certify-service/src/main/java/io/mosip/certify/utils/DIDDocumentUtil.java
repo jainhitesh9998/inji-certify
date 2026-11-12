@@ -127,7 +127,8 @@ public class DIDDocumentUtil {
             log.error("No certificates found for appId: {} and refId: {}; leaving it out of the DID document", appId, refId);
             return List.of();
         }
-        return keys;
+        // an mDL IACA is a trust anchor, never a verification method that signs credentials
+        return keys.stream().filter(PublicKeyDescriptor::isSigningKey).toList();
     }
 
     private Map<String, Object> processKey(

@@ -11,7 +11,7 @@ import java.util.List;
 
 /** The registry over every {@link KeyProvider} bean; signing code asks it for the provider a KeyRef names. */
 @Configuration
-@EnableConfigurationProperties(CwtSigningProperties.class)
+@EnableConfigurationProperties({CwtSigningProperties.class, SigningKeyExpiryProperties.class})
 public class SigningBeans {
 
     @Bean
@@ -25,14 +25,14 @@ public class SigningBeans {
     }
 
     /**
-     * Expiry visibility for every published signing certificate (M-05 item 5): the startup warning and the
+     * Expiry visibility for the current signing certificates (M-05): the warning and the
      * {@code certify.signing.key.expires_in_days} gauge. Micrometer is a service dependency, never a provider one.
+     * Creating the bean reads no provider: the first report runs on {@code ApplicationReadyEvent}, after keymanager has
+     * provisioned its keys, and is then reconciled every {@code certify.signing.key-expiry.reconcile-interval}.
      */
     @Bean
-    public SigningKeyExpiry signingKeyExpiry(List<KeyProvider> providers, ObjectProvider<MeterRegistry> meterRegistry) {
-        SigningKeyExpiry expiry = new SigningKeyExpiry(providers);
-        expiry.warnExpiringSoon();
-        meterRegistry.ifAvailable(expiry::register);
-        return expiry;
+    public SigningKeyExpiry signingKeyExpiry(List<KeyProvider> providers, ObjectProvider<MeterRegistry> meterRegistry,
+                                             SigningKeyExpiryProperties properties) {
+        return new SigningKeyExpiry(providers, meterRegistry.getIfAvailable(), properties);
     }
 }

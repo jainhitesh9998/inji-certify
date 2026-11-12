@@ -166,6 +166,27 @@ class KeymanagerKeyProviderTest {
         verify(keymanager.keymanagerService, times(3)).getAllCertificates(eq(ED.applicationId()), eq(Optional.of(ED.referenceId())));
     }
 
+    /**
+     * M-05 review: a read before keymanager provisioned a key (the service key, read for the JWKS or by a startup
+     * report) must not hide the key for the cache TTL once it exists: an empty answer is never cached.
+     */
+    @Test
+    void anAliasWithoutCertificatesIsNotCachedSoAKeyProvisionedLaterIsSeenAtOnce() {
+        KeymanagerAlias service = new KeymanagerAlias("CERTIFY_SERVICE", "");
+        KeymanagerKeyProvider withService = new KeymanagerKeyProvider(keymanager.keymanagerService,
+                keymanager.signatureService, List.of(service), clock, Duration.ofMinutes(1));
+        assertEquals(List.of(), withService.publicKeys(service.toKeyRef()), "not provisioned yet");
+
+        String kid = keymanager.addKey(service, SignatureAlgorithm.RS256, KeymanagerStandIn.at("2025-01-01T00:00:00Z"),
+                KeymanagerStandIn.at("2028-01-01T00:00:00Z"));
+
+        assertEquals(List.of(kid), withService.publicKeys(KeyFilter.ALL).stream().map(PublicKeyDescriptor::kid).toList(),
+                "the key provisioned a moment later is published at once, not after the TTL");
+        assertEquals(List.of(service.toKeyRef()), withService.keyRefs());
+        withService.publicKeys(KeyFilter.ALL);
+        verify(keymanager.keymanagerService, times(2)).getAllCertificates(eq("CERTIFY_SERVICE"), eq(Optional.of("")));
+    }
+
     @Test
     void ensureKeysReproducesTheHistoricalInitKeysCalls() {
         provider.ensureKeys(List.of(

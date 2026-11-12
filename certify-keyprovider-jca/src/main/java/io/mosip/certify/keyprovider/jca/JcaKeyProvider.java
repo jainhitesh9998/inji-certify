@@ -1,6 +1,8 @@
 package io.mosip.certify.keyprovider.jca;
 
 import com.nimbusds.jose.crypto.impl.ECDSA;
+import io.mosip.certify.pki.AnnexBValidator;
+import io.mosip.certify.pki.IsoMdocProfiles;
 import io.mosip.certify.signing.CertificateChain;
 import io.mosip.certify.signing.KeyFilter;
 import io.mosip.certify.signing.KeyProvider;
@@ -23,6 +25,7 @@ import java.security.PrivateKey;
 import java.security.Security;
 import java.security.Signature;
 import java.security.cert.Certificate;
+import java.security.cert.CertificateParsingException;
 import java.security.cert.X509Certificate;
 import java.security.interfaces.ECPublicKey;
 import java.security.interfaces.RSAPublicKey;
@@ -32,6 +35,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.LinkedHashSet;
 import java.util.EnumSet;
 import java.util.Enumeration;
 import java.util.LinkedHashMap;
@@ -48,6 +52,15 @@ import java.util.Set;
 public class JcaKeyProvider implements KeyProvider {
 
     public static final String ID = "jca";
+
+    /** A key that signs credentials: every plain key, the purpose keys have always carried. */
+    public static final String PURPOSE_VC_SIGNING = "vc-signing";
+    /** A CA certificate that is not an Annex B IACA, such as the P3-08 dev CA that signs generated dev keys. */
+    public static final String PURPOSE_DEV_CA = "dev-ca";
+    /** An ISO/IEC 18013-5 Annex B Issuing Authority CA: a trust anchor, never a credential signing key. */
+    public static final String PURPOSE_MDOC_IACA = PublicKeyDescriptor.PURPOSE_MDOC_IACA;
+    /** An ISO/IEC 18013-5 Annex B Document Signer (mDL extended key usage {@code 1.0.18013.5.1.2}). */
+    public static final String PURPOSE_MDOC_DSC = "mdoc-dsc";
 
     static {
         if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) == null) {
@@ -69,17 +82,22 @@ public class JcaKeyProvider implements KeyProvider {
         this.id = id;
     }
 
-    /** Loads every key entry of a PKCS#12 keystore; the purpose of each key is {@code vc-signing}. */
+    /** Loads every key entry of a PKCS#12 keystore; each key's purpose is read from its certificate ({@link #purposeOf}). */
     public static JcaKeyProvider fromPkcs12(Path path, char[] password) {
         return fromPkcs12(ID, path, password);
     }
 
     /** The same keystore published under another provider id (an {@code x509-file} provider next to keymanager). */
     public static JcaKeyProvider fromPkcs12(String id, Path path, char[] password) {
+        return fromPkcs12(id, path, password, PURPOSE_VC_SIGNING);
+    }
+
+    /** As {@link #fromPkcs12(String, Path, char[])}, with the purpose a plain key gets ({@code vc-signing} unless configured). */
+    public static JcaKeyProvider fromPkcs12(String id, Path path, char[] password, String plainPurpose) {
         try (InputStream in = Files.newInputStream(path)) {
             KeyStore keyStore = KeyStore.getInstance("PKCS12");
             keyStore.load(in, password);
-            return fromKeyStore(id, keyStore, password);
+            return fromKeyStore(id, keyStore, password, plainPurpose);
         } catch (IOException | GeneralSecurityException e) {
             throw new SigningException("Cannot load PKCS#12 keystore " + path, e);
         }
@@ -90,6 +108,15 @@ public class JcaKeyProvider implements KeyProvider {
     }
 
     public static JcaKeyProvider fromKeyStore(String id, KeyStore keyStore, char[] password) {
+        return fromKeyStore(id, keyStore, password, PURPOSE_VC_SIGNING);
+    }
+
+    /**
+     * Loads every key entry. PKCS#12 stores no purpose, so it is derived from each entry's certificate, the same way on
+     * every start ({@link #purposeOf}): a key generated as an IACA or a Document Signer keeps that purpose after a
+     * restart, and a plain key gets {@code plainPurpose} as before M-05.
+     */
+    public static JcaKeyProvider fromKeyStore(String id, KeyStore keyStore, char[] password, String plainPurpose) {
         JcaKeyProvider provider = new JcaKeyProvider(id);
         try {
             Enumeration<String> aliases = keyStore.aliases();
@@ -109,12 +136,37 @@ public class JcaKeyProvider implements KeyProvider {
                 if (x509.isEmpty()) {
                     throw new SigningException("Keystore entry " + alias + " has no certificate");
                 }
-                provider.add(alias, privateKey, new CertificateChain(x509), null, "vc-signing");
+                provider.add(alias, privateKey, new CertificateChain(x509), null, purposeOf(x509.get(0), plainPurpose));
             }
         } catch (GeneralSecurityException e) {
             throw new SigningException("Cannot read keystore", e);
         }
         return provider;
+    }
+
+    /**
+     * The purpose a stored certificate implies (docs/design/20-mdl-issuer.md M-05): a CA certificate that is self-signed
+     * and passes {@link AnnexBValidator#validateIaca} is {@value #PURPOSE_MDOC_IACA}, any other CA certificate
+     * {@value #PURPOSE_DEV_CA}; a certificate with the mDL extended key usage is {@value #PURPOSE_MDOC_DSC}; anything
+     * else is a plain key and gets {@code plainPurpose}.
+     */
+    public static String purposeOf(X509Certificate certificate, String plainPurpose) {
+        if (certificate.getBasicConstraints() >= 0) {
+            boolean selfSigned = certificate.getSubjectX500Principal().equals(certificate.getIssuerX500Principal());
+            return selfSigned && AnnexBValidator.validateIaca(certificate).isEmpty() ? PURPOSE_MDOC_IACA : PURPOSE_DEV_CA;
+        }
+        return hasMdlEku(certificate) ? PURPOSE_MDOC_DSC : plainPurpose;
+    }
+
+    /** Whether the certificate carries the mDL Document Signer extended key usage {@code 1.0.18013.5.1.2}. */
+    public static boolean hasMdlEku(X509Certificate certificate) {
+        try {
+            List<String> eku = certificate.getExtendedKeyUsage();
+            return eku != null && eku.contains(IsoMdocProfiles.DS_EXTENDED_KEY_USAGE);
+        } catch (CertificateParsingException e) {
+            throw new SigningException("Cannot read the extended key usage of "
+                    + certificate.getSubjectX500Principal(), e);
+        }
     }
 
     /**
@@ -164,7 +216,8 @@ public class JcaKeyProvider implements KeyProvider {
      */
     public SigningKey generateIaca(String alias, MdocIacaSpec spec) {
         DevKeys.Generated generated = DevKeys.generateIaca(spec);
-        add(alias, generated.privateKey(), CertificateChain.of(generated.certificate()), spec.algorithm(), "mdoc-iaca");
+        add(alias, generated.privateKey(), CertificateChain.of(generated.certificate()), spec.algorithm(),
+                PURPOSE_MDOC_IACA);
         return resolve(new KeyRef(id, alias));
     }
 
@@ -183,7 +236,7 @@ public class JcaKeyProvider implements KeyProvider {
         DevKeys.Generated generated = DevKeys.generateDsc(algorithm, commonName, validityDays, iaca.privateKey(),
                 iacaCertificate);
         add(alias, generated.privateKey(), CertificateChain.of(generated.certificate(), iacaCertificate), algorithm,
-                "mdoc-dsc");
+                PURPOSE_MDOC_DSC);
         return resolve(new KeyRef(id, alias));
     }
 
@@ -225,8 +278,10 @@ public class JcaKeyProvider implements KeyProvider {
     /**
      * Resolves a reference, applying the rotation rule of docs/design/20-mdl-issuer.md M-05: a reference without a
      * version resolves to the newest of the alias's entries whose certificate is valid now ({@code notBefore <= now <
-     * notAfter}); a versioned reference resolves to that version exactly. An alias with one entry and no versioned
-     * siblings resolves to that entry whatever its dates, so existing keystores behave as before.
+     * notAfter}; newest by {@code notBefore}, ties broken by {@link VersionLabels} order, so {@code 2026-11.10} wins
+     * over {@code 2026-11.2}); a versioned reference resolves to that version exactly, valid or not. An alias with one
+     * entry and no versioned siblings resolves to that entry whatever its dates, so existing keystores behave as
+     * before, except a Document Signer: an mDL signed outside its DSC's validity is one every verifier rejects.
      */
     @Override
     public SigningKey resolve(KeyRef ref) {
@@ -243,35 +298,53 @@ public class JcaKeyProvider implements KeyProvider {
             List<String> versions = ref.versionOpt().isPresent() ? List.of() : versions(ref.alias());
             if (!versions.isEmpty()) {
                 message += "; no version has a certificate valid now (versions: " + String.join(", ", versions) + ")";
+            } else if (ref.versionOpt().isEmpty() && entries.containsKey(ref.alias())) {
+                Entry only = entries.get(ref.alias());
+                message += "; its Document Signer certificate is valid from " + only.descriptor().notBefore()
+                        + " to " + only.descriptor().notAfter() + " and an mDL is never signed outside it";
             }
             throw new SigningException(message);
         }
         return new SigningKey(ref, entry.descriptor(), entry.privateKey());
     }
 
-    /** The entry a bare alias names: the newest one valid now, or the only entry when the alias has no versions. */
+    /**
+     * The entry a bare alias names: the newest one valid now, or the only entry when the alias has no versions and is
+     * not a Document Signer.
+     */
     private Entry current(String alias) {
-        List<Entry> candidates = entries.values().stream()
-                .filter(e -> e.alias().equals(alias) || e.alias().startsWith(alias + "@"))
-                .toList();
-        if (candidates.size() == 1 && candidates.get(0).alias().equals(alias)) {
+        List<Entry> candidates = versionsOf(alias);
+        if (candidates.size() == 1 && candidates.get(0).alias().equals(alias) && !isDocumentSigner(candidates.get(0))) {
             return candidates.get(0);
         }
         Instant now = Instant.now();
         return candidates.stream()
                 .filter(e -> e.descriptor().isValidAt(now))
-                .max(Comparator.comparing((Entry e) -> e.descriptor().notBefore(),
-                                Comparator.nullsFirst(Comparator.naturalOrder()))
-                        .thenComparing(Entry::alias))
+                .max(ROTATION_ORDER)
                 .orElse(null);
     }
 
-    /** The version labels of an alias, oldest first: what the error message lists when none is valid now. */
-    private List<String> versions(String alias) {
-        return entries.keySet().stream()
-                .filter(aliasAndVersion -> aliasAndVersion.startsWith(alias + "@"))
-                .sorted()
+    /** Oldest first: by certificate {@code notBefore}, then by version label in {@link VersionLabels} order. */
+    private static final Comparator<Entry> ROTATION_ORDER = Comparator
+            .comparing((Entry e) -> e.descriptor().notBefore(), Comparator.nullsFirst(Comparator.naturalOrder()))
+            .thenComparing(e -> VersionLabels.versionOf(e.alias()), VersionLabels.ORDER);
+
+    /** Every entry of an alias, the unversioned one and each {@code alias@version}, oldest first. */
+    private List<Entry> versionsOf(String alias) {
+        return entries.values().stream()
+                .filter(e -> e.alias().equals(alias) || e.alias().startsWith(alias + "@"))
+                .sorted(ROTATION_ORDER)
                 .toList();
+    }
+
+    private static boolean isDocumentSigner(Entry entry) {
+        return PURPOSE_MDOC_DSC.equals(entry.descriptor().purpose())
+                || entry.descriptor().chain().leaf().map(JcaKeyProvider::hasMdlEku).orElse(false);
+    }
+
+    /** The versioned aliases of an alias, oldest first: what the error message lists when none is valid now. */
+    private List<String> versions(String alias) {
+        return versionsOf(alias).stream().map(Entry::alias).filter(a -> a.startsWith(alias + "@")).toList();
     }
 
     @Override
@@ -281,8 +354,9 @@ public class JcaKeyProvider implements KeyProvider {
     }
 
     /**
-     * Every version of the alias, current and rotated, oldest first: a JWKS or DID document lists them all so a
-     * credential signed before a rotation still verifies. A versioned reference names that version only.
+     * Every version of the alias, current and rotated, oldest first ({@code notBefore}, then {@link VersionLabels}
+     * order): a JWKS or DID document lists them all so a credential signed before a rotation still verifies. A
+     * versioned reference names that version only.
      */
     @Override
     public List<PublicKeyDescriptor> publicKeys(KeyRef ref) {
@@ -293,11 +367,15 @@ public class JcaKeyProvider implements KeyProvider {
             Entry entry = entries.get(ref.alias() + "@" + ref.version());
             return entry == null ? List.of() : List.of(entry.descriptor());
         }
-        return entries.values().stream()
-                .filter(e -> e.alias().equals(ref.alias()) || e.alias().startsWith(ref.alias() + "@"))
-                .sorted(Comparator.comparing(Entry::alias))
-                .map(Entry::descriptor)
-                .toList();
+        return versionsOf(ref.alias()).stream().map(Entry::descriptor).toList();
+    }
+
+    /** One unversioned reference per alias held, in the order the aliases were added: {@code mdl-dsc}, not each version. */
+    @Override
+    public List<KeyRef> keyRefs() {
+        LinkedHashSet<String> bases = new LinkedHashSet<>();
+        entries.keySet().forEach(alias -> bases.add(VersionLabels.baseOf(alias)));
+        return bases.stream().map(base -> new KeyRef(id, base)).toList();
     }
 
     @Override
