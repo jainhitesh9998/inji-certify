@@ -11,19 +11,43 @@ import java.time.Duration;
  *
  * @param digestAlgorithm      the MSO digest algorithm, one of {@code SHA-256}, {@code SHA-384}, {@code SHA-512}
  *                             (ISO/IEC 18013-5 9.1.2.4); the same algorithm computes and declares the digests
- * @param msoVersion           {@code version} of the MSO (9.1.2.4)
+ * @param msoVersion           {@code version} of the MSO (9.1.2.4); ISO/IEC 18013-5 defines only {@code "1.0"}
  * @param msoValidity          how long the MSO claims the document is valid, capped at the DSC {@code notAfter}
- *                             (docs/design/20-mdl-issuer.md D7)
+ *                             (docs/design/20-mdl-issuer.md D7); when unset {@link #validity()} applies the P90D default
  * @param validityPeriodYears  the pre-D7 setting ({@code certify.format.mdoc.validity-period-years}); kept as an
- *                             alias so an existing deployment needs no change, ignored when {@code mso-validity} is set
+ *                             alias so an existing deployment needs no change. It is only a fallback: an explicitly
+ *                             configured {@code mso-validity} wins over it
  */
 @ConfigurationProperties(prefix = "certify.format.mdoc")
 public record MdocProperties(@DefaultValue("SHA-256") String digestAlgorithm, @DefaultValue("1.0") String msoVersion,
-                             @DefaultValue("P90D") Duration msoValidity, Integer validityPeriodYears) {
+                             Duration msoValidity, Integer validityPeriodYears) {
 
-    /** The validity span to apply: {@code mso-validity}, or the legacy {@code validity-period-years} when that is set. */
+    private static final Duration DEFAULT_VALIDITY = Duration.ofDays(90);
+
+    public MdocProperties {
+        if (msoVersion == null || !"1.0".equals(msoVersion)) {
+            throw new IllegalArgumentException("certify.format.mdoc.mso-version must be \"1.0\" (ISO/IEC 18013-5 9.1.2.4), was "
+                    + msoVersion);
+        }
+        if (msoValidity != null && (msoValidity.isZero() || msoValidity.isNegative())) {
+            throw new IllegalArgumentException("certify.format.mdoc.mso-validity must be positive, was " + msoValidity);
+        }
+        if (validityPeriodYears != null && validityPeriodYears <= 0) {
+            throw new IllegalArgumentException("certify.format.mdoc.validity-period-years must be positive, was " + validityPeriodYears);
+        }
+    }
+
+    /**
+     * The validity span to apply: an explicitly configured {@code mso-validity} first, then the deprecated
+     * {@code validity-period-years}, then the P90D default (D7).
+     */
     public Duration validity() {
-        return validityPeriodYears == null ? (msoValidity == null ? Duration.ofDays(90) : msoValidity)
-                : Duration.ofDays(365L * validityPeriodYears);
+        if (msoValidity != null) {
+            return msoValidity;
+        }
+        if (validityPeriodYears != null) {
+            return Duration.ofDays(365L * validityPeriodYears);
+        }
+        return DEFAULT_VALIDITY;
     }
 }

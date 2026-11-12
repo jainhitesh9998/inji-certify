@@ -10,6 +10,7 @@ import org.bouncycastle.math.ec.ECPoint;
 import org.bouncycastle.util.BigIntegers;
 
 import java.io.IOException;
+import java.math.BigInteger;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.LinkedHashMap;
@@ -72,7 +73,11 @@ final class MdocCoseKey {
             }
         } catch (FormatException e) {
             throw e;
-        } catch (RuntimeException | IOException e) {
+        } catch (IOException e) {
+            // the JWK JSON could not be read: JsonParseException/JsonMappingException (the caller chose the key)
+            throw holderKeyError("the holder key " + abbreviate(value) + " is not a readable JWK: " + e.getMessage());
+        } catch (IllegalArgumentException e) {
+            // base64url/base58 decoding and BouncyCastle point decoding report malformed keys this way
             throw holderKeyError("the holder key " + abbreviate(value) + " could not be encoded as a COSE_Key: " + e.getMessage());
         }
         throw holderKeyError("the holder key " + abbreviate(value) + " is not a did:jwk, a did:key or a JWK");
@@ -94,10 +99,13 @@ final class MdocCoseKey {
                         + "; an mDL device key is P-256, P-384 or P-521 (ISO/IEC 18013-5 9.1.5.2)");
             };
             int width = NIST_COORDINATE_LENGTH[curve - 1];
+            byte[] x = fixedWidth(decodeCoordinate(text(jwk, "x"), "x"), width, "x");
+            byte[] y = fixedWidth(decodeCoordinate(text(jwk, "y"), "y"), width, "y");
+            requireOnCurve(curve, x, y);
             coseKey.put(LABEL_KTY, KTY_EC2);
             coseKey.put(LABEL_CURVE, curve);
-            coseKey.put(LABEL_X, fixedWidth(decodeCoordinate(text(jwk, "x"), "x"), width, "x"));
-            coseKey.put(LABEL_Y, fixedWidth(decodeCoordinate(text(jwk, "y"), "y"), width, "y"));
+            coseKey.put(LABEL_X, x);
+            coseKey.put(LABEL_Y, y);
             return coseKey;
         }
         if ("OKP".equals(kty)) {
@@ -105,9 +113,14 @@ final class MdocCoseKey {
                 throw holderKeyError("the holder's OKP key is on curve " + text(jwk, "crv")
                         + "; an mDL device key is Ed25519 (ISO/IEC 18013-5 9.1.5.2)");
             }
+            byte[] x = decodeCoordinate(text(jwk, "x"), "x");
+            if (x.length != ED25519_KEY_LENGTH) {
+                // RFC 8032: an Ed25519 public key is exactly 32 bytes; zero-padding would invent a different key
+                throw holderKeyError("the holder JWK Ed25519 x is " + x.length + " bytes, expected " + ED25519_KEY_LENGTH);
+            }
             coseKey.put(LABEL_KTY, KTY_OKP);
             coseKey.put(LABEL_CURVE, CURVE_ED25519);
-            coseKey.put(LABEL_X, fixedWidth(decodeCoordinate(text(jwk, "x"), "x"), ED25519_KEY_LENGTH, "x"));
+            coseKey.put(LABEL_X, x);
             return coseKey;
         }
         throw holderKeyError("the holder key is a " + kty + " key; an mDL device key is EC2 (P-256/384/521) or OKP (Ed25519)");
@@ -118,7 +131,7 @@ final class MdocCoseKey {
         byte[] decoded;
         try {
             decoded = Multibase.decode(multibase);
-        } catch (RuntimeException e) {
+        } catch (IllegalArgumentException | IllegalStateException | IndexOutOfBoundsException e) {
             throw holderKeyError("the did:key " + abbreviate(multibase) + " is not valid multibase: " + e.getMessage());
         }
         if (decoded.length > 2 && Arrays.equals(Arrays.copyOf(decoded, 2), ED25519_MULTICODEC)) {
@@ -153,7 +166,7 @@ final class MdocCoseKey {
         ECPoint decoded;
         try {
             decoded = ecCurve.decodePoint(point);
-        } catch (RuntimeException e) {
+        } catch (IllegalArgumentException e) {
             throw holderKeyError("the did:key point is not on " + NIST_CURVE_NAME[curve - 1] + ": " + e.getMessage());
         }
         Map<Object, Object> coseKey = new LinkedHashMap<>();
@@ -197,6 +210,21 @@ final class MdocCoseKey {
             } catch (IllegalArgumentException e) {
                 throw holderKeyError("the holder JWK " + field + " is not base64url: " + e.getMessage());
             }
+        }
+    }
+
+    /** A raw-JWK EC point must be a point of its curve; otherwise the COSE_Key is not a usable public key. */
+    private static void requireOnCurve(int curve, byte[] x, byte[] y) {
+        ECCurve ecCurve = ECNamedCurveTable.getParameterSpec(NIST_CURVE_NAME[curve - 1]).getCurve();
+        ECPoint point;
+        try {
+            point = ecCurve.createPoint(new BigInteger(1, x), new BigInteger(1, y));
+        } catch (IllegalArgumentException e) {
+            point = null;
+        }
+        if (point == null || point.isInfinity() || !point.isValid()) {
+            throw holderKeyError("the holder's P-" + (curve == CURVE_P256 ? "256" : curve == CURVE_P384 ? "384" : "521")
+                    + " point is not on " + NIST_CURVE_NAME[curve - 1]);
         }
     }
 
