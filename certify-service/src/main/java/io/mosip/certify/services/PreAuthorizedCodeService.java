@@ -129,8 +129,8 @@ public class PreAuthorizedCodeService {
         }
         OfferSurface surface = requestedSurface(request);
         // Only an /oid4vci offer is bound to a tenant: a legacy offer stays tenant-agnostic, exactly as it was before
-        // the surface existed, so an unchanged deployment keeps the same cached entry, the same token audience and no
-        // cross-tenant rule (M-09 review round 2).
+        // the surface existed, so an unchanged deployment keeps the same token audience and no cross-tenant rule; its
+        // cached entry only gains issuer "legacy", which never reaches the wire (M-09 review round 2).
         String tenantId = surface == OfferSurface.OID4VCI ? requestTenantId() : null;
 
         String offerId = UUID.randomUUID().toString();

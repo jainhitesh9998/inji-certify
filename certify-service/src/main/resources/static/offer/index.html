@@ -100,7 +100,7 @@
   const el = (id) => document.getElementById(id);
   let metadata = null, newMetadata = null, offerDocument = null, offerConfigurationId = null, offerSurface = null, tokenEndpoint = null;
   // the blob URL of the last portrait this page rendered, released when the next one replaces it
-  let portraitObjectUrl = null;
+  let portraitObjectUrls = [];
 
   async function api(method, path, body, headers, form) {
     const h = Object.assign({}, headers || {});
@@ -182,7 +182,14 @@
         fetchedOffer = offer.credential_offer; // by value: the offer travelled in the answer, no fetch needed
       } else {
         const offerUrl = new URL(deepLink.replace(/^[a-z-]+:\/\//, "https://x/")).searchParams.get("credential_offer_uri");
-        fetchedOffer = offerUrl ? (await api("GET", offerUrl)).body : null;
+        const fetched = offerUrl ? await api("GET", offerUrl) : null;
+        if (!fetched || fetched.status !== 200 || !fetched.body || typeof fetched.body !== "object"
+            || !fetched.body.grants || !fetched.body.grants["urn:ietf:params:oauth:grant-type:pre-authorized_code"]) {
+          // the previous offer stays active: nothing has been published yet
+          status("offerStatus", "The offer was created but could not be fetched from credential_offer_uri ("
+            + (fetched ? fetched.status : "no URI") + ")", false); return;
+        }
+        fetchedOffer = fetched.body;
       }
       // the QR image is built before anything is published, so a rendering fault cannot leave a half-replaced offer
       const qr = document.createElement("div");
@@ -287,7 +294,7 @@
   function renderMdoc(credential) {
     const view = el("mdocView"), table = el("mdocTable");
     // the previous credential's portrait image is dropped by the table reset below: release its blob URL first
-    if (portraitObjectUrl) { URL.revokeObjectURL(portraitObjectUrl); portraitObjectUrl = null; }
+    portraitObjectUrls.forEach((url) => URL.revokeObjectURL(url)); portraitObjectUrls = [];
     table.innerHTML = "";
     // the format of the configuration this page offered, not of whatever the dropdown shows now
     if (formatOf(offerConfigurationId) !== "mso_mdoc") { view.hidden = true; return; }
@@ -315,8 +322,9 @@
             if (mime) {
               const image = document.createElement("img");
               // no base64 round trip (String.fromCharCode over a byte array overflows the call stack on large images)
-              portraitObjectUrl = URL.createObjectURL(new Blob([item.elementValue], { type: mime }));
-              image.src = portraitObjectUrl;
+              const url = URL.createObjectURL(new Blob([item.elementValue], { type: mime }));
+              portraitObjectUrls.push(url);
+              image.src = url;
               image.alt = "portrait";
               image.style.cssText = "max-width:120px;border-radius:6px";
               value.appendChild(image);
@@ -328,7 +336,8 @@
           }
         } else if (item.elementValue !== null && typeof item.elementValue === "object") {
           // integers beyond Number.MAX_SAFE_INTEGER decode to a BigInt: render them as the exact decimal digits
-          value.textContent = JSON.stringify(item.elementValue, (key, nested) => typeof nested === "bigint" ? nested.toString() : nested);
+          value.textContent = JSON.stringify(item.elementValue, (key, nested) =>
+            typeof nested === "bigint" ? nested.toString() : nested instanceof Uint8Array ? "<" + nested.length + " bytes>" : nested);
         } else {
           value.textContent = String(item.elementValue);
         }

@@ -18,6 +18,8 @@
  *   bytes [0xa1,0x69,'_','_','p','r','o','t','o','_','_',0x01] -> an own "__proto__" key, Object.prototype untouched
  *   bytes [0x7f,0x01,0xff]          -> throws       (a text-string chunk that is not a text string)
  *   bytes [0x9f]                    -> throws       (unexpected end of input, never a hang)
+ *   bytes a2 01 61 61 61 31 61 62   -> throws       (keys 1 and "1" render alike: ambiguous, never overwritten)
+ *   bytes [0xf9]                    -> throws       (truncated half float)
  *   bytes [0x1f] / [0xff] / [0x7c]  -> throws       (indefinite integer, stray break, reserved additional information)
  *   hex 1b0020000000000001          -> 9007199254740993n  (2^53+1: a BigInt, not 9007199254740992)
  *   hex 3b0020000000000001          -> -9007199254740994n (below Number.MIN_SAFE_INTEGER)
@@ -90,6 +92,8 @@ var Cbor = (function () {
   }
 
   function float(reader, additional) {
+    var width = additional === 25 ? 2 : additional === 26 ? 4 : additional === 27 ? 8 : 0;
+    if (width && reader.offset + width > reader.bytes.length) throw new Error("CBOR: unexpected end of input");
     var view = new DataView(reader.bytes.buffer, reader.bytes.byteOffset + reader.offset);
     if (additional === 25) {
       var half = view.getUint16(0);
@@ -199,8 +203,10 @@ var Cbor = (function () {
         // no prototype: a decoded "__proto__" key is data, not an assignment to Object.prototype
         var map = Object.create(null);
         var put = function () {
-          var key = decode(reader);
-          map[keyOf(key)] = decode(reader);
+          var rendered = keyOf(decode(reader));
+          // RFC 8949 5.6: duplicate keys make a map invalid; keys that only render alike (1 and "1") are refused too, never overwritten
+          if (Object.prototype.hasOwnProperty.call(map, rendered)) throw new Error("CBOR: duplicate or ambiguous map key " + rendered);
+          map[rendered] = decode(reader);
         };
         if (length < 0) {
           while (reader.peek() !== 0xff) put();

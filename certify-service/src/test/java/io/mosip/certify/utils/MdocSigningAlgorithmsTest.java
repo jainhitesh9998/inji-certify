@@ -19,6 +19,13 @@ class MdocSigningAlgorithmsTest {
     }
 
     @Test
+    void legacyRowsKeepTheIdentifiersTheyPublishedBefore() {
+        // existing mDoc rows that list these must publish the same integers as on design/extensibility (CLAUDE.md rule 1)
+        assertEquals(-47, MdocSigningAlgorithms.coseId("ES256K"));
+        assertEquals(-257, MdocSigningAlgorithms.coseId("RS256"));
+    }
+
+    @Test
     void anUnknownAlgorithmIsOmittedWithAWarningInsteadOfFailingTheDocument() {
         assertNull(MdocSigningAlgorithms.coseId("HS256"));
         assertNull(MdocSigningAlgorithms.coseId(null));

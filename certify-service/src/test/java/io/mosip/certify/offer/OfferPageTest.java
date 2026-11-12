@@ -43,7 +43,7 @@ class OfferPageTest {
         // M-09 review round 2: the in-page wallet stays available for a legacy offer (its token is accepted at
         // /oid4vci/credential through allowed-audiences), and a replaced portrait releases its blob URL
         assertTrue(html.contains("el(\"wallet\").disabled = !grant;"), "the wallet is offered for either surface");
-        assertTrue(html.contains("URL.revokeObjectURL(portraitObjectUrl)"), "a replaced portrait's object URL is revoked");
+        assertTrue(html.contains("portraitObjectUrls.forEach((url) => URL.revokeObjectURL(url))"), "a replaced portrait's object URL is revoked");
         MvcResult script = mockMvc.perform(get("/offer/qrcode.min.js")).andReturn();
         assertEquals(200, script.getResponse().getStatus());
         assertTrue(script.getResponse().getContentAsString().startsWith("var QRCode;"));
