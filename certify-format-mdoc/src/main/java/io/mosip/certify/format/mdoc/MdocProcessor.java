@@ -80,7 +80,11 @@ public class MdocProcessor {
                 validity.put(MdocConstants.VALID_FROM, createCBORTaggedDateTime(formattedCurrentTime));
             }
             if ("${_signed}".equals(signedValue)) {
-                validity.put(MdocConstants.SIGNED, createCBORTaggedDateTime(formattedCurrentTime));
+                // The caller's claims may already carry a concrete validFrom (the Velocity template context fills it):
+                // tagging signed with the wall clock here would sign the MSO for a later instant than the one it
+                // becomes valid from, which an independent verifier rejects (ISO/IEC 18013-5 9.1.2.4, gap G8).
+                String signedTime = "${_validFrom}".equals(validFromValue) ? formattedCurrentTime : validFromValue;
+                validity.put(MdocConstants.SIGNED, createCBORTaggedDateTime(signedTime));
             }
             if ("${_validUntil}".equals(validUntilValue)) {
                 String futureTime = currentTime.plusYears(mDocConfig.validityPeriodYears())

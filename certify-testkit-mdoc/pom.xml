@@ -13,16 +13,22 @@
         implementation, Authlete CBOR as a second COSE oracle. Test-only; consume it with scope test
         (docs/design/20-mdl-issuer.md M-01, decision D9).</description>
 
+    <!-- Test-only: never published, and it must not appear on any production runtime classpath. -->
+    <properties>
+        <maven.deploy.skip>true</maven.deploy.skip>
+    </properties>
+
     <dependencies>
         <!-- Primary verifier: OpenWallet Foundation Multipaz, pinned exactly. The Kotlin stdlib and kotlinx
-             dependencies it drags in must stay inside this module; other modules see them only through a
-             test-scoped dependency on this artifact. -->        <dependency>
+             dependencies it drags in stay inside this module; other modules see them only through a test-scoped
+             dependency on this artifact. -->
+        <dependency>
             <groupId>org.multipaz</groupId>
             <artifactId>multipaz-jvm</artifactId>
             <version>${multipaz.version}</version>
             <exclusions>
-                <!-- Android key attestation is a runtime dependency of the Android flavour; the JVM verifier
-                     never reaches it, and it is not on Maven Central. -->
+                <!-- Android key attestation is a runtime dependency of the Android flavour; the JVM verifier never
+                     reaches it. See the README. -->
                 <exclusion>
                     <groupId>com.android.keyattestation</groupId>
                     <artifactId>keyattestation</artifactId>
@@ -63,4 +69,17 @@
             </dependency>
         </dependencies>
     </dependencyManagement>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.sonatype.central</groupId>
+                <artifactId>central-publishing-maven-plugin</artifactId>
+                <configuration>
+                    <!-- the testkit is a test dependency of the build, not an artifact of the product -->
+                    <skipPublishing>true</skipPublishing>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
 </project>

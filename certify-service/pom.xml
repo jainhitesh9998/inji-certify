@@ -306,20 +306,10 @@
             <scope>compile</scope>
         </dependency>
         <dependency>
-            <!-- pixelpass-jar 0.8.0 needs kotlin.text.HexExtensionsKt (Kotlin 1.9; still present in 2.2.21), which
-                 the former 1.8.20 pin broke for every QR (claim-169) issuance. 2.2.21 is Multipaz's version: the
-                 independent mDoc verifier (certify-testkit-mdoc, M-01) needs kotlin.time.Instant, and one stdlib
-                 version has to serve production and tests alike. -->
+            <!-- version managed by spring-boot-dependencies (1.9.22): pixelpass-jar 0.8.0 needs kotlin.text.HexExtensionsKt (Kotlin 1.9);
+                 the former 1.8.20 pin broke every QR (claim-169) issuance with NoClassDefFoundError -->
             <groupId>org.jetbrains.kotlin</groupId>
             <artifactId>kotlin-stdlib</artifactId>
-            <version>${multipaz.kotlin.version}</version>
-        </dependency>
-        <!-- Independent ISO/IEC 18013-5 verifier for the mDoc golden test (M-01, docs/design/20-mdl-issuer.md). -->
-        <dependency>
-            <groupId>io.inji.certify</groupId>
-            <artifactId>certify-testkit-mdoc</artifactId>
-            <version>${project.version}</version>
-            <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>io.inji</groupId>

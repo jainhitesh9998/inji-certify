@@ -29,9 +29,6 @@ import io.mosip.certify.core.dto.ClaimsDTO;
 import io.mosip.certify.core.dto.ClaimsDisplayFieldsConfigDTO;
 import io.mosip.certify.core.spi.CredentialConfigurationService;
 import io.mosip.certify.repository.CredentialConfigRepository;
-import io.mosip.certify.testkit.mdoc.IndependentMdocVerifier;
-import io.mosip.certify.testkit.mdoc.Options;
-import io.mosip.certify.testkit.mdoc.VerificationReport;
 import org.json.JSONObject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -49,7 +46,6 @@ import org.springframework.test.web.servlet.MvcResult;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Instant;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Date;
@@ -408,6 +404,8 @@ class IssuanceGoldenTest {
         JsonNode body = objectMapper.readTree(result.getResponse().getContentAsString());
         assertEquals(200, result.getResponse().getStatus(), body.toString());
         String credential = body.get("credentials").get(0).get("credential").asText();
+        // before the assertions: certify-conformance-mdoc and the CI python verifier read it even if a later check fails
+        writeMdocSample("legacy-mdl", credential, holder, "org.iso.18013.5.1.mDL");
 
         com.upokecenter.cbor.CBORObject issuerSigned = com.upokecenter.cbor.CBORObject.DecodeFromBytes(Base64.getUrlDecoder().decode(credential));
         assertTrue(issuerSigned.ContainsKey("nameSpaces"), "IssuerSigned.nameSpaces");
@@ -581,6 +579,8 @@ class IssuanceGoldenTest {
         JsonNode body = objectMapper.readTree(result.getResponse().getContentAsString());
         assertEquals(200, result.getResponse().getStatus(), body.toString());
         String credential = body.get("credentials").get(0).get("credential").asText();
+        // before the assertions: certify-conformance-mdoc and the CI python verifier read it even if a later check fails
+        writeMdocSample("oid4vci-mdl", credential, holder, "org.iso.18013.5.1.mDL");
 
         com.upokecenter.cbor.CBORObject issuerSigned = com.upokecenter.cbor.CBORObject.DecodeFromBytes(Base64.getUrlDecoder().decode(credential));
         com.upokecenter.cbor.CBORObject issuerAuth = issuerSigned.get("issuerAuth");
@@ -599,11 +599,8 @@ class IssuanceGoldenTest {
         verifier.initVerify(leaf.getPublicKey());
         verifier.update(sigStructure);
         assertTrue(verifier.verify(com.nimbusds.jose.crypto.impl.ECDSA.transcodeSignatureToDER(issuerAuth.get(3).GetByteString())), "IssuerAuth from the new surface verifies with JCA");
-        // ...and with libraries Certify does not maintain: Multipaz and Authlete re-parse the IssuerSigned, verify the
-        // COSE_Sign1 signature, the MSO digests, the holder device key and the docType (gap G24, M-01)
-        VerificationReport independent = new IndependentMdocVerifier().verify(Base64.getUrlDecoder().decode(credential),
-                holder, java.util.Optional.empty(), Instant.now().plusSeconds(1), Options.baseline("org.iso.18013.5.1.mDL"));
-        independent.assertAllPassed();
+        // ...and, after this test, by libraries Certify does not maintain: certify-conformance-mdoc re-verifies the
+        // sample written below with Multipaz and Authlete (gap G24, M-01)
         com.upokecenter.cbor.CBORObject msoWrapped = com.upokecenter.cbor.CBORObject.DecodeFromBytes(payload);
         com.upokecenter.cbor.CBORObject mso = msoWrapped.HasMostOuterTag(24)
                 ? com.upokecenter.cbor.CBORObject.DecodeFromBytes(msoWrapped.Untag().GetByteString()) : msoWrapped;
@@ -868,6 +865,48 @@ class IssuanceGoldenTest {
     }
 
     /** mso_mdoc: docType, namespace claims, ES256 with the EC_R1 key; the validator wants a cryptosuite key of the signing-alg map. */
+    /**
+     * Writes what {@code certify-conformance-mdoc} and {@code docs/design/tools/verify_mdoc.py} re-verify afterwards:
+     * the raw IssuerSigned CBOR, the holder public JWK, the docType the configuration asked for and, when the x5chain
+     * ends in a self-signed anchor, that anchor as PEM. Raw CBOR plus sidecars keeps the sample readable by tools that
+     * know nothing about this code (docs/design/20-mdl-issuer.md M-01, gap G24). This module deliberately has no
+     * test-scope dependency on the verifier: it must stay off certify-service's runtime classpath.
+     */
+    static void writeMdocSample(String name, String credential, JWK holder, String docType) throws Exception {
+        byte[] issuerSigned = Base64.getUrlDecoder().decode(credential);
+        Path directory = Path.of("target", "mdoc-samples");
+        Files.createDirectories(directory);
+        Files.write(directory.resolve(name + ".mdoc"), issuerSigned);
+        Files.writeString(directory.resolve(name + ".holder.jwk"), holder.toPublicJWK().toJSONString());
+        Files.writeString(directory.resolve(name + ".doctype"), docType);
+        com.upokecenter.cbor.CBORObject root = com.upokecenter.cbor.CBORObject.DecodeFromBytes(issuerSigned);
+        com.upokecenter.cbor.CBORObject chain = root.get("issuerAuth").get(1)
+                .get(com.upokecenter.cbor.CBORObject.FromObject(33));
+        if (chain == null) {
+            return;
+        }
+        List<byte[]> der = new java.util.ArrayList<>();
+        if (chain.getType() == com.upokecenter.cbor.CBORType.Array) {
+            for (com.upokecenter.cbor.CBORObject certificate : chain.getValues()) {
+                der.add(certificate.GetByteString());
+            }
+        } else {
+            der.add(chain.GetByteString());
+        }
+        if (der.size() < 2) {
+            return; // one certificate is the leaf, not an anchor to hand out
+        }
+        java.security.cert.X509Certificate last = (java.security.cert.X509Certificate)
+                java.security.cert.CertificateFactory.getInstance("X.509")
+                        .generateCertificate(new java.io.ByteArrayInputStream(der.get(der.size() - 1)));
+        if (!last.getSubjectX500Principal().equals(last.getIssuerX500Principal())) {
+            return;
+        }
+        Files.writeString(directory.resolve(name + ".iaca.pem"), "-----BEGIN CERTIFICATE-----\n"
+                + Base64.getMimeEncoder(64, new byte[] {'\n'}).encodeToString(last.getEncoded())
+                + "\n-----END CERTIFICATE-----\n");
+    }
+
     static CredentialConfigurationDTO mdocConfig() throws Exception {
         CredentialConfigurationDTO dto = new CredentialConfigurationDTO();
         dto.setCredentialConfigKeyId(MDOC_ID);

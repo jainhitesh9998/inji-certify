@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>io.inji.certify</groupId>
+        <artifactId>certify-parent</artifactId>
+        <version>1.0.0-beta.1-SNAPSHOT</version>
+    </parent>
+    <artifactId>certify-conformance-mdoc</artifactId>
+    <name>certify-conformance-mdoc</name>
+    <description>Cross-module mDoc conformance run: re-verifies every IssuerSigned credential the service and formatter
+        tests write under target/mdoc-samples/ with the independent verifier (Multipaz, Authlete), so the bytes the
+        product emits are read by software Certify does not maintain (docs/design/20-mdl-issuer.md M-01, G24).</description>
+
+    <!-- Test-only: never published. -->
+    <properties>
+        <maven.deploy.skip>true</maven.deploy.skip>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.inji.certify</groupId>
+            <artifactId>certify-testkit-mdoc</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- Multipaz is built against Kotlin 2.2.21 and needs kotlin.time.Instant, which Spring Boot 3.2's BOM pins
+             away (1.9.22) for any module that does not say otherwise. Declaring it here, test scope, is the price of
+             keeping one stdlib version for the verifier without touching the product's classpath: the same reason
+             certify-format-mdoc declares it. -->
+        <dependency>
+            <groupId>org.jetbrains.kotlin</groupId>
+            <artifactId>kotlin-stdlib</artifactId>
+            <version>${multipaz.kotlin.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.sonatype.central</groupId>
+                <artifactId>central-publishing-maven-plugin</artifactId>
+                <configuration>
+                    <skipPublishing>true</skipPublishing>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

@@ -5,6 +5,13 @@
  */
 package io.mosip.certify.format.mdoc;
 
+import co.nstant.in.cbor.CborDecoder;
+import co.nstant.in.cbor.CborEncoder;
+import co.nstant.in.cbor.model.Array;
+import co.nstant.in.cbor.model.ByteString;
+import co.nstant.in.cbor.model.DataItem;
+import co.nstant.in.cbor.model.UnicodeString;
+import co.nstant.in.cbor.model.UnsignedInteger;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nimbusds.jose.jwk.JWK;
 import io.mosip.certify.keyprovider.jca.JcaKeyProvider;
@@ -22,21 +29,23 @@ import io.mosip.certify.spi.SigningContext;
 import io.mosip.certify.spi.TenantContext;
 import io.mosip.certify.spi.UnsignedCredential;
 import io.mosip.certify.testkit.mdoc.IndependentMdocVerifier;
+import io.mosip.certify.testkit.mdoc.MdocSamples;
 import io.mosip.certify.testkit.mdoc.Options;
 import io.mosip.certify.testkit.mdoc.VerificationReport;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
-import java.nio.file.Files;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.nio.file.Path;
 import java.security.cert.X509Certificate;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -44,12 +53,25 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * The formatter's own tests agree with its writer; this one checks the bytes with libraries Certify does not maintain
- * (Multipaz and Authlete CBOR, {@code certify-testkit-mdoc}). Checks today's output cannot pass are separate,
- * disabled methods naming the work package that enables them (docs/design/20-mdl-issuer.md M-01).
+ * (Multipaz and Authlete CBOR, {@code certify-testkit-mdoc}).
+ *
+ * <p>Two kinds of test:
+ * <ul>
+ *     <li>the baseline, today's output under every rule the harness can enforce; the checks the open gaps block
+ *     (G1, G2, G9, chain-to-IACA) are asserted as <em>skipped, by name</em>, never as passed;</li>
+ *     <li>mutations and strict-mode negatives, so a check that stops detecting what it claims to detect goes red:
+ *     a re-signed-over signature, a wrong docType, an expired window, a foreign IACA, a self-signed certificate in
+ *     the chain, and the strict-mode failures the M-02/M-03/M-06 work packages will flip.</li>
+ * </ul>
+ *
+ * <p>Every credential that issues here is written to {@code target/mdoc-samples/} together with its holder key,
+ * docType and IACA, for {@code certify-conformance-mdoc} and {@code docs/design/tools/verify_mdoc.py} to re-verify
+ * with two more independent stacks.
  */
 class MdocIndependentVerificationTest {
 
     static final String DOCTYPE = "org.iso.18013.5.1.mDL";
+    static final String NAMESPACE = "org.iso.18013.5.1";
     static final JcaKeyProvider KEYS = JcaKeyProvider.devMode();
     static final Instant AT = Instant.now();
     static final IssuanceContext CONTEXT = new IssuanceContext(TenantContext.DEFAULT, null, List.of(),
@@ -59,35 +81,74 @@ class MdocIndependentVerificationTest {
             + "\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"}";
     static final String HOLDER = "did:jwk:" + Base64.getUrlEncoder().withoutPadding().encodeToString(HOLDER_JWK.getBytes());
 
+    /**
+     * The checks today's output cannot satisfy yet. Listed in the one test that accepts them, so the acceptance is a
+     * reviewable line rather than a default.
+     */
+    static final Set<String> BASELINE_GAPS = Set.of(IndependentMdocVerifier.CHECK_TDATE_TAGS,
+            IndependentMdocVerifier.CHECK_CHAIN_TO_IACA, IndependentMdocVerifier.CHECK_NO_SELF_SIGNED,
+            IndependentMdocVerifier.CHECK_ELEMENT_TYPES);
+
+    static final List<String> EVERY_CHECK = List.of(IndependentMdocVerifier.CHECK_SIGNATURE_MULTIPAZ,
+            IndependentMdocVerifier.CHECK_SIGNATURE_AUTHLETE, IndependentMdocVerifier.CHECK_MSO_PAYLOAD_TAG,
+            IndependentMdocVerifier.CHECK_NAMESPACES, IndependentMdocVerifier.CHECK_VALUE_DIGESTS,
+            IndependentMdocVerifier.CHECK_CALCULATED_DIGESTS, IndependentMdocVerifier.CHECK_DIGEST_IDS_UNIQUE,
+            IndependentMdocVerifier.CHECK_DEVICE_KEY, IndependentMdocVerifier.CHECK_DOC_TYPE,
+            IndependentMdocVerifier.CHECK_VALIDITY_INFO, IndependentMdocVerifier.CHECK_TDATE_TAGS,
+            IndependentMdocVerifier.CHECK_CHAIN_TO_IACA, IndependentMdocVerifier.CHECK_NO_SELF_SIGNED,
+            IndependentMdocVerifier.CHECK_ELEMENT_TYPES);
+
     final IndependentMdocVerifier verifier = new IndependentMdocVerifier();
     final MdocFormatter formatter = new MdocFormatter(new ObjectMapper(), new MdocProperties("SHA-256", "1.0", 2));
+
+    // ---- the credential under test -----------------------------------------------------------------------------
 
     static Map<String, Object> element(int digestId, String identifier, Object value) {
         return Map.of("digestID", digestId, "elementIdentifier", identifier, "elementValue", value);
     }
 
+    static Map<String, Object> validity() {
+        return Map.of("validFrom", "${_validFrom}", "validUntil", "${_validUntil}", "signed", "${_signed}");
+    }
+
     static Map<String, Object> document() {
         return Map.of("docType", DOCTYPE,
-                "validityInfo", Map.of("validFrom", "${_validFrom}", "validUntil", "${_validUntil}", "signed", "${_signed}"),
-                "nameSpaces", Map.of("org.iso.18013.5.1", List.of(
+                "validityInfo", validity(),
+                "nameSpaces", Map.of(NAMESPACE, List.of(
                         element(0, "family_name", "Farmer"), element(1, "birth_date", "1990-01-01"))));
     }
 
-    SigningContext signing() {
-        SigningKey key = KEYS.resolve(KeyRef.parse("jca:dev-es256"));
-        return new SigningContext(new SigningConfig(key.ref(), SignatureAlgorithm.ES256, null, null, null,
-                "did:web:issuer.example"), key, KEYS);
+    /** A document with a non-negative integer element, for the re-encoding digest test. */
+    static Map<String, Object> documentWithInteger() {
+        return Map.of("docType", DOCTYPE,
+                "validityInfo", validity(),
+                "nameSpaces", Map.of(NAMESPACE, List.of(
+                        element(0, "family_name", "Farmer"), element(1, "age_in_years", 0))));
     }
 
-    CredentialConfiguration configuration() {
+    SigningContext signing(JcaKeyProvider provider, String alias) {
+        SigningKey key = provider.resolve(KeyRef.parse("jca:" + alias));
+        return new SigningContext(new SigningConfig(key.ref(), SignatureAlgorithm.ES256, null, null, null,
+                "did:web:issuer.example"), key, provider);
+    }
+
+    SigningContext signing() {
+        return signing(KEYS, "dev-es256");
+    }
+
+    CredentialConfiguration configuration(SigningContext signing) {
         return new CredentialConfiguration(null, "mdl", "mdl_scope", "mso_mdoc",
-                formatter.parseConfig(Map.of("docType", DOCTYPE)), null, signing().config(), null, null, null, null, null);
+                formatter.parseConfig(Map.of("docType", DOCTYPE)), null, signing.config(), null, null, null, null, null);
     }
 
     byte[] issue(Map<String, Object> document) throws Exception {
-        UnsignedCredential unsigned = formatter.build(ClaimSet.of(document), configuration(), CONTEXT,
+        return issue(document, signing());
+    }
+
+    byte[] issue(Map<String, Object> document, SigningContext signing) throws Exception {
+        UnsignedCredential unsigned = formatter.build(ClaimSet.of(document), configuration(signing), CONTEXT,
                 HolderBinding.did(HOLDER, "jwt"));
-        IssuedCredential issued = formatter.sign(unsigned, signing(), CONTEXT);
+        IssuedCredential issued = formatter.sign(unsigned, signing, CONTEXT);
         return Base64.getUrlDecoder().decode((String) issued.credential());
     }
 
@@ -96,56 +157,142 @@ class MdocIndependentVerificationTest {
         return verifier.verify(issuerSigned, JWK.parse(HOLDER_JWK), iaca, Instant.now().plusSeconds(1), options);
     }
 
+    static void assertFails(VerificationReport report, String check, String why) {
+        assertFalse(report.check(check).passed(), why + System.lineSeparator() + report);
+        assertTrue(report.check(check).state() == VerificationReport.State.FAIL, why + " (state must be FAIL, not skipped)"
+                + System.lineSeparator() + report);
+    }
+
+    // ---- the baseline: everything today's output can satisfy ---------------------------------------------------
+
     @Test
     void todayOutputPassesEveryCheckTheHarnessCanEnforce() throws Exception {
         byte[] issuerSigned = issue(document());
-        writeSample(issuerSigned); // before the assertions: the CI python verifier reads it even when a check fails
+        // before the assertions: the conformance module and the CI python verifier read the sample even when a check fails
+        MdocSamples.write(Path.of("target", "mdoc-samples"), "mdl-formatter", issuerSigned, JWK.parse(HOLDER_JWK), DOCTYPE);
         VerificationReport report = verify(issuerSigned, Optional.empty(), Options.baseline(DOCTYPE));
-        report.assertAllPassed();
-        assertEquals(Set.of(IndependentMdocVerifier.CHECK_SIGNATURE_MULTIPAZ,
-                        IndependentMdocVerifier.CHECK_SIGNATURE_AUTHLETE,
-                        IndependentMdocVerifier.CHECK_VALUE_DIGESTS,
-                        IndependentMdocVerifier.CHECK_DIGEST_IDS_UNIQUE,
-                        IndependentMdocVerifier.CHECK_DEVICE_KEY,
-                        IndependentMdocVerifier.CHECK_DOC_TYPE,
-                        IndependentMdocVerifier.CHECK_VALIDITY_INFO,
-                        IndependentMdocVerifier.CHECK_CHAIN_TO_IACA,
-                        IndependentMdocVerifier.CHECK_NO_SELF_SIGNED,
-                        IndependentMdocVerifier.CHECK_ELEMENT_TYPES),
-                report.checks().stream().map(VerificationReport.Check::name).collect(Collectors.toSet()));
+        report.assertAllPassed(BASELINE_GAPS);
+        assertEquals(EVERY_CHECK, report.checks().stream().map(VerificationReport.Check::name).toList(),
+                "the harness still runs every check it claims to");
+        assertEquals(BASELINE_GAPS, report.skippedNames(),
+                "exactly the open gaps are skipped, and nothing else went unverified");
     }
 
-    /** The sample {@code docs/design/tools/verify_mdoc.py} runs over in CI, and the one an operator can inspect. */
-    static void writeSample(byte[] issuerSigned) throws Exception {
-        Path directory = Path.of("target", "mdoc-samples");
-        Files.createDirectories(directory);
-        Files.write(directory.resolve("mdl-issuer-signed.mdoc"), issuerSigned);
-        Files.writeString(directory.resolve("mdl-issuer-signed.b64url"),
-                Base64.getUrlEncoder().withoutPadding().encodeToString(issuerSigned));
+    // ---- mutations: the checks that must catch a bad credential ------------------------------------------------
+
+    @Test
+    void aTamperedSignatureFailsBothCoseOracles() throws Exception {
+        byte[] issuerSigned = issue(document());
+        co.nstant.in.cbor.model.Map root = (co.nstant.in.cbor.model.Map) decode(issuerSigned);
+        Array issuerAuth = (Array) root.get(new UnicodeString("issuerAuth"));
+        List<DataItem> coseSign1 = new ArrayList<>(issuerAuth.getDataItems());
+        byte[] signature = ((ByteString) coseSign1.get(3)).getBytes().clone();
+        signature[signature.length - 1] ^= 0x01; // one bit of the ECDSA signature, everything else untouched
+        coseSign1.set(3, new ByteString(signature));
+        root.put(new UnicodeString("issuerAuth"), array(coseSign1));
+
+        VerificationReport report = verify(encode(root), Optional.empty(), Options.baseline(DOCTYPE));
+        assertFails(report, IndependentMdocVerifier.CHECK_SIGNATURE_MULTIPAZ, "Multipaz must reject a tampered signature");
+        assertFails(report, IndependentMdocVerifier.CHECK_SIGNATURE_AUTHLETE, "Authlete must reject a tampered signature");
+        assertTrue(report.check(IndependentMdocVerifier.CHECK_VALUE_DIGESTS).passed(),
+                "the signature covers the MSO, not the items: the digest check must still pass" + System.lineSeparator() + report);
     }
 
     @Test
-    void aTamperedElementFailsTheDigestCheck() throws Exception {
+    void aWrongDocTypeFailsTheDocTypeCheck() throws Exception {
+        VerificationReport report = verify(issue(document()), Optional.empty(), Options.baseline(DOCTYPE + ".mdl"));
+        assertFails(report, IndependentMdocVerifier.CHECK_DOC_TYPE, "a doctype other than the issued one must fail");
+    }
+
+    @Test
+    void anExpiredCredentialFailsTheValidityWindow() throws Exception {
+        // properly signed and properly tagged, only the window is in the past: nothing but the window check can tell
+        byte[] expired = resignValidity(issue(document()),
+                Map.of("signed", "2020-01-01T00:00:00Z", "validFrom", "2020-01-01T00:00:00Z",
+                        "validUntil", "2021-01-01T00:00:00Z"), Set.of());
+        VerificationReport report = verify(expired, Optional.empty(), Options.baseline(DOCTYPE));
+        assertFails(report, IndependentMdocVerifier.CHECK_VALIDITY_INFO, "validUntil in 2021 must fail at " + Instant.now());
+        assertTrue(report.check(IndependentMdocVerifier.CHECK_SIGNATURE_MULTIPAZ).passed(),
+                "the credential is properly re-signed: only the window is wrong" + System.lineSeparator() + report);
+        assertTrue(report.check(IndependentMdocVerifier.CHECK_TDATE_TAGS).passed(),
+                "the fixture is a whole-second tag-0 tdate, so the tdate check must pass" + System.lineSeparator() + report);
+    }
+
+    @Test
+    void aForeignIacaFailsTheChainCheck() throws Exception {
+        JcaKeyProvider other = new JcaKeyProvider();
+        X509Certificate foreign = other.generate("dev-other", SignatureAlgorithm.ES256, "CN=Not the IACA", "vc-signing")
+                .chain().leaf().orElseThrow();
+        VerificationReport report = verify(issue(document()), Optional.of(foreign), Options.baseline(DOCTYPE));
+        assertFails(report, IndependentMdocVerifier.CHECK_CHAIN_TO_IACA,
+                "an x5chain that does not reach the supplied IACA must fail");
+    }
+
+    @Test
+    void aSelfSignedCertificateInTheX5chainIsDetected() throws Exception {
+        // [leaf, ca] where the ca is self-signed: HAIP forbids carrying the trust anchor, so strict mode must catch it
+        JcaKeyProvider chainKeys = new JcaKeyProvider();
+        chainKeys.generateCa("dev-ca", SignatureAlgorithm.ES256, "CN=Inji Certify dev CA", "vc-signing");
+        chainKeys.generateSignedBy("dev-dsc", SignatureAlgorithm.ES256, "CN=Inji Certify dev DSC", "vc-signing", "dev-ca");
+        SigningContext withChain = signing(chainKeys, "dev-dsc");
+        byte[] issuerSigned = issue(document(), withChain);
+
+        VerificationReport report = verify(issuerSigned, Optional.empty(), Options.strict(DOCTYPE));
+        assertFails(report, IndependentMdocVerifier.CHECK_NO_SELF_SIGNED,
+                "the self-signed CA in x5chain must be reported (HAIP)");
+        assertEquals(2, x5chain(issuerSigned).size(), "the fixture must actually carry [leaf, ca]");
+    }
+
+    @Test
+    void anX5chainAsArrayIsAccepted() throws Exception {
+        // RFC 9360 allows x5chain as a bstr or an array; the harness must read both
         byte[] issuerSigned = issue(document());
-        // flip a byte in the CBOR of the first IssuerSignedItem: the signature covers the MSO, not the items,
-        // so only the digest check can catch this
-        byte[] tampered = issuerSigned.clone();
-        byte[] needle = "Farmer".getBytes(java.nio.charset.StandardCharsets.UTF_8);
-        for (int i = 0; i + needle.length <= tampered.length; i++) {
-            boolean match = true;
-            for (int j = 0; j < needle.length; j++) {
-                if (tampered[i + j] != needle[j]) {
-                    match = false;
-                    break;
-                }
-            }
-            if (match) {
-                tampered[i] = 'B';
-                break;
-            }
-        }
-        VerificationReport report = verify(tampered, Optional.empty(), Options.baseline(DOCTYPE));
-        assertFalse(report.check(IndependentMdocVerifier.CHECK_VALUE_DIGESTS).passed(), report.toString());
+        co.nstant.in.cbor.model.Map root = (co.nstant.in.cbor.model.Map) decode(issuerSigned);
+        Array issuerAuth = (Array) root.get(new UnicodeString("issuerAuth"));
+        List<DataItem> coseSign1 = new ArrayList<>(issuerAuth.getDataItems());
+        co.nstant.in.cbor.model.Map unprotected = (co.nstant.in.cbor.model.Map) coseSign1.get(1);
+        DataItem chain = unprotected.get(new UnsignedInteger(33));
+        unprotected.put(new UnsignedInteger(33),
+                array(List.of(chain instanceof Array existing ? existing.getDataItems().get(0) : chain)));
+        coseSign1.set(1, unprotected);
+        root.put(new UnicodeString("issuerAuth"), array(coseSign1));
+
+        VerificationReport report = verify(encode(root), Optional.empty(), Options.baseline(DOCTYPE));
+        assertTrue(report.check(IndependentMdocVerifier.CHECK_SIGNATURE_MULTIPAZ).passed(), report.toString());
+        assertTrue(report.check(IndependentMdocVerifier.CHECK_SIGNATURE_AUTHLETE).passed(), report.toString());
+    }
+
+    @Test
+    void aNonPreferredIntegerEncodingFailsTheDigestCheck() throws Exception {
+        // ISO/IEC 18013-5 9.1.2.5 hashes the bytes as sent: 0x00 becomes the legal but non-preferred 0x18 0x00 and
+        // the valueDigests entry is left alone. A verifier that re-encodes would not notice, so this test is the
+        // reason the harness hashes the received bytes and keeps calculateDigest as a second opinion only.
+        byte[] issuerSigned = issue(documentWithInteger());
+        byte[] nonPreferred = nonPreferredInteger(issuerSigned, 0);
+
+        VerificationReport report = verify(nonPreferred, Optional.empty(), Options.baseline(DOCTYPE));
+        assertFails(report, IndependentMdocVerifier.CHECK_VALUE_DIGESTS,
+                "the received tag-24 bytes no longer hash to the declared digest");
+        assertTrue(report.check(IndependentMdocVerifier.CHECK_CALCULATED_DIGESTS).passed(),
+                "Multipaz re-encodes 0x18 0x00 back to 0x00, which is exactly why it cannot be the primary oracle"
+                        + System.lineSeparator() + report);
+    }
+
+    @Test
+    void aDuplicatedElementInANamespaceFailsTheNamespaceCheck() throws Exception {
+        // two items with the same elementIdentifier: Multipaz's IssuerNamespaces.validate must report it
+        byte[] issuerSigned = issue(document());
+        co.nstant.in.cbor.model.Map root = (co.nstant.in.cbor.model.Map) decode(issuerSigned);
+        co.nstant.in.cbor.model.Map nameSpaces = (co.nstant.in.cbor.model.Map) root.get(new UnicodeString("nameSpaces"));
+        Array items = (Array) nameSpaces.get(new UnicodeString(NAMESPACE));
+        List<DataItem> duplicated = new ArrayList<>(items.getDataItems());
+        duplicated.add(duplicated.get(0));
+        nameSpaces.put(new UnicodeString(NAMESPACE), array(duplicated));
+        root.put(new UnicodeString("nameSpaces"), nameSpaces);
+
+        VerificationReport report = verify(encode(root), Optional.empty(), Options.baseline(DOCTYPE));
+        assertFails(report, IndependentMdocVerifier.CHECK_NAMESPACES,
+                "a duplicate elementIdentifier must fail the Multipaz namespace validator");
     }
 
     @Test
@@ -154,48 +301,156 @@ class MdocIndependentVerificationTest {
         JWK other = JWK.parse(new com.nimbusds.jose.jwk.gen.ECKeyGenerator(
                 com.nimbusds.jose.jwk.Curve.P_256).generate().toPublicJWK().toJSONString());
         VerificationReport report = verifier.verify(issuerSigned, other, Optional.empty(), AT, Options.baseline(DOCTYPE));
-        assertFalse(report.check(IndependentMdocVerifier.CHECK_DEVICE_KEY).passed(), report.toString());
+        assertFails(report, IndependentMdocVerifier.CHECK_DEVICE_KEY, "the deviceKey must be the holder key");
+    }
+
+    // ---- strict mode today: each check fails, and M-02/M-03/M-06 flip these tests ------------------------------
+    // These are enabled on purpose. They assert where today's output stands, so the work packages that fix it must
+    // change the assertion in the same commit that changes the output; they cannot be forgotten as @Disabled tests.
+
+    @Test
+    void strictModeCurrentlyRejectsFractionalSecondTdate() throws Exception {
+        // gap G1: UTC_DATETIME_PATTERN emits "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"; M-02 truncates to whole seconds
+        VerificationReport report = verify(issue(document()), Optional.empty(), Options.strict(DOCTYPE));
+        assertFails(report, IndependentMdocVerifier.CHECK_TDATE_TAGS,
+                "today's tdate carries milliseconds (ISO/IEC 18013-5 9.1.2.4)");
     }
 
     @Test
-    @Disabled("enabled by M-02: seconds-only tdate (gap G1, ISO/IEC 18013-5 9.1.2.4)")
-    void strictTdateRejectsFractionalSeconds() throws Exception {
-        VerificationReport report = verify(issue(document()), Optional.empty(),
-                new Options(DOCTYPE, true, false, false));
-        assertTrue(report.check(IndependentMdocVerifier.CHECK_VALIDITY_INFO).passed(), report.toString());
+    void strictModeCurrentlyRejectsAnUntaggedDate() throws Exception {
+        // same rule, other half: a plain tstr where #6.0(tstr) belongs. The formatter always tags, so the fixture
+        // re-signs a valid credential with validFrom untagged and Multipaz must not be given a repaired copy.
+        byte[] untagged = resignValidity(issue(document()), Map.of(), Set.of("validFrom"));
+        VerificationReport report = verify(untagged, Optional.empty(), Options.strict(DOCTYPE));
+        assertFails(report, IndependentMdocVerifier.CHECK_TDATE_TAGS, "an untagged validFrom must fail strict mode");
     }
 
     @Test
-    @Disabled("enabled by M-02: x5chain without the trust anchor (gap G9, HAIP)")
-    void x5chainCarriesNoSelfSignedCertificate() throws Exception {
-        VerificationReport report = verify(issue(document()), Optional.empty(),
-                new Options(DOCTYPE, false, true, false));
-        assertTrue(report.check(IndependentMdocVerifier.CHECK_NO_SELF_SIGNED).passed(), report.toString());
+    void strictModeCurrentlyRejectsASelfSignedX5chain() throws Exception {
+        // gap G9: CoseHeaderPolicy.mdocIssuerAuth() carries the whole chain; M-02 signs without the anchor
+        VerificationReport report = verify(issue(document()), Optional.empty(), Options.strict(DOCTYPE));
+        assertFails(report, IndependentMdocVerifier.CHECK_NO_SELF_SIGNED,
+                "the self-signed leaf is in x5chain today (HAIP)");
     }
 
     @Test
-    @Disabled("enabled by M-06: the DSC chain reaches the configured IACA")
-    void x5chainValidatesToTheConfiguredIaca() throws Exception {
-        X509Certificate iaca = signing().key().chain().root().orElseThrow();
-        VerificationReport report = verify(issue(document()), Optional.of(iaca), Options.strict(DOCTYPE));
-        assertTrue(report.check(IndependentMdocVerifier.CHECK_CHAIN_TO_IACA).passed(), report.toString());
+    void strictModeCurrentlyRejectsUntypedMandatoryElements() throws Exception {
+        // gap G2/G3: no element typing table and no mandatory-element check; M-03 adds both
+        VerificationReport report = verify(issue(document()), Optional.empty(), Options.strict(DOCTYPE));
+        assertFails(report, IndependentMdocVerifier.CHECK_ELEMENT_TYPES,
+                "an mDL without its Table 5 mandatory elements must fail");
     }
 
     @Test
-    @Disabled("enabled by M-03: typed elements and a binary portrait (gap G2, ISO/IEC 18013-5 7.2.1 Table 5)")
-    void mdlElementsAreTypedLikeMultipazDrivingLicense() throws Exception {
-        Map<String, Object> document = Map.of("docType", DOCTYPE,
-                "validityInfo", Map.of("validFrom", "${_validFrom}", "validUntil", "${_validUntil}", "signed", "${_signed}"),
-                "nameSpaces", Map.of("org.iso.18013.5.1", List.of(
-                        element(0, "family_name", "Farmer"), element(1, "given_name", "Golden"),
-                        element(2, "birth_date", "1990-01-01"), element(3, "issue_date", "2024-01-01"),
-                        element(4, "expiry_date", "2034-01-01"), element(5, "issuing_country", "IN"),
-                        element(6, "issuing_authority", "Lorem Ipsum Demo"), element(7, "document_number", "MDL-0001"),
-                        element(8, "un_distinguishing_sign", "LID"), element(9, "portrait", "aGVsbG8="),
-                        element(10, "driving_privileges", List.of(Map.of("vehicle_category_code", "B",
-                                "issue_date", "2024-01-01", "expiry_date", "2034-01-01"))))));
-        VerificationReport report = verify(issue(document), Optional.empty(),
-                new Options(DOCTYPE, false, false, true));
-        assertTrue(report.check(IndependentMdocVerifier.CHECK_ELEMENT_TYPES).passed(), report.toString());
+    void strictModeWithoutAnIacaFailsTheChainCheck() throws Exception {
+        VerificationReport report = verify(issue(document()), Optional.empty(), Options.strict(DOCTYPE));
+        assertFails(report, IndependentMdocVerifier.CHECK_CHAIN_TO_IACA,
+                "strict mode must fail, not skip, when there is no IACA to anchor the chain");
+        assertFalse(report.passed(), "today's output cannot pass strict mode" + System.lineSeparator() + report);
+    }
+
+    // ---- CBOR mutation helpers ---------------------------------------------------------------------------------
+
+    static DataItem decode(byte[] cbor) throws Exception {
+        return new CborDecoder(new ByteArrayInputStream(cbor)).decode().get(0);
+    }
+
+    static byte[] encode(DataItem item) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        new CborEncoder(out).encode(item);
+        return out.toByteArray();
+    }
+
+    static Array array(List<DataItem> items) {
+        Array array = new Array();
+        items.forEach(array::add);
+        return array;
+    }
+
+    static List<DataItem> x5chain(byte[] issuerSigned) throws Exception {
+        Array issuerAuth = (Array) ((co.nstant.in.cbor.model.Map) decode(issuerSigned)).get(new UnicodeString("issuerAuth"));
+        co.nstant.in.cbor.model.Map unprotected = (co.nstant.in.cbor.model.Map) issuerAuth.getDataItems().get(1);
+        DataItem chain = unprotected.get(new UnsignedInteger(33));
+        return chain instanceof Array values ? values.getDataItems() : List.of(chain);
+    }
+
+    /** Re-encodes one integer element as 0x18 <value>, which CBOR allows and canonical encoders never emit. */
+    static byte[] nonPreferredInteger(byte[] issuerSigned, int value) throws Exception {
+        co.nstant.in.cbor.model.Map root = (co.nstant.in.cbor.model.Map) decode(issuerSigned);
+        co.nstant.in.cbor.model.Map nameSpaces = (co.nstant.in.cbor.model.Map) root.get(new UnicodeString("nameSpaces"));
+        Array items = (Array) nameSpaces.get(new UnicodeString(NAMESPACE));
+        List<DataItem> replaced = new ArrayList<>(items.getDataItems());
+        byte[] key = "elementValue".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        for (int i = 0; i < replaced.size(); i++) {
+            ByteString item = (ByteString) replaced.get(i);
+            byte[] inner = item.getBytes();
+            int at = indexOf(inner, key);
+            if (at < 0 || inner[at + key.length] != (byte) value) {
+                continue;
+            }
+            byte[] patched = new byte[inner.length + 1];
+            int valueOffset = at + key.length;
+            System.arraycopy(inner, 0, patched, 0, valueOffset);
+            patched[valueOffset] = 0x18; // additional information 24: one more byte carries the argument
+            patched[valueOffset + 1] = (byte) value;
+            System.arraycopy(inner, valueOffset + 1, patched, valueOffset + 2, inner.length - valueOffset - 1);
+            ByteString replacement = new ByteString(patched);
+            if (item.hasTag()) {
+                replacement.setTag(item.getTag());
+            }
+            replaced.set(i, replacement);
+            nameSpaces.put(new UnicodeString(NAMESPACE), array(replaced));
+            root.put(new UnicodeString("nameSpaces"), nameSpaces);
+            return encode(root);
+        }
+        throw new AssertionError("no IssuerSignedItem with elementValue " + value + " in the fixture");
+    }
+
+    /**
+     * Rewrites the MSO validityInfo and signs the result again with the same DSC, so a test can bend the validity
+     * dates (or drop a tdate tag) while everything else — the signature over the Sig_structure, the item digests,
+     * the COSE headers — stays as the formatter wrote it.
+     */
+    static byte[] resignValidity(byte[] issuerSigned, Map<String, String> replace, Set<String> untag) throws Exception {
+        co.nstant.in.cbor.model.Map root = (co.nstant.in.cbor.model.Map) decode(issuerSigned);
+        Array issuerAuth = (Array) root.get(new UnicodeString("issuerAuth"));
+        List<DataItem> coseSign1 = new ArrayList<>(issuerAuth.getDataItems());
+        byte[] protectedBytes = ((ByteString) coseSign1.get(0)).getBytes();
+        // the COSE payload is a plain bstr whose content is #6.24(bstr .cbor MSO); co.nstant models a tag as a flag
+        ByteString taggedMso = (ByteString) decode(((ByteString) coseSign1.get(2)).getBytes());
+        co.nstant.in.cbor.model.Map mso = (co.nstant.in.cbor.model.Map) decode(taggedMso.getBytes());
+        co.nstant.in.cbor.model.Map validity = (co.nstant.in.cbor.model.Map)
+                mso.get(new UnicodeString("validityInfo"));
+        replace.forEach((field, text) -> validity.put(new UnicodeString(field), tdate(text)));
+        untag.forEach(field -> {
+            String text = ((UnicodeString) validity.get(new UnicodeString(field))).getString();
+            validity.put(new UnicodeString(field), new UnicodeString(text)); // same text, no #6.0 tag
+        });
+        ByteString rewrittenMso = new ByteString(encode(mso));
+        rewrittenMso.setTag(24); // #6.24(bstr .cbor MobileSecurityObject)
+        byte[] payloadBytes = encode(rewrittenMso);
+        byte[] sigStructure = encode(array(List.of(new UnicodeString("Signature1"),
+                new ByteString(protectedBytes), new ByteString(new byte[0]), new ByteString(payloadBytes))));
+        byte[] signature = KEYS.signRaw(sigStructure, KEYS.resolve(KeyRef.parse("jca:dev-es256")),
+                SignatureAlgorithm.ES256);
+        coseSign1.set(2, new ByteString(payloadBytes)); // a plain bstr, as CoseEnvelope.sign1 writes it
+        coseSign1.set(3, new ByteString(signature));
+        root.put(new UnicodeString("issuerAuth"), array(coseSign1));
+        return encode(root);
+    }
+
+    static UnicodeString tdate(String text) {
+        UnicodeString tdate = new UnicodeString(text);
+        tdate.setTag(0); // #6.0(tstr)
+        return tdate;
+    }
+
+    static int indexOf(byte[] haystack, byte[] needle) {
+        for (int i = 0; i + needle.length <= haystack.length; i++) {
+            if (Arrays.equals(Arrays.copyOfRange(haystack, i, i + needle.length), needle)) {
+                return i;
+            }
+        }
+        return -1;
     }
 }

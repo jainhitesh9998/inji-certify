@@ -38,21 +38,37 @@ jobs:
         # Testcontainers suites join this step as their work packages land.
         run: mvn -B -ntp -U -Dgpg.skip=true verify
 
+      - name: certify-service runtime classpath guard
+        # A test-only verifier must never change what the product ships. certify-service/runtime-classpath.txt is the
+        # reviewed baseline of the resolved runtime classpath; M-01's first attempt pinned Multipaz's Kotlin 2.2.21
+        # in the service for a test, which this guard now fails on (docs/design/20-mdl-issuer.md M-01).
+        run: docs/design/tools/check-runtime-classpath.sh
+        shell: bash
+
       - name: Independent mDoc verifier (pymdoccbor)
-        # Second, non-Java opinion on every mDoc the tests write to target/mdoc-samples/ (M-01, decision D9):
-        # pymdoccbor verifies the IssuerAuth COSE_Sign1 signature and the element digests. The Java harness
-        # (certify-testkit-mdoc: Multipaz + Authlete) runs in the test step above.
+        # Second, non-Java opinion on every mDoc the tests write to target/mdoc-samples/ (M-01, decision D9).
+        # The Java harness (certify-testkit-mdoc: Multipaz + Authlete) runs in the test step above; this one verifies
+        # the IssuerAuth COSE_Sign1 signature, the x5chain and the element digests, and takes the docType and the IACA
+        # from the sample's sidecar files so an mDL is checked against what the credential configuration asked for.
         run: |
-          python3 -m venv /tmp/pymdoccbor
-          /tmp/pymdoccbor/bin/pip install --quiet pymdoccbor==1.4.0
+          python3 -m venv /tmp/verify-mdoc
+          /tmp/verify-mdoc/bin/pip install --quiet -r docs/design/tools/requirements-verify.txt
           shopt -s nullglob
           samples=(*/target/mdoc-samples/*.mdoc)
           if [ ${#samples[@]} -eq 0 ]; then
-            echo "no mDoc samples under target/mdoc-samples: the formatter test did not run"
+            echo "no mDoc samples under target/mdoc-samples: the mDoc tests did not run"
             exit 1
           fi
           for sample in "${samples[@]}"; do
-            /tmp/pymdoccbor/bin/python docs/design/tools/verify_mdoc.py "$sample"
+            base="${sample%.mdoc}"
+            args=("$sample")
+            if [ -f "${base}.doctype" ]; then
+              args+=(--doctype "$(cat "${base}.doctype")")
+            fi
+            if [ -f "${base}.iaca.pem" ]; then
+              args+=(--iaca "${base}.iaca.pem")
+            fi
+            /tmp/verify-mdoc/bin/python docs/design/tools/verify_mdoc.py "${args[@]}"
           done
         shell: bash
 
