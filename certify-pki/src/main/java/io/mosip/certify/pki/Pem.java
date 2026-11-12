@@ -1,7 +1,10 @@
 package io.mosip.certify.pki;
 
+import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.DERNull;
+import org.bouncycastle.asn1.misc.MiscObjectIdentifiers;
 import org.bouncycastle.asn1.nist.NISTObjectIdentifiers;
+import org.bouncycastle.asn1.pkcs.PBES2Parameters;
 import org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers;
 import org.bouncycastle.asn1.pkcs.PrivateKeyInfo;
 import org.bouncycastle.asn1.x509.AlgorithmIdentifier;
@@ -40,6 +43,10 @@ import java.util.List;
  * encrypted: PKCS#8 with AES-256-CBC under PBKDF2/HMAC-SHA256 ({@code ENCRYPTED PRIVATE KEY}), and the legacy OpenSSL
  * {@code EC PRIVATE KEY} with DEK-Info headers ({@code PEMEncryptedKeyPair}), because an IACA key created offline (D3)
  * is a password-protected file an operator copies, not a plaintext one.
+ *
+ * <p>An encrypted PKCS#8 key is read when it uses PBES2 with PBKDF2 (what {@code openssl pkcs8 -topk8} writes, and
+ * what {@link #writeEncryptedPrivateKey} writes) or one of the PKCS#12 PBE schemes older OpenSSL releases wrote. Any
+ * other scheme, scrypt included, is refused with {@code PEM_KEY_UNSUPPORTED} before a password is tried.
  */
 public final class Pem {
 
@@ -113,6 +120,7 @@ public final class Pem {
                     return normalize(converter.getPrivateKey(pair.getPrivateKeyInfo()));
                 }
                 if (object instanceof PKCS8EncryptedPrivateKeyInfo encrypted) {
+                    checkPbeScheme(encrypted.getEncryptionAlgorithm());
                     PrivateKeyInfo info = encrypted.decryptPrivateKeyInfo(decryptor(password));
                     return normalize(converter.getPrivateKey(info));
                 }
@@ -127,6 +135,33 @@ public final class Pem {
             }
         }
         throw new PkiException("PEM_NOT_A_KEY: the PEM text contains no private key");
+    }
+
+    /**
+     * Refuses a PKCS#8 encryption scheme the reader does not support with a message that names it, rather than the
+     * provider's internal error (BouncyCastle fails a scrypt key with a {@code ClassCastException}).
+     */
+    private static void checkPbeScheme(AlgorithmIdentifier scheme) {
+        ASN1ObjectIdentifier oid = scheme.getAlgorithm();
+        if (PKCSObjectIdentifiers.id_PBES2.equals(oid)) {
+            ASN1ObjectIdentifier kdf;
+            try {
+                kdf = PBES2Parameters.getInstance(scheme.getParameters()).getKeyDerivationFunc().getAlgorithm();
+            } catch (RuntimeException e) {
+                throw new PkiException("PEM_KEY_UNSUPPORTED: unsupported PBE scheme: PBES2 parameters cannot be read", e);
+            }
+            if (!PKCSObjectIdentifiers.id_PBKDF2.equals(kdf)) {
+                String name = MiscObjectIdentifiers.id_scrypt.equals(kdf) ? "scrypt" : kdf.getId();
+                throw new PkiException("PEM_KEY_UNSUPPORTED: unsupported PBE scheme: PBES2 with " + name
+                        + " key derivation; only PBKDF2 is read. Re-encrypt the key with"
+                        + " openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256");
+            }
+            return;
+        }
+        if (!oid.on(PKCSObjectIdentifiers.pkcs_12PbeIds)) {
+            throw new PkiException("PEM_KEY_UNSUPPORTED: unsupported PBE scheme " + oid.getId()
+                    + "; re-encrypt the key with openssl pkcs8 -topk8 -v2 aes-256-cbc -v2prf hmacWithSHA256");
+        }
     }
 
     private static char[] password(char[] password) {

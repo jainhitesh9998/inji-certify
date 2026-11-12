@@ -90,6 +90,44 @@ class PemTest {
         assertTrue(exception.getMessage().startsWith("PEM_NOT_A_CERTIFICATE"), exception.getMessage());
     }
 
+    /**
+     * PBES2 with scrypt (what {@code openssl pkcs8 -topk8 -scrypt} writes) and a PKCS#5 v1 scheme are refused with a
+     * message that names the scheme, before any password is tried.
+     */
+    @Test
+    void anUnsupportedPbeSchemeIsRefusedByName() throws Exception {
+        byte[] salt = new byte[16];
+        byte[] iv = new byte[16];
+        var scrypt = new org.bouncycastle.asn1.x509.AlgorithmIdentifier(
+                org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers.id_PBES2,
+                new org.bouncycastle.asn1.pkcs.PBES2Parameters(
+                        new org.bouncycastle.asn1.pkcs.KeyDerivationFunc(
+                                org.bouncycastle.asn1.misc.MiscObjectIdentifiers.id_scrypt,
+                                new org.bouncycastle.asn1.misc.ScryptParams(salt, 16384, 8, 1)),
+                        new org.bouncycastle.asn1.pkcs.EncryptionScheme(
+                                org.bouncycastle.asn1.nist.NISTObjectIdentifiers.id_aes256_CBC,
+                                new org.bouncycastle.asn1.DEROctetString(iv))));
+        PkiException exception = assertThrows(PkiException.class, () -> Pem.readPrivateKey(encryptedPem(scrypt), PASSWORD));
+        assertTrue(exception.getMessage().startsWith("PEM_KEY_UNSUPPORTED: unsupported PBE scheme"), exception.getMessage());
+        assertTrue(exception.getMessage().contains("scrypt"), exception.getMessage());
+
+        var pbeWithMd5AndDes = new org.bouncycastle.asn1.x509.AlgorithmIdentifier(
+                org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers.pbeWithMD5AndDES_CBC,
+                new org.bouncycastle.asn1.pkcs.PBEParameter(new byte[8], 2048));
+        PkiException legacy = assertThrows(PkiException.class,
+                () -> Pem.readPrivateKey(encryptedPem(pbeWithMd5AndDes), PASSWORD));
+        assertTrue(legacy.getMessage().startsWith("PEM_KEY_UNSUPPORTED: unsupported PBE scheme"), legacy.getMessage());
+    }
+
+    private static String encryptedPem(org.bouncycastle.asn1.x509.AlgorithmIdentifier scheme) throws Exception {
+        byte[] der = new org.bouncycastle.asn1.pkcs.EncryptedPrivateKeyInfo(scheme, new byte[48]).getEncoded();
+        StringWriter out = new StringWriter();
+        try (org.bouncycastle.util.io.pem.PemWriter writer = new org.bouncycastle.util.io.pem.PemWriter(out)) {
+            writer.writeObject(new org.bouncycastle.util.io.pem.PemObject("ENCRYPTED PRIVATE KEY", der));
+        }
+        return out.toString();
+    }
+
     private static String legacyEncrypted(KeyPair keyPair) throws Exception {
         var encryptor = new JcePEMEncryptorBuilder("AES-256-CBC").setProvider(BadCerts.BC).build(PASSWORD);
         StringWriter out = new StringWriter();

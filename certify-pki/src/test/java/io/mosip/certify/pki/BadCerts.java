@@ -119,19 +119,39 @@ final class BadCerts {
         return SubjectPublicKeyInfo.getInstance(key.getEncoded());
     }
 
-    /** The same key with a compressed point, which Annex B does not allow. */
+    /** The same key with a compressed point, which the key profile of this module does not allow. */
     static SubjectPublicKeyInfo compressed(KeyPair bcKeyPair) {
         ECPublicKey key = (ECPublicKey) bcKeyPair.getPublic();
         SubjectPublicKeyInfo original = spki(bcKeyPair.getPublic());
         return new SubjectPublicKeyInfo(original.getAlgorithm(), new DERBitString(key.getQ().getEncoded(true)));
     }
 
-    /** The same key with explicit curve parameters instead of a named-curve OID, which Annex B does not allow. */
+    /** The same key with explicit curve parameters instead of a named-curve OID, which the key profile does not allow. */
     static SubjectPublicKeyInfo explicitParameters(PublicKey key) {
         X9ECParameters curve = ECNamedCurveTable.getByName("secp256r1");
         return new SubjectPublicKeyInfo(
                 new AlgorithmIdentifier(spki(key).getAlgorithm().getAlgorithm(), curve.toASN1Primitive()),
                 new DERBitString(spki(key).getPublicKeyData().getBytes()));
+    }
+
+    /**
+     * A P-256 subjectPublicKeyInfo whose uncompressed point has the given coordinates, which need not be on the curve:
+     * {@code 04 || x || y} with each coordinate left-padded to 32 octets.
+     */
+    static SubjectPublicKeyInfo p256Point(BigInteger x, BigInteger y) {
+        byte[] point = new byte[65];
+        point[0] = 0x04;
+        byte[] xs = org.bouncycastle.util.BigIntegers.asUnsignedByteArray(32, x);
+        byte[] ys = org.bouncycastle.util.BigIntegers.asUnsignedByteArray(32, y);
+        System.arraycopy(xs, 0, point, 1, 32);
+        System.arraycopy(ys, 0, point, 33, 32);
+        return new SubjectPublicKeyInfo(new AlgorithmIdentifier(
+                org.bouncycastle.asn1.x9.X9ObjectIdentifiers.id_ecPublicKey, Certificates.P256), new DERBitString(point));
+    }
+
+    /** {@code 04 || 64 zero octets}: the point (0, 0), which is not on P-256 (and which some libraries read as infinity). */
+    static SubjectPublicKeyInfo zeroPoint() {
+        return p256Point(BigInteger.ZERO, BigInteger.ZERO);
     }
 
     static byte[] keyId(PublicKey key) {
@@ -182,7 +202,7 @@ final class BadCerts {
         return builder.build();
     }
 
-    /** A country encoded as a UTF8String, which Annex B forbids in favour of a PrintableString. */
+    /** A country encoded as a UTF8String, where X.520 countryName is a PrintableString. */
     static X500Name utf8CountryName(String country, String commonName) {
         return new X500Name(new RDN[] {
                 new RDN(BCStyle.C, new DERUTF8String(country)),
@@ -210,6 +230,15 @@ final class BadCerts {
                 new RDN(BCStyle.C, new DERUTF8String(country)),
                 new RDN(BCStyle.ST, new DERPrintableString(state)),
                 new RDN(BCStyle.CN, new DERUTF8String(commonName))});
+    }
+
+    /** A name of the given attribute type and value pairs, one RDN each, with the ASN.1 string types given. */
+    static X500Name rdns(Object... typesAndValues) {
+        RDN[] rdns = new RDN[typesAndValues.length / 2];
+        for (int i = 0; i < rdns.length; i++) {
+            rdns[i] = new RDN((ASN1ObjectIdentifier) typesAndValues[2 * i], (ASN1Encodable) typesAndValues[2 * i + 1]);
+        }
+        return new X500Name(rdns);
     }
 
     /** A JCA key whose encoding carries explicit curve parameters, which no JDK key factory would produce. */
@@ -290,7 +319,7 @@ final class BadCerts {
         private String signatureAlgorithm = "SHA256withECDSA";
         private final List<Ext> extensions = new ArrayList<>();
 
-        private record Ext(ASN1ObjectIdentifier oid, boolean critical, ASN1Encodable value) {}
+        private record Ext(ASN1ObjectIdentifier oid, boolean critical, ASN1Encodable value, byte[] raw) {}
 
         Cert issuer(X500Name issuer) {
             this.issuer = issuer;
@@ -342,7 +371,7 @@ final class BadCerts {
             for (int i = 0; i < extensions.size(); i++) {
                 Ext extension = extensions.get(i);
                 if (extension.oid().equals(oid)) {
-                    extensions.set(i, new Ext(oid, critical, extension.value()));
+                    extensions.set(i, new Ext(oid, critical, extension.value(), extension.raw()));
                 }
             }
             return this;
@@ -350,7 +379,14 @@ final class BadCerts {
 
         Cert with(ASN1ObjectIdentifier oid, boolean critical, ASN1Encodable value) {
             without(oid);
-            extensions.add(new Ext(oid, critical, value));
+            extensions.add(new Ext(oid, critical, value, null));
+            return this;
+        }
+
+        /** An extension whose extnValue holds exactly these octets, well-formed or not. */
+        Cert withRaw(ASN1ObjectIdentifier oid, boolean critical, byte[] der) {
+            without(oid);
+            extensions.add(new Ext(oid, critical, null, der));
             return this;
         }
 
@@ -358,20 +394,58 @@ final class BadCerts {
             return build(extensions);
         }
 
+        /**
+         * The certificate parsed by the JDK rather than BouncyCastle: BouncyCastle refuses a certificate whose keyUsage or
+         * basicConstraints cannot be read, while the JDK keeps a malformed non-critical extension as raw octets, which is
+         * the shape a malformed-extension rule has to see.
+         */
+        X509Certificate buildJdk() {
+            return toCertificate(encoded(holder(extensions)));
+        }
+
+        /** The certificate with an explicit NULL in both signature AlgorithmIdentifiers, which RFC 5758 forbids. */
+        X509Certificate buildWithAlgorithmParameters() {
+            AlgorithmIdentifier withNull = new AlgorithmIdentifier(Certificates.ECDSA_WITH_SHA256, org.bouncycastle.asn1.DERNull.INSTANCE);
+            return toCertificate(BadCerts.resign(encoded(holder(extensions)), signingKey, "SHA256withECDSA", withNull,
+                    elements -> {
+                        elements.set(tbsSignatureIndex(elements), withNull);
+                        return elements;
+                    }));
+        }
+
         private X509Certificate build(List<Ext> with) {
+            try {
+                return new JcaX509CertificateConverter().setProvider(BC).getCertificate(holder(with));
+            } catch (Exception e) {
+                throw new IllegalStateException(e);
+            }
+        }
+
+        private org.bouncycastle.cert.X509CertificateHolder holder(List<Ext> with) {
             SubjectPublicKeyInfo spki = subjectPublicKeyInfo != null ? subjectPublicKeyInfo : BadCerts.spki(publicKey);
             X509v3CertificateBuilder builder = new X509v3CertificateBuilder(issuer, serial, notBefore, notAfter, subject, spki);
             for (Ext extension : with) {
                 try {
-                    builder.addExtension(extension.oid(), extension.critical(), extension.value());
+                    if (extension.raw() != null) {
+                        builder.addExtension(extension.oid(), extension.critical(), extension.raw());
+                    } else {
+                        builder.addExtension(extension.oid(), extension.critical(), extension.value());
+                    }
                 } catch (Exception e) {
                     throw new IllegalStateException(e);
                 }
             }
             try {
-                return new JcaX509CertificateConverter().setProvider(BC).getCertificate(builder.build(
-                        new org.bouncycastle.operator.jcajce.JcaContentSignerBuilder(signatureAlgorithm)
-                                .setProvider(BC).build(signingKey)));
+                return builder.build(new org.bouncycastle.operator.jcajce.JcaContentSignerBuilder(signatureAlgorithm)
+                        .setProvider(BC).build(signingKey));
+            } catch (Exception e) {
+                throw new IllegalStateException(e);
+            }
+        }
+
+        private static byte[] encoded(org.bouncycastle.cert.X509CertificateHolder holder) {
+            try {
+                return holder.getEncoded();
             } catch (Exception e) {
                 throw new IllegalStateException(e);
             }
@@ -383,13 +457,14 @@ final class BadCerts {
          */
         X509Certificate buildV1() {
             return toCertificate(BadCerts.resign(encoded(build(List.of())), signingKey, "SHA256withECDSA",
-                    Certificates.ECDSA_WITH_SHA256.getId(), elements -> new ArrayList<>(elements.subList(1, elements.size()))));
+                    new AlgorithmIdentifier(Certificates.ECDSA_WITH_SHA256),
+                    elements -> new ArrayList<>(elements.subList(1, elements.size()))));
         }
 
         /** The same certificate with a tbsCertificate AlgorithmIdentifier that differs from the outer one. */
         X509Certificate buildInnerAlgorithmMismatch() {
             return toCertificate(BadCerts.resign(encoded(build()), signingKey, "SHA256withECDSA",
-                    Certificates.ECDSA_WITH_SHA256.getId(), elements -> {
+                    new AlgorithmIdentifier(Certificates.ECDSA_WITH_SHA256), elements -> {
                         // the same OID with an explicit NULL parameter: RFC 5280 4.1.1.2 requires the two
                         // AlgorithmIdentifiers to be identical, and every reference implementation still parses it
                         elements.set(tbsSignatureIndex(elements),
@@ -427,7 +502,7 @@ final class BadCerts {
         private final List<Ext> extensions = new ArrayList<>();
         private final List<Entry> entries = new ArrayList<>();
 
-        private record Ext(ASN1ObjectIdentifier oid, boolean critical, ASN1Encodable value) {}
+        private record Ext(ASN1ObjectIdentifier oid, boolean critical, ASN1Encodable value, byte[] raw) {}
 
         private record Entry(BigInteger serial, Date revokedAt, Extensions extensions) {}
 
@@ -478,7 +553,7 @@ final class BadCerts {
             for (int i = 0; i < extensions.size(); i++) {
                 Ext extension = extensions.get(i);
                 if (extension.oid().equals(oid)) {
-                    extensions.set(i, new Ext(oid, critical, extension.value()));
+                    extensions.set(i, new Ext(oid, critical, extension.value(), extension.raw()));
                 }
             }
             return this;
@@ -486,7 +561,14 @@ final class BadCerts {
 
         Crl with(ASN1ObjectIdentifier oid, boolean critical, ASN1Encodable value) {
             without(oid);
-            extensions.add(new Ext(oid, critical, value));
+            extensions.add(new Ext(oid, critical, value, null));
+            return this;
+        }
+
+        /** A CRL extension whose extnValue holds exactly these octets, well-formed or not. */
+        Crl withRaw(ASN1ObjectIdentifier oid, boolean critical, byte[] der) {
+            without(oid);
+            extensions.add(new Ext(oid, critical, null, der));
             return this;
         }
 
@@ -495,7 +577,7 @@ final class BadCerts {
             return this;
         }
 
-        /** An entry with an extension, which Annex B Table B.9 prohibits. */
+        /** An entry with an extension, which the profile (as read, to be confirmed) does not allow. */
         Crl revokeWithReason(BigInteger serial) {
             ExtensionsGenerator generator = new ExtensionsGenerator();
             try {
@@ -517,7 +599,11 @@ final class BadCerts {
             }
             for (Ext extension : extensions) {
                 try {
-                    builder.addExtension(extension.oid(), extension.critical(), extension.value());
+                    if (extension.raw() != null) {
+                        builder.addExtension(extension.oid(), extension.critical(), extension.raw());
+                    } else {
+                        builder.addExtension(extension.oid(), extension.critical(), extension.value());
+                    }
                 } catch (Exception e) {
                     throw new IllegalStateException(e);
                 }
@@ -534,19 +620,29 @@ final class BadCerts {
         /** The same CRL as X.509 version 1: the version field dropped, the signature re-made. */
         X509CRL buildV1() {
             return toCrl(BadCerts.resign(encoded(build()), signingKey, "SHA256withECDSA",
-                    Certificates.ECDSA_WITH_SHA256.getId(), elements -> new ArrayList<>(elements.subList(1, elements.size()))));
+                    new AlgorithmIdentifier(Certificates.ECDSA_WITH_SHA256),
+                    elements -> new ArrayList<>(elements.subList(1, elements.size()))));
         }
 
         /** The same CRL with a tbsCertList AlgorithmIdentifier that differs from the outer one. */
         X509CRL buildInnerAlgorithmMismatch() {
             return toCrl(BadCerts.resign(encoded(build()), signingKey, "SHA256withECDSA",
-                    Certificates.ECDSA_WITH_SHA256.getId(), elements -> {
+                    new AlgorithmIdentifier(Certificates.ECDSA_WITH_SHA256), elements -> {
                         // the same OID with an explicit NULL parameter: RFC 5280 4.1.1.2 requires the two
                         // AlgorithmIdentifiers to be identical, and every reference implementation still parses it
                         elements.set(tbsSignatureIndex(elements),
                                 new AlgorithmIdentifier(Certificates.ECDSA_WITH_SHA256, org.bouncycastle.asn1.DERNull.INSTANCE));
                         return elements;
                     }));
+        }
+
+        /** The CRL with an explicit NULL in both signature AlgorithmIdentifiers, which RFC 5758 forbids. */
+        X509CRL buildWithAlgorithmParameters() {
+            AlgorithmIdentifier withNull = new AlgorithmIdentifier(Certificates.ECDSA_WITH_SHA256, org.bouncycastle.asn1.DERNull.INSTANCE);
+            return toCrl(BadCerts.resign(encoded(build()), signingKey, "SHA256withECDSA", withNull, elements -> {
+                elements.set(tbsSignatureIndex(elements), withNull);
+                return elements;
+            }));
         }
 
         private static byte[] encoded(X509CRL crl) {
@@ -565,7 +661,7 @@ final class BadCerts {
      * rewriting its tbs part, and signs the rewritten tbs with the given algorithm. Used for the two fields no builder
      * can produce: a missing version and a tbs signature algorithm that disagrees with the outer one.
      */
-    private static byte[] resign(byte[] signed, PrivateKey key, String signatureAlgorithm, String signatureOid,
+    private static byte[] resign(byte[] signed, PrivateKey key, String signatureAlgorithm, AlgorithmIdentifier outer,
                                  UnaryOperator<List<ASN1Encodable>> rewrite) {
         try {
             ASN1Sequence structure = ASN1Sequence.getInstance(signed);
@@ -580,7 +676,7 @@ final class BadCerts {
             signer.update(rewritten.getEncoded(org.bouncycastle.asn1.ASN1Encoding.DER));
             ASN1EncodableVector out = new ASN1EncodableVector();
             out.add(rewritten);
-            out.add(new AlgorithmIdentifier(new ASN1ObjectIdentifier(signatureOid)));
+            out.add(outer);
             out.add(new DERBitString(signer.sign()));
             return new DERSequence(out).getEncoded(org.bouncycastle.asn1.ASN1Encoding.DER);
         } catch (Exception e) {
@@ -625,7 +721,8 @@ final class BadCerts {
      * match the key it is made with.
      */
     static byte[] csrWithSignatureAlgorithm(byte[] csr, String signatureOid, String signingAlgorithm, PrivateKey key) {
-        return resign(csr, key, signingAlgorithm, signatureOid, elements -> elements);
+        return resign(csr, key, signingAlgorithm, new AlgorithmIdentifier(new ASN1ObjectIdentifier(signatureOid)),
+                elements -> elements);
     }
 
     /** A CRL number extension the validator must reject: outside 0..2^159. */

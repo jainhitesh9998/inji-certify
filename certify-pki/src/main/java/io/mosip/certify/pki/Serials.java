@@ -18,7 +18,11 @@ public final class Serials {
     /** RFC 5280 section 4.1.2.2: no more than 20 octets of DER INTEGER content, sign octet included. */
     public static final int MAX_OCTETS = 20;
 
-    /** Annex B: at least 63 random bits, so that serials an IACA signs do not collide. */
+    /**
+     * The builders' floor: a serial a builder writes or accepts has at least 64 bits, so Annex B's 63 bits of CSPRNG
+     * output fit. The validator cannot measure entropy and applies a lower heuristic,
+     * {@link AnnexBValidator#MIN_SERIAL_BITS}, to certificates obtained elsewhere.
+     */
     public static final int MIN_BITS = 64;
 
     /** Content octets of a serial this class generates: 71 bits of magnitude, no sign octet needed. */
@@ -45,7 +49,7 @@ public final class Serials {
         return new BigInteger(1, bytes);
     }
 
-    /** Whether a serial fits RFC 5280 and Annex B: positive, at least {@value #MIN_BITS} bits, at most 20 octets. */
+    /** Whether a builder accepts the serial: positive, at least {@value #MIN_BITS} bits, at most 20 DER content octets. */
     public static boolean fits(BigInteger serial) {
         return serial != null && serial.signum() > 0
                 && serial.bitLength() >= MIN_BITS && octets(serial) <= MAX_OCTETS;

@@ -6,6 +6,7 @@ import org.bouncycastle.asn1.x500.RDN;
 import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.asn1.x500.style.BCStyle;
 import org.bouncycastle.asn1.x509.Extension;
+import org.bouncycastle.asn1.x509.KeyUsage;
 import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo;
 import org.bouncycastle.pkcs.PKCS10CertificationRequest;
 import org.bouncycastle.pkcs.PKCS10CertificationRequestBuilder;
@@ -110,7 +111,7 @@ class IsoMdocProfilesTest {
         return fixture.iaca.getSigAlgName();
     }
 
-    /** Annex B (2021) signs with P-256/384/521 only; brainpool and explicit parameters are refused, not written. */
+    /** This module allows P-256/384/521 only (decision log, 2026-11-13); brainpool and explicit parameters are refused, not written. */
     @Test
     void keysOutsideTheCurveAllowlistAreRefused() {
         Fixture fixture = new Fixture();
@@ -131,7 +132,17 @@ class IsoMdocProfilesTest {
 
         // a compressed point cannot survive a JCA PublicKey (every encoder writes it uncompressed), so it is refused
         // where it can arrive: a CSR's subjectPublicKeyInfo and a certificate under validation
+    }
 
+    /** A CSR's point must decode to a finite point on its curve; the proof of possession is not even tried otherwise. */
+    @Test
+    void aCsrWhosePointIsNotOnTheCurveIsRefused() {
+        KeyPair keyPair = BadCerts.ec(256);
+        assertRule("CSR_KEY_INVALID", () -> Csr.parse(csr(keyPair, BadCerts.zeroPoint(), "SHA256withECDSA")));
+        assertRule("CSR_KEY_INVALID", () -> Csr.parse(csr(keyPair,
+                BadCerts.p256Point(BigInteger.ONE, BigInteger.ONE), "SHA256withECDSA")));
+        assertRule("CSR_KEY_INVALID", () -> Csr.parse(csr(keyPair,
+                BadCerts.p256Point(BigInteger.ONE.shiftLeft(256).subtract(BigInteger.ONE), BigInteger.ONE), "SHA256withECDSA")));
     }
 
     @Test
@@ -176,12 +187,44 @@ class IsoMdocProfilesTest {
         assertRule("IACA_VALIDITY_TOO_LONG", () -> iaca(iacaKeyPair, Duration.ofDays(36_500)));
         assertRule("IACA_VALIDITY_INVALID", () -> iaca(iacaKeyPair, Duration.ZERO));
         assertRule("IACA_VALIDITY_INVALID", () -> iaca(iacaKeyPair, Duration.ofDays(-1)));
+        assertRule("IACA_VALIDITY_INVALID", () -> iaca(iacaKeyPair, Duration.ofSeconds(1)));
+        assertRule("IACA_VALIDITY_INVALID", () -> iaca(iacaKeyPair, IsoMdocProfiles.MIN_VALIDITY.minusSeconds(1)));
+        X509Certificate shortest = iaca(iacaKeyPair, IsoMdocProfiles.MIN_VALIDITY);
+        assertTrue(shortest.getNotAfter().after(shortest.getNotBefore()));
+        assertEquals(List.of(), AnnexBValidator.validateIaca(shortest));
 
         Fixture fixture = new Fixture();
         assertRule("DS_VALIDITY_TOO_LONG", () -> IsoMdocProfiles.ds(BadCerts.ec(256), fixture.iaca, fixture.iacaKeyPair)
                 .commonName("Long lived DSC").validity(Duration.ofDays(1_000)).build());
         assertRule("DS_VALIDITY_INVALID", () -> IsoMdocProfiles.ds(BadCerts.ec(256), fixture.iaca, fixture.iacaKeyPair)
                 .commonName("No validity").validity(Duration.ZERO).build());
+        assertRule("DS_VALIDITY_INVALID", () -> IsoMdocProfiles.ds(BadCerts.ec(256), fixture.iaca, fixture.iacaKeyPair)
+                .commonName("One second").validity(Duration.ofSeconds(1)).build());
+    }
+
+    /**
+     * A Document Signer clamped to the end of its IACA is refused when what remains is shorter than the minimum: the
+     * builder does not silently issue a certificate valid for seconds.
+     */
+    @Test
+    void aDsClampedBelowTheMinimumIsRefused() {
+        KeyPair iacaKeyPair = BadCerts.ec(256);
+        Instant start = Instant.parse("2026-01-01T00:00:00Z");
+        X509Certificate iaca = IsoMdocProfiles.iaca(iacaKeyPair)
+                .country("IN").commonName("Two hour IACA")
+                .issuerAltUri("https://example.test/iaca").crlDistributionPoint(Fixture.CRL_URI)
+                .notBefore(start).validity(Duration.ofHours(2))
+                .build();
+
+        assertRule("DS_VALIDITY_OUTSIDE_IACA", () -> IsoMdocProfiles.ds(BadCerts.ec(256), iaca, iacaKeyPair)
+                .commonName("Ten second DSC").notBefore(iaca.getNotAfter().toInstant().minusSeconds(9)).build());
+        assertRule("DS_VALIDITY_OUTSIDE_IACA", () -> IsoMdocProfiles.ds(BadCerts.ec(256), iaca, iacaKeyPair)
+                .commonName("Late DSC").notBefore(start.plus(Duration.ofHours(3))).build());
+
+        X509Certificate ds = IsoMdocProfiles.ds(BadCerts.ec(256), iaca, iacaKeyPair)
+                .commonName("Clamped DSC").notBefore(start.plus(Duration.ofMinutes(30))).build();
+        assertEquals(iaca.getNotAfter(), ds.getNotAfter(), "clamped to the IACA");
+        assertEquals(List.of(), AnnexBValidator.validateDs(ds, iaca));
     }
 
     @Test
@@ -237,7 +280,7 @@ class IsoMdocProfilesTest {
 
         assertEquals(42, crl.getRevokedCertificate(BigInteger.valueOf(42)).getSerialNumber().intValue());
         assertTrue(!crl.getRevokedCertificate(BigInteger.valueOf(42)).hasExtensions(),
-                "Annex B Table B.9 prohibits CRL entry extensions");
+                "the profile (as read, to be confirmed) allows no CRL entry extensions");
         assertEquals(2, crl.getVersion(), "X.509 v2");
         assertEquals(List.of(), AnnexBValidator.validateCrl(crl, fixture.iaca));
     }
@@ -275,7 +318,10 @@ class IsoMdocProfilesTest {
         assertRule("IACA_ISSUER_ALT_NAME_MISSING", () -> IsoMdocProfiles.iaca(keyPair).country("IN")
                 .commonName("No alt name").crlDistributionPoint(Fixture.CRL_URI).build());
         assertRule("IACA_ISSUER_ALT_NAME_INVALID", () -> IsoMdocProfiles.iaca(keyPair).country("IN")
-                .commonName("Not a URI").issuerAltUri("ftp://example.test/iaca")
+                .commonName("Relative URI").issuerAltUri("mdoc/iaca")
+                .crlDistributionPoint(Fixture.CRL_URI).build());
+        assertRule("IACA_ISSUER_ALT_NAME_INVALID", () -> IsoMdocProfiles.iaca(keyPair).country("IN")
+                .commonName("Scheme only").issuerAltUri("https:")
                 .crlDistributionPoint(Fixture.CRL_URI).build());
         assertRule("IACA_ISSUER_ALT_NAME_INVALID", () -> IsoMdocProfiles.iaca(keyPair).country("IN")
                 .commonName("Not an email").issuerAltEmail("not an address")
@@ -285,13 +331,78 @@ class IsoMdocProfilesTest {
         assertRule("IACA_CRL_DP_INVALID", () -> IsoMdocProfiles.iaca(keyPair).country("IN")
                 .commonName("Bad CRL DP").issuerAltUri("https://example.test")
                 .crlDistributionPoint("ldap://example.test/iaca.crl").build());
+        assertRule("IACA_CRL_DP_INVALID", () -> IsoMdocProfiles.iaca(keyPair).country("IN")
+                .commonName("Bad CRL DP").issuerAltUri("https://example.test")
+                .crlDistributionPoint("not a uri").build());
+        assertRule("IACA_SUBJECT_CN_TOO_LONG", () -> IsoMdocProfiles.iaca(keyPair).country("IN")
+                .commonName("C".repeat(65)).issuerAltUri("https://example.test").crlDistributionPoint(Fixture.CRL_URI).build());
+        assertRule("IACA_SUBJECT_STATE_EMPTY", () -> IsoMdocProfiles.iaca(keyPair).country("IN").state("")
+                .commonName("Empty state").issuerAltUri("https://example.test").crlDistributionPoint(Fixture.CRL_URI).build());
+        assertRule("IACA_SUBJECT_ORGANIZATION_EMPTY", () -> IsoMdocProfiles.iaca(keyPair).country("IN").organization(" ")
+                .commonName("Blank organization").issuerAltUri("https://example.test")
+                .crlDistributionPoint(Fixture.CRL_URI).build());
+        assertEquals(List.of(), AnnexBValidator.validateIaca(IsoMdocProfiles.iaca(keyPair).country("IN")
+                .commonName("C".repeat(64)).issuerAltUri("https://example.test").crlDistributionPoint(Fixture.CRL_URI)
+                .build()), "64 characters is RFC 5280's ub-common-name");
 
         Fixture fixture = new Fixture();
         assertRule("DS_SUBJECT_CN_MISSING", () -> IsoMdocProfiles.ds(BadCerts.ec(256), fixture.iaca, fixture.iacaKeyPair).build());
         assertRule("DS_CRL_DP_INVALID", () -> IsoMdocProfiles.ds(BadCerts.ec(256), fixture.iaca, fixture.iacaKeyPair)
                 .commonName("Bad CRL DP").crlDistributionPoint("file:///tmp/iaca.crl").build());
+        assertRule("DS_SUBJECT_CN_TOO_LONG", () -> IsoMdocProfiles.ds(BadCerts.ec(256), fixture.iaca, fixture.iacaKeyPair)
+                .commonName("D".repeat(65)).build());
         assertRule("IACA_KEY_MISMATCH", () -> IsoMdocProfiles.ds(BadCerts.ec(256), fixture.iaca, BadCerts.ec(256))
                 .commonName("Wrong IACA key").build());
+    }
+
+    /** The issuerAltName contact may be any absolute URI, a mailto: address included; the DS copies it unchanged. */
+    @Test
+    void anIssuerAltNameMayBeAMailtoUri() {
+        KeyPair keyPair = BadCerts.ec(256);
+        X509Certificate iaca = IsoMdocProfiles.iaca(keyPair).country("IN").commonName("Mailto IACA")
+                .issuerAltUri("mailto:pki@credentials.example.test").crlDistributionPoint(Fixture.CRL_URI).build();
+        assertEquals(List.of(), AnnexBValidator.validateIaca(iaca));
+        X509Certificate ds = IsoMdocProfiles.ds(BadCerts.ec(256), iaca, keyPair).commonName("Mailto DSC").build();
+        assertEquals(List.of(), AnnexBValidator.validateDs(ds, iaca));
+    }
+
+    @Test
+    void theCrlBuilderRefusesWhatTheValidatorWouldReport() {
+        Fixture fixture = new Fixture();
+        Instant thisUpdate = Instant.parse("2026-11-01T00:00:00Z");
+        BigInteger serial = BigInteger.valueOf(99);
+        assertRule("CRL_ENTRY_DUPLICATE", () -> CrlBuilder.forIaca(fixture.iaca, fixture.iacaKeyPair)
+                .revoke(serial, thisUpdate.minusSeconds(60)).revoke(serial, thisUpdate.minusSeconds(30)));
+        assertRule("CRL_ENTRY_DATE_INVALID", () -> CrlBuilder.forIaca(fixture.iaca, fixture.iacaKeyPair)
+                .thisUpdate(thisUpdate).revoke(serial, thisUpdate.plusSeconds(1)));
+        // thisUpdate moved before an entry after the entry was added
+        assertRule("CRL_ENTRY_DATE_INVALID", () -> CrlBuilder.forIaca(fixture.iaca, fixture.iacaKeyPair)
+                .crlNumber(BigInteger.ONE).revoke(serial, thisUpdate).thisUpdate(thisUpdate.minusSeconds(1)).build());
+        assertRule("CRL_NUMBER_INVALID", () -> CrlBuilder.forIaca(fixture.iaca, fixture.iacaKeyPair)
+                .crlNumber(BigInteger.ONE.shiftLeft(159)).build());
+        assertRule("CRL_NEXT_UPDATE_AFTER_IACA", () -> CrlBuilder.forIaca(fixture.iaca, fixture.iacaKeyPair)
+                .crlNumber(BigInteger.ONE).nextUpdate(fixture.iaca.getNotAfter().toInstant().plusSeconds(1)).build());
+
+        // an IACA without cRLSign cannot sign a CRL
+        KeyPair keyPair = BadCerts.ec(256);
+        X509Certificate noCrlSign = BadCerts.iaca(keyPair)
+                .with(Extension.keyUsage, true, new KeyUsage(KeyUsage.keyCertSign))
+                .build();
+        assertRule("CRL_IACA_INVALID", () -> CrlBuilder.forIaca(noCrlSign, keyPair));
+    }
+
+    /** Without an explicit nextUpdate, the CRL is due again in 30 days or when the IACA expires, whichever is sooner. */
+    @Test
+    void theDefaultNextUpdateDoesNotOutliveTheIaca() {
+        KeyPair iacaKeyPair = BadCerts.ec(256);
+        X509Certificate iaca = IsoMdocProfiles.iaca(iacaKeyPair)
+                .country("IN").commonName("Ten day IACA")
+                .issuerAltUri("https://example.test/iaca").crlDistributionPoint(Fixture.CRL_URI)
+                .validity(Duration.ofDays(10))
+                .build();
+        X509CRL crl = CrlBuilder.forIaca(iaca, iacaKeyPair).crlNumber(BigInteger.ONE).build();
+        assertEquals(iaca.getNotAfter(), crl.getNextUpdate());
+        assertEquals(List.of(), AnnexBValidator.validateCrl(crl, iaca));
     }
 
     @Test

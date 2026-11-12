@@ -18,6 +18,7 @@ import org.bouncycastle.asn1.x509.GeneralNames;
 import org.bouncycastle.asn1.x509.SubjectKeyIdentifier;
 import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo;
 import org.bouncycastle.asn1.sec.SECObjectIdentifiers;
+import org.bouncycastle.asn1.x9.ECNamedCurveTable;
 import org.bouncycastle.asn1.x9.X9ObjectIdentifiers;
 import org.bouncycastle.cert.X509CRLHolder;
 import org.bouncycastle.cert.X509CertificateHolder;
@@ -25,6 +26,7 @@ import org.bouncycastle.cert.jcajce.JcaX509CRLConverter;
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
 import org.bouncycastle.cert.jcajce.JcaX509ExtensionUtils;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
+import org.bouncycastle.math.ec.ECPoint;
 import org.bouncycastle.operator.ContentSigner;
 import org.bouncycastle.operator.OperatorCreationException;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
@@ -32,6 +34,7 @@ import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -43,6 +46,7 @@ import java.security.cert.X509CRL;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -55,8 +59,9 @@ import javax.security.auth.x500.X500Principal;
  * BouncyCastle is used as an explicit provider instance rather than installed in {@code java.security}, so the library
  * changes no global state.
  *
- * <p>The curve allowlist is deliberate: Annex B (2021 edition) signs with ECDSA over P-256, P-384 or P-521 and nothing
- * else, so brainpool, secp256k1 and explicit curve parameters are refused here rather than checked at each call site.
+ * <p>The curve allowlist is a choice of this module, not the text of the standard: ISO/IEC 18013-5 also lists brainpool
+ * curves, which this profile excludes for now (decision log, 2026-11-13). P-256, P-384 and P-521 are accepted; brainpool,
+ * secp256k1 and explicit curve parameters are refused here rather than checked at each call site.
  */
 final class Certificates {
 
@@ -68,12 +73,16 @@ final class Certificates {
     static final ASN1ObjectIdentifier P384 = SECObjectIdentifiers.secp384r1;
     static final ASN1ObjectIdentifier P521 = SECObjectIdentifiers.secp521r1;
 
-    /** The named curves Annex B allows, each with the {@code ecdsa-with-SHA*} signature algorithm it signs with. */
+    /** The named curves this module allows (decision log, 2026-11-13), each with the {@code ecdsa-with-SHA*} signature algorithm it signs with. */
     static final Map<ASN1ObjectIdentifier, ASN1ObjectIdentifier> CURVES = curveTable();
 
     private static final Map<ASN1ObjectIdentifier, ASN1ObjectIdentifier> SIGNATURES = signatureTable();
 
-    private static final Pattern EMAIL = Pattern.compile("[^@\\s,;]+@[^@\\s,;]+\\.[A-Za-z]{2,}");
+    /** RFC 5322 dot-atom text: one atom of a local part. */
+    private static final Pattern ATOM = Pattern.compile("[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+");
+
+    /** RFC 1035/5321 letter-digit-hyphen label of at most 63 octets. */
+    private static final Pattern LABEL = Pattern.compile("[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?");
 
     private static final Provider BC = new BouncyCastleProvider();
 
@@ -138,12 +147,6 @@ final class Certificates {
         return encoded == null ? null : ASN1OctetString.getInstance(encoded).getOctets();
     }
 
-    /** The DER value of a CRL extension, or {@code null} when the CRL does not carry it. */
-    static byte[] extension(X509CRL crl, ASN1ObjectIdentifier oid) {
-        byte[] encoded = crl.getExtensionValue(oid.getId());
-        return encoded == null ? null : ASN1OctetString.getInstance(encoded).getOctets();
-    }
-
     /** Whether the certificate carries the extension and marks it critical. */
     static boolean critical(X509Certificate certificate, ASN1ObjectIdentifier oid) {
         return certificate.getCriticalExtensionOIDs() != null
@@ -164,12 +167,6 @@ final class Certificates {
     /** The AuthorityKeyIdentifier keyIdentifier of a certificate, or {@code null} when absent. */
     static byte[] authorityKeyIdentifier(X509Certificate certificate) {
         byte[] extension = extension(certificate, Extension.authorityKeyIdentifier);
-        return extension == null ? null : AuthorityKeyIdentifier.getInstance(extension).getKeyIdentifier();
-    }
-
-    /** The AuthorityKeyIdentifier keyIdentifier of a CRL, or {@code null} when absent. */
-    static byte[] authorityKeyIdentifier(X509CRL crl) {
-        byte[] extension = extension(crl, Extension.authorityKeyIdentifier);
         return extension == null ? null : AuthorityKeyIdentifier.getInstance(extension).getKeyIdentifier();
     }
 
@@ -222,17 +219,21 @@ final class Certificates {
         return value instanceof ASN1String string ? string.getString() : value.toString();
     }
 
-    /** An issuerAltName value with an optional URI and an optional rfc822 email. */
+    /**
+     * An issuerAltName value with an optional URI and an optional rfc822 email. The URI may use any scheme (an
+     * {@code https:} page or a {@code mailto:} address) as long as it is absolute; the email must be a mailbox. The
+     * validator applies the same two checks.
+     */
     static GeneralNames issuerAltNames(String uri, String email) {
         List<GeneralName> names = new ArrayList<>(2);
         if (uri != null) {
-            if (!isHttpUri(uri)) {
-                throw new PkiException("IACA_ISSUER_ALT_NAME_INVALID: " + uri + " is not an http or https URI");
+            if (!isAbsoluteUri(uri)) {
+                throw new PkiException("IACA_ISSUER_ALT_NAME_INVALID: " + uri + " is not an absolute URI");
             }
             names.add(new GeneralName(GeneralName.uniformResourceIdentifier, uri));
         }
         if (email != null) {
-            if (!EMAIL.matcher(email).matches()) {
+            if (!isMailbox(email)) {
                 throw new PkiException("IACA_ISSUER_ALT_NAME_INVALID: " + email + " is not an rfc822 mailbox");
             }
             names.add(new GeneralName(GeneralName.rfc822Name, email));
@@ -243,24 +244,82 @@ final class Certificates {
         return new GeneralNames(names.toArray(GeneralName[]::new));
     }
 
-    /** Whether the value is an absolute http or https URI with a host, the only scheme Annex B CRL access allows. */
-    static boolean isHttpUri(String value) {
+    /**
+     * Whether the value is an absolute URI (RFC 3986 section 4.3: a scheme and a non-empty scheme-specific part) made
+     * of printable ASCII, which is what an IA5String GeneralName can carry. Any scheme is accepted; callers that need a
+     * fetchable location use {@link #isHttpUri}.
+     */
+    static boolean isAbsoluteUri(String value) {
+        if (value == null || value.isEmpty()) {
+            return false;
+        }
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c <= 0x20 || c >= 0x7f) {
+                return false;
+            }
+        }
         try {
             URI uri = new URI(value);
-            String scheme = uri.getScheme();
-            return uri.isAbsolute() && uri.getHost() != null
-                    && ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme));
-        } catch (Exception e) {
+            String specific = uri.getRawSchemeSpecificPart();
+            return uri.isAbsolute() && specific != null && !specific.isEmpty();
+        } catch (URISyntaxException e) {
             return false;
         }
     }
 
+    /** Whether the value is an absolute {@code http} or {@code https} URI with a host: a location a verifier can fetch. */
+    static boolean isHttpUri(String value) {
+        if (!isAbsoluteUri(value)) {
+            return false;
+        }
+        try {
+            URI uri = new URI(value);
+            String scheme = uri.getScheme();
+            return uri.getHost() != null && !uri.getHost().isEmpty()
+                    && ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme));
+        } catch (URISyntaxException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Whether the value is an RFC 5280 rfc822Name mailbox (RFC 5321 section 4.1.2): a dot-atom local part of at most 64
+     * octets, {@code @}, and a domain of letter-digit-hyphen labels of at most 255 octets. Quoted local parts and address
+     * literals are not accepted (decision log, 2026-11-13).
+     */
+    static boolean isMailbox(String value) {
+        if (value == null) {
+            return false;
+        }
+        int at = value.indexOf('@');
+        if (at <= 0 || at != value.lastIndexOf('@') || at == value.length() - 1) {
+            return false;
+        }
+        String local = value.substring(0, at);
+        String domain = value.substring(at + 1);
+        if (local.length() > 64 || domain.length() > 255) {
+            return false;
+        }
+        for (String atom : local.split("\\.", -1)) {
+            if (!ATOM.matcher(atom).matches()) {
+                return false;
+            }
+        }
+        for (String label : domain.split("\\.", -1)) {
+            if (!LABEL.matcher(label).matches()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     // ------------------------------------------------------- distribution point
 
-    /** A CRL distribution point extension with one URI, refusing anything a verifier could not fetch. */
+    /** A CRL distribution point extension with one http(s) URI, refusing anything a verifier could not fetch. */
     static CRLDistPoint crlDistributionPoint(String uri) {
         if (!isHttpUri(uri)) {
-            throw new PkiException("IACA_CRL_DP_INVALID: " + uri + " is not an http or https URI");
+            throw new PkiException("IACA_CRL_DP_INVALID: " + uri + " is not an absolute http or https URI");
         }
         return new CRLDistPoint(new DistributionPoint[] {
                 new DistributionPoint(
@@ -302,8 +361,9 @@ final class Certificates {
     }
 
     /**
-     * Why the subjectPublicKeyInfo is outside the Annex B key profile, or {@code null} when it conforms: EC only, a
-     * named curve from {@link #CURVES}, no explicit parameters, an uncompressed point.
+     * Why the subjectPublicKeyInfo is outside the key profile of this module, or {@code null} when it conforms: EC only,
+     * a named curve from {@link #CURVES}, no explicit parameters, an uncompressed point of the curve's size that decodes
+     * to a finite point on that curve (infinity, off-curve points and coordinates outside the field are refused).
      */
     static String keyProblem(SubjectPublicKeyInfo spki) {
         ASN1ObjectIdentifier algorithm = spki.getAlgorithm().getAlgorithm();
@@ -321,6 +381,9 @@ final class Certificates {
         if (!CURVES.containsKey(curve)) {
             return "the curve " + curve.getId() + " is not P-256, P-384 or P-521";
         }
+        if (spki.getPublicKeyData().getPadBits() != 0) {
+            return "the subjectPublicKey BIT STRING is not a whole number of octets";
+        }
         byte[] point = spki.getPublicKeyData().getBytes();
         int fieldOctets = (curveBits(curve) + 7) / 8;
         if (point.length == 0 || point[0] != 0x04) {
@@ -329,6 +392,14 @@ final class Certificates {
         if (point.length != 1 + 2 * fieldOctets) {
             return "the public key is " + point.length + " octets, an uncompressed " + curveBits(curve)
                     + " bit point is " + (1 + 2 * fieldOctets);
+        }
+        try {
+            ECPoint decoded = ECNamedCurveTable.getByOID(curve).getCurve().decodePoint(point);
+            if (decoded.isInfinity() || !decoded.isValid()) {
+                return "the public key is not a finite point on " + curveName(curve);
+            }
+        } catch (RuntimeException e) {
+            return "the public key is not a point on " + curveName(curve) + ": " + e.getMessage();
         }
         return null;
     }
@@ -341,6 +412,10 @@ final class Certificates {
             throw new PkiException(profile + "_KEY_INVALID: " + problem);
         }
         return (ASN1ObjectIdentifier) spki.getAlgorithm().getParameters().toASN1Primitive();
+    }
+
+    static String curveName(ASN1ObjectIdentifier curve) {
+        return "P-" + curveBits(curve);
     }
 
     static int curveBits(ASN1ObjectIdentifier curve) {
@@ -384,11 +459,15 @@ final class Certificates {
 
     // ------------------------------------------------------------- validity
 
-    /** Refuses a validity that is not positive or that exceeds the profile cap, with a named rule. */
+    /**
+     * Refuses a validity shorter than {@link IsoMdocProfiles#MIN_VALIDITY} or longer than the profile cap, with a named
+     * rule. The minimum keeps every builder output well clear of {@code notAfter <= notBefore}, which the validator
+     * reports as {@code *_VALIDITY_REVERSED}.
+     */
     static void checkValidity(Duration validity, Duration maximum, String profile) {
-        if (validity == null || validity.isZero() || validity.isNegative()) {
+        if (validity == null || validity.compareTo(IsoMdocProfiles.MIN_VALIDITY) < 0) {
             throw new PkiException(profile + "_VALIDITY_INVALID: the validity " + validity
-                    + " is not a positive duration");
+                    + " is shorter than the minimum of " + IsoMdocProfiles.MIN_VALIDITY);
         }
         if (validity.compareTo(maximum) > 0) {
             throw new PkiException(profile + "_VALIDITY_TOO_LONG: the validity " + validity + " exceeds " + maximum);
@@ -400,17 +479,17 @@ final class Certificates {
      * runs from {@code notBefore} through {@code notBefore + 1 day - 1 s}.
      */
     static Instant end(Instant start, Duration validity) {
-        return start.plus(validity).minusSeconds(1);
+        return start.plus(validity).minusSeconds(1).truncatedTo(ChronoUnit.SECONDS);
     }
 
-    /** Refuses a serial that is not positive, shorter than 64 bits or longer than 20 DER content octets. */
+    /** Refuses a serial that is not positive, shorter than {@value Serials#MIN_BITS} bits or longer than 20 DER content octets. */
     static void checkSerial(BigInteger serial, String profile) {
         if (serial == null || serial.signum() <= 0) {
             throw new PkiException(profile + "_SERIAL_NOT_POSITIVE: the serial number must be a positive integer");
         }
         if (serial.bitLength() < Serials.MIN_BITS) {
             throw new PkiException(profile + "_SERIAL_TOO_SHORT: the serial number has " + serial.bitLength()
-                    + " bits, Annex B requires at least " + Serials.MIN_BITS);
+                    + " bits; the builders write at least " + Serials.MIN_BITS + " so that Annex B's 63 random bits fit");
         }
         if (Serials.octets(serial) > Serials.MAX_OCTETS) {
             throw new PkiException(profile + "_SERIAL_TOO_LONG: the serial number is " + Serials.octets(serial)

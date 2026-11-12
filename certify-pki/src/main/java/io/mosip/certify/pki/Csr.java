@@ -20,8 +20,9 @@ import javax.security.auth.x500.X500Principal;
  * out.
  *
  * <p>A CSR is untrusted input: it may come from a keymanager the operator does not control. So it is held to the same
- * key profile as a generated key (EC, named P-256/384/521, uncompressed point, no explicit parameters) and its
- * signature algorithm must be one of {@code ecdsa-with-SHA256/384/512} matching that curve.
+ * key profile as a generated key (EC, named P-256/384/521, an uncompressed point that decodes to a finite point on
+ * that curve, no explicit parameters) and its signature algorithm must be one of {@code ecdsa-with-SHA256/384/512}
+ * matching that curve, with its parameters field absent.
  */
 public final class Csr {
 
