@@ -405,8 +405,12 @@ public class CredentialConfigurationSupportedServiceImplTest {
         Assert.assertEquals(List.of(-7), supportedDTO.getCredentialSigningAlgValuesSupported());
     }
 
+    /**
+     * M-09 (G20): an algorithm mDoc has no COSE identifier for is left out of the document with a warning; it must not
+     * fail the whole metadata response, which every wallet reads.
+     */
     @Test
-    public void should_throwException_when_msoMdocAlgorithmIsUnsupported() {
+    public void should_omitTheAlgorithm_when_msoMdocAlgorithmIsUnsupported() {
         CredentialConfig config = new CredentialConfig();
         config.setConfigId(UUID.randomUUID().toString());
         config.setCredentialConfigKeyId("mdoc-invalid-alg");
@@ -426,7 +430,10 @@ public class CredentialConfigurationSupportedServiceImplTest {
         dto.setDocType("org.iso.18013.5.1.mDL");
         when(credentialConfigMapper.toDto(config)).thenReturn(dto);
 
-        assertThrows(IllegalArgumentException.class, () -> credentialConfigurationService.fetchCredentialIssuerMetadata());
+        CredentialIssuerMetadataDTO result = credentialConfigurationService.fetchCredentialIssuerMetadata();
+
+        Assert.assertTrue(result.getCredentialConfigurationSupportedDTO().containsKey("mdoc-invalid-alg"));
+        Assert.assertNull(result.getCredentialConfigurationSupportedDTO().get("mdoc-invalid-alg").getCredentialSigningAlgValuesSupported());
     }
 
     @Test

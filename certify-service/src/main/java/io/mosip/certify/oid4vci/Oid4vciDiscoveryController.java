@@ -26,10 +26,12 @@ public class Oid4vciDiscoveryController {
     private final io.mosip.certify.tenancy.TenantContexts tenants;
     private final TenantIssuerMetadata tenantMetadata;
     private final Oid4vciProperties properties;
+    private final Oid4vciIssuerResolver issuers;
 
     public Oid4vciDiscoveryController(CredentialRegistry registry, NonceService nonceService, Oid4vciIssuer issuer,
                                       io.mosip.certify.core.dto.AuthorizationContext authorizationContext,
-                                      io.mosip.certify.tenancy.TenantContexts tenants, TenantIssuerMetadata tenantMetadata, Oid4vciProperties properties) {
+                                      io.mosip.certify.tenancy.TenantContexts tenants, TenantIssuerMetadata tenantMetadata, Oid4vciProperties properties,
+                                      Oid4vciIssuerResolver issuers) {
         this.registry = registry;
         this.nonceService = nonceService;
         this.issuer = issuer;
@@ -37,17 +39,17 @@ public class Oid4vciDiscoveryController {
         this.tenants = tenants;
         this.tenantMetadata = tenantMetadata;
         this.properties = properties;
+        this.issuers = issuers;
     }
 
-    /** The default tenant's document is develop's (goldens); another tenant's is built from the core under its own identifier. */
+    /** The default tenant's document is develop's (goldens) plus this surface's identity; another tenant's is built from the core under its own identifier. */
     @GetMapping(value = "/.well-known/openid-credential-issuer", produces = "application/json")
     public Object issuerMetadata() {
         CredentialIssuerMetadataDTO legacy = registry.issuerMetadata();
         String tenantId = authorizationContext.getTenantId();
         if (tenantId != null && !io.mosip.certify.spi.TenantContext.DEFAULT_TENANT_ID.equals(tenantId)) {
             io.mosip.certify.spi.TenantContext tenant = tenants.forRequest(tenantId, issuer.identifier(), null);
-            Oid4vciIssuer tenantIssuer = issuer.identifier().equals(tenant.issuerIdentifier()) ? issuer : Oid4vciIssuer.derive(tenant.issuerIdentifier(), null);
-            return tenantMetadata.document(tenant, tenantIssuer, legacy);
+            return tenantMetadata.document(tenant, issuers.forTenant(tenantId), legacy);
         }
         CredentialIssuerMetadataDTO metadata = new CredentialIssuerMetadataDTO();
         metadata.setCredentialIssuer(issuer.identifier());
@@ -58,6 +60,9 @@ public class Oid4vciDiscoveryController {
         if (properties.batch().size() > 1) {
             metadata.setBatchCredentialIssuance(java.util.Map.of("batch_size", properties.batch().size()));
         }
+        // OpenID4VCI 1.0 section 12.2.4: the issuer display is the deployment's (the compatibility document's), inherited
+        // as-is. This surface has no display of its own, so there is nothing to prefer over it.
+        metadata.setDisplay(legacy.getDisplay());
         metadata.setCredentialConfigurationSupportedDTO(legacy.getCredentialConfigurationSupportedDTO());
         return metadata;
     }

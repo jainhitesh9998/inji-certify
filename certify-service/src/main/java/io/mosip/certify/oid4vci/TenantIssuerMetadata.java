@@ -1,12 +1,12 @@
 package io.mosip.certify.oid4vci;
 
-import com.authlete.cose.constants.COSEAlgorithms;
 import io.mosip.certify.core.dto.CredentialIssuerMetadataDTO;
 import io.mosip.certify.issuance.ConfigurationRegistry;
 import io.mosip.certify.spi.CredentialConfiguration;
 import io.mosip.certify.spi.CredentialFormatter;
 import io.mosip.certify.spi.ProtocolVersion;
 import io.mosip.certify.spi.TenantContext;
+import io.mosip.certify.utils.MdocSigningAlgorithms;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -22,9 +22,6 @@ import java.util.Map;
  */
 @Component
 public class TenantIssuerMetadata {
-
-    static final Map<String, Integer> JOSE_TO_COSE = Map.of("ES256", COSEAlgorithms.ES256, "EdDSA", COSEAlgorithms.EdDSA,
-            "ES256K", COSEAlgorithms.ES256K, "RS256", COSEAlgorithms.RS256);
 
     private final ConfigurationRegistry configurations;
     private final List<CredentialFormatter> formatters;
@@ -75,11 +72,14 @@ public class TenantIssuerMetadata {
         entry.put("scope", configuration.scope());
         put(entry, "cryptographic_binding_methods_supported", raw.get("cryptographicBindingMethodsSupported"));
         // the JOSE name of the configured algorithm (the legacy column holds the suite name); COSE identifiers for mDoc
+        // through the one map both metadata builders use (MdocSigningAlgorithms)
         if (configuration.signing() != null && configuration.signing().algorithm() != null) {
             String jose = configuration.signing().algorithm().joseName();
-            Object value = "mso_mdoc".equals(configuration.format()) ? JOSE_TO_COSE.get(jose) : jose;
+            List<Object> value = "mso_mdoc".equals(configuration.format())
+                    ? MdocSigningAlgorithms.coseIds(List.of(jose))
+                    : List.of(jose);
             if (value != null) {
-                entry.put("credential_signing_alg_values_supported", List.of(value));
+                entry.put("credential_signing_alg_values_supported", value);
             }
         }
         put(entry, "proof_types_supported", raw.get("proofTypesSupported"));

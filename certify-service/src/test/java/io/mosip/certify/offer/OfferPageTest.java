@@ -36,9 +36,20 @@ class OfferPageTest {
         assertEquals(200, page.getResponse().getStatus());
         String html = page.getResponse().getContentAsString();
         assertTrue(html.contains("<title>Credential offer</title>") && html.contains("/pre-authorized-data") && html.contains("openid4vci-proof+jwt"), "the page creates offers and plays the wallet");
+        // M-09: the page can target either surface, defaults to the new one for mso_mdoc, and reads an IssuerSigned it is
+        // handed; the IACA it verifies against is published next to it
+        assertTrue(html.contains("id=\"surface\"") && html.contains("offer_by_value"), "the page offers the surface selector and by-value offers");
+        assertTrue(html.contains("Cbor.decode") && html.contains("../mdoc/iaca"), "the page decodes mso_mdoc and links the IACA");
+        // M-09 review round 2: the in-page wallet stays available for a legacy offer (its token is accepted at
+        // /oid4vci/credential through allowed-audiences), and a replaced portrait releases its blob URL
+        assertTrue(html.contains("el(\"wallet\").disabled = !grant;"), "the wallet is offered for either surface");
+        assertTrue(html.contains("portraitObjectUrls.forEach((url) => URL.revokeObjectURL(url))"), "a replaced portrait's object URL is revoked");
         MvcResult script = mockMvc.perform(get("/offer/qrcode.min.js")).andReturn();
         assertEquals(200, script.getResponse().getStatus());
         assertTrue(script.getResponse().getContentAsString().startsWith("var QRCode;"));
+        MvcResult cbor = mockMvc.perform(get("/offer/cbor.js")).andReturn();
+        assertEquals(200, cbor.getResponse().getStatus());
+        assertTrue(cbor.getResponse().getContentAsString().contains("var Cbor"), "the CBOR decoder is bundled, not fetched from a CDN");
         MvcResult directory = mockMvc.perform(get("/offer/")).andReturn();
         assertEquals(200, directory.getResponse().getStatus());
         assertTrue(directory.getResponse().getContentType().startsWith("text/html") && directory.getResponse().getContentAsString().equals(html), "the directory path answers the same page");

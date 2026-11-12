@@ -22,9 +22,10 @@ public class PreAuthorizedCodeController {
     @PostMapping(value = "/pre-authorized-data", produces = "application/json")
     public PreAuthorizedResponse generatePreAuthorizedCode(@Valid @RequestBody PreAuthorizedRequest request) {
 
-        String credentialOfferUri = preAuthorizedCodeService.generatePreAuthorizedCode(request);
+        PreAuthorizedCodeService.CredentialOfferResult result = preAuthorizedCodeService.createCredentialOffer(request);
         PreAuthorizedResponse preAuthorizedResponse = new PreAuthorizedResponse();
-        preAuthorizedResponse.setCredentialOfferUri(credentialOfferUri);
+        preAuthorizedResponse.setCredentialOfferUri(result.deepLink());
+        preAuthorizedResponse.setCredentialOffer(result.offer()); // only when the request asked for the offer by value
         return preAuthorizedResponse;
     }
 
