@@ -50,8 +50,12 @@ public class PreAuthorizedRequest {
      * {@code credential_issuer} (so the wallet uses {@code /oid4vci/credential}), {@code legacy} keeps the
      * compatibility identifier. Absent, the deployment's default applies
      * ({@code certify.protocol.oid4vci-v1.offers.default-issuer}, {@code legacy} unless set).
+     *
+     * <p>Not the token's {@code iss}: an offer does not carry an issuer claim, this only selects which of the two
+     * issuer surfaces the offer (and the access token it yields) addresses. The value is matched case-insensitively by
+     * {@code OfferSurface.from}, as the configured default is when it binds.
      */
-    @Pattern(regexp = "^(oid4vci|legacy)$", message = "issuer must be 'oid4vci' or 'legacy'")
+    @Pattern(regexp = "^(?i:oid4vci|legacy)$", message = "issuer must be 'oid4vci' or 'legacy'")
     @JsonProperty("issuer")
     private String issuer;
 

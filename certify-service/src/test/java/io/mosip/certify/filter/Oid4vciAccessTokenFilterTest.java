@@ -5,10 +5,18 @@ import com.nimbusds.jose.JWSHeader;
 import com.nimbusds.jose.crypto.RSASSASigner;
 import com.nimbusds.jwt.JWTClaimsSet;
 import com.nimbusds.jwt.SignedJWT;
+import io.mosip.certify.core.dto.AuthorizationContext;
 import io.mosip.certify.core.dto.ParsedAccessToken;
 import io.mosip.certify.dpop.DpopProofValidator;
 import io.mosip.certify.oid4vci.Oid4vciAccessTokenFilter;
 import io.mosip.certify.oid4vci.Oid4vciIssuer;
+import io.mosip.certify.oid4vci.Oid4vciIssuerResolver;
+import io.mosip.certify.tenancy.PathTenantResolver;
+import io.mosip.certify.tenancy.TenancyProperties;
+import io.mosip.certify.tenancy.TenantContexts;
+import io.mosip.certify.tenancy.TenantResolutionFilter;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.mock.web.MockHttpServletRequest;
@@ -23,6 +31,7 @@ import java.security.interfaces.RSAPublicKey;
 import java.time.Instant;
 import java.util.Date;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -41,6 +50,15 @@ class Oid4vciAccessTokenFilterTest {
     static final String ISSUER_IDENTIFIER = "https://issuer.example/v1/certify/oid4vci";
     static final String AS_ISSUER = "https://issuer.example/v1/certify";
     static final String LEGACY_AUDIENCE = "https://issuer.example/v1/certify/issuance/credential";
+    static final String TENANT_A_SURFACE = AS_ISSUER + "/t/a/oid4vci";
+
+    /** Path-resolved tenants {@code a} and {@code b}, each without an issuer override: {@code {deployment}/t/{id}/oid4vci}. */
+    static final TenancyProperties TENANCY = new TenancyProperties(true, TenancyProperties.RESOLVER_PATH,
+            Map.of("a", tenant(), "b", tenant()));
+
+    private static TenancyProperties.Tenant tenant() {
+        return new TenancyProperties.Tenant(List.of(), null, null, null, List.of(), List.of());
+    }
 
     private KeyPair keys;
     private ParsedAccessToken parsedAccessToken;
@@ -108,16 +126,63 @@ class Oid4vciAccessTokenFilterTest {
         assertFalse(asFilter.shouldNotFilter(request));
     }
 
+    /**
+     * The tenant binding of an offer token: an offer created under path tenant {@code a} yields a token addressed to
+     * {@code /t/a/oid4vci/credential}, and only tenant A's surface accepts it. Tenant B's surface, the default one and
+     * the compatibility filter all refuse it; a token addressed to the default surface is refused at tenant A unless
+     * the deployment lists that audience. Tenant resolution runs through the real {@link TenantResolutionFilter} and
+     * {@link PathTenantResolver}, before the token filter, exactly as in production.
+     */
+    @Test
+    void aTenantOfferTokenIsAcceptedOnlyAtThatTenantsSurface() throws Exception {
+        AuthorizationContext context = new AuthorizationContext();
+        Oid4vciAccessTokenFilter filter = oid4vciFilter(context);
+        TenantResolutionFilter tenants = new TenantResolutionFilter(new PathTenantResolver(TENANCY), context);
+
+        String tenantAToken = token(TENANT_A_SURFACE + "/credential");
+        assertTrue(run(tenants, filter, "/v1/certify/t/a/oid4vci/credential", tenantAToken),
+                "tenant A's own surface accepts the token addressed to its credential endpoint");
+        assertFalse(run(tenants, filter, "/v1/certify/oid4vci/credential", tenantAToken),
+                "the default surface does not accept tenant A's token");
+        assertFalse(run(tenants, filter, "/v1/certify/t/b/oid4vci/credential", tenantAToken),
+                "tenant B does not accept tenant A's token");
+
+        String defaultToken = token(ISSUER_IDENTIFIER + "/credential");
+        assertFalse(run(tenants, filter, "/v1/certify/t/a/oid4vci/credential", defaultToken),
+                "tenant A does not accept the default surface's token (it is not in mosip.certify.authn.allowed-audiences)");
+        assertTrue(run(tenants, filter, "/v1/certify/oid4vci/credential", defaultToken),
+                "the default surface still accepts its own token");
+    }
+
     // ---- helpers -----------------------------------------------------------------------------------------------
 
     private Oid4vciAccessTokenFilter oid4vciFilter() {
+        return oid4vciFilter(new AuthorizationContext());
+    }
+
+    private Oid4vciAccessTokenFilter oid4vciFilter(AuthorizationContext context) {
         Oid4vciAccessTokenFilter filter = new Oid4vciAccessTokenFilter();
         org.springframework.beans.factory.support.DefaultListableBeanFactory beans =
                 new org.springframework.beans.factory.support.DefaultListableBeanFactory();
-        beans.registerSingleton("oid4vciIssuer", new Oid4vciIssuer(ISSUER_IDENTIFIER));
-        ReflectionTestUtils.setField(filter, "issuer", beans.getBeanProvider(Oid4vciIssuer.class));
+        beans.registerSingleton("oid4vciIssuerResolver",
+                new Oid4vciIssuerResolver(new Oid4vciIssuer(ISSUER_IDENTIFIER), new TenantContexts(TENANCY)));
+        beans.registerSingleton("authorizationContext", context);
+        ReflectionTestUtils.setField(filter, "issuers", beans.getBeanProvider(Oid4vciIssuerResolver.class));
+        ReflectionTestUtils.setField(filter, "authorizationContext", beans.getBeanProvider(AuthorizationContext.class));
         prepare(filter, parsedAccessToken);
         return filter;
+    }
+
+    /** Runs tenant resolution and then the token filter for one request, and answers whether the token was accepted. */
+    private boolean run(TenantResolutionFilter tenants, Oid4vciAccessTokenFilter filter, String path, String token)
+            throws Exception {
+        parsedAccessToken.setActive(false);
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", path);
+        request.setRequestURI(path);
+        request.addHeader("Authorization", "Bearer " + token);
+        tenants.doFilter(request, new MockHttpServletResponse(), (req, res) ->
+                filter.doFilter((HttpServletRequest) req, (HttpServletResponse) res, (req2, res2) -> { }));
+        return parsedAccessToken.isActive();
     }
 
     @SuppressWarnings("unchecked")

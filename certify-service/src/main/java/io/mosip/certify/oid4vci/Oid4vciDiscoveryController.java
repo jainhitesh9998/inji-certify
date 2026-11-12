@@ -60,11 +60,9 @@ public class Oid4vciDiscoveryController {
         if (properties.batch().size() > 1) {
             metadata.setBatchCredentialIssuance(java.util.Map.of("batch_size", properties.batch().size()));
         }
-        // OpenID4VCI 1.0 section 12.2.4: the issuer's display is the deployment's (the compatibility document's), inherited
-        // as-is; only a document that already carries one keeps its own.
-        if (metadata.getDisplay() == null) {
-            metadata.setDisplay(legacy.getDisplay());
-        }
+        // OpenID4VCI 1.0 section 12.2.4: the issuer display is the deployment's (the compatibility document's), inherited
+        // as-is. This surface has no display of its own, so there is nothing to prefer over it.
+        metadata.setDisplay(legacy.getDisplay());
         metadata.setCredentialConfigurationSupportedDTO(legacy.getCredentialConfigurationSupportedDTO());
         return metadata;
     }

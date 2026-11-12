@@ -51,9 +51,10 @@ public record Oid4vciProperties(@DefaultValue CompatCore compatCore, @DefaultVal
     public record DidWebHolders(@DefaultValue("false") boolean enabled, @DefaultValue("PT5S") java.time.Duration timeout) {}
 
     /**
-     * {@code default-issuer}: the surface a pre-authorized offer targets when its request names none, {@code oid4vci} or
-     * {@code legacy}. {@code legacy} is the default, so an unchanged deployment's offers keep the compatibility
+     * {@code default-issuer}: the surface a pre-authorized offer targets when its request names none. Typed as the
+     * {@link OfferSurface} enum (bound case-insensitively, like the request field), so a typo fails at startup rather
+     * than at the first offer. {@code legacy} is the default, so an unchanged deployment's offers keep the compatibility
      * identifier (the mDL profile sets {@code oid4vci}; docs/design/20-mdl-issuer.md, decision D5).
      */
-    public record Offers(@DefaultValue("legacy") String defaultIssuer) {}
+    public record Offers(@DefaultValue("legacy") OfferSurface defaultIssuer) {}
 }

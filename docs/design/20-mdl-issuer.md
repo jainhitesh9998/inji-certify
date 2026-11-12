@@ -96,7 +96,7 @@ Each under about 800 lines excluding goldens and binaries.
 
 ### M-03 ISO 18013-5 data model and element typing (G2, G3, G7)
 - `MdocElementTypes` (built-in table for `org.iso.18013.5.1`, types and the mandatory set of Table 5), `MdocDataModelValidator`, typed conversion in `MdocProcessor`, optional `formatConfig.elementTypes`.
-- Conversions: `bstr` from base64/base64url (portrait, `signature_usual_mark`, `biometric_template_*`), `full-date` (tag 1004), `tdate` (tag 0, seconds), `uint`, `bool`, `driving_privileges` (array of maps; `issue_date`/`expiry_date` full-date; `codes[]`). Validation for `org.iso.18013.5.1.mDL`: mandatory elements, JPEG/JPEG2000 portrait, `issuing_country` alpha-2 equal to the DSC subject C (checked at sign), `un_distinguishing_sign`. Violation -> `FormatException("mdoc_data_model_invalid")`; the v2 preview surfaces it.
+- Conversions: `bstr` from base64/base64url (portrait, `signature_usual_mark`, `biometric_template_*`), `full-date` (tag 1004), `tdate` (tag 0 over an RFC 3339 `tstr` without fractional seconds), `uint`, `bool`, `driving_privileges` (array of maps; `issue_date`/`expiry_date` full-date; `codes[]`). Validation for `org.iso.18013.5.1.mDL`: mandatory elements, JPEG/JPEG2000 portrait, `issuing_country` alpha-2 equal to the DSC subject C (checked at sign), `un_distinguishing_sign`. Violation -> `FormatException("mdoc_data_model_invalid")`; the v2 preview surfaces it.
 
 ### M-04 `certify-pki`: Annex B profiles (G10, G11)
 - New module, BouncyCastle only, no Spring/Web/JPA: `IsoMdocProfiles` (IACA and DS builders), `AnnexBValidator` (named violations for IACA, DS, CRL), `CrlBuilder`, `Csr` (PKCS#10 parse, proof-of-possession check), `Serials` (positive, up to 20 octets, at least 63 random bits).

@@ -23,9 +23,6 @@ import java.util.Map;
 @Slf4j
 public final class MdocSigningAlgorithms {
 
-    /** The ISO/IEC 18013-5 algorithms, in the order the metadata should prefer them. */
-    public static final java.util.List<String> ISO_MDOC = java.util.List.of("ES256", "ES384", "ES512", "EdDSA");
-
     private static final Map<String, Integer> JOSE_TO_COSE = map();
 
     private MdocSigningAlgorithms() {}

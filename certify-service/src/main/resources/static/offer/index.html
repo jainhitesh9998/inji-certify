@@ -98,7 +98,7 @@
   // Same origin as the issuer: the servlet path is everything before /offer/
   const BASE = location.pathname.replace(/\/offer\/.*$/, "");
   const el = (id) => document.getElementById(id);
-  let metadata = null, newMetadata = null, offer = null, offerDocument = null, tokenEndpoint = null;
+  let metadata = null, newMetadata = null, offerDocument = null, offerConfigurationId = null, offerSurface = null, tokenEndpoint = null;
 
   async function api(method, path, body, headers, form) {
     const h = Object.assign({}, headers || {});
@@ -136,10 +136,14 @@
     syncSurfaceDefault();
   }
 
-  function selectedFormat() {
+  function formatOf(configurationId) {
     const configurations = (metadata && metadata.credential_configurations_supported) || {};
-    const selected = configurations[el("configuration").value];
+    const selected = configurations[configurationId];
     return selected && selected.format;
+  }
+
+  function selectedFormat() {
+    return formatOf(el("configuration").value);
   }
 
   function syncSurfaceDefault() {
@@ -149,8 +153,11 @@
   el("configuration").addEventListener("change", syncSurfaceDefault);
 
   el("create").addEventListener("click", async () => {
-    const request = { credential_configuration_id: el("configuration").value, expires_in: Number(el("expires").value) || 600,
-      issuer: el("surface").value };
+    // remember what was offered: the wallet below redeems this offer, not whatever the dropdown says later
+    offerConfigurationId = el("configuration").value;
+    offerSurface = el("surface").value;
+    const request = { credential_configuration_id: offerConfigurationId, expires_in: Number(el("expires").value) || 600,
+      issuer: offerSurface };
     if (el("byValue").checked) request.offer_by_value = true;
     if (el("txCode").value.trim()) request.tx_code = el("txCode").value.trim();
     if (el("subject").value.trim()) request.subject = el("subject").value.trim();
@@ -164,7 +171,7 @@
       if (r.status !== 200 || !r.body || !r.body.credential_offer_uri) {
         status("offerStatus", "The issuer refused the offer (" + r.status + "): " + (typeof r.body === "string" ? r.body : JSON.stringify(r.body)), false); return;
       }
-      offer = r.body;
+      const offer = r.body;
       const deepLink = offer.credential_offer_uri;
       el("offerUri").textContent = deepLink; el("offerUri").hidden = false;
       el("qr").innerHTML = "";
@@ -179,11 +186,12 @@
       }
       el("offerDoc").textContent = JSON.stringify(offerDocument, null, 2); el("offerDoc").hidden = !offerDocument;
       const grant = offerDocument && offerDocument.grants && offerDocument.grants["urn:ietf:params:oauth:grant-type:pre-authorized_code"];
-      // the offer names the surface it targets; the /oid4vci one is what this page's own wallet redeems
-      const onNewSurface = offerDocument && newMetadata && offerDocument.credential_issuer === newMetadata.credential_issuer;
-      const surfaceNote = onNewSurface ? " It targets the /oid4vci surface." : " It targets the compatibility surface: scanning it works, but choose /oid4vci to run the flow in this page.";
+      // the surface this offer actually targets, not what the dropdown says now: this page's wallet always speaks /oid4vci
+      const onNewSurface = offerSurface === "oid4vci";
+      const surfaceNote = onNewSurface ? " It targets the /oid4vci surface."
+        : " It targets the compatibility surface, which a wallet can redeem but this page's wallet cannot: it only speaks /oid4vci. Choose /oid4vci to run the flow here.";
       status("offerStatus", (grant ? "Offer created; the pre-authorized code is in the offer document below." : "Offer created (the offer document could not be fetched).") + surfaceNote, true);
-      el("wallet").disabled = !grant;
+      el("wallet").disabled = !grant || !onNewSurface;
       el("credential").hidden = true; status("walletStatus", "");
     } catch (e) {
       status("offerStatus", "Request failed: " + e.message, false);
@@ -224,13 +232,22 @@
       const nonce = await api("POST", "/oid4vci/nonce");
       if (nonce.status !== 200) { status("walletStatus", "Nonce request refused (" + nonce.status + ")", false); return; }
       status("walletStatus", "3/3 signing the proof and requesting the credential…");
+      // the configuration this page offered: the dropdown may have changed since
+      const configurationId = offerConfigurationId || el("configuration").value;
       const proof = await proofJwt(newMetadata.credential_issuer, nonce.body.c_nonce);
-      const credential = await api("POST", "/oid4vci/credential", { credential_configuration_id: el("configuration").value, proofs: { jwt: [proof] } },
+      const credential = await api("POST", "/oid4vci/credential", { credential_configuration_id: configurationId, proofs: { jwt: [proof] } },
         { Authorization: (token.body.token_type || "Bearer") + " " + token.body.access_token });
       el("credential").textContent = JSON.stringify(credential.body, null, 2); el("credential").hidden = false;
       const issued = credential.status === 200 && credential.body.credentials && credential.body.credentials.length;
       status("walletStatus", issued ? "Credential issued (" + credential.body.credentials.length + "); notification id " + credential.body.notification_id : "Credential request refused (" + credential.status + ")", !!issued);
-      if (issued) renderMdoc(credential.body.credentials[0].credential);
+      if (issued) {
+        // its own guard: a rendering fault must not turn a successful issuance into "the flow failed"
+        try {
+          renderMdoc(credential.body.credentials[0].credential);
+        } catch (e) {
+          status("walletStatus", "Credential issued, but the IssuerSigned view could not be rendered: " + e.message, false);
+        }
+      }
     } catch (e) {
       status("walletStatus", "The flow failed: " + e.message, false);
     } finally {
@@ -248,13 +265,25 @@
     return bytes;
   }
 
+  /** The image type the portrait's magic bytes declare, so the browser gets a MIME it renders (JPEG or JPEG 2000). */
+  function imageMime(bytes) {
+    if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+    if (bytes.length >= 8 && bytes[0] === 0x00 && bytes[1] === 0x00 && bytes[2] === 0x00 && bytes[3] === 0x0c &&
+        bytes[4] === 0x6a && bytes[5] === 0x50 && bytes[6] === 0x20 && bytes[7] === 0x20) return "image/jp2";
+    return null;
+  }
+
   function renderMdoc(credential) {
     const view = el("mdocView"), table = el("mdocTable");
     table.innerHTML = "";
-    if (selectedFormat() !== "mso_mdoc") { view.hidden = true; return; }
+    // the format of the configuration this page offered, not of whatever the dropdown shows now
+    if (formatOf(offerConfigurationId) !== "mso_mdoc") { view.hidden = true; return; }
     let issuerSigned;
     try { issuerSigned = Cbor.decode(base64urlBytes(credential)); } catch (e) {
-      view.hidden = false; table.innerHTML = "<tr><td>The credential is not a CBOR IssuerSigned: " + e.message + "</td></tr>"; return;
+      view.hidden = false;
+      const row = document.createElement("tr"), cell = document.createElement("td");
+      cell.textContent = "The credential is not a CBOR IssuerSigned: " + e.message;
+      row.appendChild(cell); table.appendChild(row); return;
     }
     const namespaces = issuerSigned.nameSpaces || {};
     Object.keys(namespaces).sort().forEach((namespace) => {
@@ -269,11 +298,17 @@
         if (item.elementValue instanceof Uint8Array) {
           if (item.elementIdentifier === "portrait") {
             // the mDL portrait is a JPEG (or JPEG 2000) byte string: show it, the way a wallet would
-            const image = document.createElement("img");
-            image.src = "data:image/jpeg;base64," + btoa(String.fromCharCode(...item.elementValue));
-            image.alt = "portrait";
-            image.style.cssText = "max-width:120px;border-radius:6px";
-            value.appendChild(image);
+            const mime = imageMime(item.elementValue);
+            if (mime) {
+              const image = document.createElement("img");
+              // no base64 round trip (String.fromCharCode over a byte array overflows the call stack on large images)
+              image.src = URL.createObjectURL(new Blob([item.elementValue], { type: mime }));
+              image.alt = "portrait";
+              image.style.cssText = "max-width:120px;border-radius:6px";
+              value.appendChild(image);
+            } else {
+              value.textContent = "<" + item.elementValue.length + " bytes, not a JPEG or JPEG 2000>";
+            }
           } else {
             value.textContent = "<" + item.elementValue.length + " bytes>";
           }

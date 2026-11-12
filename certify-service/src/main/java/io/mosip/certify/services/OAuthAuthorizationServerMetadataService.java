@@ -74,22 +74,33 @@ public class OAuthAuthorizationServerMetadataService {
             metadata.setDpopSigningAlgValuesSupported(dpop.getAllowedAlgorithms()); // RFC 9449 section 5.1
         }
         io.mosip.certify.as.AsProperties as = asProperties == null ? null : asProperties.getIfAvailable(); // null when built outside Spring (unit tests)
-        if (as != null && as.enabled() && tokenEndpoint != null && tokenEndpoint.endsWith("/oauth/token")) {
+        // Certify's own token endpoint serves the pre-authorized grant whether or not an authorization-code client is
+        // registered, so the two features are advertised independently of each other.
+        boolean ownTokenEndpoint = as != null && tokenEndpoint != null && tokenEndpoint.endsWith("/oauth/token");
+        if (ownTokenEndpoint && as.enabled()) {
             String base = tokenEndpoint.substring(0, tokenEndpoint.length() - "/oauth/token".length());
             metadata.setAuthorizationEndpoint(base + "/oauth/authorize");
             metadata.setPushedAuthorizationRequestEndpoint(base + "/oauth/par");
             metadata.setRequirePushedAuthorizationRequests(Boolean.TRUE);
-            // OID4VCI 1.0 authorization server metadata: this token endpoint redeems a pre-authorized code with no
-            // transaction code, so an offer can be followed without interacting with the issuer. Only Certify's own AS
-            // publishes it; with eSignet the document is eSignet's own.
-            metadata.setPreAuthorizedGrantAnonymousAccessSupported(Boolean.TRUE);
             if (as.clientAttestation() != null && as.clientAttestation().attesters() != null && !as.clientAttestation().attesters().isEmpty()) {
                 metadata.setTokenEndpointAuthMethodsSupported(java.util.List.of(io.mosip.certify.as.ClientAttestationValidator.AUTH_METHOD));
             }
         }
+        // OID4VCI 1.0 section 12.3: a Token Request with a pre-authorized code and no client_id is answered here, so an
+        // offer can be followed without interacting with the issuer. Omitted once client attestation is required (the
+        // token request then has to be authenticated, so it is not anonymous) and with an external AS (eSignet), whose
+        // own metadata document is authoritative.
+        if (ownTokenEndpoint && !clientAttestationRequired(as)) {
+            metadata.setPreAuthorizedGrantAnonymousAccessSupported(Boolean.TRUE);
+        }
 
         log.debug("OAuth Authorization Server metadata built successfully for issuer: {}", issuer);
         return metadata;
+    }
+
+    /** {@code true} when {@code certify.as.client-attestation.required} refuses unauthenticated token requests. */
+    private static boolean clientAttestationRequired(io.mosip.certify.as.AsProperties as) {
+        return as.clientAttestation() != null && as.clientAttestation().required();
     }
 
     /**

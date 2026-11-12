@@ -34,8 +34,9 @@ public enum OfferSurface {
         if (value == null || value.isBlank()) {
             return LEGACY;
         }
+        String trimmed = value.trim();
         for (OfferSurface surface : values()) {
-            if (surface.wireName.equalsIgnoreCase(value.trim())) {
+            if (surface.wireName.equalsIgnoreCase(trimmed)) {
                 return surface;
             }
         }

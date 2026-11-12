@@ -10,6 +10,9 @@ import io.mosip.certify.core.exception.InvalidRequestException;
 import io.mosip.certify.core.spi.CredentialConfigurationService;
 import io.mosip.certify.core.spi.CredentialRegistry;
 import io.mosip.certify.core.util.CommonUtil;
+import io.mosip.certify.oid4vci.Oid4vciIssuerResolver;
+import io.mosip.certify.oid4vci.Oid4vciProperties;
+import io.mosip.certify.oid4vci.OfferSurface;
 import io.mosip.certify.repository.CredentialConfigRepository;
 import io.mosip.certify.utils.AccessTokenJwtUtil;
 import jakarta.validation.ConstraintViolation;
@@ -44,11 +47,11 @@ public class PreAuthorizedCodeService {
 
     private final Validator validator;
 
-    private final io.mosip.certify.oid4vci.Oid4vciProperties oid4vciProperties;
+    private final Oid4vciProperties oid4vciProperties;
 
-    private final io.mosip.certify.oid4vci.Oid4vciIssuerResolver oid4vciIssuers;
+    private final Oid4vciIssuerResolver oid4vciIssuers;
 
-    private final io.mosip.certify.core.dto.AuthorizationContext authorizationContext;
+    private final AuthorizationContext authorizationContext;
 
     @Value("${mosip.certify.identifier}")
     private String issuerIdentifier;
@@ -82,9 +85,9 @@ public class PreAuthorizedCodeService {
                                     CredentialConfigurationService credentialConfigurationService,
                                     CredentialConfigRepository credentialConfigRepository,
                                     Validator validator,
-                                    io.mosip.certify.oid4vci.Oid4vciProperties oid4vciProperties,
-                                    io.mosip.certify.oid4vci.Oid4vciIssuerResolver oid4vciIssuers,
-                                    io.mosip.certify.core.dto.AuthorizationContext authorizationContext) {
+                                    Oid4vciProperties oid4vciProperties,
+                                    Oid4vciIssuerResolver oid4vciIssuers,
+                                    AuthorizationContext authorizationContext) {
         this.vciCacheService = vciCacheService;
         this.accessTokenJwtUtil = accessTokenJwtUtil;
         this.objectMapper = objectMapper;
@@ -124,7 +127,8 @@ public class PreAuthorizedCodeService {
             log.error("expires_in {} out of bounds [{}, {}]", expirySeconds, minExpirySeconds, maxExpirySeconds);
             throw new InvalidRequestException(ErrorConstants.INVALID_EXPIRY_RANGE);
         }
-        io.mosip.certify.oid4vci.OfferSurface surface = requestedSurface(request);
+        OfferSurface surface = requestedSurface(request);
+        String tenantId = requestTenantId();
 
         String offerId = UUID.randomUUID().toString();
         String preAuthCode = generateUniquePreAuthCode();
@@ -136,24 +140,33 @@ public class PreAuthorizedCodeService {
                 .subject(blankToNull(request.getSubject()))
                 .txnCode(request.getTxCode())
                 .issuer(surface.wireName())
+                .tenantId(tenantId)
+                .audience(audience(surface, tenantId))
                 .createdAt(currentTime)
                 .expiresAt(currentTime + (expirySeconds * 1000L)).build();
 
         vciCacheService.setPreAuthCodeData(preAuthCode, codeData);
 
-        CredentialOfferResponse offerResponse = buildCredentialOffer(request.getCredentialConfigurationId(), preAuthCode, request.getTxCode(), surface);
-        vciCacheService.setCredentialOffer(offerId, offerResponse);
-
-        // the offer is cached (and fetchable) by reference either way; by value it also travels in the answer
+        CredentialOfferResponse offerResponse = buildCredentialOffer(request.getCredentialConfigurationId(), preAuthCode, request.getTxCode(), surface, tenantId);
         boolean byValue = Boolean.TRUE.equals(request.getOfferByValue());
-        return new CredentialOfferResult(byValue ? buildCredentialOfferByValueLink(offerResponse) : buildCredentialOfferUri(offerId),
-                byValue ? offerResponse : null);
+        if (byValue) {
+            // by value nothing points at the cached copy, so caching it would only leave an offer nobody can reach
+            return new CredentialOfferResult(buildCredentialOfferByValueLink(offerResponse), offerResponse);
+        }
+        vciCacheService.setCredentialOffer(offerId, offerResponse);
+        return new CredentialOfferResult(buildCredentialOfferUri(offerId), null);
     }
 
-    private io.mosip.certify.oid4vci.OfferSurface requestedSurface(PreAuthorizedRequest request) {
-        String requested = request.getIssuer() != null && !request.getIssuer().isBlank()
-                ? request.getIssuer() : oid4vciProperties.offers().defaultIssuer();
-        return io.mosip.certify.oid4vci.OfferSurface.from(requested);
+    private OfferSurface requestedSurface(PreAuthorizedRequest request) {
+        if (request.getIssuer() == null || request.getIssuer().isBlank()) {
+            return oid4vciProperties.offers().defaultIssuer();
+        }
+        return OfferSurface.from(request.getIssuer());
+    }
+
+    /** The tenant the request belongs to, resolved before the token filters and stamped on the offer. */
+    private String requestTenantId() {
+        return authorizationContext == null ? AuthorizationContext.DEFAULT_TENANT : authorizationContext.getTenantId();
     }
 
     /**
@@ -161,9 +174,9 @@ public class PreAuthorizedCodeService {
      * {@code oid4vci} it is exactly the value the surface's discovery document publishes as {@code credential_issuer}
      * (tenant-aware), so a wallet that reads the offer and then the metadata sees one identifier.
      */
-    private String credentialIssuer(io.mosip.certify.oid4vci.OfferSurface surface) {
-        if (surface == io.mosip.certify.oid4vci.OfferSurface.OID4VCI) {
-            return oid4vciIssuers.forTenant(authorizationContext == null ? null : authorizationContext.getTenantId()).identifier();
+    private String credentialIssuer(OfferSurface surface, String tenantId) {
+        if (surface == OfferSurface.OID4VCI) {
+            return oid4vciIssuers.forTenant(tenantId).identifier();
         }
         return issuerIdentifier;
     }
@@ -293,7 +306,7 @@ public class PreAuthorizedCodeService {
     }
 
     private CredentialOfferResponse buildCredentialOffer(String configId, String preAuthCode, String txnCode,
-                                                         io.mosip.certify.oid4vci.OfferSurface surface) {
+                                                         OfferSurface surface, String tenantId) {
         Grant.PreAuthorizedCodeGrantType grant = Grant.PreAuthorizedCodeGrantType.builder()
                 .preAuthorizedCode(preAuthCode)
                 .txCode(StringUtils.hasText(txnCode) ? buildTxCodeInfo(txnCode) : null).build();
@@ -301,7 +314,7 @@ public class PreAuthorizedCodeService {
         Grant grants = Grant.builder().preAuthorizedCode(grant).build();
 
         return CredentialOfferResponse.builder()
-                .credentialIssuer(credentialIssuer(surface))
+                .credentialIssuer(credentialIssuer(surface, tenantId))
                 .credentialConfigurationIds(Collections.singletonList(configId))
                 .grants(grants)
                 .build();
@@ -317,24 +330,30 @@ public class PreAuthorizedCodeService {
 
     private String buildCredentialOfferUri(String offerId) {
         String offerFetchUrl = credentialOfferUrl + offerId;
-        try {
-            String encodedUrl = URLEncoder.encode(offerFetchUrl, StandardCharsets.UTF_8.name());
-            return "openid-credential-offer://?credential_offer_uri=" + encodedUrl;
-        } catch (java.io.UnsupportedEncodingException e) {
-            // UTF-8 is always supported, this should never happen
-            throw new CertifyException(ErrorConstants.UNKNOWN_ERROR, "UTF-8 encoding not supported", e);
-        }
+        return "openid-credential-offer://?credential_offer_uri=" + percentEncode(offerFetchUrl);
     }
 
     /** The deep link that carries the offer itself, URL-encoded (OpenID4VCI 1.0 section 4.1.1, {@code credential_offer}). */
     private String buildCredentialOfferByValueLink(CredentialOfferResponse offer) {
         try {
-            String encodedOffer = URLEncoder.encode(objectMapper.writeValueAsString(offer), StandardCharsets.UTF_8.name());
-            return "openid-credential-offer://?credential_offer=" + encodedOffer;
-        } catch (java.io.UnsupportedEncodingException e) {
-            throw new CertifyException(ErrorConstants.UNKNOWN_ERROR, "UTF-8 encoding not supported", e);
+            return "openid-credential-offer://?credential_offer="
+                    + percentEncode(objectMapper.writeValueAsString(offer));
         } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
             throw new CertifyException(ErrorConstants.UNKNOWN_ERROR, "The credential offer could not be serialized", e);
+        }
+    }
+
+    /**
+     * RFC 3986 percent-encoding for the query value of a deep link: {@link URLEncoder} encodes a space as {@code +}
+     * (application/x-www-form-urlencoded), which a wallet reading the raw query would decode literally, so the space is
+     * written as {@code %20} and every other byte as its percent triplet.
+     */
+    private static String percentEncode(String value) {
+        try {
+            return URLEncoder.encode(value, StandardCharsets.UTF_8.name()).replace("+", "%20");
+        } catch (java.io.UnsupportedEncodingException e) {
+            // UTF-8 is always supported, this should never happen
+            throw new CertifyException(ErrorConstants.UNKNOWN_ERROR, "UTF-8 encoding not supported", e);
         }
     }
 
@@ -391,6 +410,14 @@ public class PreAuthorizedCodeService {
         if (!Constants.PRE_AUTHORIZED_CODE_GRANT_TYPE.equals(request.getGrant_type())) {
             log.error("Unsupported grant type: {}", request.getGrant_type());
             throw new CertifyException(ErrorConstants.UNSUPPORTED_GRANT_TYPE, "Grant type not supported");
+        }
+
+        // A code belongs to the tenant that issued the offer: another tenant's token endpoint must not redeem it, or a
+        // token minted beside an offer at one tenant would be accepted at another (checked before the claim, so a
+        // misrouted request does not burn the code)
+        if (codeData != null && codeData.getTenantId() != null && !codeData.getTenantId().equals(requestTenantId())) {
+            log.error("Pre-authorized code of tenant {} presented at tenant {}", codeData.getTenantId(), requestTenantId());
+            throw new CertifyException(ErrorConstants.INVALID_GRANT, "Pre-authorized code was not issued by this tenant");
         }
 
         // Atomically claim the pre-authorized code
@@ -458,7 +485,7 @@ public class PreAuthorizedCodeService {
                     credentialScope,
                     "",
                     oauthIssuer,
-                    audience(codeData.getIssuer()),
+                    audience(codeData),
                     accessTokenExpirySeconds,
                     dpopJkt
             );
@@ -469,14 +496,23 @@ public class PreAuthorizedCodeService {
     }
 
     /**
-     * The access token's audience is the credential endpoint of the surface the offer targeted (OpenID4VCI 1.0 section
-     * 6.1: a token for this issuer's credential endpoint): the compatibility endpoint as configured for {@code legacy},
-     * this surface's credential endpoint for {@code oid4vci}, which its access-token filter accepts.
+     * The access token's audience is the one resolved when the offer was created (OpenID4VCI 1.0 section 6.1: a token
+     * for this issuer's credential endpoint), so it stays the tenant's own endpoint even when the code is exchanged
+     * later. An entry written before the field existed carries none and keeps the configured legacy audience.
      */
-    private String audience(String issuer) {
-        if (issuer == null || !io.mosip.certify.oid4vci.OfferSurface.OID4VCI.wireName().equalsIgnoreCase(issuer)) {
+    private String audience(PreAuthCodeData codeData) {
+        return codeData.getAudience() != null ? codeData.getAudience() : oauthAudience;
+    }
+
+    /**
+     * The audience of the token an offer's code is exchanged for: the compatibility endpoint as configured for
+     * {@code legacy}, this surface's credential endpoint (tenant-aware) for {@code oid4vci}, which its access-token
+     * filter accepts.
+     */
+    private String audience(OfferSurface surface, String tenantId) {
+        if (surface != OfferSurface.OID4VCI) {
             return oauthAudience;
         }
-        return oid4vciIssuers.forTenant(authorizationContext == null ? null : authorizationContext.getTenantId()).credentialEndpoint();
+        return oid4vciIssuers.forTenant(tenantId).credentialEndpoint();
     }
 }

@@ -32,6 +32,14 @@ With `certify.tenancy` enabled, a tenant configured with `issuer-did` issues und
 
 `POST /pre-authorized-data` accepts an optional `subject` next to `claims`: the identifier the data provider resolves (for the CSV plugin, the row id). It becomes the access token's `sub`, so plugins that look the record up by `sub` work in the pre-authorized code flow without eSignet. Offers with `claims` behave as before.
 
+## Offers on the `/oid4vci` surface
+
+`POST /pre-authorized-data` accepts an optional `issuer` (`oid4vci` or `legacy`, case-insensitive; absent, `certify.protocol.oid4vci-v1.offers.default-issuer`, `legacy` unless set) and an optional `offer_by_value`. An `oid4vci` offer names the `/oid4vci` identifier in `credential_issuer`, and the access token its code is exchanged for is addressed to that surface's credential endpoint, so the wallet can redeem it at `POST /oid4vci/credential` without the deployment adding an audience. The code stays bound to the tenant that created the offer: another tenant's token endpoint refuses it, and an offer token is accepted only at its own tenant's `/oid4vci` surface. `offer_by_value: true` returns the offer document as `credential_offer` next to the `openid-credential-offer://` deep link (which then carries the offer, URL-encoded per RFC 3986, instead of a pointer). The `/oid4vci` metadata document now publishes the issuer `display`, and both metadata documents publish `mso_mdoc` signing algorithms from one COSE map. The offer page gains a surface selector, defaults to `/oid4vci` for `mso_mdoc`, returns offers by value, and decodes and shows an `mso_mdoc` credential's IssuerSigned elements and portrait. Behaviour without `issuer`, `offer_by_value` and an `mso_mdoc` configuration is unchanged.
+
+## Compatibility metadata: `mso_mdoc` signing algorithms
+
+Two changes are visible on the compatibility surface's `/.well-known/openid-credential-issuer`. An `mso_mdoc` configuration whose signing algorithm has no COSE identifier no longer fails the whole metadata document: the value is dropped with a warning (previously an `IllegalArgumentException` answered the request with an error), so the document still advertises everything else, and the configuration is better fixed by choosing ES256, ES384, ES512 or EdDSA. And an ES384 or ES512 configuration now publishes the COSE identifiers -35 and -36, where it previously failed the document for lack of a mapping. ES256, EdDSA, ES256K and RS256 rows are byte-identical to before.
+
 ## Token Status List
 
 A configuration whose `status.mechanism` is `TokenStatusList` gives its SD-JWT VC payload or mDoc MSO a `status.status_list` entry (draft-ietf-oauth-status-list); the lists are signed JWTs (`typ statuslist+jwt`) under `certify.status.token-status-list.key-ref`, served at `GET /credentials/token-status-list/{id}` as `application/statuslist+jwt`, and re-signed by the status-list batch job on revocation. Bitstring Status List for `ldp_vc` is unchanged.

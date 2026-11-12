@@ -16,7 +16,6 @@ class MdocSigningAlgorithmsTest {
         assertEquals(-35, MdocSigningAlgorithms.coseId("ES384"));
         assertEquals(-36, MdocSigningAlgorithms.coseId("ES512"));
         assertEquals(-8, MdocSigningAlgorithms.coseId("EdDSA"));
-        assertEquals(List.of("ES256", "ES384", "ES512", "EdDSA"), MdocSigningAlgorithms.ISO_MDOC);
     }
 
     @Test
