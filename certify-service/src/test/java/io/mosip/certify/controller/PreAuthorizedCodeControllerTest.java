@@ -21,6 +21,7 @@ import org.springframework.test.web.servlet.MockMvc;
 
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -62,14 +63,15 @@ public class PreAuthorizedCodeControllerTest {
         request.setClaims(claims);
 
         String expectedUri = "openid-credential-offer://?credential_offer_uri=test";
-        Mockito.when(preAuthorizedCodeService.generatePreAuthorizedCode(Mockito.any(PreAuthorizedRequest.class)))
-                .thenReturn(expectedUri);
+        Mockito.when(preAuthorizedCodeService.createCredentialOffer(Mockito.any(PreAuthorizedRequest.class)))
+                .thenReturn(new PreAuthorizedCodeService.CredentialOfferResult(expectedUri, null));
 
         mockMvc.perform(post("/pre-authorized-data")
                 .content(objectMapper.writeValueAsBytes(request))
                 .contentType(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.credential_offer_uri").value(expectedUri));
+                .andExpect(jsonPath("$.credential_offer_uri").value(expectedUri))
+                .andExpect(jsonPath("$.credential_offer").doesNotExist());
     }
 
     @Test
@@ -78,14 +80,39 @@ public class PreAuthorizedCodeControllerTest {
         request.setCredentialConfigurationId("test-config");
         request.setSubject("2154189532"); // the record the data provider resolves; no claims needed
         String expectedUri = "openid-credential-offer://?credential_offer_uri=test";
-        Mockito.when(preAuthorizedCodeService.generatePreAuthorizedCode(Mockito.any(PreAuthorizedRequest.class)))
-                .thenReturn(expectedUri);
+        Mockito.when(preAuthorizedCodeService.createCredentialOffer(Mockito.any(PreAuthorizedRequest.class)))
+                .thenReturn(new PreAuthorizedCodeService.CredentialOfferResult(expectedUri, null));
 
         mockMvc.perform(post("/pre-authorized-data")
                 .content(objectMapper.writeValueAsBytes(request))
                 .contentType(MediaType.APPLICATION_JSON))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.credential_offer_uri").value(expectedUri));
+                .andExpect(jsonPath("$.credential_offer_uri").value(expectedUri))
+                .andExpect(jsonPath("$.credential_offer").doesNotExist());
+    }
+
+    @Test
+    public void generatePreAuthorizedCode_ByValue_ReturnsTheOfferDocument() throws Exception {
+        PreAuthorizedRequest request = new PreAuthorizedRequest();
+        request.setCredentialConfigurationId("test-config");
+        request.setClaims(Map.of("name", "John"));
+        request.setIssuer("oid4vci");
+        request.setOfferByValue(true);
+        String expectedUri = "openid-credential-offer://?credential_offer=%7B%7D";
+        CredentialOfferResponse offer = CredentialOfferResponse.builder()
+                .credentialIssuer("https://issuer.com/oid4vci")
+                .credentialConfigurationIds(List.of("test-config"))
+                .build();
+        Mockito.when(preAuthorizedCodeService.createCredentialOffer(Mockito.any(PreAuthorizedRequest.class)))
+                .thenReturn(new PreAuthorizedCodeService.CredentialOfferResult(expectedUri, offer));
+
+        mockMvc.perform(post("/pre-authorized-data")
+                .content(objectMapper.writeValueAsBytes(request))
+                .contentType(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.credential_offer_uri").value(expectedUri))
+                .andExpect(jsonPath("$.credential_offer.credential_issuer").value("https://issuer.com/oid4vci"))
+                .andExpect(jsonPath("$.credential_offer.credential_configuration_ids[0]").value("test-config"));
     }
 
     @Test

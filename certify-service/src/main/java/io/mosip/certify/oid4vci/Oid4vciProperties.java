@@ -11,7 +11,7 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 @ConfigurationProperties(prefix = "certify.protocol.oid4vci-v1")
 public record Oid4vciProperties(@DefaultValue CompatCore compatCore, @DefaultValue Notification notification,
                                   @DefaultValue Nonce nonce, @DefaultValue Batch batch, @DefaultValue KeyAttestation keyAttestation,
-                               @DefaultValue DidWebHolders didWebHolders) {
+                               @DefaultValue DidWebHolders didWebHolders, @DefaultValue Offers offers) {
 
     public static final String COMPAT_CORE_PREFIX = "certify.protocol.oid4vci-v1.compat-core";
 
@@ -49,4 +49,11 @@ public record Oid4vciProperties(@DefaultValue CompatCore compatCore, @DefaultVal
      * DID document over HTTPS ({@code timeout} per fetch); off by default, so such proofs are rejected as before.
      */
     public record DidWebHolders(@DefaultValue("false") boolean enabled, @DefaultValue("PT5S") java.time.Duration timeout) {}
+
+    /**
+     * {@code default-issuer}: the surface a pre-authorized offer targets when its request names none, {@code oid4vci} or
+     * {@code legacy}. {@code legacy} is the default, so an unchanged deployment's offers keep the compatibility
+     * identifier (the mDL profile sets {@code oid4vci}; docs/design/20-mdl-issuer.md, decision D5).
+     */
+    public record Offers(@DefaultValue("legacy") String defaultIssuer) {}
 }

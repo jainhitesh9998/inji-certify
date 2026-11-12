@@ -42,6 +42,11 @@
       <h2>1. Offer</h2>
       <label for="configuration">Credential configuration</label>
       <select id="configuration"></select>
+      <label for="surface">Credential issuer (surface the offer targets)</label>
+      <select id="surface">
+        <option value="oid4vci">/oid4vci (OpenID4VCI 1.0)</option>
+        <option value="legacy">legacy (compatibility endpoints)</option>
+      </select>
       <label for="subject">Subject (the record id the data provider resolves, e.g. the CSV row id)</label>
       <input id="subject" placeholder="2154189532">
       <label for="claims">Or claims as JSON (used when the subject is empty)</label>
@@ -50,6 +55,7 @@
         <div style="flex:1"><label for="txCode">Transaction code (optional)</label><input id="txCode" placeholder="1234"></div>
         <div style="flex:1"><label for="expires">Expires in (seconds)</label><input id="expires" value="600"></div>
       </div>
+      <label><input type="checkbox" id="byValue" style="width:auto"> Return the offer by value (credential_offer in the response)</label>
       <button id="create">Create offer</button>
       <div id="offerStatus" class="status"></div>
       <div id="offerUri" class="uri" hidden></div>
@@ -77,10 +83,16 @@
     <button id="wallet" disabled>Run the pre-authorized code flow here</button>
     <div id="walletStatus" class="status"></div>
     <pre id="credential" hidden></pre>
+    <div id="mdocView" hidden>
+      <h3 style="font-size:0.95rem;margin:16px 0 6px">IssuerSigned (ISO/IEC 18013-5) elements</h3>
+      <table id="mdocTable" style="width:100%;border-collapse:collapse;font-size:0.85rem"></table>
+      <p class="hint">The IssuerAuth chain must verify against the issuer's IACA: <a href="../mdoc/iaca" target="_blank" rel="noopener">../mdoc/iaca</a></p>
+    </div>
   </section>
 </main>
 
 <script src="qrcode.min.js"></script>
+<script src="cbor.js"></script>
 <script>
 (function () {
   // Same origin as the issuer: the servlet path is everything before /offer/
@@ -119,10 +131,27 @@
       select.appendChild(option);
     });
     if (!Object.keys(configurations).length) status("offerStatus", "No credential configuration is advertised by " + BASE, false);
+    // ISO/IEC 18013-5 credentials are only issued on the OpenID4VCI 1.0 surface, so that is the default there (D5);
+    // every other format keeps the compatibility surface the page has always used.
+    syncSurfaceDefault();
   }
 
+  function selectedFormat() {
+    const configurations = (metadata && metadata.credential_configurations_supported) || {};
+    const selected = configurations[el("configuration").value];
+    return selected && selected.format;
+  }
+
+  function syncSurfaceDefault() {
+    el("surface").value = selectedFormat() === "mso_mdoc" ? "oid4vci" : "legacy";
+  }
+
+  el("configuration").addEventListener("change", syncSurfaceDefault);
+
   el("create").addEventListener("click", async () => {
-    const request = { credential_configuration_id: el("configuration").value, expires_in: Number(el("expires").value) || 600 };
+    const request = { credential_configuration_id: el("configuration").value, expires_in: Number(el("expires").value) || 600,
+      issuer: el("surface").value };
+    if (el("byValue").checked) request.offer_by_value = true;
     if (el("txCode").value.trim()) request.tx_code = el("txCode").value.trim();
     if (el("subject").value.trim()) request.subject = el("subject").value.trim();
     else if (el("claims").value.trim()) {
@@ -142,11 +171,18 @@
       new QRCode(el("qr"), { text: deepLink, width: 256, height: 256, correctLevel: QRCode.CorrectLevel.M });
       el("copy").disabled = false;
       el("open").href = deepLink; el("open").hidden = false;
-      const offerUrl = new URL(deepLink.replace(/^[a-z-]+:\/\//, "https://x/")).searchParams.get("credential_offer_uri");
-      offerDocument = offerUrl ? (await api("GET", offerUrl)).body : null;
+      if (offer.credential_offer) {
+        offerDocument = offer.credential_offer; // by value: the offer travelled in the answer, no fetch needed
+      } else {
+        const offerUrl = new URL(deepLink.replace(/^[a-z-]+:\/\//, "https://x/")).searchParams.get("credential_offer_uri");
+        offerDocument = offerUrl ? (await api("GET", offerUrl)).body : null;
+      }
       el("offerDoc").textContent = JSON.stringify(offerDocument, null, 2); el("offerDoc").hidden = !offerDocument;
       const grant = offerDocument && offerDocument.grants && offerDocument.grants["urn:ietf:params:oauth:grant-type:pre-authorized_code"];
-      status("offerStatus", grant ? "Offer created; the pre-authorized code is in the offer document below." : "Offer created (the offer document could not be fetched).", true);
+      // the offer names the surface it targets; the /oid4vci one is what this page's own wallet redeems
+      const onNewSurface = offerDocument && newMetadata && offerDocument.credential_issuer === newMetadata.credential_issuer;
+      const surfaceNote = onNewSurface ? " It targets the /oid4vci surface." : " It targets the compatibility surface: scanning it works, but choose /oid4vci to run the flow in this page.";
+      status("offerStatus", (grant ? "Offer created; the pre-authorized code is in the offer document below." : "Offer created (the offer document could not be fetched).") + surfaceNote, true);
       el("wallet").disabled = !grant;
       el("credential").hidden = true; status("walletStatus", "");
     } catch (e) {
@@ -194,12 +230,63 @@
       el("credential").textContent = JSON.stringify(credential.body, null, 2); el("credential").hidden = false;
       const issued = credential.status === 200 && credential.body.credentials && credential.body.credentials.length;
       status("walletStatus", issued ? "Credential issued (" + credential.body.credentials.length + "); notification id " + credential.body.notification_id : "Credential request refused (" + credential.status + ")", !!issued);
+      if (issued) renderMdoc(credential.body.credentials[0].credential);
     } catch (e) {
       status("walletStatus", "The flow failed: " + e.message, false);
     } finally {
       el("wallet").disabled = false;
     }
   });
+
+  // ---- mso_mdoc: decode the base64url IssuerSigned (ISO/IEC 18013-5 8.3.2) and list namespace/element/value
+  function base64urlBytes(text) {
+    const b64 = text.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "===".slice(0, (4 - (b64.length % 4)) % 4);
+    const raw = atob(padded);
+    const bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    return bytes;
+  }
+
+  function renderMdoc(credential) {
+    const view = el("mdocView"), table = el("mdocTable");
+    table.innerHTML = "";
+    if (selectedFormat() !== "mso_mdoc") { view.hidden = true; return; }
+    let issuerSigned;
+    try { issuerSigned = Cbor.decode(base64urlBytes(credential)); } catch (e) {
+      view.hidden = false; table.innerHTML = "<tr><td>The credential is not a CBOR IssuerSigned: " + e.message + "</td></tr>"; return;
+    }
+    const namespaces = issuerSigned.nameSpaces || {};
+    Object.keys(namespaces).sort().forEach((namespace) => {
+      (namespaces[namespace] || []).forEach((item) => {
+        if (!item || typeof item !== "object") return;
+        const row = document.createElement("tr");
+        const name = document.createElement("td");
+        name.textContent = namespace + " / " + item.elementIdentifier;
+        name.style.cssText = "padding:4px 6px;border-top:1px solid #eee;vertical-align:top;white-space:nowrap";
+        const value = document.createElement("td");
+        value.style.cssText = "padding:4px 6px;border-top:1px solid #eee;word-break:break-word";
+        if (item.elementValue instanceof Uint8Array) {
+          if (item.elementIdentifier === "portrait") {
+            // the mDL portrait is a JPEG (or JPEG 2000) byte string: show it, the way a wallet would
+            const image = document.createElement("img");
+            image.src = "data:image/jpeg;base64," + btoa(String.fromCharCode(...item.elementValue));
+            image.alt = "portrait";
+            image.style.cssText = "max-width:120px;border-radius:6px";
+            value.appendChild(image);
+          } else {
+            value.textContent = "<" + item.elementValue.length + " bytes>";
+          }
+        } else if (item.elementValue !== null && typeof item.elementValue === "object") {
+          value.textContent = JSON.stringify(item.elementValue);
+        } else {
+          value.textContent = String(item.elementValue);
+        }
+        row.appendChild(name); row.appendChild(value); table.appendChild(row);
+      });
+    });
+    view.hidden = false;
+  }
 
   load().catch((e) => status("offerStatus", "Could not load the issuer metadata: " + e.message, false));
 })();

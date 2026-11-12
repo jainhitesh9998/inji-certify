@@ -21,6 +21,8 @@ public class PreAuthCodeData implements Serializable {
     /** The access token subject the offer named, else null (the claims JSON is the subject then). */
     private String subject;
     private String txnCode;
+    /** The surface the offer targeted ({@code oid4vci} or {@code legacy}): the access token is addressed to its endpoint. */
+    private String issuer;
     private long createdAt;
     private long expiresAt;
 }

@@ -79,6 +79,10 @@ public class OAuthAuthorizationServerMetadataService {
             metadata.setAuthorizationEndpoint(base + "/oauth/authorize");
             metadata.setPushedAuthorizationRequestEndpoint(base + "/oauth/par");
             metadata.setRequirePushedAuthorizationRequests(Boolean.TRUE);
+            // OID4VCI 1.0 authorization server metadata: this token endpoint redeems a pre-authorized code with no
+            // transaction code, so an offer can be followed without interacting with the issuer. Only Certify's own AS
+            // publishes it; with eSignet the document is eSignet's own.
+            metadata.setPreAuthorizedGrantAnonymousAccessSupported(Boolean.TRUE);
             if (as.clientAttestation() != null && as.clientAttestation().attesters() != null && !as.clientAttestation().attesters().isEmpty()) {
                 metadata.setTokenEndpointAuthMethodsSupported(java.util.List.of(io.mosip.certify.as.ClientAttestationValidator.AUTH_METHOD));
             }

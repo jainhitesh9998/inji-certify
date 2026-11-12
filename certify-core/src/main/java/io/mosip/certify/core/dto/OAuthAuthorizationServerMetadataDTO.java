@@ -86,4 +86,13 @@ public class OAuthAuthorizationServerMetadataDTO {
      */
     @JsonProperty("require_interactive_authorization_request")
     private Boolean requireInteractiveAuthorizationRequest;
+
+    /**
+     * OID4VCI 1.0 authorization server metadata: the pre-authorized code grant accepts a request without a transaction
+     * code ({@code anonymous}), so a wallet can redeem an offer with no user interaction. Advertised only when Certify
+     * serves the metadata document for its own authorization server; with an external AS (eSignet) that server's own
+     * document is authoritative.
+     */
+    @JsonProperty("pre-authorized_grant_anonymous_access_supported")
+    private Boolean preAuthorizedGrantAnonymousAccessSupported;
 }

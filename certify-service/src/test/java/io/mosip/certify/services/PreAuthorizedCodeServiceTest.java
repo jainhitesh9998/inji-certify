@@ -50,6 +50,12 @@ public class PreAuthorizedCodeServiceTest {
     @Mock
     private Validator validator;
 
+    private io.mosip.certify.oid4vci.Oid4vciProperties oid4vciProperties;
+
+    private io.mosip.certify.oid4vci.Oid4vciIssuerResolver oid4vciIssuers;
+
+    private io.mosip.certify.core.dto.AuthorizationContext authorizationContext;
+
     private PreAuthorizedRequest request;
     private Map<String, Object> issuerMetadata;
     private Map<String, Object> supportedConfigs;
@@ -60,12 +66,28 @@ public class PreAuthorizedCodeServiceTest {
     private PreAuthorizedCodeService preAuthorizedCodeService;
     @Before
     public void setup() throws Exception {
+        oid4vciProperties = new io.mosip.certify.oid4vci.Oid4vciProperties(
+                new io.mosip.certify.oid4vci.Oid4vciProperties.CompatCore(false),
+                new io.mosip.certify.oid4vci.Oid4vciProperties.Notification(java.time.Duration.ofDays(1), java.time.Duration.ofHours(1)),
+                new io.mosip.certify.oid4vci.Oid4vciProperties.Nonce(true),
+                new io.mosip.certify.oid4vci.Oid4vciProperties.Batch(10),
+                new io.mosip.certify.oid4vci.Oid4vciProperties.KeyAttestation(Map.of(), java.time.Duration.ofSeconds(60)),
+                new io.mosip.certify.oid4vci.Oid4vciProperties.DidWebHolders(false, java.time.Duration.ofSeconds(5)),
+                new io.mosip.certify.oid4vci.Oid4vciProperties.Offers("legacy"));
+        authorizationContext = new io.mosip.certify.core.dto.AuthorizationContext();
+        io.mosip.certify.tenancy.TenancyProperties tenancy = mock(io.mosip.certify.tenancy.TenancyProperties.class);
+        oid4vciIssuers = new io.mosip.certify.oid4vci.Oid4vciIssuerResolver(
+                new io.mosip.certify.oid4vci.Oid4vciIssuer("https://issuer.com/oid4vci"),
+                new io.mosip.certify.tenancy.TenantContexts(tenancy));
         preAuthorizedCodeService = new PreAuthorizedCodeService(vciCacheService, credentialRegistry,
                 accessTokenJwtUtil,
                 objectMapper,
                 credentialConfigurationService,
                 credentialConfigRepository,
-                validator
+                validator,
+                oid4vciProperties,
+                oid4vciIssuers,
+                authorizationContext
         );
         ReflectionTestUtils.setField(preAuthorizedCodeService, "issuerIdentifier", "https://issuer.com");
         ReflectionTestUtils.setField(preAuthorizedCodeService, "defaultExpirySeconds", 600);
@@ -534,5 +556,133 @@ public class PreAuthorizedCodeServiceTest {
                 () -> preAuthorizedCodeService.exchangePreAuthorizedCode(tokenRequest));
 
         Assert.assertEquals("tx_code_mismatch", exception.getErrorCode());
+    }
+
+    // ---- the surface an offer targets (M-09, decision D5) ------------------------------------------------------
+
+    @Test
+    public void offerWithoutAnIssuerTargetsTheConfiguredDefault_Legacy() {
+        PreAuthorizedCodeService.CredentialOfferResult result = preAuthorizedCodeService.createCredentialOffer(request);
+
+        Assert.assertEquals("https://issuer.com", capturedOffer().getCredentialIssuer());
+    }
+
+    @Test
+    public void offerWithoutAnIssuerTargetsTheConfiguredDefault_Oid4vci() {
+        PreAuthorizedCodeService service = serviceWithDefaultIssuer("oid4vci");
+
+        PreAuthorizedCodeService.CredentialOfferResult result = service.createCredentialOffer(request);
+
+        Assert.assertEquals("https://issuer.com/oid4vci", capturedOffer().getCredentialIssuer());
+        Assert.assertNotNull(result.deepLink());
+    }
+
+    @Test
+    public void theRequestOverridesTheConfiguredDefault() {
+        request.setIssuer("oid4vci");
+
+        preAuthorizedCodeService.createCredentialOffer(request);
+
+        Assert.assertEquals("https://issuer.com/oid4vci", capturedOffer().getCredentialIssuer());
+    }
+
+    @Test
+    public void anUnknownIssuerIsRefusedBeforeAnythingIsCached() {
+        request.setIssuer("oid5vci");
+
+        InvalidRequestException exception = assertThrows(InvalidRequestException.class,
+                () -> preAuthorizedCodeService.createCredentialOffer(request));
+
+        Assert.assertEquals("invalid_issuer", exception.getErrorCode());
+        verify(vciCacheService, never()).setPreAuthCodeData(anyString(), any(PreAuthCodeData.class));
+    }
+
+    @Test
+    public void anOfferCanBeReturnedByValue() {
+        request.setIssuer("oid4vci");
+        request.setOfferByValue(true);
+
+        PreAuthorizedCodeService.CredentialOfferResult result = preAuthorizedCodeService.createCredentialOffer(request);
+
+        Assert.assertNotNull("the offer document travels in the answer", result.offer());
+        Assert.assertEquals("https://issuer.com/oid4vci", result.offer().getCredentialIssuer());
+        Assert.assertTrue(result.deepLink(), result.deepLink().startsWith("openid-credential-offer://?credential_offer="));
+        Assert.assertFalse(result.deepLink().contains("credential_offer_uri="));
+    }
+
+    @Test
+    public void anOfferByReferenceCarriesNoOfferDocument() {
+        PreAuthorizedCodeService.CredentialOfferResult result = preAuthorizedCodeService.createCredentialOffer(request);
+
+        Assert.assertNull(result.offer());
+        Assert.assertTrue(result.deepLink(), result.deepLink().startsWith("openid-credential-offer://?credential_offer_uri="));
+    }
+
+    @Test
+    public void theTokenForAnOid4vciOfferIsAddressedToTheSurfaceCredentialEndpoint() throws Exception {
+        String preAuthCode = "oid4vci-pre-auth-code";
+        OAuthTokenRequest tokenRequest = new OAuthTokenRequest();
+        tokenRequest.setGrant_type(Constants.PRE_AUTHORIZED_CODE_GRANT_TYPE);
+        tokenRequest.setPre_authorized_code(preAuthCode);
+        when(vciCacheService.getPreAuthCodeData(preAuthCode)).thenReturn(PreAuthCodeData.builder()
+                .credentialConfigurationId(CONFIG_ID)
+                .issuer("oid4vci")
+                .createdAt(System.currentTimeMillis())
+                .expiresAt(System.currentTimeMillis() + 600000)
+                .build());
+        when(vciCacheService.claimPreAuthCode(preAuthCode)).thenReturn(true);
+        when(vciCacheService.setPreAuthTransaction(anyString(), any(PreAuthTransaction.class))).thenReturn(null);
+        when(accessTokenJwtUtil.generateSignedJwt(anyString(), anyString(), anyString(), anyString(), anyString(), anyInt(),
+                org.mockito.ArgumentMatchers.isNull())).thenReturn("test.jwt.token");
+
+        preAuthorizedCodeService.exchangePreAuthorizedCode(tokenRequest);
+
+        verify(accessTokenJwtUtil).generateSignedJwt(anyString(), anyString(), anyString(), anyString(),
+                org.mockito.ArgumentMatchers.eq("https://issuer.com/oid4vci/credential"), anyInt(),
+                org.mockito.ArgumentMatchers.isNull());
+    }
+
+    @Test
+    public void theTokenForALegacyOfferKeepsTheConfiguredAudience() throws Exception {
+        String preAuthCode = "legacy-pre-auth-code";
+        OAuthTokenRequest tokenRequest = new OAuthTokenRequest();
+        tokenRequest.setGrant_type(Constants.PRE_AUTHORIZED_CODE_GRANT_TYPE);
+        tokenRequest.setPre_authorized_code(preAuthCode);
+        when(vciCacheService.getPreAuthCodeData(preAuthCode)).thenReturn(PreAuthCodeData.builder()
+                .credentialConfigurationId(CONFIG_ID)
+                .issuer("legacy")
+                .createdAt(System.currentTimeMillis())
+                .expiresAt(System.currentTimeMillis() + 600000)
+                .build());
+        when(vciCacheService.claimPreAuthCode(preAuthCode)).thenReturn(true);
+        when(vciCacheService.setPreAuthTransaction(anyString(), any(PreAuthTransaction.class))).thenReturn(null);
+        when(accessTokenJwtUtil.generateSignedJwt(anyString(), anyString(), anyString(), anyString(), anyString(), anyInt(),
+                org.mockito.ArgumentMatchers.isNull())).thenReturn("test.jwt.token");
+
+        preAuthorizedCodeService.exchangePreAuthorizedCode(tokenRequest);
+
+        verify(accessTokenJwtUtil).generateSignedJwt(anyString(), anyString(), anyString(), anyString(),
+                org.mockito.ArgumentMatchers.eq("https://oauth.audience.com"), anyInt(),
+                org.mockito.ArgumentMatchers.isNull());
+    }
+
+    private PreAuthorizedCodeService serviceWithDefaultIssuer(String defaultIssuer) {
+        return new PreAuthorizedCodeService(vciCacheService, credentialRegistry, accessTokenJwtUtil, objectMapper,
+                credentialConfigurationService, credentialConfigRepository, validator,
+                new io.mosip.certify.oid4vci.Oid4vciProperties(
+                        new io.mosip.certify.oid4vci.Oid4vciProperties.CompatCore(false),
+                        new io.mosip.certify.oid4vci.Oid4vciProperties.Notification(java.time.Duration.ofDays(1), java.time.Duration.ofHours(1)),
+                        new io.mosip.certify.oid4vci.Oid4vciProperties.Nonce(true),
+                        new io.mosip.certify.oid4vci.Oid4vciProperties.Batch(10),
+                        new io.mosip.certify.oid4vci.Oid4vciProperties.KeyAttestation(Map.of(), java.time.Duration.ofSeconds(60)),
+                        new io.mosip.certify.oid4vci.Oid4vciProperties.DidWebHolders(false, java.time.Duration.ofSeconds(5)),
+                        new io.mosip.certify.oid4vci.Oid4vciProperties.Offers(defaultIssuer)),
+                oid4vciIssuers, authorizationContext);
+    }
+
+    private CredentialOfferResponse capturedOffer() {
+        org.mockito.ArgumentCaptor<CredentialOfferResponse> stored = org.mockito.ArgumentCaptor.forClass(CredentialOfferResponse.class);
+        verify(vciCacheService).setCredentialOffer(anyString(), stored.capture());
+        return stored.getValue();
     }
 }

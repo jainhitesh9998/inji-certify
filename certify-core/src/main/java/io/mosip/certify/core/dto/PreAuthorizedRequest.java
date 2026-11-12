@@ -44,4 +44,22 @@ public class PreAuthorizedRequest {
     @Pattern(regexp = "^[A-Za-z0-9]{4,8}$", message = "Transaction code must be 4-8 alphanumeric characters")
     @JsonProperty("tx_code")
     private String txCode;
+
+    /**
+     * The surface the offer targets: {@code oid4vci} names the OpenID4VCI 1.0 surface's identifier in
+     * {@code credential_issuer} (so the wallet uses {@code /oid4vci/credential}), {@code legacy} keeps the
+     * compatibility identifier. Absent, the deployment's default applies
+     * ({@code certify.protocol.oid4vci-v1.offers.default-issuer}, {@code legacy} unless set).
+     */
+    @Pattern(regexp = "^(oid4vci|legacy)$", message = "issuer must be 'oid4vci' or 'legacy'")
+    @JsonProperty("issuer")
+    private String issuer;
+
+    /**
+     * Return the offer itself ({@code credential_offer}, OpenID4VCI 1.0 section 4.1.1) instead of only a link to it.
+     * The {@code openid-credential-offer://} deep link carries the offer URL-encoded either way. Absent, the offer is
+     * returned by reference, as before.
+     */
+    @JsonProperty("offer_by_value")
+    private Boolean offerByValue;
 }
