@@ -195,6 +195,63 @@ class CredentialConfigurationV2Test {
         configurations.findByTenantIdAndCredentialConfigKeyId("default", id).ifPresent(configurations::delete);
     }
 
+    /**
+     * The v2 save runs the format's element typing rule (D6): an override for a new identifier is accepted and reaches
+     * the CBOR preview with the declared type, while an override that would change a Table 5 element is refused.
+     */
+    @Test
+    void mdocElementTypesOverrideIsValidatedAndTypedOnTheWire() throws Exception {
+        String id = "V2MdlTypedCredential";
+        configurations.findByTenantIdAndCredentialConfigKeyId("default", id).ifPresent(configurations::delete);
+        // the shared H2 database may hold the golden mDL row; this test needs the mDL doctype to itself
+        configurations.findByTenantIdAndCredentialFormatAndDocType("default", "mso_mdoc", "org.iso.18013.5.1.mDL")
+                .ifPresent(configurations::delete);
+        String template = mdocTemplate();
+        int insertion = template.lastIndexOf("]");
+        String extra = ",\n            {\"digestID\": 12, \"elementIdentifier\": \"custom_score\", \"elementValue\": \"${score}\"},"
+                + "\n            {\"digestID\": 13, \"elementIdentifier\": \"custom_text\", \"elementValue\": \"${code}\"}";
+        template = template.substring(0, insertion) + extra + template.substring(insertion);
+
+        Map<String, Object> body = mdocBody(id, template);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> formatConfig = (Map<String, Object>) body.get("formatConfig");
+        formatConfig.put("elementTypes", Map.of("org.iso.18013.5.1", Map.of(
+                "custom_score", "uint", "custom_text", "tstr")));
+        body.put("sampleClaims", Map.of("fullName", "Sample Person", "dateOfBirth", "1999-09-09", "city", "Sample City",
+                "score", "7", "code", "2024-01-01"));
+        MvcResult created = call(post(PATH), body);
+        assertEquals(201, created.getResponse().getStatus(), created.getResponse().getContentAsString());
+
+        MvcResult preview = call(post(PATH + "/" + id + "/preview"),
+                Map.of("claims", Map.of("fullName", "Preview Person", "dateOfBirth", "2000-02-02", "city", "Delhi",
+                        "score", "9", "code", "2024-01-01")));
+        JsonNode previewed = objectMapper.readTree(preview.getResponse().getContentAsString());
+        assertEquals(200, preview.getResponse().getStatus(), previewed.toString());
+        Map<String, com.upokecenter.cbor.CBORObject> items = new LinkedHashMap<>();
+        for (JsonNode encoded : previewed.get("attributes").get("taggedNamespaces").get("org.iso.18013.5.1")) {
+            com.upokecenter.cbor.CBORObject item = com.upokecenter.cbor.CBORObject
+                    .DecodeFromBytes(Base64.getDecoder().decode(encoded.asText()));
+            items.put(item.get("elementIdentifier").AsString(), item);
+        }
+        com.upokecenter.cbor.CBORObject customScore = items.get("custom_score").get("elementValue");
+        assertEquals(0, customScore.EncodeToBytes()[0] >> 5, "custom_score is a CBOR uint (major type 0)");
+        assertEquals(9, customScore.AsInt32());
+        com.upokecenter.cbor.CBORObject customText = items.get("custom_text").get("elementValue");
+        assertEquals(3, customText.EncodeToBytes()[0] >> 5, "custom_text is a CBOR tstr (major type 3)");
+        assertFalse(customText.HasMostOuterTag(1004), "a typed tstr is not guessed to be a full-date");
+
+        // a configuration that changes a Table 5 element is refused at save, not at issuance
+        Map<String, Object> changed = mdocBody("V2MdlChangedTable5", template);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> changedConfig = (Map<String, Object>) changed.get("formatConfig");
+        changedConfig.put("elementTypes", Map.of("org.iso.18013.5.1", Map.of("document_number", "uint")));
+        MvcResult refused = call(post(PATH), changed);
+        assertEquals(400, refused.getResponse().getStatus(), refused.getResponse().getContentAsString());
+        assertTrue(refused.getResponse().getContentAsString().contains("document_number"),
+                refused.getResponse().getContentAsString());
+        configurations.findByTenantIdAndCredentialConfigKeyId("default", id).ifPresent(configurations::delete);
+    }
+
     @Test
     void refusedBodiesAreNotSaved() throws Exception {
         call(post(PATH), body(ID, template(ID)));

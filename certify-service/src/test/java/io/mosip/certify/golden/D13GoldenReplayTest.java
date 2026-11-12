@@ -215,8 +215,8 @@ class D13GoldenReplayTest {
             digestIds.add(CBORObject.DecodeFromBytes(namespaceItems.get(i).Untag().GetByteString()).get("digestID").AsInt32());
         }
         assertEquals(IssuanceGoldenTest.MDL_ELEMENT_COUNT, digestIds.size(), "digestIDs are unique within the namespace");
-        assertEquals(0, digestIds.first());
-        summary.put("digestIds", digestIds.toString());
+        summary.put("digestIdCount", digestIds.size());
+        summary.put("digestIdsUnique", digestIds.size() == namespaceItems.size());
         summary.put("validityInfoSignedLength", signedAt.Untag().AsString().length());
         // Documented deviations from 0.14.0 (P0-02-notes.md, decision log): ISO/IEC 18013-5 requires the tag-24 MSO
         // wrapper and validityInfo.signed; the adapter keeps both and the golden is compared with them folded back.

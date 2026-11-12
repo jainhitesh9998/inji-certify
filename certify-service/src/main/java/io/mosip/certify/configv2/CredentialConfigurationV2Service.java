@@ -221,6 +221,13 @@ public class CredentialConfigurationV2Service {
                 if (doctype == null || doctype.isBlank()) {
                     throw ConfigV2Exception.invalid("formatConfig.doctype is required for mso_mdoc");
                 }
+                try {
+                    // the format validates its own table now, not only in parseConfig: a malformed elementTypes override,
+                    // or one that would change a Table 5 element, must not be saved (ISO/IEC 18013-5 7.2.1, D6)
+                    formatters.require(format).parseConfig(formatConfig);
+                } catch (io.mosip.certify.spi.FormatException e) {
+                    throw ConfigV2Exception.invalid(e.getErrorCode() + ": " + e.getMessage());
+                }
                 configurations.findByTenantIdAndCredentialFormatAndDocType(tenant, format, doctype)
                         .filter(other -> !other.getConfigId().equals(exclude))
                         .ifPresent(other -> { throw conflict("doctype", other); });

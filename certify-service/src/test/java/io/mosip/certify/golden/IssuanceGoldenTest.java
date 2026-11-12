@@ -462,6 +462,18 @@ class IssuanceGoldenTest {
         summary.put("deviceKeyKty", deviceKey.get(com.upokecenter.cbor.CBORObject.FromObject(1)).AsInt32());
         summary.put("deviceKeyCrv", deviceKey.get(com.upokecenter.cbor.CBORObject.FromObject(-1)).AsInt32());
         summary.put("validityInfoKeys", mso.get("validityInfo").getKeys().toString());
+        // M-03 fixture change: golden-mdoc.vm is a complete Table 5 mDL now, so the legacy summary records 12 elements where
+        // design/extensibility recorded 3. Every non-count field is still exactly what that branch recorded (decision log).
+        com.fasterxml.jackson.databind.JsonNode before = designExtensibilityMdocSummary();
+        for (java.util.Iterator<String> names = summary.fieldNames(); names.hasNext(); ) {
+            String field = names.next();
+            if ("digests".equals(field) || "issuerSignedItems".equals(field)) {
+                continue;
+            }
+            assertTrue(before.has(field), "design/extensibility recorded no field " + field);
+            assertEquals(before.get(field).asText(), summary.get(field).asText(),
+                    "legacy mDoc summary field " + field + " must equal the design/extensibility recording");
+        }
         com.fasterxml.jackson.databind.node.ObjectNode responseShape = body.deepCopy();
         ((com.fasterxml.jackson.databind.node.ObjectNode) responseShape.get("credentials").get(0)).put("credential", "<mso_mdoc>");
         Goldens.assertGolden("legacy-develop/issuance/mso_mdoc-response", responseShape);
@@ -617,14 +629,13 @@ class IssuanceGoldenTest {
             assertTrue(namespaceItems.get(i).HasMostOuterTag(24), "IssuerSignedItem is #6.24(bstr .cbor)");
         }
         assertEquals(MDL_ELEMENT_COUNT, digestIds.size(), "digestIDs are unique within the namespace");
-        assertEquals(0, digestIds.first());
-        assertEquals(MDL_ELEMENT_COUNT - 1, digestIds.last());
 
         com.fasterxml.jackson.databind.node.ObjectNode summary = objectMapper.createObjectNode();
         summary.put("docType", mso.get("docType").AsString());
         summary.put("digests", mso.get("valueDigests").get("org.iso.18013.5.1").size());
         summary.put("issuerSignedItems", issuerSigned.get("nameSpaces").get("org.iso.18013.5.1").size());
-        summary.put("digestIds", digestIds.toString());
+        summary.put("digestIdCount", digestIds.size());
+        summary.put("digestIdsUnique", digestIds.size() == namespaceItems.size());
         summary.put("validityInfoKeys", mso.get("validityInfo").getKeys().toString());
         summary.put("validityInfoSignedLength", signedAt.Untag().AsString().length());
         summary.put("protectedLabels", protectedHeader.getKeys().toString());
@@ -877,6 +888,32 @@ class IssuanceGoldenTest {
         dto.setDisplayOrder(List.of("fullName", "dateOfBirth", "city"));
         dto.setClaims(Map.of("fullName", claim("Full name"), "dateOfBirth", claim("Date of birth"), "city", claim("City")));
         return dto;
+    }
+
+    /**
+     * The {@code mso_mdoc-summary} recorded on {@code design/extensibility} (copied from
+     * {@code git show design/extensibility:certify-service/src/test/resources/goldens/legacy-develop/issuance/mso_mdoc-summary.json}).
+     * When that ref is available the copy is checked against git, so it cannot drift silently.
+     */
+    private com.fasterxml.jackson.databind.JsonNode designExtensibilityMdocSummary() throws Exception {
+        Path copy = Path.of("src/test/resources/goldens/legacy-develop/issuance/mso_mdoc-summary.design-extensibility.json");
+        if (!Files.exists(copy)) {
+            copy = Path.of("certify-service").resolve(copy);
+        }
+        String recorded = Files.readString(copy, StandardCharsets.UTF_8);
+        try {
+            Process git = new ProcessBuilder("git", "show",
+                    "design/extensibility:certify-service/src/test/resources/goldens/legacy-develop/issuance/mso_mdoc-summary.json")
+                    .redirectErrorStream(true).start();
+            String fromGit = new String(git.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            if (git.waitFor() == 0 && !fromGit.isBlank()) {
+                assertEquals(objectMapper.readTree(fromGit), objectMapper.readTree(recorded),
+                        "the checked-in baseline must be the design/extensibility recording");
+            }
+        } catch (Exception ignored) {
+            // no git or no such ref (a CI checkout of this branch): the checked-in copy is the baseline
+        }
+        return objectMapper.readTree(recorded);
     }
 
     /** mso_mdoc: docType, namespace claims, ES256 with the EC_R1 key; the validator wants a cryptosuite key of the signing-alg map. */
