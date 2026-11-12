@@ -27,3 +27,4 @@ Live review with comments: https://claude.ai/code/artifact/5cf478f6-018c-4079-88
 - [17. Conformance gaps](17-conformance-gaps.md): what the OpenID Foundation issuer test (1.0 Final/HAIP) needs, what exists, and the order of the missing work.
 - [18. Compatibility validation](18-compatibility-validation.md): every holder key form and issuer DID method 1.0.0-beta.1 accepted, and the test that proves each on both surfaces.
 - [19. Conformance run](19-conformance-run.md): host, properties, credential configuration and plan inputs for the OpenID Foundation issuer test, and how to read a failure.
+- [20. mDL issuer](20-mdl-issuer.md): ISO 18013-5 mDL on the OpenID4VCI 1.0 surface, Annex B IACA/DSC flows, gaps G1-G26 and work packages M-01..M-12.
