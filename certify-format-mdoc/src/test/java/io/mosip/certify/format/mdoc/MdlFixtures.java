@@ -146,7 +146,7 @@ final class MdlFixtures {
         items.add(item("document_number", "DL-0420110149646"));
         items.add(item("portrait", PORTRAIT));
         items.add(item("driving_privileges", List.of(privilege())));
-        items.add(item("un_distinguishing_sign", "IN"));
+        items.add(item("un_distinguishing_sign", "IND"));
         items.add(item("resident_city", "Bengaluru"));
 
         Map<String, Object> namespaces = new LinkedHashMap<>();

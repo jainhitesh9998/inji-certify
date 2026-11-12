@@ -31,6 +31,8 @@ final class MdocConstants {
 
     static final String ERROR_TEMPLATE = "mdoc_template_processing_failed";
     static final String ERROR_SIGNING = "mdoc_signing_failed";
+    /** The signing key's certificate chain cannot sign an mDoc (no {@code x5chain}, dropped intermediates, expired DSC). */
+    static final String ERROR_CHAIN = "certificate_chain_invalid";
     /** The document violates the ISO/IEC 18013-5 data model (7.2.1 Table 5); {@code MdocDataModelValidator} names the rule. */
     static final String ERROR_DATA_MODEL = "mdoc_data_model_invalid";
     /**

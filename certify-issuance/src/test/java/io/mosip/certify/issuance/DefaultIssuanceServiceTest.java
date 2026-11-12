@@ -18,6 +18,7 @@ import io.mosip.certify.spi.CredentialFormatter;
 import io.mosip.certify.spi.DataSourceException;
 import io.mosip.certify.spi.ExternalIssuer;
 import io.mosip.certify.spi.FormatConfig;
+import io.mosip.certify.spi.FormatException;
 import io.mosip.certify.spi.HolderBinding;
 import io.mosip.certify.spi.IssuanceContext;
 import io.mosip.certify.spi.IssuanceListener;
@@ -312,6 +313,36 @@ class DefaultIssuanceServiceTest {
         assertEquals(IssuanceException.ISSUANCE_FAILED, listener.failures.get(0).errorCode());
     }
 
+    /**
+     * A formatter that finds the holder's own key unusable names it {@code invalid_proof} (the mDoc device key, G6), and
+     * the core turns exactly that code into the protocol's {@code invalid_proof}, from build and from sign; any other
+     * format error stays a server-side {@code issuance_failed}.
+     */
+    @Test
+    void aFormatterInvalidProofBecomesInvalidProofAndNoOtherFormatErrorDoes() {
+        formatter.buildFailure = new FormatException(IssuanceException.INVALID_PROOF, "no device key in the proof");
+        IssuanceException fromBuild = assertThrows(IssuanceException.class, () -> service.issue(command("farmer").build()));
+        assertEquals(IssuanceException.INVALID_PROOF, fromBuild.getErrorCode());
+        assertInstanceOf(FormatException.class, fromBuild.getCause());
+        assertEquals(IssuanceException.INVALID_PROOF, listener.failures.get(0).errorCode());
+
+        formatter.buildFailure = null;
+        formatter.signFailure = new FormatException(IssuanceException.INVALID_PROOF, "the device key is not a point");
+        IssuanceException fromSign = assertThrows(IssuanceException.class, () -> service.issue(command("farmer").build()));
+        assertEquals(IssuanceException.INVALID_PROOF, fromSign.getErrorCode());
+
+        for (String code : List.of("mdoc_data_model_invalid", "certificate_chain_invalid", "mdoc_signing_failed")) {
+            formatter.signFailure = new FormatException(code, "not the caller's proof");
+            IssuanceException other = assertThrows(IssuanceException.class, () -> service.issue(command("farmer").build()), code);
+            assertEquals(IssuanceException.ISSUANCE_FAILED, other.getErrorCode(), code + " is not a proof error");
+            assertEquals(code, ((FormatException) other.getCause()).getErrorCode(), "the format's own code is kept as the cause");
+        }
+        formatter.signFailure = null;
+        formatter.buildFailure = new FormatException("mdoc_template_processing_failed", "template broken");
+        assertEquals(IssuanceException.ISSUANCE_FAILED,
+                assertThrows(IssuanceException.class, () -> service.issue(command("farmer").build())).getErrorCode());
+    }
+
     @Test
     void unknownFormatIsUnsupportedFormat() {
         registry.register(new CredentialConfiguration(null, "mdoc", "farmer_vc", "mso_mdoc", null, null, SigningConfig.of(KEY, SignatureAlgorithm.ES256),
@@ -447,6 +478,8 @@ class DefaultIssuanceServiceTest {
         final List<HolderBinding> holders = new ArrayList<>();
         IssuedCredential signed;
         boolean explode;
+        FormatException buildFailure;
+        FormatException signFailure;
 
         public String formatId() { return "vc+jwt"; }
 
@@ -459,6 +492,7 @@ class DefaultIssuanceServiceTest {
         public UnsignedCredential build(ClaimSet claims, CredentialConfiguration configuration, IssuanceContext context, HolderBinding holder) {
             Trace.step("build");
             if (explode) throw new IllegalStateException("boom");
+            if (buildFailure != null) throw buildFailure;
             holders.add(holder);
             Map<String, Object> payload = new LinkedHashMap<>(claims.claims());
             payload.put("sub", holder.value());
@@ -468,6 +502,7 @@ class DefaultIssuanceServiceTest {
 
         public IssuedCredential sign(UnsignedCredential credential, SigningContext signing, IssuanceContext context) {
             Trace.step("sign");
+            if (signFailure != null) throw signFailure;
             String json = toJson(credential.asMap());
             String jws = JwsEnvelope.sign(json, JwsHeaderPolicy.compact("JWT"), signing.key(), signing.signer());
             signed = new IssuedCredential(formatId(), jws, null, credential.attributes());

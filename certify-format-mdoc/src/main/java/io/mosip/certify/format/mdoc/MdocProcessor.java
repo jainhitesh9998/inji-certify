@@ -42,7 +42,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * algorithm the MSO declares (9.1.2.5); {@code digestID} is a random distinct {@code uint} per namespace, drawn from a
  * range much larger than the element count, so a disclosed identifier reveals nothing about the order or the number of
  * elements (9.1.2.5); element values are encoded by the {@link MdocElementTypes} table rather than by guessing (7.2.1),
- * and the {@code YYYY-MM-DD} heuristic applies only to namespaces that have no type table at all.
+ * and the {@code YYYY-MM-DD} heuristic applies only to element values in namespaces that have no type table at all;
+ * element identifiers, namespace names and {@code docType} are always {@code tstr}. An integer beyond {@code long} in
+ * an untyped value stays an integer (uint/nint up to 64 bits, bignum beyond).
  */
 public class MdocProcessor {
 
@@ -71,7 +73,8 @@ public class MdocProcessor {
 
     /**
      * Process templated JSON to create final mDoc structure: validityInfo from the request clock, element values typed
-     * by the namespace's table, and {@code digestID}s assigned as a random permutation per namespace.
+     * by the namespace's table, and {@code digestID}s drawn as random distinct uints in {@code 0..2^31-1} per namespace
+     * (not a permutation of {@code 0..n-1}, so an identifier reveals nothing about the element count or order).
      */
     public Map<String, Object> processTemplatedJson(String templatedJSON, Map<String, Object> templateParams,
                                                     MdocElementTypes elementTypes, Instant now) {
@@ -189,10 +192,11 @@ public class MdocProcessor {
         Optional<MdocElementTypes.Type> type = elementTypes == null ? Optional.empty() : elementTypes.type(namespaceName, identifier);
         if (type.isEmpty()) {
             Object logical = plain(value);
-            // Only a namespace without any type table keeps the pre-M-03 heuristic. In a namespace that has a table an
-            // unlisted (new) identifier is written exactly as the template gives it, never guessed to be a date.
+            // Only a namespace without any type table keeps the pre-M-03 heuristic, and only inside the element's value:
+            // the element identifier, the namespace name and the docType are structural text and never become dates. In a
+            // namespace that has a table an unlisted (new) identifier is written exactly as the template gives it.
             boolean heuristic = elementTypes == null || !elementTypes.hasTable(namespaceName);
-            return new ConvertedValue(logical, heuristic ? null : convertToDataItem(logical));
+            return new ConvertedValue(logical, heuristic ? heuristicItem(logical) : convertToDataItem(logical));
         }
         if (value == null || value.isNull()) {
             throw dataModelError(identifier, "has no value; the signed document must carry one");
@@ -231,6 +235,13 @@ public class MdocProcessor {
                 yield new ConvertedValue(dateTime, taggedItem(MdocConstants.CBOR_TAG_TDATE, dateTime));
             }
             case DRIVING_PRIVILEGES -> new ConvertedValue(drivingPrivileges(identifier, value), encodedDrivingPrivileges(identifier, value));
+            case ARRAY -> {
+                if (!value.isArray()) {
+                    throw dataModelError(identifier, "must be an array, was " + value.getNodeType().toString().toLowerCase(Locale.ROOT));
+                }
+                Object list = plain(value);
+                yield new ConvertedValue(list, convertToDataItem(list)); // typed: its strings stay text, never dates
+            }
         };
     }
 
@@ -506,7 +517,7 @@ public class MdocProcessor {
             Map<Integer, byte[]> digestMap = new HashMap<>();
 
             for (Map<String, Object> element : elements) {
-                // 1) Encode element (IssuerSignedItem) to CBOR, with the typed value pre-built where the table gave one
+                // 1) Encode element (IssuerSignedItem) to CBOR with its pre-built value (typed, or the untyped heuristic)
                 Map<String, Object> wireElement = new LinkedHashMap<>(element);
                 Object typed = wireElement.remove(MdocConstants.WIRE_VALUE);
                 if (typed != null) {
@@ -605,14 +616,6 @@ public class MdocProcessor {
             return obj;
         }
 
-        if (obj instanceof String) {
-            String str = (String) obj;
-            if (isDateOnlyString(str)) {
-                return createCBORTaggedDate(str);
-            }
-            return str;
-        }
-
         if (obj instanceof Map) {
             Map<Object, Object> map = (Map<Object, Object>) obj;
             if (map.containsKey(MdocConstants.__CBOR_TAG)) {
@@ -666,6 +669,9 @@ public class MdocProcessor {
                 return new UnsignedInteger(value);
             }
         }
+        if (obj instanceof java.math.BigInteger big) {
+            return integerItem(big);
+        }
         if (obj instanceof Boolean) {
             return (Boolean) obj ? SimpleValue.TRUE : SimpleValue.FALSE;
         }
@@ -708,6 +714,54 @@ public class MdocProcessor {
     }
 
 
+    private static final java.math.BigInteger UINT64_MAX = java.math.BigInteger.ONE.shiftLeft(64).subtract(java.math.BigInteger.ONE);
+    private static final java.math.BigInteger NINT64_MIN = java.math.BigInteger.ONE.shiftLeft(64).negate();
+
+    /**
+     * An integer beyond {@code long}: a CBOR uint or nint while it fits the 64-bit argument (RFC 8949 3.1, major types 0
+     * and 1 reach {@code 2^64-1} and {@code -2^64}), a bignum beyond that (tag 2 or 3 around the unsigned big-endian
+     * magnitude, without leading zeros; RFC 8949 3.4.3). Never text: a number must stay a number on the wire.
+     */
+    static DataItem integerItem(java.math.BigInteger value) {
+        if (value.signum() >= 0) {
+            if (value.compareTo(UINT64_MAX) <= 0) {
+                return new UnsignedInteger(value);
+            }
+            ByteString bignum = new ByteString(org.bouncycastle.util.BigIntegers.asUnsignedByteArray(value));
+            bignum.setTag(2);
+            return bignum;
+        }
+        if (value.compareTo(NINT64_MIN) >= 0) {
+            return new NegativeInteger(value);
+        }
+        ByteString bignum = new ByteString(org.bouncycastle.util.BigIntegers.asUnsignedByteArray(
+                java.math.BigInteger.ONE.negate().subtract(value))); // tag 3 carries -1 - n
+        bignum.setTag(3);
+        return bignum;
+    }
+
+    /**
+     * The pre-M-03 date heuristic, for the value of an element in a namespace without a type table: a {@code YYYY-MM-DD}
+     * string anywhere inside the value becomes {@code #6.1004}. Map keys stay text, and nothing outside an element value
+     * (identifiers, namespace names, docType) ever reaches this method.
+     */
+    private static DataItem heuristicItem(Object value) {
+        if (value instanceof String text) {
+            return isDateOnlyString(text) ? taggedItem(MdocConstants.CBOR_TAG_FULL_DATE, text) : new UnicodeString(text);
+        }
+        if (value instanceof Map<?, ?> map && !map.containsKey(MdocConstants.__CBOR_TAG)) {
+            co.nstant.in.cbor.model.Map out = new co.nstant.in.cbor.model.Map();
+            map.forEach((key, entry) -> out.put(convertToDataItem(key), heuristicItem(entry)));
+            return out;
+        }
+        if (value instanceof List<?> list) {
+            Array out = new Array();
+            list.forEach(entry -> out.add(heuristicItem(entry)));
+            return out;
+        }
+        return convertToDataItem(value);
+    }
+
     /**
      * Checks if a string represents a date-only value (YYYY-MM-DD)
      */
@@ -718,13 +772,6 @@ public class MdocProcessor {
         } catch (DateTimeParseException e) {
             return false;
         }
-    }
-
-    /**
-     * Creates a CBOR tagged date (tag 1004) for date-only strings
-     */
-    private static Map<String, Object> createCBORTaggedDate(String dateStr) {
-        return taggedMap(MdocConstants.CBOR_TAG_FULL_DATE, dateStr);
     }
 
     /** A pre-built tagged text item: {@code #6.<tag>(tstr)} with no heuristic applied later. */
@@ -743,21 +790,46 @@ public class MdocProcessor {
     }
 
     /**
-     * The MSO's {@code validityInfo} (18013-5 9.1.2.4): {@code signed} and {@code validFrom} are the instant of signing
-     * truncated to seconds, {@code validUntil} is that instant plus the configured validity, capped at the document
-     * signer certificate's {@code notAfter} so the credential never outlives the key that signed it.
+     * The MSO's {@code validityInfo} (18013-5 9.1.2.4) without a document expiry: see
+     * {@link #validityInfo(Instant, Duration, Instant, Instant)}.
      */
     public static Map<String, Object> validityInfo(Instant signedAt, Duration validity, Instant notAfter) {
+        return validityInfo(signedAt, validity, notAfter, null);
+    }
+
+    /**
+     * The MSO's {@code validityInfo} (18013-5 9.1.2.4): {@code signed} and {@code validFrom} are the instant of signing
+     * truncated to seconds; {@code validUntil} is that instant plus the configured validity, capped at the document
+     * signer certificate's {@code notAfter} (the credential never outlives the key that signed it) and at the document's
+     * own expiry (an mDL's {@code expiry_date}), then truncated to seconds. The comparison with {@code signed} is made on
+     * the truncated values, i.e. on what the MSO will say: a {@code validUntil} that encodes equal to {@code signed} is
+     * refused, with the code of the bound that made it so.
+     */
+    public static Map<String, Object> validityInfo(Instant signedAt, Duration validity, Instant notAfter, Instant documentExpiry) {
         Instant signed = (signedAt == null ? Instant.now() : signedAt).truncatedTo(ChronoUnit.SECONDS);
         Instant until = signed.plus(validity == null ? Duration.ofDays(90) : validity);
+        String bound = "validity";
         if (notAfter != null && notAfter.isBefore(until)) {
-            until = notAfter.truncatedTo(ChronoUnit.SECONDS);
+            until = notAfter;
+            bound = "certificate";
         }
+        if (documentExpiry != null && documentExpiry.isBefore(until)) {
+            until = documentExpiry;
+            bound = "expiry";
+        }
+        until = until.truncatedTo(ChronoUnit.SECONDS); // tdate carries whole seconds: compare what will be encoded
         if (!until.isAfter(signed)) {
-            // 9.1.2.4/9.3.3: a document whose validity ends before it is signed can never be valid. This is a certificate
-            // fault, refused here before the generic chain check so the operator sees the DSC that is already expired.
-            throw new FormatException("certificate_chain_invalid", "the document signer certificate expires at " + notAfter
-                    + ", not after the signing instant " + signed + "; the MSO would not be valid");
+            throw switch (bound) {
+                // 9.1.2.4/9.3.3: a document whose validity ends before it is signed can never be valid. This is a
+                // certificate fault, refused here before the generic chain check so the operator sees the DSC.
+                case "certificate" -> new FormatException(MdocConstants.ERROR_CHAIN, "the document signer certificate expires at "
+                        + notAfter + ", which leaves no whole second after the signing instant " + signed
+                        + "; the MSO validUntil would not be after signed (ISO/IEC 18013-5 9.1.2.4)");
+                case "expiry" -> new FormatException(MdocConstants.ERROR_DATA_MODEL, "the document expires at " + documentExpiry
+                        + ", not after the signing instant " + signed + "; an expired document is not issued");
+                default -> new FormatException(MdocConstants.ERROR_SIGNING, "the MSO validity " + validity
+                        + " leaves validUntil equal to signed once truncated to whole seconds (ISO/IEC 18013-5 9.1.2.4)");
+            };
         }
         Map<String, Object> validityInfo = new HashMap<>();
         validityInfo.put(MdocConstants.VALID_FROM, taggedMap(MdocConstants.CBOR_TAG_TDATE, TDATE.format(signed)));

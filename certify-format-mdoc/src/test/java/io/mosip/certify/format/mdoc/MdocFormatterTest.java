@@ -123,6 +123,10 @@ class MdocFormatterTest {
         assertThrows(IllegalArgumentException.class, () -> new MdocProperties("SHA-256", "1.0", Duration.ZERO, null));
         assertThrows(IllegalArgumentException.class, () -> new MdocProperties("SHA-256", "1.0", Duration.ofDays(-1), null));
         assertThrows(IllegalArgumentException.class, () -> new MdocProperties("SHA-256", "1.0", null, 0));
+        // tdates carry whole seconds: anything below one minute is refused at binding, one minute is the floor
+        assertThrows(IllegalArgumentException.class, () -> new MdocProperties("SHA-256", "1.0", Duration.ofMillis(1500), null));
+        assertThrows(IllegalArgumentException.class, () -> new MdocProperties("SHA-256", "1.0", Duration.ofSeconds(59), null));
+        assertEquals(Duration.ofMinutes(1), new MdocProperties("SHA-256", "1.0", Duration.ofMinutes(1), null).validity());
     }
 
     @Test

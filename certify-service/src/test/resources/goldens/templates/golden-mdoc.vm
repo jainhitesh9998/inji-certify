@@ -20,7 +20,7 @@
                 {"vehicle_category_code": "B", "issue_date": "2020-01-01", "expiry_date": "2030-01-01",
                  "codes": [{"code": "01", "sign": "IN", "value": "B"}]}
             ]},
-            {"digestID": 10, "elementIdentifier": "un_distinguishing_sign", "elementValue": "IN"},
+            {"digestID": 10, "elementIdentifier": "un_distinguishing_sign", "elementValue": "IND"},
             {"digestID": 11, "elementIdentifier": "resident_city", "elementValue": "${city}"}
         ]
     }

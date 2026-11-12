@@ -225,24 +225,92 @@ class MdocWireTest {
         }
     }
 
-    @Test
-    void portraitMustBeADecodableImage() {
-        // a JPEG header with no image behind it is refused
-        FormatException fake = assertThrows(FormatException.class, () -> formatter().build(
-                ClaimSet.of(MdlFixtures.with("portrait", Base64.getEncoder().encodeToString(
-                        new byte[] {(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, 0x00, 0x01, 0x02, 0x03}))),
+    /** Builds an mDL whose portrait is {@code portrait} and returns the refusal. */
+    private FormatException refusedPortrait(byte[] portrait) {
+        return assertThrows(FormatException.class, () -> formatter().build(
+                ClaimSet.of(MdlFixtures.with("portrait", Base64.getEncoder().encodeToString(portrait))),
                 MdlFixtures.configuration(formatter()), MdlFixtures.context(), MdlFixtures.holder()));
-        assertEquals("mdoc_data_model_invalid", fake.getErrorCode());
-        assertTrue(fake.getMessage().contains("decode"), fake.getMessage());
+    }
 
-        // a JP2 signature box followed by ftyp is accepted (ImageIO has no JP2 reader by default)
+    @Test
+    void portraitMustBeACompleteDecodableJpeg() {
+        // a JPEG header with no image behind it is refused
+        FormatException fake = refusedPortrait(new byte[] {(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, 0x00, 0x01, 0x02, 0x03});
+        assertEquals("mdoc_data_model_invalid", fake.getErrorCode());
+
+        // the first half of a real JPEG: no EOI
+        byte[] half = java.util.Arrays.copyOf(MdlFixtures.JPEG, MdlFixtures.JPEG.length / 2);
+        FormatException truncated = refusedPortrait(half);
+        assertEquals("mdoc_data_model_invalid", truncated.getErrorCode());
+        assertTrue(truncated.getMessage().contains("EOI"), truncated.getMessage());
+
+        // the same half with an EOI appended: ImageIO would decode it with grey padding; its warning refuses it
+        byte[] halfWithEoi = java.util.Arrays.copyOf(half, half.length + 2);
+        halfWithEoi[half.length] = (byte) 0xFF;
+        halfWithEoi[half.length + 1] = (byte) 0xD9;
+        FormatException corrupt = refusedPortrait(halfWithEoi);
+        assertEquals("mdoc_data_model_invalid", corrupt.getErrorCode());
+        assertTrue(corrupt.getMessage().contains("decode cleanly"), corrupt.getMessage());
+
+        // a complete JPEG without its last two bytes (the EOI marker)
+        FormatException noEoi = refusedPortrait(java.util.Arrays.copyOf(MdlFixtures.JPEG, MdlFixtures.JPEG.length - 2));
+        assertEquals("mdoc_data_model_invalid", noEoi.getErrorCode());
+        assertTrue(noEoi.getMessage().contains("EOI"), noEoi.getMessage());
+
+        // JPEG 2000 is refused: this issuer issues JPEG portraits only (decision log 2026-11-13)
+        FormatException codestream = refusedPortrait(new byte[] {(byte) 0xFF, 0x4F, (byte) 0xFF, 0x51});
+        assertEquals("mdoc_data_model_invalid", codestream.getErrorCode());
+        assertTrue(codestream.getMessage().contains("JPEG"), codestream.getMessage());
         byte[] jp2 = new byte[32];
         byte[] signature = {0x00, 0x00, 0x00, 0x0C, 0x6A, 0x50, 0x20, 0x20, 0x0D, 0x0A, (byte) 0x87, 0x0A};
         System.arraycopy(signature, 0, jp2, 0, signature.length);
         byte[] ftyp = {0x00, 0x00, 0x00, 0x14, 0x66, 0x74, 0x79, 0x70, 0x6A, 0x70, 0x32, 0x20};
         System.arraycopy(ftyp, 0, jp2, signature.length, ftyp.length);
-        formatter().build(ClaimSet.of(MdlFixtures.with("portrait", Base64.getEncoder().encodeToString(jp2))),
-                MdlFixtures.configuration(formatter()), MdlFixtures.context(), MdlFixtures.holder());
+        assertEquals("mdoc_data_model_invalid", refusedPortrait(jp2).getErrorCode(), "a JP2 file is refused too");
+
+        // a few hundred bytes declaring 20000x20000 pixels: refused from the header, before any pixel is decoded
+        byte[] huge = hugeDeclaredJpeg();
+        assertTrue(huge.length < 1024, "the header alone: " + huge.length + " bytes");
+        FormatException dimensions = refusedPortrait(huge);
+        assertEquals("mdoc_data_model_invalid", dimensions.getErrorCode());
+        assertTrue(dimensions.getMessage().contains("20000x20000"), dimensions.getMessage());
+
+        // more than 1 MiB is refused before anything else is read
+        byte[] large = new byte[MdocDataModelValidator.PORTRAIT_MAX_BYTES + 1];
+        System.arraycopy(MdlFixtures.JPEG, 0, large, 0, MdlFixtures.JPEG.length);
+        large[large.length - 2] = (byte) 0xFF;
+        large[large.length - 1] = (byte) 0xD9;
+        FormatException oversized = refusedPortrait(large);
+        assertEquals("mdoc_data_model_invalid", oversized.getErrorCode());
+        assertTrue(oversized.getMessage().contains("bytes"), oversized.getMessage());
+    }
+
+    /**
+     * The fixture JPEG's headers up to the end of the SOS header with SOF0 rewritten to 20000x20000, then EOI: a file of
+     * about 630 bytes whose decoder would allocate 400 million pixels.
+     */
+    private static byte[] hugeDeclaredJpeg() {
+        byte[] jpeg = MdlFixtures.JPEG;
+        int sof = -1;
+        int sos = -1;
+        for (int i = 0; i < jpeg.length - 1; i++) {
+            if ((jpeg[i] & 0xFF) == 0xFF && (jpeg[i + 1] & 0xFF) == 0xC0 && sof < 0) {
+                sof = i;
+            }
+            if ((jpeg[i] & 0xFF) == 0xFF && (jpeg[i + 1] & 0xFF) == 0xDA && sos < 0) {
+                sos = i;
+            }
+        }
+        assertTrue(sof > 0 && sos > sof, "the fixture is a baseline JPEG with SOF0 before SOS");
+        int sosLength = ((jpeg[sos + 2] & 0xFF) << 8) | (jpeg[sos + 3] & 0xFF);
+        byte[] header = java.util.Arrays.copyOf(jpeg, sos + 2 + sosLength + 2);
+        header[sof + 5] = 0x4E; // height 0x4E20 = 20000
+        header[sof + 6] = 0x20;
+        header[sof + 7] = 0x4E; // width 0x4E20 = 20000
+        header[sof + 8] = 0x20;
+        header[header.length - 2] = (byte) 0xFF;
+        header[header.length - 1] = (byte) 0xD9;
+        return header;
     }
 
     @Test
@@ -450,8 +518,11 @@ class MdocWireTest {
                         .encodeToString("{\"kty\":\"EC\",\"crv\":\"secp256k1\"}".getBytes()), "jwt")));
         assertEquals("invalid_proof", secp256k1.getErrorCode());
 
-        // an EC point that is not on the curve is refused, not encoded as a COSE_Key
-        String offCurve = "{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\",\"y\":\"AQ\"}";
+        // an EC point that is not on the curve (full-width coordinates, y = 1) is refused, not encoded as a COSE_Key
+        byte[] yOne = new byte[32];
+        yOne[31] = 1;
+        String offCurve = "{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\",\"y\":\""
+                + Base64.getUrlEncoder().withoutPadding().encodeToString(yOne) + "\"}";
         FormatException point = assertThrows(FormatException.class, () -> formatter().build(ClaimSet.of(MdlFixtures.mdl()),
                 MdlFixtures.configuration(formatter()), MdlFixtures.context(),
                 HolderBinding.did("did:jwk:" + Base64.getUrlEncoder().withoutPadding().encodeToString(offCurve.getBytes()), "jwt")));
@@ -558,5 +629,260 @@ class MdocWireTest {
                 Map.of("docType", MdlFixtures.MDL_DOCTYPE, "elementTypes", Map.of("org.example.custom", Map.of("photo", "jpeg")))));
         assertEquals(MdocConstants.ERROR_TEMPLATE, unknown.getErrorCode());
         assertTrue(unknown.getMessage().contains("jpeg"), unknown.getMessage());
+    }
+
+    private static SigningContext withChainInclusion(io.mosip.certify.signing.SigningKey key,
+                                                     io.mosip.certify.signing.JwsHeaderPolicy.ChainInclusion inclusion) {
+        return new SigningContext(new io.mosip.certify.spi.SigningConfig(key.ref(), key.algorithm(), null, null,
+                new io.mosip.certify.signing.CoseHeaderPolicy(inclusion, null, false), null), key, MdlFixtures.KEYS);
+    }
+
+    private static io.mosip.certify.signing.SigningKey withChain(io.mosip.certify.signing.SigningKey key,
+                                                                 io.mosip.certify.signing.CertificateChain chain) {
+        io.mosip.certify.signing.PublicKeyDescriptor d = key.descriptor();
+        return new io.mosip.certify.signing.SigningKey(key.ref(), new io.mosip.certify.signing.PublicKeyDescriptor(d.kid(),
+                d.algorithm(), d.publicKey(), chain, d.notBefore(), d.notAfter(), d.purpose()), key.providerHandle());
+    }
+
+    @Test
+    void theIssuerAuthAlwaysCarriesTheDocumentSignerCertificate() {
+        MdocFormatter formatter = formatter();
+        UnsignedCredential unsigned = formatter.build(ClaimSet.of(MdlFixtures.mdl()), MdlFixtures.configuration(formatter),
+                MdlFixtures.context(), MdlFixtures.holder());
+
+        // 9.1.2.4: x5chain is required in the IssuerAuth unprotected header, so "none" cannot sign
+        FormatException none = assertThrows(FormatException.class, () -> formatter.sign(unsigned,
+                withChainInclusion(MdlFixtures.dsc(), io.mosip.certify.signing.JwsHeaderPolicy.ChainInclusion.NONE), MdlFixtures.context()));
+        assertEquals("certificate_chain_invalid", none.getErrorCode());
+        assertTrue(none.getMessage().contains("x5chain"), none.getMessage());
+
+        // a key without any certificate cannot sign an mDoc, whatever the configuration says
+        io.mosip.certify.signing.SigningKey chainless = withChain(MdlFixtures.dsc(), io.mosip.certify.signing.CertificateChain.EMPTY);
+        FormatException empty = assertThrows(FormatException.class,
+                () -> formatter.sign(unsigned, MdlFixtures.signing(chainless), MdlFixtures.context()));
+        assertEquals("certificate_chain_invalid", empty.getErrorCode());
+
+        // "leaf" would drop an intermediate between the DSC and the IACA: no verifier could build the path
+        io.mosip.certify.signing.SigningKey chained = MdlFixtures.dscWithIaca();
+        io.mosip.certify.signing.CertificateChain threeDeep = new io.mosip.certify.signing.CertificateChain(List.of(
+                chained.chain().leaf().orElseThrow(), MdlFixtures.dsc().chain().leaf().orElseThrow(), chained.chain().root().orElseThrow()));
+        FormatException intermediates = assertThrows(FormatException.class, () -> formatter.sign(unsigned,
+                withChainInclusion(withChain(chained, threeDeep), io.mosip.certify.signing.JwsHeaderPolicy.ChainInclusion.LEAF),
+                MdlFixtures.context()));
+        assertEquals("certificate_chain_invalid", intermediates.getErrorCode());
+        assertTrue(intermediates.getMessage().contains("intermediate"), intermediates.getMessage());
+
+        // "leaf" over [DSC, IACA] drops only the anchor: the DSC travels alone, as a single bstr (RFC 9360)
+        IssuedCredential leaf = formatter.sign(unsigned,
+                withChainInclusion(chained, io.mosip.certify.signing.JwsHeaderPolicy.ChainInclusion.LEAF), MdlFixtures.context());
+        CBORObject x5chain = issuerSigned((String) leaf.credential()).get("issuerAuth").get(1).get(CBORObject.FromObject(33));
+        assertEquals(CBORType.ByteString, x5chain.getType());
+    }
+
+    @Test
+    void validUntilIsComparedAsItWillBeEncoded() {
+        // signed 10:00:00.700 encodes as 10:00:00; a DSC ending at 10:00:00.900 would encode validUntil 10:00:00 too
+        Instant signedAt = Instant.parse("2026-01-01T10:00:00.700Z");
+        FormatException subSecond = assertThrows(FormatException.class,
+                () -> MdocProcessor.validityInfo(signedAt, Duration.ofDays(90), Instant.parse("2026-01-01T10:00:00.900Z")));
+        assertEquals("certificate_chain_invalid", subSecond.getErrorCode());
+        // a span shorter than a second is refused even without a cap (the property binding already refuses < 1 minute)
+        FormatException shortSpan = assertThrows(FormatException.class,
+                () -> MdocProcessor.validityInfo(signedAt, Duration.ofMillis(500), null));
+        assertEquals(MdocConstants.ERROR_SIGNING, shortSpan.getErrorCode());
+        // a DSC ending 1.5 s after the truncated signing instant leaves exactly one whole second
+        Map<String, Object> validity = MdocProcessor.validityInfo(signedAt, Duration.ofDays(90), Instant.parse("2026-01-01T10:00:01.500Z"));
+        assertEquals("2026-01-01T10:00:01Z", ((Map<?, ?>) validity.get("validUntil")).get(MdocConstants.__CBOR_VALUE));
+        assertEquals("2026-01-01T10:00:00Z", ((Map<?, ?>) validity.get("signed")).get(MdocConstants.__CBOR_VALUE));
+    }
+
+    @Test
+    void anExpiredMdlIsRefusedAndTheMsoNeverOutlivesTheDocument() {
+        String yesterday = java.time.LocalDate.ofInstant(MdlFixtures.NOW, java.time.ZoneOffset.UTC).minusDays(1).toString();
+        FormatException expired = assertThrows(FormatException.class, () -> formatter().build(
+                ClaimSet.of(MdlFixtures.with("expiry_date", yesterday)), MdlFixtures.configuration(formatter()),
+                MdlFixtures.context(), MdlFixtures.holder()));
+        assertEquals("mdoc_data_model_invalid", expired.getErrorCode());
+        assertTrue(expired.getMessage().contains("expiry_date"), expired.getMessage());
+
+        // expiry in ten days with P90D configured: validUntil is the start of the expiry day, not signed + 90 days
+        java.time.LocalDate expiryDay = java.time.LocalDate.ofInstant(MdlFixtures.NOW, java.time.ZoneOffset.UTC).plusDays(10);
+        CBORObject validityInfo = mso(issuerSigned(issue(MdlFixtures.with("expiry_date", expiryDay.toString())))).get("validityInfo");
+        assertEquals(expiryDay + "T00:00:00Z", validityInfo.get("validUntil").Untag().AsString());
+
+        // a tdate expiry caps at that instant
+        String expiryInstant = MdlFixtures.tdate(MdlFixtures.NOW.plus(Duration.ofDays(3)));
+        CBORObject capped = mso(issuerSigned(issue(MdlFixtures.with("expiry_date", expiryInstant)))).get("validityInfo");
+        assertEquals(expiryInstant, capped.get("validUntil").Untag().AsString());
+    }
+
+    @Test
+    void structuralStringsAreNeverDates() {
+        // docType, namespace name and element identifier all look like YYYY-MM-DD; only the untyped value is a date
+        MdocFormatter formatter = formatter();
+        Map<String, Object> document = new LinkedHashMap<>();
+        document.put("docType", "2024-01-01");
+        document.put("nameSpaces", Map.of("2024-01-01", List.of(MdlFixtures.item("2024-01-01", "2020-05-05"))));
+        UnsignedCredential unsigned = formatter.build(ClaimSet.of(document), MdlFixtures.configuration(formatter, "2024-01-01"),
+                MdlFixtures.context(), MdlFixtures.holder());
+        IssuedCredential issued = formatter.sign(unsigned, MdlFixtures.signing(MdlFixtures.dsc()), MdlFixtures.context());
+        CBORObject issuerSigned = issuerSigned((String) issued.credential());
+
+        for (CBORObject namespace : issuerSigned.get("nameSpaces").getKeys()) {
+            assertEquals(CBORType.TextString, namespace.getType());
+            assertFalse(namespace.isTagged(), "a namespace name is a tstr, never #6.1004");
+        }
+        CBORObject item = CBORObject.DecodeFromBytes(issuerSigned.get("nameSpaces").get("2024-01-01").get(0).Untag().GetByteString());
+        assertEquals(CBORType.TextString, item.get("elementIdentifier").getType());
+        assertFalse(item.get("elementIdentifier").isTagged(), "an element identifier is a tstr, never #6.1004");
+        assertTrue(item.get("elementValue").HasMostOuterTag(1004), "the untyped value keeps the pre-M-03 heuristic");
+
+        CBORObject mso = mso(issuerSigned);
+        assertEquals(CBORType.TextString, mso.get("docType").getType());
+        assertFalse(mso.get("docType").isTagged(), "docType is a tstr, never #6.1004");
+        for (CBORObject namespace : mso.get("valueDigests").getKeys()) {
+            assertFalse(namespace.isTagged(), "a valueDigests namespace is a tstr");
+        }
+        assertEquals("2024-01-01", issued.attributes().get("docType"));
+    }
+
+    @Test
+    void unDistinguishingSignAndJurisdictionHaveTheirShapes() {
+        for (String sign : new String[] {"in", "INDI", "I1", ""}) {
+            FormatException e = assertThrows(FormatException.class, () -> formatter().build(
+                    ClaimSet.of(MdlFixtures.with("un_distinguishing_sign", sign)), MdlFixtures.configuration(formatter()),
+                    MdlFixtures.context(), MdlFixtures.holder()), sign);
+            assertEquals("mdoc_data_model_invalid", e.getErrorCode(), sign);
+        }
+        for (String jurisdiction : new String[] {"US-CA", "INKA", "IN-KARN", "in-ka"}) {
+            FormatException e = assertThrows(FormatException.class, () -> formatter().build(
+                    ClaimSet.of(MdlFixtures.with("issuing_jurisdiction", jurisdiction)), MdlFixtures.configuration(formatter()),
+                    MdlFixtures.context(), MdlFixtures.holder()), jurisdiction);
+            assertEquals("mdoc_data_model_invalid", e.getErrorCode(), jurisdiction);
+        }
+        Map<String, CBORObject> values = valuesByIdentifier(issuerSigned(issue(MdlFixtures.with("issuing_jurisdiction", "IN-KA"))),
+                MdlFixtures.MDL_NAMESPACE);
+        assertEquals("IN-KA", values.get("issuing_jurisdiction").AsString());
+        assertEquals("IND", values.get("un_distinguishing_sign").AsString());
+    }
+
+    @Test
+    void anArrayTypeIsAPlainArrayAndDrivingPrivilegesIsNamed() {
+        assertEquals(MdocElementTypes.Type.ARRAY, MdocElementTypes.Type.parse("array").orElseThrow(),
+                "array is a plain CBOR array, not an alias for driving_privileges");
+        assertEquals(MdocElementTypes.Type.DRIVING_PRIVILEGES, MdocElementTypes.Type.parse("driving_privileges").orElseThrow());
+
+        Map<String, Object> document = MdlFixtures.mdl();
+        List<Map<String, Object>> custom = new ArrayList<>();
+        custom.add(MdlFixtures.item("tags", List.of("2024-01-01", "plain")));
+        custom.add(MdlFixtures.item("privileges", List.of(MdlFixtures.privilege())));
+        ((Map<String, Object>) document.get("nameSpaces")).put("org.example.custom", custom);
+        Map<String, Object> config = Map.of("docType", MdlFixtures.MDL_DOCTYPE,
+                "elementTypes", Map.of("org.example.custom", Map.of("tags", "array", "privileges", "driving_privileges")));
+        MdocFormatter formatter = formatter();
+        UnsignedCredential unsigned = formatter.build(ClaimSet.of(document), MdlFixtures.configuration(formatter, config),
+                MdlFixtures.context(), MdlFixtures.holder());
+        IssuedCredential issued = formatter.sign(unsigned, MdlFixtures.signing(MdlFixtures.dsc()), MdlFixtures.context());
+        Map<String, CBORObject> values = valuesByIdentifier(issuerSigned((String) issued.credential()), "org.example.custom");
+        assertEquals(CBORType.Array, values.get("tags").getType());
+        assertEquals(CBORType.TextString, values.get("tags").get(0).getType());
+        assertFalse(values.get("tags").get(0).isTagged(), "a typed array's strings stay text");
+        assertEquals(1004, values.get("privileges").get(0).get("issue_date").getMostOuterTag().ToInt32Checked());
+
+        Map<String, Object> notAnArray = MdlFixtures.mdl();
+        ((Map<String, Object>) notAnArray.get("nameSpaces")).put("org.example.custom", List.of(MdlFixtures.item("tags", "one")));
+        FormatException refused = assertThrows(FormatException.class, () -> formatter.build(ClaimSet.of(notAnArray),
+                MdlFixtures.configuration(formatter, config), MdlFixtures.context(), MdlFixtures.holder()));
+        assertEquals("mdoc_data_model_invalid", refused.getErrorCode());
+    }
+
+    @Test
+    void largeIntegersStayIntegersOnTheWire() {
+        java.math.BigInteger two64 = java.math.BigInteger.ONE.shiftLeft(64);
+        Map<String, Object> document = MdlFixtures.mdl();
+        List<Map<String, Object>> custom = new ArrayList<>();
+        custom.add(MdlFixtures.item("uint64_max", two64.subtract(java.math.BigInteger.ONE)));
+        custom.add(MdlFixtures.item("two_to_64", two64));
+        custom.add(MdlFixtures.item("nint64_min", two64.negate()));
+        custom.add(MdlFixtures.item("below_nint64", two64.negate().subtract(java.math.BigInteger.ONE)));
+        ((Map<String, Object>) document.get("nameSpaces")).put("org.example.custom", custom);
+        // an extension identifier in the typed mDL namespace: untyped element, same rule
+        MdlFixtures.items(document, MdlFixtures.MDL_NAMESPACE).add(MdlFixtures.item("custom_big", two64));
+
+        CBORObject issuerSigned = issuerSigned(issue(document));
+        Map<String, byte[]> untyped = itemBytes(issuerSigned, "org.example.custom");
+        byte[] ff8 = {(byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF};
+        byte[] bignumTwo64 = {0x49, 0x01, 0, 0, 0, 0, 0, 0, 0, 0};
+        assertContains(untyped.get("uint64_max"), concat(new byte[] {0x1B}, ff8), "2^64-1 is a 64-bit uint (major type 0)");
+        assertContains(untyped.get("two_to_64"), concat(new byte[] {(byte) 0xC2}, bignumTwo64), "2^64 is a tag-2 bignum");
+        assertContains(untyped.get("nint64_min"), concat(new byte[] {0x3B}, ff8), "-2^64 is a 64-bit nint (major type 1)");
+        assertContains(untyped.get("below_nint64"), concat(new byte[] {(byte) 0xC3}, bignumTwo64), "-2^64-1 is a tag-3 bignum");
+        assertContains(itemBytes(issuerSigned, MdlFixtures.MDL_NAMESPACE).get("custom_big"),
+                concat(new byte[] {(byte) 0xC2}, bignumTwo64), "an untyped element of a typed namespace follows the same rule");
+        for (byte[] item : untyped.values()) {
+            assertFalse(new String(item, java.nio.charset.StandardCharsets.ISO_8859_1).contains("18446744073709551"),
+                    "never the decimal text of the number");
+        }
+    }
+
+    @Test
+    void invalidRawHolderKeysAreRefusedNotRepaired() {
+        // an Ed25519 x that is not a point (y = 2 does not decode) and the small-order identity are refused
+        byte[] notAPoint = new byte[32];
+        notAPoint[0] = 2;
+        byte[] identity = new byte[32];
+        identity[0] = 1;
+        for (byte[] x : List.of(notAPoint, identity)) {
+            String jwk = "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"" + Base64.getUrlEncoder().withoutPadding().encodeToString(x) + "\"}";
+            FormatException e = assertThrows(FormatException.class, () -> MdocCoseKey.fromHolder(jwk, MAPPER));
+            assertEquals("invalid_proof", e.getErrorCode());
+            assertTrue(e.getMessage().contains("Ed25519"), e.getMessage());
+        }
+        // the same check applies to an Ed25519 did:key
+        byte[] multicodec = new byte[34];
+        multicodec[0] = (byte) 0xed;
+        multicodec[1] = 0x01;
+        System.arraycopy(notAPoint, 0, multicodec, 2, 32);
+        assertEquals("invalid_proof", assertThrows(FormatException.class, () -> MdocCoseKey.fromHolder(
+                "did:key:" + Multibase.encode(Multibase.Base.Base58BTC, multicodec), MAPPER)).getErrorCode());
+
+        // RFC 7518 6.2.1.2: a 31-byte P-256 x is refused, not left-padded into another key
+        String shortX = "{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"" + Base64.getUrlEncoder().withoutPadding().encodeToString(
+                java.util.Arrays.copyOfRange(Base64.getUrlDecoder().decode("f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU"), 1, 32))
+                + "\",\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"}";
+        FormatException shortCoordinate = assertThrows(FormatException.class, () -> MdocCoseKey.fromHolder(shortX, MAPPER));
+        assertEquals("invalid_proof", shortCoordinate.getErrorCode());
+        assertTrue(shortCoordinate.getMessage().contains("exactly 32"), shortCoordinate.getMessage());
+    }
+
+    /** {@code elementIdentifier -> the encoded IssuerSignedItem} of a namespace, exactly as the digest covers it. */
+    private static Map<String, byte[]> itemBytes(CBORObject issuerSigned, String namespace) {
+        Map<String, byte[]> out = new LinkedHashMap<>();
+        CBORObject array = issuerSigned.get("nameSpaces").get(namespace);
+        for (int i = 0; i < array.size(); i++) {
+            byte[] encoded = array.get(i).Untag().GetByteString();
+            out.put(CBORObject.DecodeFromBytes(encoded).get("elementIdentifier").AsString(), encoded);
+        }
+        return out;
+    }
+
+    private static byte[] concat(byte[] first, byte[] second) {
+        byte[] out = java.util.Arrays.copyOf(first, first.length + second.length);
+        System.arraycopy(second, 0, out, first.length, second.length);
+        return out;
+    }
+
+    private static void assertContains(byte[] haystack, byte[] needle, String message) {
+        outer:
+        for (int i = 0; i + needle.length <= haystack.length; i++) {
+            for (int j = 0; j < needle.length; j++) {
+                if (haystack[i + j] != needle[j]) {
+                    continue outer;
+                }
+            }
+            return;
+        }
+        throw new AssertionError(message + ": " + java.util.HexFormat.of().formatHex(needle) + " not in "
+                + java.util.HexFormat.of().formatHex(haystack));
     }
 }

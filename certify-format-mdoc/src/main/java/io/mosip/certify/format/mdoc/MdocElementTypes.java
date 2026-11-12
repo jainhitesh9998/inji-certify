@@ -19,17 +19,20 @@ import java.util.Set;
  */
 public final class MdocElementTypes {
 
-    /** The CBOR types of Table 5. */
+    /**
+     * The CBOR types of Table 5, plus {@code ARRAY} for configured elements: a plain CBOR array of the template's values
+     * (strings stay text). {@code DRIVING_PRIVILEGES} is the Table 5 structure and is only named explicitly.
+     */
     public enum Type {
         TSTR, UINT, BOOL, BSTR, FULL_DATE, TDATE, /** {@code full-date} or {@code tdate}, chosen by the value's shape (Table 5). */
-        FULL_DATE_OR_TDATE, DRIVING_PRIVILEGES;
+        FULL_DATE_OR_TDATE, DRIVING_PRIVILEGES, ARRAY;
 
         static Optional<Type> parse(String value) {
             if (value == null) {
                 return Optional.empty();
             }
             String normalized = value.trim().toUpperCase(Locale.ROOT).replace('-', '_').replace(" ", "_");
-            if ("ARRAY".equals(normalized) || "DRIVINGPRIVILEGES".equals(normalized)) {
+            if ("DRIVINGPRIVILEGES".equals(normalized)) {
                 return Optional.of(DRIVING_PRIVILEGES);
             }
             if ("DATE_OR_TDATE".equals(normalized) || "FULL_DATE_OR_TDATE".equals(normalized)
@@ -104,7 +107,7 @@ public final class MdocElementTypes {
                 Type type = Type.parse(element.getValue() == null ? null : String.valueOf(element.getValue()))
                         .orElseThrow(() -> new FormatException(MdocConstants.ERROR_TEMPLATE,
                                 MdocConstants.ELEMENT_TYPES + "." + namespace.getKey() + "." + element.getKey() + " is not a known type: "
-                                        + element.getValue() + " (expected one of tstr, uint, bool, bstr, full-date, tdate, date_or_tdate, driving_privileges)"));
+                                        + element.getValue() + " (expected one of tstr, uint, bool, bstr, full-date, tdate, date_or_tdate, driving_privileges, array)"));
                 String identifier = String.valueOf(element.getKey());
                 Optional<Type> builtIn = builtInType(String.valueOf(namespace.getKey()), identifier);
                 if (MDL_DOCTYPE.equals(docType) && builtIn.isPresent() && builtIn.get() != type) {

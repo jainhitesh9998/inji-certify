@@ -87,6 +87,18 @@ OpenID4VCI 1.0 (section 12.2.2) forms the metadata URL of a Credential Issuer Id
 ## Proof `iss` in the pre-authorized code flow
 
 A `jwt` proof presented with a token from the anonymous pre-authorized code flow may carry `iss` equal to the holder's own DID (the `did:jwk` of the proof key, or its `kid` without the fragment), which Inji Wallet sends to issuers with a nonce endpoint; OpenID4VCI 1.0 asks wallets to omit `iss` there, and the value names nothing the signature does not prove. A client_id, when known, must still match `iss`; any other value is still refused. The compose stack's seeded `FarmerCredential` now advertises EdDSA next to RS256, PS256 and ES256, as the deployment default does, so Inji Wallet's Ed25519 proofs are accepted there.
+## mDoc output on the draft-13 and compatibility surfaces follows ISO/IEC 18013-5
+
+The `mso_mdoc` formatter is shared by every surface (decision D1 of `docs/design/20-mdl-issuer.md`), so credentials from the draft-13 endpoints (`/issuance/credential` with the 0.14.0 body, `/issuance/vd12/credential`, `/issuance/vd11/credential`) and the compatibility surface change on the wire:
+
+- `validityInfo` timestamps are `tdate` (`#6.0`) strings with whole seconds only (`2026-11-13T10:15:30Z`), never fractional seconds (9.1.2.4).
+- `digestID`s are random distinct unsigned integers in `0..2^31-1` per namespace; the template's `digestID` values are ignored (9.1.2.5). Verifiers must look items up by the identifier they carry, not by position.
+- The IssuerAuth `x5chain` carries the document signer certificate and its intermediates, never the self-signed IACA (HAIP); a configuration whose key has no certificate chain, or with `signing.x5c` `none` (also refused at save on the v2 API), or `leaf` with intermediates, now fails with `certificate_chain_invalid` instead of issuing an mDoc without `x5chain`.
+- Element values are typed by ISO/IEC 18013-5 Table 5 for namespace `org.iso.18013.5.1` (`portrait` and the biometric templates are `bstr` from base64, `birth_date` `#6.1004`, `issue_date`/`expiry_date` `full-date` or `tdate`, `driving_privileges` an array of maps, `age_over_NN` `bool`, `sex`/`height`/`weight` `uint`) and by `formatConfig.elementTypes` elsewhere; untyped namespaces keep the `YYYY-MM-DD` heuristic, but only inside element values (identifiers, namespace names and `docType` stay text), and integers beyond 64 bits stay CBOR integers (bignums) instead of text.
+- The MSO's default validity is 90 days (`certify.format.mdoc.mso-validity`, a `Duration`, at least one minute) instead of two years, capped at the document signer certificate's `notAfter` and at an mDL's `expiry_date`; `certify.format.mdoc.validity-period-years` still works as a fallback when `mso-validity` is not set. An mDL whose `expiry_date` has passed is refused.
+- For the `org.iso.18013.5.1.mDL` doctype the document is validated before signing (`mdoc_data_model_invalid`): every mandatory Table 5 element, `issuing_country` equal to the document signer certificate's country, `un_distinguishing_sign` 1-3 upper-case letters, and a JPEG-only `portrait` (complete, at most 1 MiB and 4096x4096 pixels, decodable without errors); JPEG 2000 portraits are no longer accepted.
+- The device key is taken from the proof's `did:jwk`, `did:key` or JWK as P-256/P-384/P-521 (EC2) or Ed25519 (OKP) without an `alg` label; a holder key the MSO cannot carry (another curve, EC coordinates shorter than the field width, a point off the curve, an Ed25519 key that is not a valid point) is answered `400 invalid_proof` instead of `500`.
+
 # Changes in release 0.11.0
 
 ## Removal of  Artifactory dependency

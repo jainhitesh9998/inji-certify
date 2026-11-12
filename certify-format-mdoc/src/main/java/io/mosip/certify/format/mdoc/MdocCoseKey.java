@@ -118,6 +118,7 @@ final class MdocCoseKey {
                 // RFC 8032: an Ed25519 public key is exactly 32 bytes; zero-padding would invent a different key
                 throw holderKeyError("the holder JWK Ed25519 x is " + x.length + " bytes, expected " + ED25519_KEY_LENGTH);
             }
+            requireEd25519Point(x);
             coseKey.put(LABEL_KTY, KTY_OKP);
             coseKey.put(LABEL_CURVE, CURVE_ED25519);
             coseKey.put(LABEL_X, x);
@@ -138,10 +139,12 @@ final class MdocCoseKey {
             if (decoded.length != 2 + ED25519_KEY_LENGTH) {
                 throw holderKeyError("the did:key Ed25519 key is " + (decoded.length - 2) + " bytes, expected " + ED25519_KEY_LENGTH);
             }
+            byte[] x = Arrays.copyOfRange(decoded, 2, decoded.length);
+            requireEd25519Point(x);
             Map<Object, Object> coseKey = new LinkedHashMap<>();
             coseKey.put(LABEL_KTY, KTY_OKP);
             coseKey.put(LABEL_CURVE, CURVE_ED25519);
-            coseKey.put(LABEL_X, Arrays.copyOfRange(decoded, 2, decoded.length));
+            coseKey.put(LABEL_X, x);
             return coseKey;
         }
         for (int curve = CURVE_P256; curve <= CURVE_P521; curve++) {
@@ -197,7 +200,7 @@ final class MdocCoseKey {
         return node == null || node.isNull() ? null : node.asText();
     }
 
-    /** A JWK coordinate or key: base64url, unpadded, and possibly shorter than the field it fills. */
+    /** A JWK coordinate or key: base64url, unpadded (its length is checked by the caller). */
     private static byte[] decodeCoordinate(String encoded, String field) {
         if (encoded == null || encoded.isBlank()) {
             throw holderKeyError("the holder JWK has no " + field + " coordinate");
@@ -228,17 +231,27 @@ final class MdocCoseKey {
         }
     }
 
-    /** RFC 7518 6.2.1.2: coordinates are fixed-width, so a leading zero must not shorten the value. */
+    /**
+     * RFC 7518 6.2.1.2/6.2.1.3: an EC coordinate MUST be the full width of the field, leading zeros included. A shorter
+     * value is a malformed JWK and is refused, not padded: the issuer would otherwise sign a key the holder never stated.
+     */
     private static byte[] fixedWidth(byte[] coordinate, int width, String field) {
-        if (coordinate.length == width) {
-            return coordinate;
+        if (coordinate.length != width) {
+            throw holderKeyError("the holder JWK " + field + " coordinate is " + coordinate.length + " bytes, expected exactly "
+                    + width + " (RFC 7518 6.2.1.2)");
         }
-        if (coordinate.length > width) {
-            throw holderKeyError("the holder JWK " + field + " coordinate is " + coordinate.length + " bytes, expected " + width);
+        return coordinate;
+    }
+
+    /**
+     * An Ed25519 public key must decode to a point of the prime-order subgroup (RFC 8032 5.1.3; BouncyCastle's full
+     * validation also refuses non-canonical encodings and small-order points): otherwise no signature could ever verify
+     * under the device key the MSO would carry.
+     */
+    private static void requireEd25519Point(byte[] x) {
+        if (!org.bouncycastle.math.ec.rfc8032.Ed25519.validatePublicKeyFull(x, 0)) {
+            throw holderKeyError("the holder's Ed25519 key is not a valid Ed25519 public key (RFC 8032 5.1.3)");
         }
-        byte[] padded = new byte[width];
-        System.arraycopy(coordinate, 0, padded, width - coordinate.length, coordinate.length);
-        return padded;
     }
 
     private static FormatException holderKeyError(String message) {

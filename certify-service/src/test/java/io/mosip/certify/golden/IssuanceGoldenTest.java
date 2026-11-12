@@ -620,7 +620,8 @@ class IssuanceGoldenTest {
         assertTrue(signedAt.HasMostOuterTag(0), "validityInfo.signed is #6.0(tstr)");
         assertEquals(20, signedAt.Untag().AsString().length(), "20-character RFC 3339: " + signedAt.Untag().AsString());
         assertEquals(mso.get("validityInfo").get("validFrom").Untag().AsString(), signedAt.Untag().AsString(), "validFrom is the signing instant");
-        // 9.1.2.5: digestIDs are a permutation of 0..n-1 and reveal nothing about the template's order
+        // 9.1.2.5: digestIDs are random distinct uints in 0..2^31-1 (not a permutation of 0..n-1), so they reveal nothing
+        // about the template's order or the element count
         java.util.TreeSet<Integer> digestIds = new java.util.TreeSet<>();
         com.upokecenter.cbor.CBORObject namespaceItems = issuerSigned.get("nameSpaces").get("org.iso.18013.5.1");
         for (int i = 0; i < namespaceItems.size(); i++) {

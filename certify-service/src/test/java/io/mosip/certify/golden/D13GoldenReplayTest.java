@@ -205,7 +205,7 @@ class D13GoldenReplayTest {
         summary.put("deviceKeyKty", deviceKey.get(CBORObject.FromObject(1)).AsInt32());
         summary.put("deviceKeyCrv", deviceKey.get(CBORObject.FromObject(-1)).AsInt32());
         summary.put("validityInfoKeys", mso.get("validityInfo").getKeys().toString());
-        // ISO/IEC 18013-5 9.1.2.4/9.1.2.5 on the draft-13 surface too (decision D1): seconds-only tdate, ID permutation
+        // ISO/IEC 18013-5 9.1.2.4/9.1.2.5 on the draft-13 surface too (decision D1): seconds-only tdate, random distinct digestIDs
         CBORObject signedAt = mso.get("validityInfo").get("signed");
         assertTrue(signedAt.HasMostOuterTag(0), "validityInfo.signed is #6.0(tstr)");
         assertEquals(20, signedAt.Untag().AsString().length(), "20-character RFC 3339: " + signedAt.Untag().AsString());

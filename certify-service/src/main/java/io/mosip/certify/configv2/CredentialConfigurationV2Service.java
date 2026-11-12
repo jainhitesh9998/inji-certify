@@ -221,6 +221,13 @@ public class CredentialConfigurationV2Service {
                 if (doctype == null || doctype.isBlank()) {
                     throw ConfigV2Exception.invalid("formatConfig.doctype is required for mso_mdoc");
                 }
+                if (signing.getX5c() != null && !signing.getX5c().isBlank()
+                        && io.mosip.certify.registry.JpaConfigurationRegistry.chainInclusion(signing.getX5c())
+                        == io.mosip.certify.signing.JwsHeaderPolicy.ChainInclusion.NONE) {
+                    // ISO/IEC 18013-5 9.1.2.4: the IssuerAuth carries the DSC in x5chain; the formatter refuses to sign without it
+                    throw ConfigV2Exception.invalid("signing.x5c none is not allowed for mso_mdoc: ISO/IEC 18013-5 9.1.2.4 requires"
+                            + " the document signer certificate in the IssuerAuth x5chain (use without-anchor)");
+                }
                 try {
                     // the format validates its own table now, not only in parseConfig: a malformed elementTypes override,
                     // or one that would change a Table 5 element, must not be saved (ISO/IEC 18013-5 7.2.1, D6)

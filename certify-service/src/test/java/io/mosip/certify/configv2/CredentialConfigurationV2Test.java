@@ -196,6 +196,27 @@ class CredentialConfigurationV2Test {
     }
 
     /**
+     * ISO/IEC 18013-5 9.1.2.4 requires the document signer certificate in the IssuerAuth {@code x5chain}: an mso_mdoc
+     * configuration that would leave the chain out ({@code signing.x5c: none}) is refused when it is saved.
+     */
+    @Test
+    void mdocConfigurationWithoutX5chainIsRefused() throws Exception {
+        String id = "V2MdlNoChainCredential";
+        configurations.findByTenantIdAndCredentialConfigKeyId("default", id).ifPresent(configurations::delete);
+        Map<String, Object> body = mdocBody(id, mdocTemplate());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> signing = new LinkedHashMap<>((Map<String, Object>) body.get("signing"));
+        signing.put("x5c", "none");
+        body.put("signing", signing);
+        MvcResult refused = call(post(PATH), body);
+        assertEquals(400, refused.getResponse().getStatus(), refused.getResponse().getContentAsString());
+        assertEquals("invalid_configuration", error(refused));
+        String description = objectMapper.readTree(refused.getResponse().getContentAsString()).get("error_description").asText();
+        assertTrue(description.contains("x5c") && description.contains("9.1.2.4"), description);
+        assertTrue(configurations.findByTenantIdAndCredentialConfigKeyId("default", id).isEmpty(), "nothing was saved");
+    }
+
+    /**
      * The v2 save runs the format's element typing rule (D6): an override for a new identifier is accepted and reaches
      * the CBOR preview with the declared type, while an override that would change a Table 5 element is refused.
      */
