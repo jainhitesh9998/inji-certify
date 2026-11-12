@@ -29,6 +29,9 @@ import io.mosip.certify.core.dto.ClaimsDTO;
 import io.mosip.certify.core.dto.ClaimsDisplayFieldsConfigDTO;
 import io.mosip.certify.core.spi.CredentialConfigurationService;
 import io.mosip.certify.repository.CredentialConfigRepository;
+import io.mosip.certify.testkit.mdoc.IndependentMdocVerifier;
+import io.mosip.certify.testkit.mdoc.Options;
+import io.mosip.certify.testkit.mdoc.VerificationReport;
 import org.json.JSONObject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -46,6 +49,7 @@ import org.springframework.test.web.servlet.MvcResult;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Date;
@@ -595,6 +599,11 @@ class IssuanceGoldenTest {
         verifier.initVerify(leaf.getPublicKey());
         verifier.update(sigStructure);
         assertTrue(verifier.verify(com.nimbusds.jose.crypto.impl.ECDSA.transcodeSignatureToDER(issuerAuth.get(3).GetByteString())), "IssuerAuth from the new surface verifies with JCA");
+        // ...and with libraries Certify does not maintain: Multipaz and Authlete re-parse the IssuerSigned, verify the
+        // COSE_Sign1 signature, the MSO digests, the holder device key and the docType (gap G24, M-01)
+        VerificationReport independent = new IndependentMdocVerifier().verify(Base64.getUrlDecoder().decode(credential),
+                holder, java.util.Optional.empty(), Instant.now().plusSeconds(1), Options.baseline("org.iso.18013.5.1.mDL"));
+        independent.assertAllPassed();
         com.upokecenter.cbor.CBORObject msoWrapped = com.upokecenter.cbor.CBORObject.DecodeFromBytes(payload);
         com.upokecenter.cbor.CBORObject mso = msoWrapped.HasMostOuterTag(24)
                 ? com.upokecenter.cbor.CBORObject.DecodeFromBytes(msoWrapped.Untag().GetByteString()) : msoWrapped;

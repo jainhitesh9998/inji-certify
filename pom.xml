@@ -106,6 +106,13 @@
 		<google.guava.version>18.0</google.guava.version>
 		<!-- Docker Engine 29 dropped API versions below 1.44; the Testcontainers managed by Boot 3.2 (1.19.5) cannot talk to it -->
 		<testcontainers.version>1.21.4</testcontainers.version>
+		<!-- independent mDoc verifier (M-01, decision D9): pinned exactly, test-only module -->
+		<multipaz.version>0.102.0</multipaz.version>
+		<!-- Kotlin 2.2.21 is what Multipaz is built against; Spring Boot's BOM pins the repository to 1.9.22 -->
+		<multipaz.kotlin.version>2.2.21</multipaz.kotlin.version>
+		<multipaz.kotlinx.coroutines.version>1.10.2</multipaz.kotlinx.coroutines.version>
+		<multipaz.kotlinx.serialization.version>1.9.0</multipaz.kotlinx.serialization.version>
+		<authlete.cbor.version>1.19</authlete.cbor.version>
 		<!-- Docker Engine 28+ validates the Host header on the unix socket; docker-java below 3.5 is rejected with 400 -->
 		<docker-java.version>3.5.3</docker-java.version>
 	</properties>
@@ -126,6 +133,7 @@
 		<module>certify-format-ldp-vc</module>
 		<module>certify-format-sd-jwt</module>
 		<module>certify-format-mdoc</module>
+		<module>certify-testkit-mdoc</module>
 	</modules>
 	
 	<dependencies>
