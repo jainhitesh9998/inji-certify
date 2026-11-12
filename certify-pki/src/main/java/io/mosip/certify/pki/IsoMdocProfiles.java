@@ -1,6 +1,9 @@
 package io.mosip.certify.pki;
 
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
+import org.bouncycastle.asn1.DERUTF8String;
+import org.bouncycastle.asn1.x500.AttributeTypeAndValue;
+import org.bouncycastle.asn1.x500.RDN;
 import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.asn1.x500.X500NameBuilder;
 import org.bouncycastle.asn1.x500.style.BCStyle;
@@ -22,11 +25,15 @@ import java.security.PublicKey;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.Period;
+import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
+import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
-import java.util.regex.Pattern;
-import javax.security.auth.x500.X500Principal;
 
 /**
  * ISO/IEC 18013-5:2021 Annex B certificate profiles.
@@ -36,14 +43,20 @@ import javax.security.auth.x500.X500Principal;
  * {@code basicConstraints = CA:true, pathLen:0} (critical), a lifetime of at most 20 years and an
  * {@code ecdsa-with-SHA256/384/512} signature matching a P-256/384/521 key.
  *
- * <p>A Document Signer certificate is issued by an IACA: the issuer is the IACA subject, the country (and state, when
- * the IACA has one) is copied from the IACA, the authority key identifier is the IACA subject key identifier, it has
- * its own subject key identifier, {@code keyUsage = digitalSignature} (critical), the document signer extended key
- * usage {@value #DS_EXTENDED_KEY_USAGE} (critical), the IACA issuerAltName, a CRL distribution point, no
- * basicConstraints, and a lifetime of at most 457 days.
+ * <p>A Document Signer certificate is issued by an IACA: the issuer is the IACA subject DER unchanged, the country and
+ * state come from the IACA's subject with their original ASN.1 string types, the authority key identifier is the IACA
+ * subject key identifier, it has its own subject key identifier, {@code keyUsage = digitalSignature} (critical), the
+ * document signer extended key usage {@value #DS_EXTENDED_KEY_USAGE} (critical), the IACA issuerAltName, a CRL
+ * distribution point, no basicConstraints, and a lifetime of at most 457 days, inside the IACA's own validity.
  *
- * <p>Builders accept either a freshly generated key pair or the public key of a PKCS#10 request ({@link Csr}); the
- * IACA is self-signed by definition, so it always takes its own key pair.
+ * <p>Builders refuse input the profile cannot represent rather than write a certificate a verifier would reject: a
+ * validity that is not positive or exceeds the cap, a serial outside RFC 5280 or Annex B, an empty common name, a
+ * country that is not an ISO 3166-1 alpha-2 code, a malformed issuerAltName or CRL distribution point, a key outside
+ * the P-256/384/521 allowlist and an IACA that fails {@link AnnexBValidator}. Every refusal message starts with a rule
+ * identifier.
+ *
+ * <p>Builders accept either a freshly generated key pair or the public key of a PKCS#10 request ({@link Csr}); the IACA
+ * is self-signed by definition, so it always takes its own key pair.
  */
 public final class IsoMdocProfiles {
 
@@ -56,7 +69,8 @@ public final class IsoMdocProfiles {
     /** Annex B caps the Document Signer certificate lifetime at 457 days. */
     public static final Duration DS_MAX_VALIDITY = Duration.ofDays(457);
 
-    private static final Pattern COUNTRY = Pattern.compile("[A-Z]{2}");
+    /** The ISO 3166-1 alpha-2 codes an IACA or DS subject country must come from. */
+    private static final List<String> COUNTRIES = List.of(Locale.getISOCountries());
 
     private IsoMdocProfiles() {}
 
@@ -70,7 +84,10 @@ public final class IsoMdocProfiles {
         return new DsBuilder(Objects.requireNonNull(subjectKeyPair, "subjectKeyPair").getPublic(), iaca, iacaKeyPair);
     }
 
-    /** A Document Signer certificate for the public key of a PKCS#10 request, issued by the IACA. */
+    /**
+     * A Document Signer certificate for the public key of a PKCS#10 request, issued by the IACA. The key is checked
+     * against the same allowlist as any other: a CSR is an untrusted input.
+     */
     public static DsBuilder ds(PublicKey subjectPublicKey, X509Certificate iaca, KeyPair iacaKeyPair) {
         return new DsBuilder(subjectPublicKey, iaca, iacaKeyPair);
     }
@@ -118,7 +135,7 @@ public final class IsoMdocProfiles {
             return this;
         }
 
-        /** issuerAltName URI, non-critical; a URI or an email is mandatory. */
+        /** issuerAltName URI, non-critical; an http(s) URI or an rfc822 email is mandatory. */
         public IacaBuilder issuerAltUri(String uri) {
             this.issuerAltUri = uri;
             return this;
@@ -130,56 +147,69 @@ public final class IsoMdocProfiles {
             return this;
         }
 
-        /** CRL distribution point URI, mandatory. */
+        /** CRL distribution point URI, mandatory and http(s). */
         public IacaBuilder crlDistributionPoint(String uri) {
             this.crlDistributionPoint = uri;
             return this;
         }
 
-        /** Start of the validity period, default now. */
+        /** Start of the validity period, default now, truncated to whole seconds. */
         public IacaBuilder notBefore(Instant notBefore) {
             this.notBefore = Objects.requireNonNull(notBefore, "notBefore");
             return this;
         }
 
-        /** Requested validity, default and cap {@link #IACA_MAX_VALIDITY}; a longer request is capped, not refused. */
+        /** Requested validity, default {@link #IACA_MAX_VALIDITY}; positive and at most the cap, else refused. */
         public IacaBuilder validity(Duration validity) {
             this.validity = Objects.requireNonNull(validity, "validity");
             return this;
         }
 
-        /** Serial number, default {@link Serials#random()}. */
+        /** Serial number, default {@link Serials#random()}; positive, 64 bits or more, at most 20 content octets. */
         public IacaBuilder serial(BigInteger serial) {
             this.serial = Objects.requireNonNull(serial, "serial");
             return this;
         }
 
         public X509Certificate build() {
-            require(country, "IACA_SUBJECT_COUNTRY_MISSING", "a country (C) is mandatory for an IACA certificate");
-            if (!COUNTRY.matcher(country).matches()) {
-                throw new PkiException("IACA_SUBJECT_COUNTRY_INVALID: country " + country + " is not an ISO 3166-1 alpha-2 code");
+            requireText(country, "IACA_SUBJECT_COUNTRY_MISSING", "a country (C) is mandatory for an IACA certificate");
+            if (!COUNTRIES.contains(country)) {
+                throw new PkiException("IACA_SUBJECT_COUNTRY_INVALID: country " + country
+                        + " is not an ISO 3166-1 alpha-2 code");
             }
-            require(commonName, "IACA_SUBJECT_CN_MISSING", "a common name (CN) is mandatory for an IACA certificate");
+            requireText(commonName, "IACA_SUBJECT_CN_MISSING", "a common name (CN) is mandatory for an IACA certificate");
             if (issuerAltUri == null && issuerAltEmail == null) {
                 throw new PkiException("IACA_ISSUER_ALT_NAME_MISSING: an IACA certificate needs an issuerAltName URI or email");
             }
-            require(crlDistributionPoint, "IACA_CRL_DP_MISSING", "an IACA certificate needs a CRL distribution point");
+            GeneralNames issuerAltNames = Certificates.issuerAltNames(issuerAltUri, issuerAltEmail);
+            requireText(crlDistributionPoint, "IACA_CRL_DP_MISSING", "an IACA certificate needs a CRL distribution point");
+            Certificates.checkValidity(validity, IACA_MAX_VALIDITY, "IACA");
+            BigInteger serialNumber = serial != null ? serial : Serials.random();
+            Certificates.checkSerial(serialNumber, "IACA");
+            Certificates.curve(keyPair.getPublic(), "IACA");
+            String algorithm = Certificates.signatureAlgorithm(keyPair.getPublic(), "IACA");
+
+            Instant start = notBefore.truncatedTo(ChronoUnit.SECONDS);
+            Instant end = Certificates.end(start, validity);
+            // 20 calendar years, measured on real dates, is the cap the validator applies
+            Instant cap = start.atZone(ZoneOffset.UTC).plus(Period.ofYears(20)).toInstant();
+            if (end.isAfter(cap)) {
+                throw new PkiException("IACA_VALIDITY_TOO_LONG: a validity ending " + end
+                        + " exceeds 20 calendar years from " + start);
+            }
             X500Name name = name(country, state, organization, commonName);
-            Date start = Date.from(notBefore);
-            Date end = Date.from(notBefore.plus(cap(validity, IACA_MAX_VALIDITY)));
-            X509v3CertificateBuilder builder = new JcaX509v3CertificateBuilder(name,
-                    serial != null ? serial : Serials.random(), start, end, name, keyPair.getPublic());
+            X509v3CertificateBuilder builder = new JcaX509v3CertificateBuilder(name, serialNumber,
+                    Date.from(start), Date.from(end), name, keyPair.getPublic());
             try {
                 builder.addExtension(Extension.subjectKeyIdentifier, false,
-                        new SubjectKeyIdentifier(Certificates.keyIdentifier(keyPair.getPublic())));
+                        new SubjectKeyIdentifier(Certificates.keyIdentifier(Certificates.spki(keyPair.getPublic()))));
                 builder.addExtension(Extension.keyUsage, true, new KeyUsage(KeyUsage.keyCertSign | KeyUsage.cRLSign));
                 builder.addExtension(Extension.basicConstraints, true, new BasicConstraints(0));
-                builder.addExtension(Extension.issuerAlternativeName, false, Certificates.issuerAltNames(issuerAltUri, issuerAltEmail));
+                builder.addExtension(Extension.issuerAlternativeName, false, issuerAltNames);
                 builder.addExtension(Extension.cRLDistributionPoints, false, Certificates.crlDistributionPoint(crlDistributionPoint));
             } catch (CertIOException e) {
                 throw new PkiException("Cannot add an extension to the IACA certificate", e);
             }
-            String algorithm = Certificates.signatureAlgorithm(keyPair.getPublic());
             return Certificates.certificate(builder.build(Certificates.signer(keyPair.getPrivate(), algorithm)));
         }
     }
@@ -202,67 +232,112 @@ public final class IsoMdocProfiles {
             this.iacaKeyPair = Objects.requireNonNull(iacaKeyPair, "iacaKeyPair");
         }
 
-        /** Common name (CN), mandatory. Country and state are copied from the IACA, never set here. */
+        /** Common name (CN), mandatory. Country and state come from the IACA, never set here. */
         public DsBuilder commonName(String commonName) {
             this.commonName = commonName;
             return this;
         }
 
-        /** CRL distribution point URI, default the IACA's own distribution point. */
+        /** CRL distribution point URI, http(s); default the IACA's own distribution point. */
         public DsBuilder crlDistributionPoint(String uri) {
             this.crlDistributionPoint = uri;
             return this;
         }
 
-        /** Start of the validity period, default now. */
+        /**
+         * Start of the validity period, default now. A start before the IACA's {@code notBefore} is moved forward to it,
+         * because a Document Signer cannot be valid before the authority that signed it.
+         */
         public DsBuilder notBefore(Instant notBefore) {
             this.notBefore = Objects.requireNonNull(notBefore, "notBefore");
             return this;
         }
 
-        /** Requested validity, default and cap {@link #DS_MAX_VALIDITY}; a longer request is capped, not refused. */
+        /** Requested validity, default {@link #DS_MAX_VALIDITY}; positive and at most the cap, else refused. */
         public DsBuilder validity(Duration validity) {
             this.validity = Objects.requireNonNull(validity, "validity");
             return this;
         }
 
-        /** Serial number, default {@link Serials#random()}. */
+        /** Serial number, default {@link Serials#random()}; positive, 64 bits or more, at most 20 content octets. */
         public DsBuilder serial(BigInteger serial) {
             this.serial = Objects.requireNonNull(serial, "serial");
             return this;
         }
 
         public X509Certificate build() {
-            require(commonName, "DS_SUBJECT_CN_MISSING", "a common name (CN) is mandatory for a Document Signer certificate");
+            requireText(commonName, "DS_SUBJECT_CN_MISSING", "a common name (CN) is mandatory for a Document Signer certificate");
             if (!Arrays.equals(iaca.getPublicKey().getEncoded(), iacaKeyPair.getPublic().getEncoded())) {
                 throw new PkiException("IACA_KEY_MISMATCH: the IACA signing key does not match the IACA certificate");
             }
-            X500Principal iacaSubject = iaca.getSubjectX500Principal();
-            String country = Certificates.attribute(iacaSubject, BCStyle.C);
-            if (country == null) {
-                throw new PkiException("DS_COUNTRY_MISSING: the IACA certificate has no country (C) to copy");
+            List<AnnexBValidator.Violation> violations = AnnexBValidator.validateIaca(iaca);
+            if (!violations.isEmpty()) {
+                throw new PkiException("DS_IACA_INVALID: the IACA does not meet the Annex B profile: " + violations.get(0));
             }
-            X500Name subject = name(country, Certificates.attribute(iacaSubject, BCStyle.ST), null, commonName);
-            Date start = Date.from(notBefore);
-            Date end = Date.from(notBefore.plus(cap(validity, DS_MAX_VALIDITY)));
-            X509v3CertificateBuilder builder = new JcaX509v3CertificateBuilder(iaca,
-                    serial != null ? serial : Serials.random(), start, end, subject, subjectPublicKey);
+            Certificates.curve(subjectPublicKey, "DS");
+            Certificates.checkValidity(validity, DS_MAX_VALIDITY, "DS");
+            BigInteger serialNumber = serial != null ? serial : Serials.random();
+            Certificates.checkSerial(serialNumber, "DS");
+            String crlUri = crlUri();
+            X500Name iacaSubject = Certificates.name(iaca);
+            X500Name subject = dsSubject(iacaSubject, commonName);
+            String algorithm = Certificates.signatureAlgorithm(iacaKeyPair.getPublic(), "IACA");
+
+            Instant iacaNotBefore = iaca.getNotBefore().toInstant().truncatedTo(ChronoUnit.SECONDS);
+            Instant iacaNotAfter = iaca.getNotAfter().toInstant().truncatedTo(ChronoUnit.SECONDS);
+            Instant start = notBefore.truncatedTo(ChronoUnit.SECONDS);
+            if (start.isBefore(iacaNotBefore)) {
+                start = iacaNotBefore;
+            }
+            Instant end = Certificates.end(start, validity);
+            if (end.isAfter(iacaNotAfter)) {
+                end = iacaNotAfter;
+            }
+            if (end.isBefore(start)) {
+                throw new PkiException("DS_VALIDITY_OUTSIDE_IACA: the IACA validity ends at " + iacaNotAfter
+                        + ", before the Document Signer could start at " + start);
+            }
+
+            X509v3CertificateBuilder builder = new JcaX509v3CertificateBuilder(
+                    issuer(iaca), serialNumber, Date.from(start), Date.from(end), subject, subjectPublicKey);
             try {
                 builder.addExtension(Extension.authorityKeyIdentifier, false,
-                        new AuthorityKeyIdentifier(Certificates.keyIdentifier(iaca)));
+                        new AuthorityKeyIdentifier(Certificates.subjectKeyIdentifier(iaca)));
                 builder.addExtension(Extension.subjectKeyIdentifier, false,
-                        new SubjectKeyIdentifier(Certificates.keyIdentifier(subjectPublicKey)));
+                        new SubjectKeyIdentifier(Certificates.keyIdentifier(Certificates.spki(subjectPublicKey))));
                 builder.addExtension(Extension.keyUsage, true, new KeyUsage(KeyUsage.digitalSignature));
                 builder.addExtension(Extension.extendedKeyUsage, true,
                         new ExtendedKeyUsage(KeyPurposeId.getInstance(new ASN1ObjectIdentifier(DS_EXTENDED_KEY_USAGE))));
                 // copied verbatim so the URI and rfc822 tags survive
                 builder.addExtension(Extension.issuerAlternativeName, false, iacaIssuerAltNames());
-                builder.addExtension(Extension.cRLDistributionPoints, false, Certificates.crlDistributionPoint(crlUri()));
+                builder.addExtension(Extension.cRLDistributionPoints, false, Certificates.crlDistributionPoint(crlUri));
             } catch (CertIOException e) {
                 throw new PkiException("Cannot add an extension to the Document Signer certificate", e);
             }
-            String algorithm = Certificates.signatureAlgorithm(iacaKeyPair.getPublic());
             return Certificates.certificate(builder.build(Certificates.signer(iacaKeyPair.getPrivate(), algorithm)));
+        }
+
+        /** The IACA subject DER, unchanged: a re-encoded issuer would break byte-equality with the IACA subject. */
+        private static X500Name issuer(X509Certificate iaca) {
+            return X500Name.getInstance(iaca.getSubjectX500Principal().getEncoded());
+        }
+
+        /**
+         * The DS subject: the IACA's country (C) and state (ST) RDNs, copied as the ASN.1 values the IACA carries so a
+         * value keeps its string type and its bytes, followed by the configured common name.
+         */
+        private static X500Name dsSubject(X500Name iacaSubject, String commonName) {
+            List<RDN> rdns = new ArrayList<>();
+            for (RDN rdn : iacaSubject.getRDNs()) {
+                for (AttributeTypeAndValue value : rdn.getTypesAndValues()) {
+                    if (value.getType().equals(BCStyle.C) || value.getType().equals(BCStyle.ST)) {
+                        rdns.add(rdn);
+                        break;
+                    }
+                }
+            }
+            rdns.add(new RDN(BCStyle.CN, new DERUTF8String(commonName)));
+            return new X500Name(rdns.toArray(RDN[]::new));
         }
 
         private GeneralNames iacaIssuerAltNames() {
@@ -275,6 +350,9 @@ public final class IsoMdocProfiles {
 
         private String crlUri() {
             if (crlDistributionPoint != null) {
+                if (!Certificates.isHttpUri(crlDistributionPoint)) {
+                    throw new PkiException("DS_CRL_DP_INVALID: " + crlDistributionPoint + " is not an http or https URI");
+                }
                 return crlDistributionPoint;
             }
             var uris = Certificates.crlDistributionPointUris(iaca);
@@ -297,12 +375,8 @@ public final class IsoMdocProfiles {
         return builder.addRDN(BCStyle.CN, commonName).build();
     }
 
-    private static Duration cap(Duration requested, Duration maximum) {
-        return requested.compareTo(maximum) > 0 ? maximum : requested;
-    }
-
-    private static void require(String value, String ruleId, String message) {
-        if (value == null) {
+    private static void requireText(String value, String ruleId, String message) {
+        if (value == null || value.isBlank()) {
             throw new PkiException(ruleId + ": " + message);
         }
     }

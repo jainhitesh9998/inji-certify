@@ -1,14 +1,27 @@
 package io.mosip.certify.pki;
 
+import org.bouncycastle.asn1.DERNull;
+import org.bouncycastle.asn1.nist.NISTObjectIdentifiers;
+import org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers;
 import org.bouncycastle.asn1.pkcs.PrivateKeyInfo;
+import org.bouncycastle.asn1.x509.AlgorithmIdentifier;
 import org.bouncycastle.cert.X509CRLHolder;
 import org.bouncycastle.cert.X509CertificateHolder;
 import org.bouncycastle.openssl.jcajce.JcaPEMKeyConverter;
+import org.bouncycastle.openssl.PEMEncryptedKeyPair;
 import org.bouncycastle.openssl.PEMException;
 import org.bouncycastle.openssl.PEMKeyPair;
 import org.bouncycastle.openssl.PEMParser;
 import org.bouncycastle.openssl.jcajce.JcaPEMWriter;
+import org.bouncycastle.openssl.jcajce.JcePEMDecryptorProviderBuilder;
+import org.bouncycastle.openssl.jcajce.JceOpenSSLPKCS8DecryptorProviderBuilder;
+import org.bouncycastle.openssl.jcajce.JceOpenSSLPKCS8EncryptorBuilder;
+import org.bouncycastle.operator.InputDecryptorProvider;
+import org.bouncycastle.operator.OperatorCreationException;
+import org.bouncycastle.operator.OutputEncryptor;
 import org.bouncycastle.pkcs.PKCS10CertificationRequest;
+import org.bouncycastle.pkcs.PKCS8EncryptedPrivateKeyInfo;
+import org.bouncycastle.pkcs.PKCSException;
 
 import java.io.IOException;
 import java.io.StringReader;
@@ -20,8 +33,19 @@ import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.List;
 
-/** PEM reading and writing for certificates, certificate chains, private and public keys, CSRs and CRLs. */
+/**
+ * PEM reading and writing for certificates, certificate chains, private and public keys, CSRs and CRLs.
+ *
+ * <p>Private keys may be written and read unencrypted (the PKCS#8 {@code PRIVATE KEY} block every JCA provider reads) or
+ * encrypted: PKCS#8 with AES-256-CBC under PBKDF2/HMAC-SHA256 ({@code ENCRYPTED PRIVATE KEY}), and the legacy OpenSSL
+ * {@code EC PRIVATE KEY} with DEK-Info headers ({@code PEMEncryptedKeyPair}), because an IACA key created offline (D3)
+ * is a password-protected file an operator copies, not a plaintext one.
+ */
 public final class Pem {
+
+    /** PBKDF2 iteration count for a written encrypted key; high enough for an offline IACA key, fast enough to load. */
+    public static final int PBKDF2_ITERATIONS = 200_000;
+
 
     private Pem() {}
 
@@ -32,7 +56,8 @@ public final class Pem {
             if (object instanceof X509CertificateHolder holder) {
                 certificates.add(Certificates.certificate(holder));
             } else if (object instanceof X509CRLHolder || object instanceof PKCS10CertificationRequest
-                    || object instanceof PrivateKeyInfo || object instanceof PEMKeyPair) {
+                    || object instanceof PrivateKeyInfo || object instanceof PEMKeyPair
+                    || object instanceof PEMEncryptedKeyPair || object instanceof PKCS8EncryptedPrivateKeyInfo) {
                 throw new PkiException("PEM_NOT_A_CERTIFICATE: the PEM text contains a " + object.getClass().getSimpleName());
             }
         }
@@ -62,8 +87,22 @@ public final class Pem {
         return Csr.parsePem(pem);
     }
 
+    /** Whether the PEM text holds an encrypted private key rather than a plaintext one. */
+    public static boolean isEncryptedPrivateKey(String pem) {
+        return read(pem).stream()
+                .anyMatch(object -> object instanceof PKCS8EncryptedPrivateKeyInfo || object instanceof PEMEncryptedKeyPair);
+    }
+
     /** A private key from a PKCS#8 ({@code PRIVATE KEY}) or SEC1/RSA ({@code EC PRIVATE KEY}) PEM block. */
     public static PrivateKey readPrivateKey(String pem) {
+        return readPrivateKey(pem, null);
+    }
+
+    /**
+     * A private key, encrypted or not. An encrypted key needs the password it was written with; a plaintext key ignores
+     * it. An encrypted key read without a password is refused rather than skipped.
+     */
+    public static PrivateKey readPrivateKey(String pem, char[] password) {
         JcaPEMKeyConverter converter = new JcaPEMKeyConverter().setProvider(Certificates.provider());
         for (Object object : read(pem)) {
             try {
@@ -71,13 +110,35 @@ public final class Pem {
                     return normalize(converter.getPrivateKey(info));
                 }
                 if (object instanceof PEMKeyPair pair) {
-                    return normalize(converter.getKeyPair(pair).getPrivate());
+                    return normalize(converter.getPrivateKey(pair.getPrivateKeyInfo()));
                 }
-            } catch (IOException e) {
+                if (object instanceof PKCS8EncryptedPrivateKeyInfo encrypted) {
+                    PrivateKeyInfo info = encrypted.decryptPrivateKeyInfo(decryptor(password));
+                    return normalize(converter.getPrivateKey(info));
+                }
+                if (object instanceof PEMEncryptedKeyPair encrypted) {
+                    PEMKeyPair pair = encrypted.decryptKeyPair(new JcePEMDecryptorProviderBuilder()
+                            .setProvider(Certificates.provider()).build(password(password)));
+                    // a traditional EC key block need not carry the public key, so only the private key is read
+                    return normalize(converter.getPrivateKey(pair.getPrivateKeyInfo()));
+                }
+            } catch (IOException | OperatorCreationException | PKCSException e) {
                 throw new PkiException("PEM_KEY_INVALID: cannot read the private key: " + e.getMessage(), e);
             }
         }
         throw new PkiException("PEM_NOT_A_KEY: the PEM text contains no private key");
+    }
+
+    private static char[] password(char[] password) {
+        if (password == null || password.length == 0) {
+            throw new PkiException("PEM_KEY_ENCRYPTED: the private key is encrypted and needs a password");
+        }
+        return password;
+    }
+
+    private static InputDecryptorProvider decryptor(char[] password) throws OperatorCreationException {
+        return new JceOpenSSLPKCS8DecryptorProviderBuilder().setProvider(Certificates.provider())
+                .build(password(password));
     }
 
     /** A public key from a {@code PUBLIC KEY} (SubjectPublicKeyInfo) PEM block. */
@@ -118,6 +179,24 @@ public final class Pem {
             return write(new org.bouncycastle.openssl.jcajce.JcaPKCS8Generator(privateKey, null));
         } catch (org.bouncycastle.util.io.pem.PemGenerationException e) {
             throw new PkiException("PEM_KEY_INVALID: cannot write the private key", e);
+        }
+    }
+
+    /**
+     * An {@code ENCRYPTED PRIVATE KEY} block: PKCS#8 with AES-256-CBC under PBKDF2 with HMAC-SHA256. Read it back with
+     * {@link #readPrivateKey(String, char[])}.
+     */
+    public static String writeEncryptedPrivateKey(PrivateKey privateKey, char[] password) {
+        try {
+            OutputEncryptor encryptor = new JceOpenSSLPKCS8EncryptorBuilder(NISTObjectIdentifiers.id_aes256_CBC)
+                    .setProvider(Certificates.provider())
+                    .setIterationCount(PBKDF2_ITERATIONS)
+                    .setPRF(new AlgorithmIdentifier(PKCSObjectIdentifiers.id_hmacWithSHA256, DERNull.INSTANCE))
+                    .setPassword(password(password))
+                    .build();
+            return write(new org.bouncycastle.openssl.jcajce.JcaPKCS8Generator(privateKey, encryptor));
+        } catch (OperatorCreationException | org.bouncycastle.util.io.pem.PemGenerationException e) {
+            throw new PkiException("PEM_KEY_INVALID: cannot write the encrypted private key", e);
         }
     }
 

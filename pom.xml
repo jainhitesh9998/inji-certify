@@ -184,6 +184,11 @@
 				<version>${bouncycastle.version}</version>
 			</dependency>
 			<dependency>
+				<groupId>org.bouncycastle</groupId>
+				<artifactId>bcutil-jdk18on</artifactId>
+				<version>${bouncycastle.version}</version>
+			</dependency>
+			<dependency>
 				<groupId>com.github.docker-java</groupId>
 				<artifactId>docker-java-api</artifactId>
 				<version>${docker-java.version}</version>

@@ -38,10 +38,13 @@ final class Fixture {
     }
 
     X509CRL crl() {
-        return CrlBuilder.forIaca(iaca, iacaKeyPair).build();
+        return CrlBuilder.forIaca(iaca, iacaKeyPair).crlNumber(BigInteger.ONE).build();
     }
 
     X509CRL crl(BigInteger revokedSerial, Instant revokedAt) {
-        return CrlBuilder.forIaca(iaca, iacaKeyPair).revoke(revokedSerial, revokedAt).build();
+        return CrlBuilder.forIaca(iaca, iacaKeyPair)
+                .crlNumber(BigInteger.TWO)
+                .revoke(revokedSerial, revokedAt)
+                .build();
     }
 }

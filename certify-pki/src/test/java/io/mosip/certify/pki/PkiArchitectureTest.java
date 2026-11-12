@@ -28,10 +28,15 @@ class PkiArchitectureTest {
             .as("certify-pki depends on no Spring, web, JPA, Velocity, JSON-LD or keymanager types")
             .allowEmptyShould(true);
 
-    /** BouncyCastle is used as an explicit provider instance; installing it globally would change the host JVM. */
+    /**
+     * BouncyCastle is used as an explicit provider instance; installing it globally would change the host JVM for every
+     * other library in the process, so neither {@code addProvider} nor {@code insertProviderAt} may appear.
+     */
     @ArchTest
     static final ArchRule pki_registers_no_global_provider = noClasses()
             .should().callMethod(java.security.Security.class, "addProvider", java.security.Provider.class)
+            .orShould().callMethod(java.security.Security.class, "insertProviderAt",
+                    java.security.Provider.class, int.class)
             .as("certify-pki installs no global JCA provider")
             .allowEmptyShould(true);
 }
