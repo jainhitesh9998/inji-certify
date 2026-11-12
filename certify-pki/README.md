@@ -140,7 +140,8 @@ X509CRL crl = CrlBuilder.forIaca(iaca, iacaKeyPair).crlNumber(BigInteger.valueOf
 
 `DsBuilder` validates the IACA it is given with `AnnexBValidator.validateIaca` and refuses to sign under one that does
 not conform or cannot be read (`DS_IACA_INVALID`), so a Document Signer can never be issued by an IACA the runtime
-would refuse. Both builders then read the IACA's subject, dates, key identifier, issuerAltName and CRL distribution
+would refuse. It also refuses a subject public key equal to the IACA's own (`DS_KEY_IS_IACA_KEY`): a Document
+Signer needs a key pair of its own, so the IACA key never signs documents. Both builders then read the IACA's subject, dates, key identifier, issuerAltName and CRL distribution
 point from its DER, as the validator does, never through the JCA getters.
 
 Private keys can be written and read encrypted, which the offline IACA flow (D3) needs:

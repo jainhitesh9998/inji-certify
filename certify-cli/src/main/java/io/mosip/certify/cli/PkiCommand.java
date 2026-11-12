@@ -8,45 +8,66 @@ import io.mosip.certify.pki.Pem;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.GeneralSecurityException;
 import java.security.KeyPair;
 import java.security.KeyStore;
 import java.security.PrivateKey;
 import java.security.PublicKey;
+import java.security.cert.CertificateFactory;
 import java.security.cert.X509CRL;
+import java.security.cert.X509CRLEntry;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.YearMonth;
 import java.time.ZoneOffset;
+import java.time.format.DateTimeParseException;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * {@code certify pki}: the offline half of the ISO/IEC 18013-5 Annex B PKI (M-07).
  *
  * <pre>
- *   certify pki iaca create -k iaca.p12 -p s3cret --country IN --cn "Lorem Ipsum Demo IACA" \
+ *   export CERTIFY_IACA_PASSWORD=…   CERTIFY_KEYSTORE_PASSWORD=…    # or omit them and answer the prompts
+ *   certify pki iaca create -k iaca.p12 --country IN --cn "Lorem Ipsum Demo IACA" \
  *       --issuer-alt-uri https://credentials.example.test --crl-uri https://credentials.example.test/mdoc/iaca/lorem.crl
- *   certify pki dsc issue --iaca iaca.p12 -p s3cret --generate -k issuer.p12 -P s3cret --alias mdl-dsc@2026-11 \
- *       --out dsc-chain.pem
- *   certify pki dsc issue --iaca iaca.p12 -p s3cret --csr dsc.csr --cn "Lorem Ipsum Demo DSC" --out dsc-chain.pem
- *   certify pki dsc rotate --iaca iaca.p12 -p s3cret -k issuer.p12 -P s3cret --alias-prefix mdl-dsc
- *   certify pki crl issue --iaca iaca.p12 -p s3cret --revoke 0x40a1... --crl-number 1 --out iaca.crl
+ *   certify pki dsc issue --iaca iaca.p12 --generate -k issuer.p12 --alias mdl-dsc@2026-11 --out dsc-chain.pem
+ *   certify pki dsc issue --iaca iaca.p12 --csr dsc.csr --cn "Lorem Ipsum Demo DSC" --out dsc-chain.pem
+ *   certify pki dsc rotate --iaca iaca.p12 -k issuer.p12 --alias-prefix mdl-dsc --out dsc-chain.pem
+ *   certify pki crl issue --iaca iaca.p12 --initial --out iaca.crl
+ *   certify pki crl issue --iaca iaca.p12 --revoke 0x40a1… --out iaca.crl --overwrite
  *   certify pki check --chain dsc-chain.pem --profile mdoc-dsc --crl iaca.crl
  * </pre>
  *
  * <p>Everything here is offline: the IACA private key is created outside the deployment (D3) and only the Document
  * Signer key, the {@code [DSC, IACA]} chain and the IACA-signed CRL travel into it. Every object is judged by
- * {@link AnnexBValidator} before it is written, so the CLI cannot produce a certificate the runtime would refuse.
- * Passwords come from the option or an environment variable and are never printed. Output is line-oriented
- * {@code key=value} text on stdout, so a script can read it.
+ * {@link AnnexBValidator} before it is written, so the CLI cannot produce a certificate the runtime would refuse. Every
+ * file is written atomically and secrets {@code rw-------} ({@link SecureFiles}); input and output paths that name the
+ * same file are refused before anything is written. Output is line-oriented {@code key=value} text on stdout.
+ *
+ * <p>Exit codes: {@code 0} done; {@code 1} usage (picocli parameter errors, missing or conflicting options, a missing
+ * password, overlapping paths, and for {@code pki check} an input it cannot read); {@code 2} a refusal of a well-formed
+ * request (Annex B violations, an existing alias or file, a CRL number that does not increase, a wrong password) and
+ * {@code pki check} findings.
  */
 @Command(name = "pki", description = "ISO/IEC 18013-5 Annex B PKI: IACA, Document Signer and CRL objects.",
         mixinStandardHelpOptions = true,
@@ -56,11 +77,32 @@ class PkiCommand {
     static final String IACA_PROFILE = "iaca";
     static final String DS_PROFILE = "mdoc-dsc";
     static final String DEFAULT_DS_CN = "Lorem Ipsum Demo DSC";
+    static final String IACA_PASSWORD = "IACA keystore password";
+    static final String KEYSTORE_PASSWORD = "issuer keystore password";
+
+    /** An alias prefix: the part before {@code @}, a KeyRef-safe name. */
+    static final Pattern ALIAS_PREFIX = Pattern.compile("[A-Za-z0-9][A-Za-z0-9._-]{0,63}");
 
     private PkiCommand() {}
 
-    static int error(int code, RuntimeException e) {
-        String message = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+    // ------------------------------------------------------------------ shared
+
+    /** Runs a command body and maps its failure to the exit code and one line on stderr. */
+    static int execute(Callable<Integer> body, String failing) {
+        try {
+            return body.call();
+        } catch (UsageException e) {
+            return error(1, e.getMessage());
+        } catch (FileAlreadyExistsException e) {
+            return error(2, e.getFile() + " already exists; refusing to overwrite it");
+        } catch (IOException e) {
+            return error(2, failing + ": " + e.getMessage());
+        } catch (Exception e) {
+            return error(2, e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+        }
+    }
+
+    static int error(int code, String message) {
         System.err.println(message);
         return code;
     }
@@ -73,7 +115,7 @@ class PkiCommand {
         for (AnnexBValidator.Violation violation : violations) {
             print(violation.ruleId(), violation.message());
         }
-        System.err.println(what + ": " + violations.size() + " Annex B violation(s)");
+        System.err.println(what + ": " + violations.size() + " violation(s)");
         return 2;
     }
 
@@ -81,12 +123,11 @@ class PkiCommand {
         return value == null || value.isBlank() ? null : value;
     }
 
-    static void write(Path out, byte[] bytes) throws IOException {
-        Path parent = out.toAbsolutePath().getParent();
-        if (parent != null) {
-            Files.createDirectories(parent);
+    /** A certificate or CRL {@code --out} that exists is refused unless {@code --overwrite}. */
+    static void refuseExisting(Path out, boolean overwrite) {
+        if (out != null && !overwrite && Files.exists(out)) {
+            throw new IllegalArgumentException(out + " already exists; pass --overwrite to replace it");
         }
-        Files.write(out, bytes);
     }
 
     static String pem(Path path) throws IOException {
@@ -101,6 +142,20 @@ class PkiCommand {
         }
     }
 
+    /** A CRL in PEM or DER, told apart by content, not by file name. */
+    static X509CRL readCrl(Path path) throws IOException {
+        byte[] bytes = Files.readAllBytes(path);
+        String text = new String(bytes, StandardCharsets.US_ASCII);
+        if (text.contains("-----BEGIN X509 CRL-----")) {
+            return Pem.readCrl(text);
+        }
+        try {
+            return (X509CRL) CertificateFactory.getInstance("X.509").generateCRL(new ByteArrayInputStream(bytes));
+        } catch (GeneralSecurityException | RuntimeException e) {
+            throw new IllegalArgumentException("cannot read the CRL " + path + " as PEM or DER: " + e.getMessage(), e);
+        }
+    }
+
     /** An IACA certificate and the private key that signs DSCs and CRLs with it. */
     record IacaKey(X509Certificate certificate, PrivateKey privateKey) {
 
@@ -110,11 +165,15 @@ class PkiCommand {
 
         /**
          * The IACA from a PKCS#12 keystore entry, or from a PEM file holding an encrypted PKCS#8 private key and the
-         * certificate (the form {@code --pem-out} writes, combined), which keeps the key off any shared filesystem.
+         * certificate (the form {@code --pem-out} writes, combined), told apart by content.
          */
-        static IacaKey load(Path path, char[] password, String alias) {
-            if (isPem(path)) {
-                String text = read(path);
+        static IacaKey load(Path path, char[] password, String alias) throws IOException {
+            if (!Files.exists(path)) {
+                throw new IllegalArgumentException("no such IACA keystore or PEM file: " + path);
+            }
+            byte[] bytes = Files.readAllBytes(path);
+            String text = new String(bytes, StandardCharsets.US_ASCII);
+            if (text.startsWith("-----BEGIN ") || text.contains("\n-----BEGIN ")) {
                 return new IacaKey(certificate(text), Pem.readPrivateKey(text, password));
             }
             KeyStore store = PkiFiles.read(path, password);
@@ -133,18 +192,6 @@ class PkiCommand {
             }
             return Pem.readCertificate(text.substring(start, stop + end.length()));
         }
-
-        private static boolean isPem(Path path) {
-            return path.getFileName().toString().toLowerCase(java.util.Locale.ROOT).endsWith(".pem");
-        }
-
-        private static String read(Path path) {
-            try {
-                return Files.readString(path, StandardCharsets.US_ASCII);
-            } catch (IOException e) {
-                throw new IllegalArgumentException("cannot read " + path + ": " + e.getMessage(), e);
-            }
-        }
     }
 
     // ------------------------------------------------------------------ pki iaca
@@ -157,12 +204,11 @@ class PkiCommand {
                 description = "Create an offline IACA key and self-signed Annex B IACA certificate.")
         static class Create implements Callable<Integer> {
 
-            @Option(names = {"-k", "--keystore"}, required = true,
-                    description = "PKCS#12 file that holds the IACA key (protected by -p)")
+            @Option(names = {"-k", "--keystore"},
+                    description = "new or existing PKCS#12 file for the IACA key (or --pem-out)")
             Path keystore;
-            @Option(names = {"-p", "--password"}, arity = "0..1", interactive = true,
-                    description = "IACA keystore password (prompted when -p has no value; "
-                            + PkiFiles.KEYSTORE_PASSWORD_ENV + " when the option is absent)")
+            @Option(names = {"-p", "--iaca-password"}, arity = "0..1", interactive = true,
+                    description = "IACA password; " + PkiFiles.IACA_PASSWORD_ENV + " when absent, prompted when neither")
             char[] password;
             @Option(names = "--alias", defaultValue = "iaca", description = "key alias in the keystore")
             String alias;
@@ -183,29 +229,70 @@ class PkiCommand {
             @Option(names = "--alg", defaultValue = "ES256", description = "ES256, ES384 or ES512")
             String algorithm;
             @Option(names = "--pem-out",
-                    description = "write the key as an encrypted PKCS#8 PEM instead of a PKCS#12 keystore")
+                    description = "write the key as an encrypted PKCS#8 PEM (plus the certificate) instead of -k")
             Path pemOut;
 
             @Override
             public Integer call() {
-                try {
-                    return create();
-                } catch (IOException e) {
-                    return error(2, new IllegalStateException("cannot write the IACA: " + e.getMessage(), e));
-                } catch (RuntimeException e) {
-                    return error(2, e);
-                }
+                return execute(this::create, "cannot write the IACA");
             }
 
             private Integer create() throws IOException {
-                char[] secret = PkiFiles.password(password, PkiFiles.KEYSTORE_PASSWORD_ENV, "-p");
+                if ((keystore == null) == (pemOut == null)) {
+                    throw new UsageException("pass exactly one of -k <iaca.p12> or --pem-out <iaca.pem>");
+                }
                 if (validityYears < 1 || validityYears > 20) {
-                    throw new IllegalArgumentException("--validity-years is " + validityYears
+                    throw new UsageException("--validity-years is " + validityYears
                             + "; Annex B allows 1 to 20 calendar years");
                 }
+                PkiFiles.curve(algorithm);
+                char[] secret = PkiFiles.password(password, PkiFiles.IACA_PASSWORD_ENV, IACA_PASSWORD, "-p");
+                try {
+                    X509Certificate iaca;
+                    if (pemOut != null) {
+                        KeyPair keyPair = PkiFiles.keyPair(algorithm);
+                        iaca = build(keyPair);
+                        if (iaca == null) {
+                            return 2;
+                        }
+                        // the key first (so `openssl pkey -in iaca.pem` reads it), then the certificate, so the same
+                        // file can stand in for the keystore wherever this CLI takes --iaca; CREATE_NEW refuses an
+                        // existing file
+                        SecureFiles.write(pemOut, (Pem.writeEncryptedPrivateKey(keyPair.getPrivate(), secret)
+                                        + Pem.writeCertificate(iaca)).getBytes(StandardCharsets.US_ASCII),
+                                SecureFiles.Visibility.SECRET, false);
+                    } else {
+                        try (SecureFiles.Lock lock = SecureFiles.lock(keystore)) {
+                            boolean exists = Files.exists(keystore);
+                            KeyStore store = PkiFiles.readOrCreate(keystore, secret);
+                            if (PkiFiles.contains(store, alias)) {
+                                throw new IllegalArgumentException("alias already exists in " + keystore + ": "
+                                        + alias);
+                            }
+                            KeyPair keyPair = PkiFiles.keyPair(algorithm);
+                            iaca = build(keyPair);
+                            if (iaca == null) {
+                                return 2;
+                            }
+                            PkiFiles.add(store, alias, keyPair.getPrivate(), secret, List.of(iaca));
+                            PkiFiles.write(store, keystore, secret, exists);
+                        }
+                    }
+                    // the certificate is the only thing on stdout, so `> iaca.pem` yields a publishable file
+                    System.out.print(Pem.writeCertificate(iaca));
+                    System.err.println("IACA created: alias=" + alias + " store=" + (pemOut != null ? pemOut : keystore));
+                    System.err.println("sha256=" + PkiFiles.sha256(iaca));
+                    return 0;
+                } finally {
+                    PkiFiles.clear(secret, password);
+                }
+            }
+
+            /** The IACA certificate, or {@code null} after printing its violations. */
+            private X509Certificate build(KeyPair keyPair) {
                 Instant start = Instant.now().truncatedTo(ChronoUnit.SECONDS);
-                Duration validity = Duration.between(start, start.atZone(ZoneOffset.UTC).plusYears(validityYears).toInstant());
-                KeyPair keyPair = PkiFiles.keyPair(algorithm);
+                Duration validity = Duration.between(start,
+                        start.atZone(ZoneOffset.UTC).plusYears(validityYears).toInstant());
                 X509Certificate iaca = IsoMdocProfiles.iaca(keyPair)
                         .country(country)
                         .state(nullIfEmpty(state))
@@ -219,30 +306,10 @@ class PkiCommand {
                         .build();
                 List<AnnexBValidator.Violation> violations = AnnexBValidator.validateIaca(iaca);
                 if (!violations.isEmpty()) {
-                    return PkiCommand.violations(violations, "IACA");
+                    PkiCommand.violations(violations, "IACA");
+                    return null;
                 }
-                if (pemOut != null) {
-                    if (Files.exists(pemOut)) {
-                        throw new IllegalArgumentException("refusing to overwrite " + pemOut);
-                    }
-                    // the key first (so `openssl pkey -in iaca.pem` reads it), then the certificate, so the same file
-                    // can stand in for the keystore wherever this CLI takes --iaca
-                    write(pemOut, (Pem.writeEncryptedPrivateKey(keyPair.getPrivate(), secret)
-                            + Pem.writeCertificate(iaca)).getBytes(StandardCharsets.US_ASCII));
-                } else {
-                    KeyStore store = PkiFiles.readOrCreate(keystore, secret);
-                    if (PkiFiles.contains(store, alias)) {
-                        throw new IllegalArgumentException("alias already exists in " + keystore + ": " + alias);
-                    }
-                    PkiFiles.add(store, alias, keyPair.getPrivate(), secret, List.of(iaca));
-                    PkiFiles.write(store, keystore, secret);
-                }
-                // the certificate is the only thing on stdout, so `> iaca.pem` yields a publishable file
-                System.out.print(Pem.writeCertificate(iaca));
-                System.err.println("IACA created: alias=" + alias + " store="
-                        + (pemOut != null ? pemOut : keystore));
-                System.err.println("sha256=" + PkiFiles.sha256(iaca));
-                return 0;
+                return iaca;
             }
         }
     }
@@ -259,8 +326,8 @@ class PkiCommand {
 
             @Option(names = "--iaca", required = true, description = "IACA PKCS#12 keystore, or a PEM key+certificate")
             Path iaca;
-            @Option(names = {"-p", "--password"}, arity = "0..1", interactive = true,
-                    description = "IACA keystore password (" + PkiFiles.KEYSTORE_PASSWORD_ENV + " when absent)")
+            @Option(names = {"-p", "--iaca-password"}, arity = "0..1", interactive = true,
+                    description = "IACA password; " + PkiFiles.IACA_PASSWORD_ENV + " when absent, prompted when neither")
             char[] password;
             @Option(names = "--iaca-alias", defaultValue = "iaca", description = "IACA key alias in the keystore")
             String iacaAlias;
@@ -270,11 +337,13 @@ class PkiCommand {
             boolean generate;
             @Option(names = {"-k", "--keystore"}, description = "issuer PKCS#12 keystore for --generate") Path keystore;
             @Option(names = {"-P", "--issuer-password"}, arity = "0..1", interactive = true,
-                    description = "issuer keystore password (" + PkiFiles.ISSUER_PASSWORD_ENV + " when absent)")
+                    description = "issuer keystore password; " + PkiFiles.KEYSTORE_PASSWORD_ENV
+                            + " when absent, prompted when neither")
             char[] issuerPassword;
             @Option(names = "--alias", description = "alias of the generated key, e.g. mdl-dsc@2026-11")
             String alias;
-            @Option(names = "--cn", description = "Document Signer CN (default: the CSR's CN, else a demo name)")
+            @Option(names = "--cn", description = "Document Signer CN; required with --csr (the CN a request asks for"
+                    + " is never copied), default \"" + DEFAULT_DS_CN + "\" with --generate")
             String commonName;
             @Option(names = "--validity-days", defaultValue = "365", description = "lifetime in days, 1..457")
             int validityDays;
@@ -282,67 +351,98 @@ class PkiCommand {
             String algorithm;
             @Option(names = "--out", required = true, description = "output chain PEM, [DSC, IACA] leaf first")
             Path out;
+            @Option(names = {"--overwrite", "--force"}, description = "replace an existing --out file")
+            boolean overwrite;
 
             @Override
             public Integer call() {
-                try {
-                    return issue();
-                } catch (IOException e) {
-                    return error(2, new IllegalStateException("cannot write the Document Signer: " + e.getMessage(), e));
-                } catch (RuntimeException e) {
-                    return error(2, e);
-                }
+                return execute(this::issue, "cannot write the Document Signer");
             }
 
             private Integer issue() throws IOException {
                 if ((csr == null) == !generate) {
-                    throw new IllegalArgumentException("pass exactly one of --csr <file> or --generate");
+                    throw new UsageException("pass exactly one of --csr <file> or --generate");
                 }
-                char[] secret = PkiFiles.password(password, PkiFiles.KEYSTORE_PASSWORD_ENV, "-p");
-                IacaKey authority = IacaKey.load(iaca, secret, iacaAlias);
+                checkValidity(validityDays);
                 if (csr != null) {
-                    Csr request = Csr.parse(Files.readAllBytes(csr));
-                    String name = commonName != null ? commonName : PkiFiles.commonName(request.subject());
-                    return Dsc.issue(authority, request.publicKey(), null, name, validityDays, out,
-                            null, null, null, null);
+                    if (commonName == null || commonName.isBlank()) {
+                        throw new UsageException("--csr needs --cn <name>: the Document Signer's CN is the operator's"
+                                + " choice and is never copied from the request");
+                    }
+                    if (keystore != null || alias != null) {
+                        throw new UsageException("-k and --alias belong to --generate; with --csr the key stays where"
+                                + " the request was made");
+                    }
+                    SecureFiles.requireDistinct(SecureFiles.paths("--iaca", iaca, "--csr", csr),
+                            SecureFiles.paths("--out", out));
+                    refuseExisting(out, overwrite);
+                    char[] secret = PkiFiles.password(password, PkiFiles.IACA_PASSWORD_ENV, IACA_PASSWORD, "-p");
+                    try {
+                        IacaKey authority = IacaKey.load(iaca, secret, iacaAlias);
+                        Csr request = Csr.parse(Files.readAllBytes(csr));
+                        return Dsc.issue(authority, request.publicKey(), null, commonName, validityDays, out, overwrite,
+                                null, null, false, null, null);
+                    } finally {
+                        PkiFiles.clear(secret, password);
+                    }
                 }
                 if (keystore == null) {
-                    throw new IllegalArgumentException("--generate needs -k <issuer.p12>");
+                    throw new UsageException("--generate needs -k <issuer.p12>");
                 }
                 if (alias == null || alias.isBlank()) {
-                    throw new IllegalArgumentException("--generate needs --alias <name>");
+                    throw new UsageException("--generate needs --alias <name>");
                 }
-                char[] issuerSecret = PkiFiles.password(issuerPassword, PkiFiles.ISSUER_PASSWORD_ENV, "-P");
-                KeyStore store = PkiFiles.readOrCreate(keystore, issuerSecret);
-                if (PkiFiles.contains(store, alias)) {
-                    throw new IllegalArgumentException("alias already exists in " + keystore + ": " + alias);
+                PkiFiles.curve(algorithm);
+                SecureFiles.requireDistinct(SecureFiles.paths("--iaca", iaca),
+                        SecureFiles.paths("-k", keystore, "--out", out, "the lock of -k", SecureFiles.lockFile(keystore)));
+                refuseExisting(out, overwrite);
+                char[] secret = PkiFiles.password(password, PkiFiles.IACA_PASSWORD_ENV, IACA_PASSWORD, "-p");
+                char[] issuerSecret = null;
+                try {
+                    issuerSecret = PkiFiles.password(issuerPassword, PkiFiles.KEYSTORE_PASSWORD_ENV,
+                            KEYSTORE_PASSWORD, "-P");
+                    IacaKey authority = IacaKey.load(iaca, secret, iacaAlias);
+                    try (SecureFiles.Lock lock = SecureFiles.lock(keystore)) {
+                        boolean exists = Files.exists(keystore);
+                        KeyStore store = PkiFiles.readOrCreate(keystore, issuerSecret);
+                        if (PkiFiles.contains(store, alias)) {
+                            throw new IllegalArgumentException("alias already exists in " + keystore + ": " + alias);
+                        }
+                        KeyPair keyPair = PkiFiles.keyPair(algorithm);
+                        return Dsc.issue(authority, keyPair.getPublic(), keyPair.getPrivate(),
+                                commonName != null ? commonName : DEFAULT_DS_CN, validityDays, out, overwrite,
+                                store, keystore, exists, issuerSecret, alias);
+                    }
+                } finally {
+                    PkiFiles.clear(secret, issuerSecret, password, issuerPassword);
                 }
-                KeyPair keyPair = PkiFiles.keyPair(algorithm);
-                return Dsc.issue(authority, keyPair.getPublic(), keyPair.getPrivate(),
-                        commonName != null ? commonName : DEFAULT_DS_CN, validityDays, out,
-                        store, keystore, issuerSecret, alias);
             }
         }
 
         @Command(name = "rotate", mixinStandardHelpOptions = true,
-                description = "Issue a new versioned Document Signer (mdl-dsc@yyyy-MM) and keep the old ones.")
+                description = "Issue a new versioned Document Signer (<prefix>@yyyy-MM[.N]) and keep the old ones.")
         static class Rotate implements Callable<Integer> {
 
             @Option(names = "--iaca", required = true, description = "IACA PKCS#12 keystore, or a PEM key+certificate")
             Path iaca;
-            @Option(names = {"-p", "--password"}, arity = "0..1", interactive = true,
-                    description = "IACA keystore password (" + PkiFiles.KEYSTORE_PASSWORD_ENV + " when absent)")
+            @Option(names = {"-p", "--iaca-password"}, arity = "0..1", interactive = true,
+                    description = "IACA password; " + PkiFiles.IACA_PASSWORD_ENV + " when absent, prompted when neither")
             char[] password;
             @Option(names = "--iaca-alias", defaultValue = "iaca", description = "IACA key alias in the keystore")
             String iacaAlias;
-            @Option(names = {"-k", "--keystore"}, required = true, description = "issuer PKCS#12 keystore")
+            @Option(names = {"-k", "--keystore"}, required = true, description = "existing issuer PKCS#12 keystore")
             Path keystore;
             @Option(names = {"-P", "--issuer-password"}, arity = "0..1", interactive = true,
-                    description = "issuer keystore password (" + PkiFiles.ISSUER_PASSWORD_ENV + " when absent)")
+                    description = "issuer keystore password; " + PkiFiles.KEYSTORE_PASSWORD_ENV
+                            + " when absent, prompted when neither")
             char[] issuerPassword;
             @Option(names = "--alias-prefix", defaultValue = "mdl-dsc",
-                    description = "alias prefix; the new alias is <prefix>@<yyyy-MM>")
+                    description = "alias prefix; the new alias is <prefix>@<yyyy-MM>, or <prefix>@<yyyy-MM>.<N> when"
+                            + " this month's already exists")
             String aliasPrefix;
+            @Option(names = "--suffix", description = "force the same-month suffix N (2 or more), e.g. 2 for"
+                    + " mdl-dsc@2026-11.2; default: the next free one when this month's alias exists")
+            Integer suffix;
             @Option(names = "--cn", description = "Document Signer CN (default: a demo name with the month)")
             String commonName;
             @Option(names = "--validity-days", defaultValue = "365", description = "lifetime in days, 1..457")
@@ -350,51 +450,76 @@ class PkiCommand {
             @Option(names = "--alg", defaultValue = "ES256", description = "key algorithm for the new key")
             String algorithm;
             @Option(names = "--out", description = "output chain PEM; stdout when omitted") Path out;
+            @Option(names = {"--overwrite", "--force"}, description = "replace an existing --out file")
+            boolean overwrite;
 
             @Override
             public Integer call() {
-                try {
-                    return rotate();
-                } catch (IOException e) {
-                    return error(2, new IllegalStateException("cannot write the Document Signer: " + e.getMessage(), e));
-                } catch (RuntimeException e) {
-                    return error(2, e);
-                }
+                return execute(this::rotate, "cannot write the Document Signer");
             }
 
             private Integer rotate() throws IOException {
-                String month = YearMonth.now(ZoneOffset.UTC).toString();
-                String alias = aliasPrefix + "@" + month;
-                char[] secret = PkiFiles.password(password, PkiFiles.KEYSTORE_PASSWORD_ENV, "-p");
-                char[] issuerSecret = PkiFiles.password(issuerPassword, PkiFiles.ISSUER_PASSWORD_ENV, "-P");
-                IacaKey authority = IacaKey.load(iaca, secret, iacaAlias);
-                KeyStore store = PkiFiles.read(keystore, issuerSecret);
-                if (PkiFiles.contains(store, alias)) {
-                    throw new IllegalArgumentException("this month's Document Signer already exists: " + alias
-                            + " in " + keystore + "; nothing to rotate until the next month");
+                if (!ALIAS_PREFIX.matcher(aliasPrefix).matches()) {
+                    throw new UsageException("--alias-prefix must be letters, digits, '.', '_' or '-' (no '@' or"
+                            + " ':'), at most 64 characters: " + aliasPrefix);
                 }
-                KeyPair keyPair = PkiFiles.keyPair(algorithm);
-                String name = commonName != null ? commonName : DEFAULT_DS_CN + " " + month;
-                int code = Dsc.issue(authority, keyPair.getPublic(), keyPair.getPrivate(), name, validityDays,
-                        out, store, keystore, issuerSecret, alias);
-                if (code == 0) {
-                    System.err.println("kept the older Document Signers in " + keystore
-                            + "; load the new one with x509-file:mdl-dsc (newest valid entry wins)");
+                if (suffix != null && suffix < 2) {
+                    throw new UsageException("--suffix starts at 2: the month's first Document Signer has none");
                 }
-                return code;
+                checkValidity(validityDays);
+                PkiFiles.curve(algorithm);
+                SecureFiles.requireDistinct(SecureFiles.paths("--iaca", iaca),
+                        SecureFiles.paths("-k", keystore, "--out", out, "the lock of -k", SecureFiles.lockFile(keystore)));
+                refuseExisting(out, overwrite);
+                char[] secret = PkiFiles.password(password, PkiFiles.IACA_PASSWORD_ENV, IACA_PASSWORD, "-p");
+                char[] issuerSecret = null;
+                try {
+                    issuerSecret = PkiFiles.password(issuerPassword, PkiFiles.KEYSTORE_PASSWORD_ENV,
+                            KEYSTORE_PASSWORD, "-P");
+                    IacaKey authority = IacaKey.load(iaca, secret, iacaAlias);
+                    try (SecureFiles.Lock lock = SecureFiles.lock(keystore)) {
+                        KeyStore store = PkiFiles.read(keystore, issuerSecret);
+                        String month = YearMonth.now(ZoneOffset.UTC).toString();
+                        String alias = Rotation.nextAlias(PkiFiles.aliases(store), aliasPrefix + "@" + month, suffix);
+                        KeyPair keyPair = PkiFiles.keyPair(algorithm);
+                        String name = commonName != null ? commonName : DEFAULT_DS_CN + " " + month;
+                        int code = Dsc.issue(authority, keyPair.getPublic(), keyPair.getPrivate(), name, validityDays,
+                                out, overwrite, store, keystore, true, issuerSecret, alias);
+                        if (code == 0) {
+                            Optional<String> current = Rotation.current(store, aliasPrefix, Instant.now());
+                            System.out.println("current=" + current.orElse(""));
+                            System.err.println("kept the older Document Signers of " + aliasPrefix + " in " + keystore
+                                    + "; x509-file:" + aliasPrefix + " resolves to " + current.orElse("(none valid)")
+                                    + " (M-05 rotation rule: the entry valid now with the newest notBefore; needs the"
+                                    + " x509-file provider with versioned aliases, certify 1.0.0-beta.1 rebuild);"
+                                    + " pin this one with x509-file:" + alias);
+                        }
+                        return code;
+                    }
+                } finally {
+                    PkiFiles.clear(secret, issuerSecret, password, issuerPassword);
+                }
+            }
+        }
+
+        static void checkValidity(int validityDays) {
+            if (validityDays < 1 || validityDays > IsoMdocProfiles.DS_MAX_VALIDITY.toDays()) {
+                throw new UsageException("--validity-days is " + validityDays + "; Annex B allows 1 to "
+                        + IsoMdocProfiles.DS_MAX_VALIDITY.toDays());
             }
         }
 
         /**
-         * Signs one Document Signer, validates it, writes the chain and, for a generated key, stores the key with the
-         * chain. The caller has already refused an existing alias, so nothing is overwritten.
+         * Signs one Document Signer, validates it, stores a generated key with its chain (keystore first: the chain
+         * is in the keystore entry too, so a failed {@code --out} loses nothing), then writes the chain. The caller
+         * holds the keystore lock and has refused an existing alias.
          */
         static int issue(IacaKey authority, PublicKey subjectKey, PrivateKey subjectPrivate, String commonName,
-                         int validityDays, Path out, KeyStore store, Path storePath, char[] storePassword,
-                         String alias) throws IOException {
-            if (validityDays < 1 || validityDays > IsoMdocProfiles.DS_MAX_VALIDITY.toDays()) {
-                throw new IllegalArgumentException("--validity-days is " + validityDays + "; Annex B allows 1 to "
-                        + IsoMdocProfiles.DS_MAX_VALIDITY.toDays());
+                         int validityDays, Path out, boolean overwrite, KeyStore store, Path storePath,
+                         boolean storeExists, char[] storePassword, String alias) throws IOException {
+            if (PkiFiles.sameKey(subjectKey, authority.certificate().getPublicKey())) {
+                throw new IllegalArgumentException("DS_KEY_IS_IACA_KEY: the Document Signer key is the IACA's own key;"
+                        + " a Document Signer needs a key of its own");
             }
             X509Certificate dsc = IsoMdocProfiles.ds(subjectKey, authority.certificate(), authority.keyPair())
                     .commonName(commonName)
@@ -407,10 +532,11 @@ class PkiCommand {
             List<X509Certificate> chain = List.of(dsc, authority.certificate());
             if (store != null) {
                 PkiFiles.add(store, alias, subjectPrivate, storePassword, chain);
-                PkiFiles.write(store, storePath, storePassword);
+                PkiFiles.write(store, storePath, storePassword, storeExists);
             }
             if (out != null) {
-                write(out, Pem.writeCertificates(chain).getBytes(StandardCharsets.US_ASCII));
+                SecureFiles.write(out, Pem.writeCertificates(chain).getBytes(StandardCharsets.US_ASCII),
+                        SecureFiles.Visibility.PUBLIC, overwrite);
             }
             System.out.println("serial=0x" + dsc.getSerialNumber().toString(16));
             System.out.println("subject=" + dsc.getSubjectX500Principal().getName());
@@ -429,6 +555,65 @@ class PkiCommand {
         }
     }
 
+    /**
+     * Versioned Document Signer aliases, consistent with the {@code x509-file} provider (M-05): one key entry per
+     * version, {@code <prefix>@<yyyy-MM>} and, for a second rotation in the same month, {@code <prefix>@<yyyy-MM>.<N>}
+     * with N from 2. {@code x509-file:<prefix>} resolves to the entry valid now with the newest {@code notBefore}, ties
+     * broken by the version label; a versioned reference resolves to that entry.
+     */
+    static final class Rotation {
+
+        private Rotation() {}
+
+        /** The alias for this rotation: the month's base alias, or the forced or next free {@code .N} after it. */
+        static String nextAlias(List<String> aliases, String base, Integer suffix) {
+            Set<String> existing = new LinkedHashSet<>(aliases);
+            if (suffix != null) {
+                String alias = base + "." + suffix;
+                if (existing.contains(alias)) {
+                    throw new IllegalArgumentException("the Document Signer " + alias + " already exists; pass another"
+                            + " --suffix, or none for the next free one");
+                }
+                return alias;
+            }
+            if (!existing.contains(base)) {
+                return base;
+            }
+            Pattern numbered = Pattern.compile(Pattern.quote(base) + "\\.(\\d{1,6})");
+            int next = 2;
+            for (String alias : existing) {
+                Matcher matcher = numbered.matcher(alias);
+                if (matcher.matches()) {
+                    next = Math.max(next, Integer.parseInt(matcher.group(1)) + 1);
+                }
+            }
+            return base + "." + next;
+        }
+
+        /** The entry {@code x509-file:<prefix>} resolves to at {@code at}: valid then, newest notBefore, then label. */
+        static Optional<String> current(KeyStore store, String prefix, Instant at) {
+            Map<String, X509Certificate> candidates = new LinkedHashMap<>();
+            for (String alias : PkiFiles.aliases(store)) {
+                if (alias.equals(prefix) || alias.startsWith(prefix + "@")) {
+                    try {
+                        if (store.getCertificate(alias) instanceof X509Certificate leaf
+                                && !at.isBefore(leaf.getNotBefore().toInstant())
+                                && at.isBefore(leaf.getNotAfter().toInstant())) {
+                            candidates.put(alias, leaf);
+                        }
+                    } catch (GeneralSecurityException e) {
+                        // an unreadable entry is not a candidate
+                    }
+                }
+            }
+            return candidates.entrySet().stream()
+                    .max(Comparator.<Map.Entry<String, X509Certificate>, Instant>comparing(
+                                    e -> e.getValue().getNotBefore().toInstant())
+                            .thenComparing(Map.Entry::getKey))
+                    .map(Map.Entry::getKey);
+        }
+    }
+
     // ------------------------------------------------------------------ pki crl
 
     @Command(name = "crl", description = "CRL operations.", mixinStandardHelpOptions = true,
@@ -436,52 +621,127 @@ class PkiCommand {
     static class Crl {
 
         @Command(name = "issue", mixinStandardHelpOptions = true,
-                description = "Sign an X.509 v2 CRL with the IACA; the CRL number must increase.")
+                description = "Sign a complete X.509 v2 CRL with the IACA: every serial ever revoked (from the"
+                        + " revocation inventory next to the IACA) plus --revoke, under the next CRL number.")
         static class Issue implements Callable<Integer> {
 
             @Option(names = "--iaca", required = true, description = "IACA PKCS#12 keystore, or a PEM key+certificate")
             Path iaca;
-            @Option(names = {"-p", "--password"}, arity = "0..1", interactive = true,
-                    description = "IACA keystore password (" + PkiFiles.KEYSTORE_PASSWORD_ENV + " when absent)")
+            @Option(names = {"-p", "--iaca-password"}, arity = "0..1", interactive = true,
+                    description = "IACA password; " + PkiFiles.IACA_PASSWORD_ENV + " when absent, prompted when neither")
             char[] password;
             @Option(names = "--iaca-alias", defaultValue = "iaca", description = "IACA key alias in the keystore")
             String iacaAlias;
             @Option(names = "--revoke", description = "serial to revoke, hexadecimal (0x prefixed or not); repeatable")
             List<String> revoke = new ArrayList<>();
-            @Option(names = "--crl-number", required = true, description = "cRLNumber, greater than the previous one")
+            @Option(names = "--crl-number",
+                    description = "cRLNumber; default the last recorded + 1, and never at or below the last recorded")
             String crlNumber;
             @Option(names = "--next-update-days", defaultValue = "30", description = "days until the next CRL is due")
             int nextUpdateDays;
-            @Option(names = "--force", description = "accept a CRL number that does not increase (audited on stderr)")
+            @Option(names = "--state", description = "revocation inventory file (default <iaca>" + CrlState.SUFFIX
+                    + ", or the sibling file that already holds this IACA)")
+            Path state;
+            @Option(names = "--base-crl", description = "import the entries and number of a CRL this IACA published"
+                    + " (verified under the IACA), e.g. when the inventory was never kept")
+            Path baseCrl;
+            @Option(names = "--initial", description = "the IACA's first CRL: no inventory exists and none is needed")
+            boolean initial;
+            @Option(names = "--force", description = "recover a lost inventory without --base-crl: needs an explicit"
+                    + " --crl-number above every number ever published; earlier revocations are listed only if passed"
+                    + " again with --revoke. Refused when an inventory exists")
             boolean force;
             @Option(names = "--out", required = true, description = "output CRL; DER for a .der name, PEM otherwise")
             Path out;
+            @Option(names = "--overwrite", description = "replace an existing --out file (the previous CRL)")
+            boolean overwrite;
 
             @Override
             public Integer call() {
-                try {
-                    return issue();
-                } catch (IOException e) {
-                    return error(2, new IllegalStateException("cannot write the CRL: " + e.getMessage(), e));
-                } catch (RuntimeException e) {
-                    return error(2, e);
-                }
+                return execute(this::issue, "cannot write the CRL");
             }
 
             private Integer issue() throws IOException {
                 if (nextUpdateDays < 1) {
-                    throw new IllegalArgumentException("--next-update-days must be at least 1");
+                    throw new UsageException("--next-update-days must be at least 1");
                 }
-                BigInteger number = parseNumber(crlNumber);
-                char[] secret = PkiFiles.password(password, PkiFiles.KEYSTORE_PASSWORD_ENV, "-p");
-                IacaKey authority = IacaKey.load(iaca, secret, iacaAlias);
-                Path state = stateFile(iaca);
-                BigInteger previous = previousNumber(state);
-                if (previous != null && number.compareTo(previous) <= 0 && !force) {
+                BigInteger requested = crlNumber == null ? null : parseNumber(crlNumber);
+                Set<BigInteger> serials = new LinkedHashSet<>();
+                for (String serial : revoke) {
+                    serials.add(parseSerial(serial));
+                }
+                if (initial && (force || baseCrl != null)) {
+                    throw new UsageException("--initial is the IACA's first CRL; it does not combine with --force or"
+                            + " --base-crl");
+                }
+                if (force && baseCrl != null) {
+                    throw new UsageException("--base-crl rebuilds the inventory; --force is for when no CRL is left");
+                }
+                if (force && requested == null) {
+                    throw new UsageException("--force needs --crl-number, greater than every CRL number this IACA has"
+                            + " published: without the inventory the CLI cannot know the last one");
+                }
+                char[] secret = PkiFiles.password(password, PkiFiles.IACA_PASSWORD_ENV, IACA_PASSWORD, "-p");
+                try {
+                    IacaKey authority = IacaKey.load(iaca, secret, iacaAlias);
+                    String keyId = CrlState.keyId(authority.certificate());
+                    Path statePath = CrlState.locate(iaca, keyId, state);
+                    SecureFiles.requireDistinct(SecureFiles.paths("--iaca", iaca, "--base-crl", baseCrl),
+                            SecureFiles.paths("--out", out, "the CRL state", statePath,
+                                    "the lock of the CRL state", SecureFiles.lockFile(statePath)));
+                    refuseExisting(out, overwrite);
+                    X509CRL base = baseCrl == null ? null : verifiedBase(baseCrl, authority.certificate());
+                    try (SecureFiles.Lock lock = SecureFiles.lock(statePath)) {
+                        return issue(authority, keyId, statePath, base, requested, serials);
+                    }
+                } finally {
+                    PkiFiles.clear(secret, password);
+                }
+            }
+
+            private Integer issue(IacaKey authority, String keyId, Path statePath, X509CRL base, BigInteger requested,
+                                  Set<BigInteger> serials) throws IOException {
+                CrlState current = CrlState.read(statePath);
+                CrlState.Inventory inventory = current == null ? null : current.inventory(keyId);
+                if (inventory == null) {
+                    if (base == null && !initial && !force) {
+                        throw new IllegalArgumentException("no revocation inventory for this IACA in " + statePath
+                                + ": a CRL issued now would drop every earlier revocation. Pass --base-crl <the last"
+                                + " CRL this IACA published> to rebuild it, or --initial for the IACA's first CRL");
+                    }
+                    inventory = new CrlState.Inventory(authority.certificate().getSubjectX500Principal().getName(),
+                            null);
+                    if (force) {
+                        System.err.println("warning: --force: no revocation inventory and no base CRL; this CRL lists"
+                                + " only the serials passed with --revoke, and the inventory starts again from it");
+                    }
+                } else if (initial || force) {
+                    throw new IllegalArgumentException((initial ? "--initial" : "--force") + " is for an IACA without"
+                            + " a revocation inventory, but " + statePath + " records CRL number "
+                            + inventory.lastCrlNumber() + " for this IACA; drop the option");
+                }
+                if (base != null) {
+                    inventory.importCrl(base, CrlState.crlNumber(base));
+                }
+                BigInteger last = inventory.lastCrlNumber();
+                BigInteger number = requested != null ? requested
+                        : last == null ? BigInteger.ONE : last.add(BigInteger.ONE);
+                if (last != null && number.compareTo(last) <= 0) {
                     throw new IllegalArgumentException("the CRL number " + number + " does not increase on the last"
-                            + " published one " + previous + " (" + state + "); pass a larger --crl-number or --force");
+                            + " recorded one " + last + " (" + statePath + "); omit --crl-number for " + last.add(
+                            BigInteger.ONE) + " or pass a larger one");
                 }
                 Instant now = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+                int added = 0;
+                for (BigInteger serial : serials) {
+                    if (inventory.isRevoked(serial)) {
+                        System.err.println("0x" + serial.toString(16) + " is already revoked since "
+                                + inventory.revoked().get(serial) + "; the original date is kept");
+                    } else {
+                        inventory.revoke(serial, now);
+                        added++;
+                    }
+                }
                 Instant next = now.plus(Duration.ofDays(nextUpdateDays));
                 Instant iacaNotAfter = authority.certificate().getNotAfter().toInstant().truncatedTo(ChronoUnit.SECONDS);
                 if (next.isAfter(iacaNotAfter)) {
@@ -489,44 +749,58 @@ class PkiCommand {
                 }
                 CrlBuilder builder = CrlBuilder.forIaca(authority.certificate(), authority.keyPair())
                         .crlNumber(number).thisUpdate(now).nextUpdate(next);
-                List<BigInteger> serials = new ArrayList<>();
-                for (String serial : revoke) {
-                    BigInteger value = parseSerial(serial);
-                    serials.add(value);
-                    builder.revoke(value, now);
-                }
+                inventory.revoked().forEach(builder::revoke);
                 X509CRL crl = builder.build();
                 List<AnnexBValidator.Violation> violations =
                         AnnexBValidator.validateCrl(crl, authority.certificate(), now);
                 if (!violations.isEmpty()) {
                     return PkiCommand.violations(violations, "CRL");
                 }
-                boolean der = out.getFileName().toString().toLowerCase(java.util.Locale.ROOT).endsWith(".der");
-                write(out, der ? encoded(crl) : Pem.writeCrl(crl).getBytes(StandardCharsets.US_ASCII));
-                BigInteger watermark = previous == null || number.compareTo(previous) > 0 ? number : previous;
-                Files.writeString(state, watermark + System.lineSeparator(), StandardCharsets.US_ASCII);
-                if (number.compareTo(watermark) < 0) {
-                    System.err.println("warning: the CRL number " + number + " is below the last published "
-                            + watermark + "; --force accepted it and the watermark stays at " + watermark);
-                }
+                // reserve the number and record the revocations before the CRL is exposed: a failure after this
+                // leaves a gap in the numbers, never a reused number or a lost revocation
+                inventory.lastCrlNumber(number);
+                CrlState updated = current == null ? CrlState.empty() : current;
+                updated.put(keyId, inventory);
+                updated.write(statePath);
+                boolean der = out.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".der");
+                SecureFiles.write(out, der ? encoded(crl) : Pem.writeCrl(crl).getBytes(StandardCharsets.US_ASCII),
+                        SecureFiles.Visibility.PUBLIC, overwrite);
                 System.out.println("crlNumber=" + number);
-                System.out.println("revoked=" + serials.size());
+                System.out.println("revoked=" + inventory.revoked().size());
+                System.out.println("newlyRevoked=" + added);
                 System.out.println("thisUpdate=" + crl.getThisUpdate().toInstant());
                 System.out.println("nextUpdate=" + crl.getNextUpdate().toInstant());
                 System.out.println("sha256=" + PkiFiles.sha256(encoded(crl)));
+                System.out.println("state=" + statePath);
                 System.out.println("out=" + out);
                 return 0;
+            }
+
+            /** A CRL to import: signed by the IACA's key and naming the IACA as issuer, else refused. */
+            private static X509CRL verifiedBase(Path path, X509Certificate iaca) throws IOException {
+                X509CRL crl = readCrl(path);
+                if (!crl.getIssuerX500Principal().equals(iaca.getSubjectX500Principal())) {
+                    throw new IllegalArgumentException("--base-crl " + path + " was issued by "
+                            + crl.getIssuerX500Principal().getName() + ", not by this IACA");
+                }
+                try {
+                    crl.verify(iaca.getPublicKey());
+                } catch (GeneralSecurityException e) {
+                    throw new IllegalArgumentException("--base-crl " + path + " is not signed by this IACA's key: "
+                            + e.getMessage(), e);
+                }
+                return crl;
             }
 
             private static BigInteger parseNumber(String value) {
                 try {
                     BigInteger number = new BigInteger(value.trim());
                     if (number.signum() < 0) {
-                        throw new IllegalArgumentException("--crl-number must not be negative");
+                        throw new UsageException("--crl-number must not be negative");
                     }
                     return number;
                 } catch (NumberFormatException e) {
-                    throw new IllegalArgumentException("--crl-number is not a decimal integer: " + value);
+                    throw new UsageException("--crl-number is not a decimal integer: " + value);
                 }
             }
 
@@ -538,103 +812,114 @@ class PkiCommand {
                 try {
                     BigInteger serial = new BigInteger(hex, 16);
                     if (serial.signum() <= 0) {
-                        throw new IllegalArgumentException("--revoke " + value + " is not a positive serial number");
+                        throw new UsageException("--revoke " + value + " is not a positive serial number");
                     }
                     return serial;
                 } catch (NumberFormatException e) {
-                    throw new IllegalArgumentException("--revoke " + value + " is not hexadecimal");
+                    throw new UsageException("--revoke " + value + " is not hexadecimal");
                 }
-            }
-        }
-
-        /** The monotonic counter next to the IACA keystore: {@code iaca.p12.crlnumber}, a decimal number. */
-        static Path stateFile(Path keystore) {
-            return keystore.resolveSibling(keystore.getFileName() + ".crlnumber");
-        }
-
-        static BigInteger previousNumber(Path state) throws IOException {
-            if (!Files.exists(state)) {
-                return null;
-            }
-            String text = Files.readString(state, StandardCharsets.US_ASCII).trim();
-            if (text.isEmpty()) {
-                return null;
-            }
-            try {
-                return new BigInteger(text);
-            } catch (NumberFormatException e) {
-                throw new IllegalArgumentException("the CRL number state file " + state
-                        + " does not hold a decimal number: " + text);
             }
         }
     }
 
     // ------------------------------------------------------------------ pki check
 
-    @Command(name = "check", mixinStandardHelpOptions = true, exitCodeOnInvalidInput = 1,
-            description = "Validate a chain against the Annex B profile; exit 0 clean, 2 violations, 1 usage.")
+    @Command(name = "check", mixinStandardHelpOptions = true,
+            description = "Validate a chain (and a CRL) against the Annex B profile at an instant; exit 0 clean,"
+                    + " 2 findings, 1 usage or unreadable input.")
     static class Check implements Callable<Integer> {
 
         @Option(names = "--chain", required = true, description = "certificate chain PEM; [DSC, IACA] or one object")
         Path chain;
         @Option(names = "--profile", required = true, description = "iaca or mdoc-dsc") String profile;
-        @Option(names = "--iaca", description = "IACA PEM, when the chain holds only the object to check")
+        @Option(names = "--iaca", description = "IACA PEM; must equal the chain's second certificate when both exist")
         Path iaca;
-        @Option(names = "--crl", description = "CRL PEM or DER to validate against the IACA") Path crl;
+        @Option(names = "--crl", description = "CRL PEM or DER to validate against the IACA; a DSC it revokes is"
+                + " DS_REVOKED") Path crl;
+        @Option(names = "--at", description = "the instant to judge validity at, ISO-8601 (default now)") String at;
 
         @Override
         public Integer call() {
             try {
                 return check();
             } catch (IOException e) {
-                return error(1, new IllegalStateException("cannot read the input: " + e.getMessage(), e));
+                return error(1, "cannot read the input: " + e.getMessage());
             } catch (RuntimeException e) {
-                return error(1, e);
+                return error(1, e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
             }
         }
 
         private Integer check() throws IOException {
+            Instant instant;
+            try {
+                instant = at == null ? Instant.now() : Instant.parse(at);
+            } catch (DateTimeParseException e) {
+                throw new UsageException("--at is not an ISO-8601 instant such as 2026-11-13T00:00:00Z: " + at);
+            }
+            if (!IACA_PROFILE.equals(profile) && !DS_PROFILE.equals(profile)) {
+                throw new UsageException("--profile is " + profile + "; use " + IACA_PROFILE + " or " + DS_PROFILE);
+            }
             List<X509Certificate> certificates = Pem.readCertificates(pem(chain));
+            if (certificates.isEmpty()) {
+                throw new UsageException(chain + " holds no certificate");
+            }
+            X509Certificate given = iaca == null ? null : Pem.readCertificate(pem(iaca));
+            X509CRL list = crl == null ? null : readCrl(crl);
             List<AnnexBValidator.Violation> violations = new ArrayList<>();
             X509Certificate authority;
-            switch (profile) {
-                case IACA_PROFILE -> {
-                    authority = certificates.get(0);
-                    violations.addAll(AnnexBValidator.validateIaca(authority));
+            X509Certificate ds = null;
+            if (IACA_PROFILE.equals(profile)) {
+                authority = certificates.get(0);
+            } else {
+                ds = certificates.get(0);
+                X509Certificate fromChain = certificates.size() > 1 ? certificates.get(1) : null;
+                if (given == null && fromChain == null) {
+                    throw new UsageException("no IACA: pass --iaca or a two-certificate --chain");
                 }
-                case DS_PROFILE -> {
-                    X509Certificate ds = certificates.get(0);
-                    authority = iaca != null ? Pem.readCertificate(pem(iaca))
-                            : certificates.size() > 1 ? certificates.get(1) : null;
-                    if (authority == null) {
-                        throw new IllegalArgumentException("no IACA: pass --iaca or a two-certificate --chain");
-                    }
-                    violations.addAll(AnnexBValidator.validateDs(ds, authority));
+                if (given != null && fromChain != null && !PkiFiles.sameCertificate(given, fromChain)) {
+                    violations.add(new AnnexBValidator.Violation("CHAIN_IACA_MISMATCH", "the chain's second"
+                            + " certificate (sha256 " + PkiFiles.sha256(fromChain) + ") is not the --iaca certificate"
+                            + " (sha256 " + PkiFiles.sha256(given) + ")"));
                 }
-                default -> throw new IllegalArgumentException("--profile is " + profile + "; use "
-                        + IACA_PROFILE + " or " + DS_PROFILE);
+                authority = given != null ? given : fromChain;
             }
-            if (crl != null) {
-                violations.addAll(AnnexBValidator.validateCrl(readCrl(crl), authority));
+            violations.addAll(AnnexBValidator.validateIaca(authority));
+            validity(authority, "IACA", instant, violations);
+            if (ds != null) {
+                violations.addAll(AnnexBValidator.validateDs(ds, authority));
+                validity(ds, "DS", instant, violations);
+            }
+            if (list != null) {
+                violations.addAll(AnnexBValidator.validateCrl(list, authority, instant));
+                if (list.getNextUpdate() != null && list.getNextUpdate().toInstant().isBefore(instant)) {
+                    violations.add(new AnnexBValidator.Violation("CRL_EXPIRED", "the CRL's nextUpdate "
+                            + list.getNextUpdate().toInstant() + " is before " + instant + "; publish a new CRL"));
+                }
+                X509CRLEntry entry = ds == null ? null : list.getRevokedCertificate(ds);
+                if (entry != null) {
+                    violations.add(new AnnexBValidator.Violation("DS_REVOKED", "the CRL revokes the Document Signer"
+                            + " 0x" + ds.getSerialNumber().toString(16) + " since "
+                            + entry.getRevocationDate().toInstant()));
+                }
             }
             if (!violations.isEmpty()) {
-                return PkiCommand.violations(violations, profile + (crl != null ? " + crl" : ""));
+                // validateDs repeats an IACA finding validateIaca already made (an unreadable IACA, say)
+                return PkiCommand.violations(new ArrayList<>(new LinkedHashSet<>(violations)),
+                        profile + (crl != null ? " + crl" : ""));
             }
-            System.out.println("ok " + profile + (crl != null ? " crl" : ""));
+            System.out.println("ok " + profile + (crl != null ? " crl" : "") + " at " + instant);
             return 0;
         }
 
-        private static X509CRL readCrl(Path path) throws IOException {
-            byte[] bytes = Files.readAllBytes(path);
-            if (path.getFileName().toString().toLowerCase(java.util.Locale.ROOT).endsWith(".der")) {
-                try {
-                    return (X509CRL) java.security.cert.CertificateFactory.getInstance("X.509")
-                            .generateCRL(new java.io.ByteArrayInputStream(bytes));
-                } catch (java.security.cert.CertificateException | java.security.cert.CRLException e) {
-                    throw new IllegalArgumentException("cannot read the DER CRL " + path + ": " + e.getMessage(), e);
-                }
+        private static void validity(X509Certificate certificate, String prefix, Instant at,
+                                     List<AnnexBValidator.Violation> violations) {
+            if (at.isBefore(certificate.getNotBefore().toInstant())) {
+                violations.add(new AnnexBValidator.Violation(prefix + "_NOT_YET_VALID", "valid from "
+                        + certificate.getNotBefore().toInstant() + ", after " + at));
+            } else if (at.isAfter(certificate.getNotAfter().toInstant())) {
+                violations.add(new AnnexBValidator.Violation(prefix + "_EXPIRED", "expired at "
+                        + certificate.getNotAfter().toInstant() + ", before " + at));
             }
-            return Pem.readCrl(new String(bytes, StandardCharsets.US_ASCII));
         }
     }
 }

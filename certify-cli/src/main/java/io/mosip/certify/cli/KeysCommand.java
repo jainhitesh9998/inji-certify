@@ -1,6 +1,7 @@
 package io.mosip.certify.cli;
 
 import io.mosip.certify.keyprovider.jca.JcaKeyProvider;
+import io.mosip.certify.pki.AnnexBValidator;
 import io.mosip.certify.pki.Pem;
 import io.mosip.certify.signing.KeyFilter;
 import io.mosip.certify.signing.KeyPublisher;
@@ -8,21 +9,22 @@ import io.mosip.certify.signing.KeyRef;
 import io.mosip.certify.signing.PublicKeyDescriptor;
 import io.mosip.certify.signing.SignatureAlgorithm;
 import io.mosip.certify.signing.SigningKey;
+import org.bouncycastle.asn1.x500.X500Name;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Mixin;
 import picocli.CommandLine.Option;
 
-import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.KeyStore;
 import java.security.PrivateKey;
 import java.security.cert.X509Certificate;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
 
-@Command(name = "keys", description = "Generate, list and export issuer keys.", mixinStandardHelpOptions = true,
+@Command(name = "keys", description = "Generate, list, export and import issuer keys.", mixinStandardHelpOptions = true,
         subcommands = {KeysCommand.Generate.class, KeysCommand.ListKeys.class, KeysCommand.Jwks.class,
                 KeysCommand.CsrCommand.class, KeysCommand.ImportKey.class})
 class KeysCommand {
@@ -37,15 +39,28 @@ class KeysCommand {
 
         @Override
         public Integer call() {
-            JcaKeyProvider provider = keystore.load();
-            if (provider.aliases().contains(alias)) {
-                System.err.println("alias already exists: " + alias);
-                return 2;
+            return PkiCommand.execute(this::generate, "cannot write the keystore");
+        }
+
+        private Integer generate() throws Exception {
+            try (SecureFiles.Lock lock = SecureFiles.lock(keystore.keystore)) {
+                char[] password = keystore.password();
+                boolean exists = Files.exists(keystore.keystore);
+                KeyStore store = PkiFiles.readOrCreate(keystore.keystore, password);
+                if (PkiFiles.contains(store, alias)) {
+                    System.err.println("alias already exists: " + alias);
+                    return 2;
+                }
+                // generated in a scratch provider, then added to the keystore read under the lock
+                SigningKey key = new JcaKeyProvider().generate(alias, algorithm, subject, purpose);
+                PkiFiles.add(store, alias, (PrivateKey) key.providerHandle(), password, key.chain().leafFirst());
+                PkiFiles.write(store, keystore.keystore, password, exists);
+                PublicKeyDescriptor descriptor = key.descriptor();
+                System.out.println(alias + "\t" + descriptor.algorithm().joseName() + "\tkid=" + descriptor.kid() + "\tvalidUntil=" + descriptor.notAfter());
+                return 0;
+            } finally {
+                keystore.clear();
             }
-            PublicKeyDescriptor descriptor = provider.generate(alias, algorithm, subject, purpose).descriptor();
-            keystore.save(provider);
-            System.out.println(alias + "\t" + descriptor.algorithm().joseName() + "\tkid=" + descriptor.kid() + "\tvalidUntil=" + descriptor.notAfter());
-            return 0;
         }
     }
 
@@ -55,11 +70,15 @@ class KeysCommand {
 
         @Override
         public Integer call() {
-            List<PublicKeyDescriptor> keys = keystore.load().publicKeys(KeyFilter.ALL);
-            for (PublicKeyDescriptor key : keys) {
-                System.out.println(key.kid() + "\t" + key.algorithm().joseName() + "\t" + key.purpose() + "\tvalidUntil=" + key.notAfter());
+            try {
+                List<PublicKeyDescriptor> keys = keystore.load().publicKeys(KeyFilter.ALL);
+                for (PublicKeyDescriptor key : keys) {
+                    System.out.println(key.kid() + "\t" + key.algorithm().joseName() + "\t" + key.purpose() + "\tvalidUntil=" + key.notAfter());
+                }
+                return 0;
+            } finally {
+                keystore.clear();
             }
-            return 0;
         }
     }
 
@@ -69,8 +88,12 @@ class KeysCommand {
 
         @Override
         public Integer call() {
-            System.out.println(new KeyPublisher(List.of(keystore.load())).jwks(KeyFilter.validNow()).toString(true));
-            return 0;
+            try {
+                System.out.println(new KeyPublisher(List.of(keystore.load())).jwks(KeyFilter.validNow()).toString(true));
+                return 0;
+            } finally {
+                keystore.clear();
+            }
         }
     }
 
@@ -79,85 +102,147 @@ class KeysCommand {
     static class CsrCommand implements Callable<Integer> {
         @Mixin KeystoreOptions keystore;
         @Option(names = "--alias", required = true, description = "alias of the existing key") String alias;
-        @Option(names = "--cn", description = "request subject CN (default: the key's certificate subject)")
+        @Option(names = "--cn", description = "request subject: one CN with this value, taken verbatim (default: the"
+                + " key's certificate subject, attribute order kept)")
         String commonName;
         @Option(names = "--out", description = "output PEM (stdout when omitted)") Path out;
+        @Option(names = {"--overwrite", "--force"}, description = "replace an existing --out file") boolean overwrite;
 
         @Override
         public Integer call() {
+            return PkiCommand.execute(this::csr, "cannot write the request");
+        }
+
+        private Integer csr() throws Exception {
             try {
+                SecureFiles.requireDistinct(SecureFiles.paths("-k", keystore.keystore), SecureFiles.paths("--out", out));
+                PkiCommand.refuseExisting(out, overwrite);
                 JcaKeyProvider provider = keystore.load();
                 SigningKey key = provider.resolve(new KeyRef(provider.id(), alias));
                 if (!(key.providerHandle() instanceof PrivateKey privateKey)) {
                     throw new IllegalArgumentException("key " + alias + " is not held as a JCA private key");
                 }
-                String subject = commonName != null
-                        ? "CN=" + commonName
-                        : key.chain().leaf().map(c -> c.getSubjectX500Principal().getName())
-                                .orElse("CN=" + alias);
+                X500Name subject = commonName != null
+                        ? PkiFiles.commonNameSubject(commonName)
+                        : key.chain().leaf().map(PkiFiles::subject).orElse(PkiFiles.commonNameSubject(alias));
                 String pem = PkiFiles.csrPem(privateKey, key.descriptor().publicKey(), subject);
                 if (out == null) {
                     System.out.print(pem);
                 } else {
-                    PkiCommand.write(out, pem.getBytes(StandardCharsets.US_ASCII));
+                    SecureFiles.write(out, pem.getBytes(StandardCharsets.US_ASCII), SecureFiles.Visibility.PUBLIC,
+                            overwrite);
                 }
                 return 0;
-            } catch (IOException e) {
-                return PkiCommand.error(2, new IllegalStateException("cannot write the request: " + e.getMessage(), e));
-            } catch (RuntimeException e) {
-                return PkiCommand.error(2, e);
+            } finally {
+                keystore.clear();
             }
         }
     }
 
     @Command(name = "import", mixinStandardHelpOptions = true,
-            description = "Import a PEM private key and certificate chain into the PKCS#12 keystore.")
+            description = "Import a PEM private key and its certificate chain into the PKCS#12 keystore; the chain must"
+                    + " link up to a self-signed root or --anchor.")
     static class ImportKey implements Callable<Integer> {
         @Mixin KeystoreOptions keystore;
         @Option(names = "--alias", required = true, description = "alias of the imported key") String alias;
-        @Option(names = "--key", required = true, description = "PEM private key (PKCS#8, encrypted or not)")
+        @Option(names = "--key", required = true, description = "PEM private key (PKCS#8 or SEC1, encrypted or not),"
+                + " EC P-256/384/521")
         Path key;
         @Option(names = "--key-password", arity = "0..1", interactive = true,
-                description = "PEM key password (" + PkiFiles.KEY_PASSWORD_ENV + " when the option is absent)")
+                description = "PEM key password; " + PkiFiles.KEY_PASSWORD_ENV + " when absent, prompted when the key"
+                        + " is encrypted and neither is set")
         char[] keyPassword;
         @Option(names = "--chain", required = true, description = "PEM certificate chain, leaf first")
         Path chain;
+        @Option(names = "--anchor", description = "PEM certificate the chain ends under, when its last certificate is"
+                + " not self-signed (e.g. the IACA for a leaf-only DSC)")
+        Path anchor;
+        @Option(names = "--profile", description = "mdoc-dsc: the key is a Document Signer; [DSC, IACA] (from the"
+                + " chain, or the chain and --anchor) must pass Annex B and is what the entry stores")
+        String profile;
 
         @Override
         public Integer call() {
+            return PkiCommand.execute(this::importKey, "cannot import the key");
+        }
+
+        private Integer importKey() throws Exception {
+            char[] keySecret = null;
             try {
-                char[] storePassword = keystore.password();
-                KeyStore store = PkiFiles.readOrCreate(keystore.keystore, storePassword);
-                if (PkiFiles.contains(store, alias)) {
-                    throw new IllegalArgumentException("alias already exists in " + keystore.keystore + ": " + alias);
+                if (profile != null && !PkiCommand.DS_PROFILE.equals(profile)) {
+                    throw new UsageException("--profile is " + profile + "; the only profile is "
+                            + PkiCommand.DS_PROFILE);
                 }
-                PrivateKey privateKey = Pem.readPrivateKey(
-                        Files.readString(key, StandardCharsets.US_ASCII), keySecret());
+                SecureFiles.requireDistinct(SecureFiles.paths("--key", key, "--chain", chain, "--anchor", anchor),
+                        SecureFiles.paths("-k", keystore.keystore,
+                                "the lock of -k", SecureFiles.lockFile(keystore.keystore)));
+                String keyPem = Files.readString(key, StandardCharsets.US_ASCII);
+                if (Pem.isEncryptedPrivateKey(keyPem)) {
+                    keySecret = PkiFiles.password(keyPassword, PkiFiles.KEY_PASSWORD_ENV, "PEM key password",
+                            "--key-password");
+                }
+                PrivateKey privateKey = Pem.readPrivateKey(keyPem, keySecret);
+                PkiFiles.requireSupportedKey(privateKey, "--key " + key);
                 List<X509Certificate> certificates = Pem.readCertificates(
                         Files.readString(chain, StandardCharsets.US_ASCII));
+                if (certificates.isEmpty()) {
+                    throw new UsageException(chain + " holds no certificate");
+                }
+                PkiFiles.requireSupportedKey(certificates.get(0).getPublicKey(), "the first certificate of " + chain);
                 if (!PkiFiles.matches(privateKey, certificates.get(0).getPublicKey())) {
                     throw new IllegalArgumentException("the private key does not belong to the first certificate of "
                             + chain + "; the chain must be leaf first");
                 }
-                PkiFiles.add(store, alias, privateKey, storePassword, certificates);
-                PkiFiles.write(store, keystore.keystore, storePassword);
+                X509Certificate anchorCertificate = anchor == null ? null
+                        : Pem.readCertificate(Files.readString(anchor, StandardCharsets.US_ASCII));
+                PkiFiles.verifyChain(certificates, anchorCertificate);
+                List<X509Certificate> stored = certificates;
+                if (PkiCommand.DS_PROFILE.equals(profile)) {
+                    stored = documentSignerChain(certificates, anchorCertificate);
+                    if (stored == null) {
+                        return 2;
+                    }
+                }
+                try (SecureFiles.Lock lock = SecureFiles.lock(keystore.keystore)) {
+                    char[] storePassword = keystore.password();
+                    boolean exists = Files.exists(keystore.keystore);
+                    KeyStore store = PkiFiles.readOrCreate(keystore.keystore, storePassword);
+                    if (PkiFiles.contains(store, alias)) {
+                        throw new IllegalArgumentException("alias already exists in " + keystore.keystore + ": "
+                                + alias);
+                    }
+                    PkiFiles.add(store, alias, privateKey, storePassword, stored);
+                    PkiFiles.write(store, keystore.keystore, storePassword, exists);
+                }
                 System.out.println("alias=" + alias);
-                System.out.println("sha256=" + PkiFiles.sha256(certificates.get(0)));
+                System.out.println("chain=" + stored.size());
+                System.out.println("sha256=" + PkiFiles.sha256(stored.get(0)));
                 return 0;
-            } catch (IOException e) {
-                return PkiCommand.error(2, new IllegalStateException("cannot import the key: " + e.getMessage(), e));
-            } catch (RuntimeException e) {
-                return PkiCommand.error(2, e);
+            } finally {
+                PkiFiles.clear(keySecret, keyPassword);
+                keystore.clear();
             }
         }
 
-        /** The key password; a plaintext key needs none, so an absent one is not an error here. */
-        private char[] keySecret() {
-            if (keyPassword != null && keyPassword.length > 0) {
-                return keyPassword;
+        /** {@code [DSC, IACA]} judged by Annex B, or {@code null} after printing the violations. */
+        private static List<X509Certificate> documentSignerChain(List<X509Certificate> certificates,
+                                                                 X509Certificate anchor) {
+            if (certificates.size() > 2) {
+                throw new IllegalArgumentException("a Document Signer chain is [DSC, IACA]; the chain has "
+                        + certificates.size() + " certificates");
             }
-            String env = System.getenv(PkiFiles.KEY_PASSWORD_ENV);
-            return env == null || env.isEmpty() ? null : env.toCharArray();
+            X509Certificate dsc = certificates.get(0);
+            X509Certificate iaca = certificates.size() == 2 ? certificates.get(1) : anchor;
+            if (iaca == null) {
+                throw new UsageException("--profile mdoc-dsc needs the IACA: a [DSC, IACA] chain, or --anchor iaca.pem");
+            }
+            List<AnnexBValidator.Violation> violations = new ArrayList<>(AnnexBValidator.validateIaca(iaca));
+            violations.addAll(AnnexBValidator.validateDs(dsc, iaca));
+            if (!violations.isEmpty()) {
+                PkiCommand.violations(violations, "Document Signer chain");
+                return null;
+            }
+            return List.of(dsc, iaca);
         }
     }
 }
