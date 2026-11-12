@@ -21,5 +21,9 @@ class CoreBackedVCIssuanceServiceTest {
         assertEquals("c_nonce is invalid or expired", nonce.getMessage());
         assertEquals("invalid_scope", CoreBackedVCIssuanceService.legacy(new IssuanceException(IssuanceException.INVALID_SCOPE, "x")).getErrorCode());
         assertEquals("vc_issuance_failed", CoreBackedVCIssuanceService.legacy(new IssuanceException(IssuanceException.ISSUANCE_FAILED, "boom")).getErrorCode());
+        // a CertifyException is answered with 400 by ExceptionHandlerAdvice: the denied subject stays a client error
+        CertifyException denied = CoreBackedVCIssuanceService.legacy(new IssuanceException(IssuanceException.CREDENTIAL_REQUEST_DENIED, "no record for sub"));
+        assertEquals("credential_request_denied", denied.getErrorCode());
+        assertEquals("no record for sub", denied.getMessage());
     }
 }

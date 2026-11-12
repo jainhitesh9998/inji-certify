@@ -86,4 +86,14 @@ public class OAuthAuthorizationServerMetadataDTO {
      */
     @JsonProperty("require_interactive_authorization_request")
     private Boolean requireInteractiveAuthorizationRequest;
+
+    /**
+     * OID4VCI 1.0 section 12.3 authorization server metadata: the token endpoint accepts a pre-authorized code grant
+     * <em>without</em> a {@code client_id} ({@code pre-authorized_grant_anonymous_access_supported}), so a wallet can
+     * redeem an offer with no client registration and no user interaction. It says nothing about {@code tx_code}: an
+     * offer may still require one. Published only when Certify's own token endpoint serves the grant and client
+     * attestation is not required; with an external AS (eSignet) that server's own document is authoritative.
+     */
+    @JsonProperty("pre-authorized_grant_anonymous_access_supported")
+    private Boolean preAuthorizedGrantAnonymousAccessSupported;
 }

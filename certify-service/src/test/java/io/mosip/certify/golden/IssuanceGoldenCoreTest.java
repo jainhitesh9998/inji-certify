@@ -6,6 +6,8 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.test.context.TestPropertySource;
 
+import java.util.List;
+
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -17,6 +19,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class IssuanceGoldenCoreTest extends IssuanceGoldenTest {
 
     @Autowired VCIssuanceService vcIssuanceService;
+
+    /** Through the core the compatibility path has the core's validity gap (G8) too. */
+    @Override
+    List<MdocSampleWriter.Gap> legacySurfaceMdocGaps() {
+        return MdocSampleWriter.CORE_GAPS;
+    }
 
     @Test
     void compatibilityPathIsServedByTheCore() {

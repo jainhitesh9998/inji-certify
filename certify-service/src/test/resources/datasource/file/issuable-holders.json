@@ -1,0 +1,20 @@
+{
+  "user@inji.io": {
+    "fullName": "Asha File",
+    "dateOfBirth": "1990-01-01",
+    "resident_address": {
+      "country": "IN",
+      "locality": "Bengaluru"
+    },
+    "driving_privileges": [
+      {
+        "vehicle_category_code": "B",
+        "issue_date": "2024-02-01"
+      },
+      {
+        "vehicle_category_code": "A1",
+        "issue_date": "2024-02-01"
+      }
+    ]
+  }
+}

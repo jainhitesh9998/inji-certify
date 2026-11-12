@@ -402,10 +402,13 @@ class IssuanceGoldenTest {
     @Test
     void mdocIssuanceGoldenAndIndependentVerification() throws Exception {
         ECKey holder = new ECKeyGenerator(Curve.P_256).generate();
+        answerAfterTwoMilliseconds();
         MvcResult result = issue(MDOC_ID, proofJwt(nonce(), holder));
         JsonNode body = objectMapper.readTree(result.getResponse().getContentAsString());
         assertEquals(200, result.getResponse().getStatus(), body.toString());
         String credential = body.get("credentials").get(0).get("credential").asText();
+        // before the assertions: certify-conformance-mdoc and the CI python verifier read it even if a later check fails
+        MdocSampleWriter.write(getClass(), "legacy", credential, holder, "org.iso.18013.5.1.mDL", legacySurfaceMdocGaps());
 
         com.upokecenter.cbor.CBORObject issuerSigned = com.upokecenter.cbor.CBORObject.DecodeFromBytes(Base64.getUrlDecoder().decode(credential));
         assertTrue(issuerSigned.ContainsKey("nameSpaces"), "IssuerSigned.nameSpaces");
@@ -587,10 +590,13 @@ class IssuanceGoldenTest {
     @Test
     void oid4vciMdocIssuanceGoldenAndIndependentVerification() throws Exception {
         ECKey holder = new ECKeyGenerator(Curve.P_256).generate();
+        answerAfterTwoMilliseconds();
         MvcResult result = issueOid4vci(MDOC_ID, oid4vciProof(holder));
         JsonNode body = objectMapper.readTree(result.getResponse().getContentAsString());
         assertEquals(200, result.getResponse().getStatus(), body.toString());
         String credential = body.get("credentials").get(0).get("credential").asText();
+        // before the assertions: certify-conformance-mdoc and the CI python verifier read it even if a later check fails
+        MdocSampleWriter.write(getClass(), "oid4vci", credential, holder, "org.iso.18013.5.1.mDL", MdocSampleWriter.CORE_GAPS);
 
         com.upokecenter.cbor.CBORObject issuerSigned = com.upokecenter.cbor.CBORObject.DecodeFromBytes(Base64.getUrlDecoder().decode(credential));
         com.upokecenter.cbor.CBORObject issuerAuth = issuerSigned.get("issuerAuth");
@@ -609,6 +615,8 @@ class IssuanceGoldenTest {
         verifier.initVerify(leaf.getPublicKey());
         verifier.update(sigStructure);
         assertTrue(verifier.verify(com.nimbusds.jose.crypto.impl.ECDSA.transcodeSignatureToDER(issuerAuth.get(3).GetByteString())), "IssuerAuth from the new surface verifies with JCA");
+        // ...and, after this test, by libraries Certify does not maintain: certify-conformance-mdoc re-verifies the
+        // sample written above with Multipaz and Authlete (gap G24, M-01)
         com.upokecenter.cbor.CBORObject msoWrapped = com.upokecenter.cbor.CBORObject.DecodeFromBytes(payload);
         com.upokecenter.cbor.CBORObject mso = msoWrapped.HasMostOuterTag(24)
                 ? com.upokecenter.cbor.CBORObject.DecodeFromBytes(msoWrapped.Untag().GetByteString()) : msoWrapped;
@@ -915,6 +923,26 @@ class IssuanceGoldenTest {
             // no git or no such ref (a CI checkout of this branch): the checked-in copy is the baseline
         }
         return objectMapper.readTree(recorded);
+    }
+
+    /**
+     * The checks the mDoc from {@code POST /issuance/credential} is known not to pass yet: on the legacy service it is
+     * signed at its validFrom; {@link IssuanceGoldenCoreTest} serves the same path through the core and overrides this.
+     */
+    List<MdocSampleWriter.Gap> legacySurfaceMdocGaps() {
+        return MdocSampleWriter.LEGACY_SERVICE_GAPS;
+    }
+
+    /**
+     * The data provider answers after 2 ms, as any real one does, so the core path's validFrom (the request instant)
+     * and signed (the formatter's wall clock) always differ: the G8 gap the core samples declare then reproduces on
+     * every run instead of all but the runs where both fall in one millisecond.
+     */
+    void answerAfterTwoMilliseconds() throws Exception {
+        when(dataProviderPlugin.fetchData(any())).thenAnswer(inv -> {
+            Thread.sleep(2);
+            return new JSONObject(Map.of("fullName", "Golden Farmer", "dateOfBirth", "1990-01-01", "city", "Bengaluru"));
+        });
     }
 
     /** mso_mdoc: docType, namespace claims, ES256 with the EC_R1 key; the validator wants a cryptosuite key of the signing-alg map. */

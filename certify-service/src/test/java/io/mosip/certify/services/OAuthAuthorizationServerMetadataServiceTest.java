@@ -1,5 +1,6 @@
 package io.mosip.certify.services;
 
+import io.mosip.certify.as.AsProperties;
 import io.mosip.certify.core.dto.OAuthAuthorizationServerMetadataDTO;
 import org.junit.Before;
 import org.junit.Test;
@@ -8,8 +9,10 @@ import org.mockito.InjectMocks;
 import org.mockito.junit.MockitoJUnitRunner;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.Assert.*;
 
@@ -147,6 +150,89 @@ public class OAuthAuthorizationServerMetadataServiceTest {
         
         List<String> expectedCodeChallengeMethods = Arrays.asList(" S256 ");
         assertEquals("Code challenge methods should match (with whitespace)", expectedCodeChallengeMethods, result.getCodeChallengeMethodsSupported());
+    }
+
+    /**
+     * OID4VCI 1.0 section 12.3: the flag is about a Token Request that carries a pre-authorized code and no
+     * {@code client_id}, so it does not depend on an authorization-code client being registered - but it is opt-in
+     * ({@code certify.as.pre-authorized-grant.advertise-anonymous-access}, default off), because an unchanged deployment
+     * has never published the field and its document must keep its exact bytes (goldens/legacy-0.14.0).
+     */
+    @Test
+    public void getOAuthAuthorizationServerMetadata_AnonymousGrantsAreNotAdvertisedByDefault() {
+        asProperties(as(Map.of("wallet", new AsProperties.Client(List.of("https://wallet.example/cb"))), false, false));
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "grantTypesSupported",
+                "authorization_code,urn:ietf:params:oauth:grant-type:pre-authorized_code");
+
+        OAuthAuthorizationServerMetadataDTO result = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+
+        assertNull("the field is new: an unchanged deployment must not grow it",
+                result.getPreAuthorizedGrantAnonymousAccessSupported());
+        assertEquals("the rest of the document is unaffected", "http://localhost:8090/v1/certify/oauth/authorize",
+                result.getAuthorizationEndpoint());
+    }
+
+    @Test
+    public void getOAuthAuthorizationServerMetadata_PreAuthOnlyDeploymentAdvertisesAnonymousGrantsWhenEnabled() {
+        asProperties(as(Map.of(), false, true));
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "grantTypesSupported",
+                "authorization_code,urn:ietf:params:oauth:grant-type:pre-authorized_code");
+
+        OAuthAuthorizationServerMetadataDTO result = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+
+        assertTrue("a deployment with no authorization-code clients still serves the pre-authorized grant",
+                Boolean.TRUE.equals(result.getPreAuthorizedGrantAnonymousAccessSupported()));
+        assertNull("the authorization code flow is still not advertised without a client", result.getAuthorizationEndpoint());
+    }
+
+    @Test
+    public void getOAuthAuthorizationServerMetadata_ClientAttestationDeploymentOmitsAnonymousGrants() {
+        asProperties(as(Map.of(), true, true));
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "grantTypesSupported",
+                "authorization_code,urn:ietf:params:oauth:grant-type:pre-authorized_code");
+
+        OAuthAuthorizationServerMetadataDTO result = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+
+        assertNull("an anonymous token request is refused once attestation is required",
+                result.getPreAuthorizedGrantAnonymousAccessSupported());
+    }
+
+    /** The pre-authorized grant is not in {@code grant_types_supported}, so there is nothing anonymous to advertise. */
+    @Test
+    public void getOAuthAuthorizationServerMetadata_GrantNotListedOmitsAnonymousGrants() {
+        asProperties(as(Map.of(), false, true));
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "grantTypesSupported", "authorization_code");
+
+        OAuthAuthorizationServerMetadataDTO result = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+
+        assertNull(result.getPreAuthorizedGrantAnonymousAccessSupported());
+    }
+
+    @Test
+    public void getOAuthAuthorizationServerMetadata_ClientsAndAttestationAdvertiseBothFlows() {
+        asProperties(as(Map.of("wallet", new AsProperties.Client(List.of("https://wallet.example/cb"))), false, true));
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "grantTypesSupported",
+                "authorization_code,urn:ietf:params:oauth:grant-type:pre-authorized_code");
+
+        OAuthAuthorizationServerMetadataDTO result = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+
+        assertTrue(Boolean.TRUE.equals(result.getPreAuthorizedGrantAnonymousAccessSupported()));
+        assertEquals("http://localhost:8090/v1/certify/oauth/authorize", result.getAuthorizationEndpoint());
+    }
+
+    private void asProperties(AsProperties properties) {
+        org.springframework.beans.factory.support.DefaultListableBeanFactory beans =
+                new org.springframework.beans.factory.support.DefaultListableBeanFactory();
+        beans.registerSingleton("asProperties", properties);
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "asProperties",
+                beans.getBeanProvider(AsProperties.class));
+    }
+
+    private static AsProperties as(Map<String, AsProperties.Client> clients, boolean attestationRequired, boolean advertiseAnonymousAccess) {
+        return new AsProperties(clients, new AsProperties.Authorization("none", null),
+                new AsProperties.Par(Duration.ofSeconds(90)),
+                new AsProperties.ClientAttestation(attestationRequired, Map.of(), Duration.ofSeconds(60), Duration.ofMinutes(5)),
+                new AsProperties.PreAuthorizedGrant(advertiseAnonymousAccess));
     }
 
     @Test

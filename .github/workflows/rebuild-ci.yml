@@ -38,6 +38,72 @@ jobs:
         # Testcontainers suites join this step as their work packages land.
         run: mvn -B -ntp -U -Dgpg.skip=true verify
 
+      - name: certify-service runtime classpath guard
+        # A test-only verifier must never change what the product ships. certify-service/runtime-classpath.txt is the
+        # reviewed baseline of the resolved runtime classpath; M-01's first attempt pinned Multipaz's Kotlin 2.2.21
+        # in the service for a test, which this guard now fails on (docs/design/20-mdl-issuer.md M-01).
+        run: docs/design/tools/check-runtime-classpath.sh
+        shell: bash
+
+      - uses: actions/setup-python@v5
+        # verify_mdoc.py and its pinned requirements are tested on this interpreter, not whatever the runner ships
+        with:
+          python-version: '3.12'
+
+      - name: Independent mDoc verifier (pymdoccbor)
+        # Second, non-Java opinion on every mDoc the tests write to target/mdoc-samples/ (M-01, decision D9).
+        # The Java harness (certify-testkit-mdoc: Multipaz + Authlete) runs in the test step above; this one verifies
+        # the IssuerAuth COSE_Sign1 signature, the x5chain, the element digests over the bytes as received, the
+        # deviceKey and the validity window, taking the docType, the IACA, the holder key and the accepted gaps from
+        # the sample's sidecar files. Gaps are problem codes (<check>:<code>), shared with the Java harness: a reported
+        # problem the sidecar does not list fails, and so does a listed code of a rule this tool implements that is no
+        # longer reported. Then every mutation under target/mdoc-mutations/ must fail, on the problem its .expect names.
+        run: |
+          python -m venv "$RUNNER_TEMP/verify-mdoc"
+          py="$RUNNER_TEMP/verify-mdoc/bin/python"
+          "$py" --version
+          "$py" -m pip install --quiet -r docs/design/tools/requirements-verify.txt
+          "$py" -m unittest discover -s docs/design/tools -p 'test_*.py'
+          shopt -s nullglob
+          samples=(*/target/mdoc-samples/*.mdoc)
+          if [ ${#samples[@]} -eq 0 ]; then
+            echo "no mDoc samples under target/mdoc-samples: the mDoc tests did not run"
+            exit 1
+          fi
+          verify() {
+            local sample="$1" base="${1%.mdoc}"
+            local args=("$sample")
+            if [ -f "${base}.doctype" ]; then
+              args+=(--doctype "$(cat "${base}.doctype")")
+            fi
+            if [ -f "${base}.iaca.pem" ]; then
+              args+=(--iaca "${base}.iaca.pem")
+            fi
+            args+=(--holder "${base}.holder.jwk" --gaps "${base}.gaps")
+            "$py" docs/design/tools/verify_mdoc.py "${args[@]}"
+          }
+          for sample in "${samples[@]}"; do
+            verify "$sample"
+          done
+          mutations=(*/target/mdoc-mutations/*.mdoc)
+          if [ ${#mutations[@]} -eq 0 ]; then
+            echo "no mDoc mutations under target/mdoc-mutations: MdocIndependentVerificationTest did not run"
+            exit 1
+          fi
+          for mutation in "${mutations[@]}"; do
+            expected="$(cat "${mutation%.mdoc}.expect")"
+            set +e
+            output="$(verify "$mutation")"
+            status=$?
+            set -e
+            echo "$output"
+            if [ "$status" -ne 1 ] || ! grep -qF "FAIL ${expected}:" <<< "$output"; then
+              echo "the mutation $mutation must fail on ${expected} (exit $status)"
+              exit 1
+            fi
+          done
+        shell: bash
+
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@v4

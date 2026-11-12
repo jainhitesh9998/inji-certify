@@ -42,6 +42,11 @@
       <h2>1. Offer</h2>
       <label for="configuration">Credential configuration</label>
       <select id="configuration"></select>
+      <label for="surface">Credential issuer (surface the offer targets)</label>
+      <select id="surface">
+        <option value="oid4vci">/oid4vci (OpenID4VCI 1.0)</option>
+        <option value="legacy">legacy (compatibility endpoints)</option>
+      </select>
       <label for="subject">Subject (the record id the data provider resolves, e.g. the CSV row id)</label>
       <input id="subject" placeholder="2154189532">
       <label for="claims">Or claims as JSON (used when the subject is empty)</label>
@@ -50,6 +55,7 @@
         <div style="flex:1"><label for="txCode">Transaction code (optional)</label><input id="txCode" placeholder="1234"></div>
         <div style="flex:1"><label for="expires">Expires in (seconds)</label><input id="expires" value="600"></div>
       </div>
+      <label><input type="checkbox" id="byValue" style="width:auto"> Return the offer by value (credential_offer in the response)</label>
       <button id="create">Create offer</button>
       <div id="offerStatus" class="status"></div>
       <div id="offerUri" class="uri" hidden></div>
@@ -77,16 +83,24 @@
     <button id="wallet" disabled>Run the pre-authorized code flow here</button>
     <div id="walletStatus" class="status"></div>
     <pre id="credential" hidden></pre>
+    <div id="mdocView" hidden>
+      <h3 style="font-size:0.95rem;margin:16px 0 6px">IssuerSigned (ISO/IEC 18013-5) elements</h3>
+      <table id="mdocTable" style="width:100%;border-collapse:collapse;font-size:0.85rem"></table>
+      <p class="hint">The IssuerAuth chain must verify against the issuer's IACA: <a href="../mdoc/iaca" target="_blank" rel="noopener">../mdoc/iaca</a></p>
+    </div>
   </section>
 </main>
 
 <script src="qrcode.min.js"></script>
+<script src="cbor.js"></script>
 <script>
 (function () {
   // Same origin as the issuer: the servlet path is everything before /offer/
   const BASE = location.pathname.replace(/\/offer\/.*$/, "");
   const el = (id) => document.getElementById(id);
-  let metadata = null, newMetadata = null, offer = null, offerDocument = null, tokenEndpoint = null;
+  let metadata = null, newMetadata = null, offerDocument = null, offerConfigurationId = null, offerSurface = null, tokenEndpoint = null;
+  // the blob URL of the last portrait this page rendered, released when the next one replaces it
+  let portraitObjectUrls = [];
 
   async function api(method, path, body, headers, form) {
     const h = Object.assign({}, headers || {});
@@ -119,10 +133,36 @@
       select.appendChild(option);
     });
     if (!Object.keys(configurations).length) status("offerStatus", "No credential configuration is advertised by " + BASE, false);
+    // ISO/IEC 18013-5 credentials are only issued on the OpenID4VCI 1.0 surface, so that is the default there (D5);
+    // every other format keeps the compatibility surface the page has always used.
+    syncSurfaceDefault();
   }
 
+  function formatOf(configurationId) {
+    const configurations = (metadata && metadata.credential_configurations_supported) || {};
+    const selected = configurations[configurationId];
+    return selected && selected.format;
+  }
+
+  function selectedFormat() {
+    return formatOf(el("configuration").value);
+  }
+
+  function syncSurfaceDefault() {
+    el("surface").value = selectedFormat() === "mso_mdoc" ? "oid4vci" : "legacy";
+  }
+
+  el("configuration").addEventListener("change", syncSurfaceDefault);
+
   el("create").addEventListener("click", async () => {
-    const request = { credential_configuration_id: el("configuration").value, expires_in: Number(el("expires").value) || 600 };
+    // what this click proposes; the page's wallet below redeems the offer that is actually active, so none of it becomes
+    // the active offer until the issuer accepted the whole thing: a failed replacement leaves the previous offer, its
+    // document, its configuration and its surface exactly as they were
+    const proposedConfigurationId = el("configuration").value;
+    const proposedSurface = el("surface").value;
+    const request = { credential_configuration_id: proposedConfigurationId, expires_in: Number(el("expires").value) || 600,
+      issuer: proposedSurface };
+    if (el("byValue").checked) request.offer_by_value = true;
     if (el("txCode").value.trim()) request.tx_code = el("txCode").value.trim();
     if (el("subject").value.trim()) request.subject = el("subject").value.trim();
     else if (el("claims").value.trim()) {
@@ -135,18 +175,40 @@
       if (r.status !== 200 || !r.body || !r.body.credential_offer_uri) {
         status("offerStatus", "The issuer refused the offer (" + r.status + "): " + (typeof r.body === "string" ? r.body : JSON.stringify(r.body)), false); return;
       }
-      offer = r.body;
+      const offer = r.body;
       const deepLink = offer.credential_offer_uri;
+      let fetchedOffer = null;
+      if (offer.credential_offer) {
+        fetchedOffer = offer.credential_offer; // by value: the offer travelled in the answer, no fetch needed
+      } else {
+        const offerUrl = new URL(deepLink.replace(/^[a-z-]+:\/\//, "https://x/")).searchParams.get("credential_offer_uri");
+        const fetched = offerUrl ? await api("GET", offerUrl) : null;
+        if (!fetched || fetched.status !== 200 || !fetched.body || typeof fetched.body !== "object"
+            || !fetched.body.grants || !fetched.body.grants["urn:ietf:params:oauth:grant-type:pre-authorized_code"]) {
+          // the previous offer stays active: nothing has been published yet
+          status("offerStatus", "The offer was created but could not be fetched from credential_offer_uri ("
+            + (fetched ? fetched.status : "no URI") + ")", false); return;
+        }
+        fetchedOffer = fetched.body;
+      }
+      // the QR image is built before anything is published, so a rendering fault cannot leave a half-replaced offer
+      const qr = document.createElement("div");
+      new QRCode(qr, { text: deepLink, width: 256, height: 256, correctLevel: QRCode.CorrectLevel.M });
+      // created and fetched: this is the active offer from here, published in one go
+      offerConfigurationId = proposedConfigurationId;
+      offerSurface = proposedSurface;
+      offerDocument = fetchedOffer;
       el("offerUri").textContent = deepLink; el("offerUri").hidden = false;
       el("qr").innerHTML = "";
-      new QRCode(el("qr"), { text: deepLink, width: 256, height: 256, correctLevel: QRCode.CorrectLevel.M });
+      while (qr.firstChild) el("qr").appendChild(qr.firstChild);
       el("copy").disabled = false;
       el("open").href = deepLink; el("open").hidden = false;
-      const offerUrl = new URL(deepLink.replace(/^[a-z-]+:\/\//, "https://x/")).searchParams.get("credential_offer_uri");
-      offerDocument = offerUrl ? (await api("GET", offerUrl)).body : null;
       el("offerDoc").textContent = JSON.stringify(offerDocument, null, 2); el("offerDoc").hidden = !offerDocument;
       const grant = offerDocument && offerDocument.grants && offerDocument.grants["urn:ietf:params:oauth:grant-type:pre-authorized_code"];
-      status("offerStatus", grant ? "Offer created; the pre-authorized code is in the offer document below." : "Offer created (the offer document could not be fetched).", true);
+      // the surface this offer actually targets, not what the dropdown says now: this page's wallet always speaks /oid4vci
+      const surfaceNote = offerSurface === "oid4vci" ? " It targets the /oid4vci surface."
+        : " It targets the compatibility surface: the wallet below still requests the credential at /oid4vci/credential, which accepts the offer's token as long as the deployment lists the compatibility credential endpoint in mosip.certify.authn.allowed-audiences (the shipped configuration does).";
+      status("offerStatus", (grant ? "Offer created; the pre-authorized code is in the offer document below." : "Offer created (the offer document could not be fetched).") + surfaceNote, true);
       el("wallet").disabled = !grant;
       el("credential").hidden = true; status("walletStatus", "");
     } catch (e) {
@@ -188,18 +250,102 @@
       const nonce = await api("POST", "/oid4vci/nonce");
       if (nonce.status !== 200) { status("walletStatus", "Nonce request refused (" + nonce.status + ")", false); return; }
       status("walletStatus", "3/3 signing the proof and requesting the credential…");
+      // the configuration this page offered: the dropdown may have changed since
+      const configurationId = offerConfigurationId || el("configuration").value;
       const proof = await proofJwt(newMetadata.credential_issuer, nonce.body.c_nonce);
-      const credential = await api("POST", "/oid4vci/credential", { credential_configuration_id: el("configuration").value, proofs: { jwt: [proof] } },
+      const credential = await api("POST", "/oid4vci/credential", { credential_configuration_id: configurationId, proofs: { jwt: [proof] } },
         { Authorization: (token.body.token_type || "Bearer") + " " + token.body.access_token });
       el("credential").textContent = JSON.stringify(credential.body, null, 2); el("credential").hidden = false;
       const issued = credential.status === 200 && credential.body.credentials && credential.body.credentials.length;
       status("walletStatus", issued ? "Credential issued (" + credential.body.credentials.length + "); notification id " + credential.body.notification_id : "Credential request refused (" + credential.status + ")", !!issued);
+      if (issued) {
+        // its own guard: a rendering fault must not turn a successful issuance into "the flow failed"
+        try {
+          renderMdoc(credential.body.credentials[0].credential);
+        } catch (e) {
+          status("walletStatus", "Credential issued, but the IssuerSigned view could not be rendered: " + e.message, false);
+        }
+      }
     } catch (e) {
       status("walletStatus", "The flow failed: " + e.message, false);
     } finally {
       el("wallet").disabled = false;
     }
   });
+
+  // ---- mso_mdoc: decode the base64url IssuerSigned (ISO/IEC 18013-5 8.3.2) and list namespace/element/value
+  function base64urlBytes(text) {
+    const b64 = text.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "===".slice(0, (4 - (b64.length % 4)) % 4);
+    const raw = atob(padded);
+    const bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    return bytes;
+  }
+
+  /** The image type the portrait's magic bytes declare, so the browser gets a MIME it renders (JPEG or JPEG 2000). */
+  function imageMime(bytes) {
+    if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+    if (bytes.length >= 8 && bytes[0] === 0x00 && bytes[1] === 0x00 && bytes[2] === 0x00 && bytes[3] === 0x0c &&
+        bytes[4] === 0x6a && bytes[5] === 0x50 && bytes[6] === 0x20 && bytes[7] === 0x20) return "image/jp2";
+    return null;
+  }
+
+  function renderMdoc(credential) {
+    const view = el("mdocView"), table = el("mdocTable");
+    // the previous credential's portrait image is dropped by the table reset below: release its blob URL first
+    portraitObjectUrls.forEach((url) => URL.revokeObjectURL(url)); portraitObjectUrls = [];
+    table.innerHTML = "";
+    // the format of the configuration this page offered, not of whatever the dropdown shows now
+    if (formatOf(offerConfigurationId) !== "mso_mdoc") { view.hidden = true; return; }
+    let issuerSigned;
+    try { issuerSigned = Cbor.decode(base64urlBytes(credential)); } catch (e) {
+      view.hidden = false;
+      const row = document.createElement("tr"), cell = document.createElement("td");
+      cell.textContent = "The credential is not a CBOR IssuerSigned: " + e.message;
+      row.appendChild(cell); table.appendChild(row); return;
+    }
+    const namespaces = issuerSigned.nameSpaces || {};
+    Object.keys(namespaces).sort().forEach((namespace) => {
+      (namespaces[namespace] || []).forEach((item) => {
+        if (!item || typeof item !== "object") return;
+        const row = document.createElement("tr");
+        const name = document.createElement("td");
+        name.textContent = namespace + " / " + item.elementIdentifier;
+        name.style.cssText = "padding:4px 6px;border-top:1px solid #eee;vertical-align:top;white-space:nowrap";
+        const value = document.createElement("td");
+        value.style.cssText = "padding:4px 6px;border-top:1px solid #eee;word-break:break-word";
+        if (item.elementValue instanceof Uint8Array) {
+          if (item.elementIdentifier === "portrait") {
+            // the mDL portrait is a JPEG (or JPEG 2000) byte string: show it, the way a wallet would
+            const mime = imageMime(item.elementValue);
+            if (mime) {
+              const image = document.createElement("img");
+              // no base64 round trip (String.fromCharCode over a byte array overflows the call stack on large images)
+              const url = URL.createObjectURL(new Blob([item.elementValue], { type: mime }));
+              portraitObjectUrls.push(url);
+              image.src = url;
+              image.alt = "portrait";
+              image.style.cssText = "max-width:120px;border-radius:6px";
+              value.appendChild(image);
+            } else {
+              value.textContent = "<" + item.elementValue.length + " bytes, not a JPEG or JPEG 2000>";
+            }
+          } else {
+            value.textContent = "<" + item.elementValue.length + " bytes>";
+          }
+        } else if (item.elementValue !== null && typeof item.elementValue === "object") {
+          // integers beyond Number.MAX_SAFE_INTEGER decode to a BigInt: render them as the exact decimal digits
+          value.textContent = JSON.stringify(item.elementValue, (key, nested) =>
+            typeof nested === "bigint" ? nested.toString() : nested instanceof Uint8Array ? "<" + nested.length + " bytes>" : nested);
+        } else {
+          value.textContent = String(item.elementValue);
+        }
+        row.appendChild(name); row.appendChild(value); table.appendChild(row);
+      });
+    });
+    view.hidden = false;
+  }
 
   load().catch((e) => status("offerStatus", "Could not load the issuer metadata: " + e.message, false));
 })();
