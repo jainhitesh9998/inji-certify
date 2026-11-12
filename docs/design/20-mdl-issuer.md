@@ -22,7 +22,7 @@ Standards: ISO/IEC 18013-5:2021 (data model 7.2, MSO 9.1.2, Annex B certificate 
 | D10 | Demo data source | `FileCredentialDataSource` in `certify-service` (records keyed by `sub` from a JSON file, binary fields read from files and base64-encoded); the mDL runs on the same compose stack as the farmer profile through an overlay. | agent |
 | D11 | Annex B edition | 18013-5:2021 tables (IACA validity <= 20 years, DS validity <= 457 days, DS EKU `1.0.18013.5.1.2`, DS without basicConstraints). | agent |
 | D12 | Public host exposure | nginx refuses admin APIs from non-local sources (`system-info`, `credential-configurations`, `v2/`, `credentials/status`, `ledger-search`, `vc-api`); the offer page and `/pre-authorized-data` stay public for the demo. | agent |
-| D13 | AS metadata | advertise `pre-authorized_grant_anonymous_access_supported: true`. | agent |
+| D13 | AS metadata | advertise `pre-authorized_grant_anonymous_access_supported: true`, opt-in through `certify.as.pre-authorized-grant.advertise-anonymous-access` so an existing deployment's document keeps its bytes (refined 2026-11-13, decision log). | agent |
 | D14 | Identifier | keep `https://<host>/v1/certify/oid4vci` (12.2.2 well-known mapping already in nginx). | agent |
 | D15 | IACA publication | plain JSON list plus PEM/DER/CRL downloads; a signed VICAL later. | agent |
 | D16 | Keymanager-held DSCs for `mso_mdoc` on `/oid4vci` | fail closed when the chain does not reach a configured IACA (master-signed certificates refused); the CSR flow through `certify-cli pki dsc issue --csr` is the supported keymanager route. | agent |

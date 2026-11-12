@@ -99,6 +99,8 @@
   const BASE = location.pathname.replace(/\/offer\/.*$/, "");
   const el = (id) => document.getElementById(id);
   let metadata = null, newMetadata = null, offerDocument = null, offerConfigurationId = null, offerSurface = null, tokenEndpoint = null;
+  // the blob URL of the last portrait this page rendered, released when the next one replaces it
+  let portraitObjectUrl = null;
 
   async function api(method, path, body, headers, form) {
     const h = Object.assign({}, headers || {});
@@ -153,11 +155,13 @@
   el("configuration").addEventListener("change", syncSurfaceDefault);
 
   el("create").addEventListener("click", async () => {
-    // remember what was offered: the wallet below redeems this offer, not whatever the dropdown says later
-    offerConfigurationId = el("configuration").value;
-    offerSurface = el("surface").value;
-    const request = { credential_configuration_id: offerConfigurationId, expires_in: Number(el("expires").value) || 600,
-      issuer: offerSurface };
+    // what this click proposes; the page's wallet below redeems the offer that is actually active, so none of it becomes
+    // the active offer until the issuer accepted the whole thing: a failed replacement leaves the previous offer, its
+    // document, its configuration and its surface exactly as they were
+    const proposedConfigurationId = el("configuration").value;
+    const proposedSurface = el("surface").value;
+    const request = { credential_configuration_id: proposedConfigurationId, expires_in: Number(el("expires").value) || 600,
+      issuer: proposedSurface };
     if (el("byValue").checked) request.offer_by_value = true;
     if (el("txCode").value.trim()) request.tx_code = el("txCode").value.trim();
     if (el("subject").value.trim()) request.subject = el("subject").value.trim();
@@ -173,25 +177,32 @@
       }
       const offer = r.body;
       const deepLink = offer.credential_offer_uri;
-      el("offerUri").textContent = deepLink; el("offerUri").hidden = false;
-      el("qr").innerHTML = "";
-      new QRCode(el("qr"), { text: deepLink, width: 256, height: 256, correctLevel: QRCode.CorrectLevel.M });
-      el("copy").disabled = false;
-      el("open").href = deepLink; el("open").hidden = false;
+      let fetchedOffer = null;
       if (offer.credential_offer) {
-        offerDocument = offer.credential_offer; // by value: the offer travelled in the answer, no fetch needed
+        fetchedOffer = offer.credential_offer; // by value: the offer travelled in the answer, no fetch needed
       } else {
         const offerUrl = new URL(deepLink.replace(/^[a-z-]+:\/\//, "https://x/")).searchParams.get("credential_offer_uri");
-        offerDocument = offerUrl ? (await api("GET", offerUrl)).body : null;
+        fetchedOffer = offerUrl ? (await api("GET", offerUrl)).body : null;
       }
+      // the QR image is built before anything is published, so a rendering fault cannot leave a half-replaced offer
+      const qr = document.createElement("div");
+      new QRCode(qr, { text: deepLink, width: 256, height: 256, correctLevel: QRCode.CorrectLevel.M });
+      // created and fetched: this is the active offer from here, published in one go
+      offerConfigurationId = proposedConfigurationId;
+      offerSurface = proposedSurface;
+      offerDocument = fetchedOffer;
+      el("offerUri").textContent = deepLink; el("offerUri").hidden = false;
+      el("qr").innerHTML = "";
+      while (qr.firstChild) el("qr").appendChild(qr.firstChild);
+      el("copy").disabled = false;
+      el("open").href = deepLink; el("open").hidden = false;
       el("offerDoc").textContent = JSON.stringify(offerDocument, null, 2); el("offerDoc").hidden = !offerDocument;
       const grant = offerDocument && offerDocument.grants && offerDocument.grants["urn:ietf:params:oauth:grant-type:pre-authorized_code"];
       // the surface this offer actually targets, not what the dropdown says now: this page's wallet always speaks /oid4vci
-      const onNewSurface = offerSurface === "oid4vci";
-      const surfaceNote = onNewSurface ? " It targets the /oid4vci surface."
-        : " It targets the compatibility surface, which a wallet can redeem but this page's wallet cannot: it only speaks /oid4vci. Choose /oid4vci to run the flow here.";
+      const surfaceNote = offerSurface === "oid4vci" ? " It targets the /oid4vci surface."
+        : " It targets the compatibility surface: the wallet below still requests the credential at /oid4vci/credential, which accepts the offer's token as long as the deployment lists the compatibility credential endpoint in mosip.certify.authn.allowed-audiences (the shipped configuration does).";
       status("offerStatus", (grant ? "Offer created; the pre-authorized code is in the offer document below." : "Offer created (the offer document could not be fetched).") + surfaceNote, true);
-      el("wallet").disabled = !grant || !onNewSurface;
+      el("wallet").disabled = !grant;
       el("credential").hidden = true; status("walletStatus", "");
     } catch (e) {
       status("offerStatus", "Request failed: " + e.message, false);
@@ -275,6 +286,8 @@
 
   function renderMdoc(credential) {
     const view = el("mdocView"), table = el("mdocTable");
+    // the previous credential's portrait image is dropped by the table reset below: release its blob URL first
+    if (portraitObjectUrl) { URL.revokeObjectURL(portraitObjectUrl); portraitObjectUrl = null; }
     table.innerHTML = "";
     // the format of the configuration this page offered, not of whatever the dropdown shows now
     if (formatOf(offerConfigurationId) !== "mso_mdoc") { view.hidden = true; return; }
@@ -302,7 +315,8 @@
             if (mime) {
               const image = document.createElement("img");
               // no base64 round trip (String.fromCharCode over a byte array overflows the call stack on large images)
-              image.src = URL.createObjectURL(new Blob([item.elementValue], { type: mime }));
+              portraitObjectUrl = URL.createObjectURL(new Blob([item.elementValue], { type: mime }));
+              image.src = portraitObjectUrl;
               image.alt = "portrait";
               image.style.cssText = "max-width:120px;border-radius:6px";
               value.appendChild(image);
@@ -313,7 +327,8 @@
             value.textContent = "<" + item.elementValue.length + " bytes>";
           }
         } else if (item.elementValue !== null && typeof item.elementValue === "object") {
-          value.textContent = JSON.stringify(item.elementValue);
+          // integers beyond Number.MAX_SAFE_INTEGER decode to a BigInt: render them as the exact decimal digits
+          value.textContent = JSON.stringify(item.elementValue, (key, nested) => typeof nested === "bigint" ? nested.toString() : nested);
         } else {
           value.textContent = String(item.elementValue);
         }

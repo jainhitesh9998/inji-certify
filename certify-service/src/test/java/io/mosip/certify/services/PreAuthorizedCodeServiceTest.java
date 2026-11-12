@@ -736,6 +736,98 @@ public class PreAuthorizedCodeServiceTest {
         verify(vciCacheService, never()).setCredentialOffer(anyString(), any(io.mosip.certify.core.dto.CredentialOfferResponse.class));
     }
 
+    // ---- tenant binding is an /oid4vci property (M-09 review round 2) -----------------------------------------
+
+    /**
+     * A {@code legacy} offer is tenant-agnostic, exactly as it was before the surface existed: nothing is bound to the
+     * tenant and no audience is stamped, so the token keeps the deployment's configured audience and the cached entry
+     * is the one an unchanged deployment always wrote.
+     */
+    @Test
+    public void aLegacyOfferIsNotBoundToATenant() {
+        authorizationContext.setTenantId("a");
+
+        preAuthorizedCodeService.createCredentialOffer(request);
+
+        PreAuthCodeData codeData = capturedCodeData();
+        Assert.assertEquals("legacy", codeData.getIssuer());
+        Assert.assertNull("a legacy offer stays tenant-agnostic", codeData.getTenantId());
+        Assert.assertNull("and stamps no audience: the configured one applies at redemption", codeData.getAudience());
+        Assert.assertEquals("https://issuer.com", capturedOffer().getCredentialIssuer());
+    }
+
+    /** A legacy code is redeemed from any tenant, with the deployment's configured audience, as before. */
+    @Test
+    public void aLegacyCodeIsRedeemedFromAnyTenant() {
+        String preAuthCode = "legacy-pre-auth-code";
+        when(vciCacheService.getPreAuthCodeData(preAuthCode)).thenReturn(PreAuthCodeData.builder()
+                .credentialConfigurationId(CONFIG_ID)
+                .issuer("legacy")
+                .createdAt(System.currentTimeMillis())
+                .expiresAt(System.currentTimeMillis() + 600000)
+                .build());
+        when(vciCacheService.claimPreAuthCode(preAuthCode)).thenReturn(true);
+        when(accessTokenJwtUtil.generateSignedJwt(anyString(), anyString(), anyString(), anyString(), anyString(), anyInt(),
+                org.mockito.ArgumentMatchers.isNull())).thenReturn("test.jwt.token");
+        authorizationContext.setTenantId("b");
+
+        preAuthorizedCodeService.exchangePreAuthorizedCode(tokenRequest(preAuthCode));
+
+        verify(accessTokenJwtUtil).generateSignedJwt(anyString(), anyString(), anyString(), anyString(),
+                org.mockito.ArgumentMatchers.eq("https://oauth.audience.com"), anyInt(),
+                org.mockito.ArgumentMatchers.isNull());
+    }
+
+    /**
+     * An {@code oid4vci} entry written before offers carried a tenant (that build was never released, so no deployment
+     * can hold one) belongs to {@code default}: it is redeemed there and refused anywhere else.
+     */
+    @Test
+    public void anOid4vciCodeWithoutATenantBelongsToTheDefaultTenant() {
+        String preAuthCode = "unbound-oid4vci-code";
+        when(vciCacheService.getPreAuthCodeData(preAuthCode)).thenReturn(PreAuthCodeData.builder()
+                .credentialConfigurationId(CONFIG_ID)
+                .issuer("oid4vci")
+                .audience("https://issuer.com/oid4vci/credential")
+                .createdAt(System.currentTimeMillis())
+                .expiresAt(System.currentTimeMillis() + 600000)
+                .build());
+        when(vciCacheService.claimPreAuthCode(preAuthCode)).thenReturn(true);
+        when(accessTokenJwtUtil.generateSignedJwt(anyString(), anyString(), anyString(), anyString(), anyString(), anyInt(),
+                org.mockito.ArgumentMatchers.isNull())).thenReturn("test.jwt.token");
+
+        preAuthorizedCodeService.exchangePreAuthorizedCode(tokenRequest(preAuthCode));
+
+        verify(accessTokenJwtUtil).generateSignedJwt(anyString(), anyString(), anyString(), anyString(),
+                org.mockito.ArgumentMatchers.eq("https://issuer.com/oid4vci/credential"), anyInt(),
+                org.mockito.ArgumentMatchers.isNull());
+
+        String another = "unbound-oid4vci-code-2";
+        when(vciCacheService.getPreAuthCodeData(another)).thenReturn(PreAuthCodeData.builder()
+                .credentialConfigurationId(CONFIG_ID)
+                .issuer("oid4vci")
+                .createdAt(System.currentTimeMillis())
+                .expiresAt(System.currentTimeMillis() + 600000)
+                .build());
+        authorizationContext.setTenantId("a");
+
+        CertifyException refused = assertThrows(CertifyException.class,
+                () -> preAuthorizedCodeService.exchangePreAuthorizedCode(tokenRequest(another)));
+
+        Assert.assertEquals(ErrorConstants.INVALID_GRANT, refused.getErrorCode());
+    }
+
+    /** A blank {@code issuer} selects nothing, so it means the configured default, exactly as an absent one does. */
+    @Test
+    public void aBlankIssuerMeansTheConfiguredDefault() {
+        request.setIssuer("   ");
+
+        preAuthorizedCodeService.createCredentialOffer(request);
+
+        Assert.assertEquals("https://issuer.com", capturedOffer().getCredentialIssuer());
+        Assert.assertNull("the default is legacy here, so nothing is bound", capturedCodeData().getTenantId());
+    }
+
     private OAuthTokenRequest tokenRequest(String preAuthCode) {
         OAuthTokenRequest tokenRequest = new OAuthTokenRequest();
         tokenRequest.setGrant_type(Constants.PRE_AUTHORIZED_CODE_GRANT_TYPE);

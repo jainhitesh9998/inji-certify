@@ -16,7 +16,8 @@ import java.util.Map;
  */
 @ConfigurationProperties(prefix = "certify.as")
 public record AsProperties(@DefaultValue Map<String, Client> clients, @DefaultValue Authorization authorization, @DefaultValue Par par,
-                           @DefaultValue ClientAttestation clientAttestation) {
+                           @DefaultValue ClientAttestation clientAttestation,
+                           @DefaultValue PreAuthorizedGrant preAuthorizedGrant) {
 
     public static final String SUBJECT_MODE_NONE = "none";
     public static final String SUBJECT_MODE_FIXED = "fixed";
@@ -36,6 +37,17 @@ public record AsProperties(@DefaultValue Map<String, Client> clients, @DefaultVa
                                     @DefaultValue("PT60S") Duration clockSkew, @DefaultValue("PT5M") Duration popMaxAge) {}
 
     public record Attester(String jwks) {}
+
+    /**
+     * What the authorization server metadata says about the pre-authorized code grant
+     * ({@code certify.as.pre-authorized-grant.*}). {@code advertise-anonymous-access} publishes
+     * {@code pre-authorized_grant_anonymous_access_supported} (OID4VCI 1.0 section 12.3): the token endpoint answers a
+     * Token Request that carries a pre-authorized code and no {@code client_id}. Off by default, because advertising a
+     * grant a deployment's wallet does not need is a wire change to a document that has not carried the field before;
+     * it is published only when this is on, client attestation is not required and
+     * {@code grant_types_supported} lists the pre-authorized code grant.
+     */
+    public record PreAuthorizedGrant(@DefaultValue("false") boolean advertiseAnonymousAccess) {}
 
     public Client client(String clientId) {
         return clients == null || clientId == null ? null : clients.get(clientId);

@@ -88,9 +88,12 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
         "mosip.certify.credential-config.credential-signing-alg-values-supported={'Ed25519Signature2020': {'EdDSA'}, 'ES256': {'ES256'}}",
         "mosip.certify.credential-config.cryptographic-binding-methods-supported={'ldp_vc': {'did:jwk','did:web'}, 'mso_mdoc': {'cose_key'}}",
         "mosip.certify.credential-config.proof-types-supported={'jwt': {'proof_signing_alg_values_supported': {'ES256','EdDSA'}}}",
-        // Certify serves the authorization server metadata for its own AS (certify.as): only then does it publish the
-        // OID4VCI pre-authorized grant flag
-        "certify.as.clients.wallet.redirect-uris[0]=https://wallet.example/cb"
+        // Certify serves the authorization server metadata for its own AS (certify.as), and advertising the anonymous
+        // pre-authorized grant is opt-in: this deployment asks for it (the default is off, so an unchanged deployment's
+        // document keeps its bytes)
+        "certify.as.clients.wallet.redirect-uris[0]=https://wallet.example/cb",
+        "certify.as.pre-authorized-grant.advertise-anonymous-access=true",
+        "mosip.certify.oauth.grant-types-supported=authorization_code,urn:ietf:params:oauth:grant-type:pre-authorized_code"
 })
 class Oid4vciOfferFlowTest {
 
@@ -253,7 +256,7 @@ class Oid4vciOfferFlowTest {
         assertEquals(legacy, surface, "one map, both documents");
     }
 
-    /** G22: the AS metadata advertises that the pre-authorized code grant needs no interaction, when Certify is the AS. */
+    /** G22: the AS metadata advertises that the pre-authorized code grant needs no interaction, when asked to. */
     @Test
     void theAsMetadataAdvertisesAnonymousPreAuthorizedGrants() throws Exception {
         JsonNode metadata = getJson("/.well-known/oauth-authorization-server");

@@ -48,7 +48,7 @@ public class PreAuthorizedRequest {
     /**
      * The surface the offer targets: {@code oid4vci} names the OpenID4VCI 1.0 surface's identifier in
      * {@code credential_issuer} (so the wallet uses {@code /oid4vci/credential}), {@code legacy} keeps the
-     * compatibility identifier. Absent, the deployment's default applies
+     * compatibility identifier. Absent - or blank, which means the same - the deployment's default applies
      * ({@code certify.protocol.oid4vci-v1.offers.default-issuer}, {@code legacy} unless set).
      *
      * <p>Not the token's {@code iss}: an offer does not carry an issuer claim, this only selects which of the two
@@ -58,6 +58,15 @@ public class PreAuthorizedRequest {
     @Pattern(regexp = "^(?i:oid4vci|legacy)$", message = "issuer must be 'oid4vci' or 'legacy'")
     @JsonProperty("issuer")
     private String issuer;
+
+    /**
+     * A blank {@code issuer} selects nothing, so it is stored as absent: normalised here, before bean validation runs,
+     * so the pattern above and the service agree on what a blank field means (the deployment's default surface).
+     * Non-blank values are trimmed, which the case-insensitive match in the service tolerates anyway.
+     */
+    public void setIssuer(String issuer) {
+        this.issuer = issuer == null || issuer.isBlank() ? null : issuer.trim();
+    }
 
     /**
      * Return the offer itself ({@code credential_offer}, OpenID4VCI 1.0 section 4.1.1) instead of only a link to it.

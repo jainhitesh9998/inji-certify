@@ -15,9 +15,14 @@ import java.util.List;
  * audiences that belong to this surface <em>for the request's tenant</em>: an access token addressed to that tenant's
  * issuer identifier or credential endpoint is accepted here without the deployment adding either to
  * {@code mosip.certify.authn.allowed-audiences}. An offer that targets {@code oid4vci} mints its token with exactly its
- * tenant's credential-endpoint audience (PreAuthorizedCodeService), so the wallet can redeem it at
- * {@code /t/{tenant}/oid4vci/credential}. Tenant A's token is not accepted at tenant B's surface, nor at the default
- * one; a token addressed to the compatibility endpoint keeps working wherever the deployment's own list says it does.
+ * tenant's credential-endpoint audience (PreAuthorizedCodeService), so the wallet can redeem it at the credential
+ * endpoint that offer named. Tenant A's token is not accepted at tenant B's surface, nor at the default one; a token
+ * addressed to the compatibility endpoint keeps working wherever the deployment's own list says it does.
+ *
+ * <p>Offers and token requests themselves are only served on the deployment's own paths: there is no
+ * {@code /t/{tenant}/pre-authorized-data} or tenant-aware token endpoint yet, so an offer token for a non-default
+ * tenant is not minted in any deployment today (decision log, 2026-11-13). This filter already applies the rule the
+ * resource server will need when those endpoints arrive.
  *
  * <p>The tenant is read from the request-scoped {@link AuthorizationContext}, which {@code TenantResolutionFilter}
  * populates before any token filter runs ({@code Order.HIGHEST_PRECEDENCE + 1} against the default order of a

@@ -128,7 +128,10 @@ public class PreAuthorizedCodeService {
             throw new InvalidRequestException(ErrorConstants.INVALID_EXPIRY_RANGE);
         }
         OfferSurface surface = requestedSurface(request);
-        String tenantId = requestTenantId();
+        // Only an /oid4vci offer is bound to a tenant: a legacy offer stays tenant-agnostic, exactly as it was before
+        // the surface existed, so an unchanged deployment keeps the same cached entry, the same token audience and no
+        // cross-tenant rule (M-09 review round 2).
+        String tenantId = surface == OfferSurface.OID4VCI ? requestTenantId() : null;
 
         String offerId = UUID.randomUUID().toString();
         String preAuthCode = generateUniquePreAuthCode();
@@ -157,6 +160,11 @@ public class PreAuthorizedCodeService {
         return new CredentialOfferResult(buildCredentialOfferUri(offerId), null);
     }
 
+    /**
+     * The surface the request names, else the configured default. A blank {@code issuer} is absent:
+     * {@link PreAuthorizedRequest#setIssuer} stores it that way before bean validation sees it, and this check repeats
+     * the reading for a request built without that setter.
+     */
     private OfferSurface requestedSurface(PreAuthorizedRequest request) {
         if (request.getIssuer() == null || request.getIssuer().isBlank()) {
             return oid4vciProperties.offers().defaultIssuer();
@@ -412,11 +420,13 @@ public class PreAuthorizedCodeService {
             throw new CertifyException(ErrorConstants.UNSUPPORTED_GRANT_TYPE, "Grant type not supported");
         }
 
-        // A code belongs to the tenant that issued the offer: another tenant's token endpoint must not redeem it, or a
-        // token minted beside an offer at one tenant would be accepted at another (checked before the claim, so a
-        // misrouted request does not burn the code)
-        if (codeData != null && codeData.getTenantId() != null && !codeData.getTenantId().equals(requestTenantId())) {
-            log.error("Pre-authorized code of tenant {} presented at tenant {}", codeData.getTenantId(), requestTenantId());
+        // An /oid4vci code belongs to the tenant that issued the offer: another tenant's token endpoint must not redeem
+        // it, or a token minted beside an offer at one tenant would be accepted at another (checked before the claim,
+        // so a misrouted request does not burn the code). A legacy code carries no tenant and is redeemed anywhere, as
+        // before.
+        String offerTenant = codeData == null ? null : offerTenant(codeData);
+        if (offerTenant != null && !offerTenant.equals(requestTenantId())) {
+            log.error("Pre-authorized code of tenant {} presented at tenant {}", offerTenant, requestTenantId());
             throw new CertifyException(ErrorConstants.INVALID_GRANT, "Pre-authorized code was not issued by this tenant");
         }
 
@@ -505,14 +515,28 @@ public class PreAuthorizedCodeService {
     }
 
     /**
-     * The audience of the token an offer's code is exchanged for: the compatibility endpoint as configured for
-     * {@code legacy}, this surface's credential endpoint (tenant-aware) for {@code oid4vci}, which its access-token
-     * filter accepts.
+     * The audience of the token an offer's code is exchanged for: none for {@code legacy}, whose token keeps the
+     * deployment's configured {@code mosip.certify.oauth.access-token.audience} exactly as before (nothing is stored,
+     * so nothing can drift), and this surface's credential endpoint (tenant-aware) for {@code oid4vci}, which its
+     * access-token filter accepts.
      */
     private String audience(OfferSurface surface, String tenantId) {
         if (surface != OfferSurface.OID4VCI) {
-            return oauthAudience;
+            return null;
         }
         return oid4vciIssuers.forTenant(tenantId).credentialEndpoint();
+    }
+
+    /**
+     * The tenant a cached code is bound to. An {@code oid4vci} offer stamps its tenant, so that is the tenant; an
+     * {@code oid4vci} entry without one can only be one written before offers were bound (that build was never
+     * released), and those belong to {@code default}. A {@code legacy} entry answers {@code null}: no tenant rule
+     * applies to it, as before the surface existed.
+     */
+    private static String offerTenant(PreAuthCodeData codeData) {
+        if (codeData.getTenantId() != null) {
+            return codeData.getTenantId();
+        }
+        return OfferSurface.OID4VCI.wireName().equals(codeData.getIssuer()) ? AuthorizationContext.DEFAULT_TENANT : null;
     }
 }

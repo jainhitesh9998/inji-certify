@@ -127,14 +127,19 @@ class Oid4vciAccessTokenFilterTest {
     }
 
     /**
-     * The tenant binding of an offer token: an offer created under path tenant {@code a} yields a token addressed to
-     * {@code /t/a/oid4vci/credential}, and only tenant A's surface accepts it. Tenant B's surface, the default one and
-     * the compatibility filter all refuse it; a token addressed to the default surface is refused at tenant A unless
-     * the deployment lists that audience. Tenant resolution runs through the real {@link TenantResolutionFilter} and
+     * The filter-level tenant rule: a token addressed to tenant {@code a}'s {@code /oid4vci} credential endpoint is
+     * accepted only where tenant {@code a} is the resolved tenant. Tenant B's surface, the default surface and the
+     * compatibility filter all refuse it; a token addressed to the default surface is refused at tenant A unless the
+     * deployment lists that audience. Tenant resolution runs through the real {@link TenantResolutionFilter} and
      * {@link PathTenantResolver}, before the token filter, exactly as in production.
+     *
+     * <p>This is the rule the filter applies, not an offer flow: {@code /pre-authorized-data} and {@code /oauth/token}
+     * have no {@code /t/{tenant}} mapping and the AS metadata publishes one token endpoint, so no offer token is minted
+     * for a non-default tenant today (M-09 review round 2; decision log 2026-11-13). Tenant-aware offer and token
+     * endpoints are deferred, and this test pins what the resource-server side will then be asked to accept.
      */
     @Test
-    void aTenantOfferTokenIsAcceptedOnlyAtThatTenantsSurface() throws Exception {
+    void aTokenAddressedToATenantsSurfaceIsAcceptedOnlyAtThatTenant() throws Exception {
         AuthorizationContext context = new AuthorizationContext();
         Oid4vciAccessTokenFilter filter = oid4vciFilter(context);
         TenantResolutionFilter tenants = new TenantResolutionFilter(new PathTenantResolver(TENANCY), context);
@@ -146,7 +151,6 @@ class Oid4vciAccessTokenFilterTest {
                 "the default surface does not accept tenant A's token");
         assertFalse(run(tenants, filter, "/v1/certify/t/b/oid4vci/credential", tenantAToken),
                 "tenant B does not accept tenant A's token");
-
         String defaultToken = token(ISSUER_IDENTIFIER + "/credential");
         assertFalse(run(tenants, filter, "/v1/certify/t/a/oid4vci/credential", defaultToken),
                 "tenant A does not accept the default surface's token (it is not in mosip.certify.authn.allowed-audiences)");

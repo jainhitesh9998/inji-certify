@@ -87,10 +87,12 @@ public class OAuthAuthorizationServerMetadataService {
             }
         }
         // OID4VCI 1.0 section 12.3: a Token Request with a pre-authorized code and no client_id is answered here, so an
-        // offer can be followed without interacting with the issuer. Omitted once client attestation is required (the
-        // token request then has to be authenticated, so it is not anonymous) and with an external AS (eSignet), whose
-        // own metadata document is authoritative.
-        if (ownTokenEndpoint && !clientAttestationRequired(as)) {
+        // offer can be followed without interacting with the issuer. Opt-in per deployment
+        // (certify.as.pre-authorized-grant.advertise-anonymous-access, default off): an unchanged deployment's document
+        // keeps the exact bytes it had, and every 0.14.0 golden stays green. Never advertised once client attestation is
+        // required (the token request is authenticated then, so it is not anonymous), nor when the deployment does not
+        // list the pre-authorized code grant, nor with an external AS (eSignet), whose own metadata is authoritative.
+        if (ownTokenEndpoint && advertiseAnonymousPreAuthorizedGrant(as)) {
             metadata.setPreAuthorizedGrantAnonymousAccessSupported(Boolean.TRUE);
         }
 
@@ -101,6 +103,22 @@ public class OAuthAuthorizationServerMetadataService {
     /** {@code true} when {@code certify.as.client-attestation.required} refuses unauthenticated token requests. */
     private static boolean clientAttestationRequired(io.mosip.certify.as.AsProperties as) {
         return as.clientAttestation() != null && as.clientAttestation().required();
+    }
+
+    /**
+     * {@code certify.as.pre-authorized-grant.advertise-anonymous-access} is on (default off), client attestation is not
+     * required and the pre-authorized code grant is in {@code grant_types_supported}: only then is the anonymous
+     * pre-authorized grant real, and only then may the document say so.
+     */
+    private boolean advertiseAnonymousPreAuthorizedGrant(io.mosip.certify.as.AsProperties as) {
+        if (as.preAuthorizedGrant() == null || !as.preAuthorizedGrant().advertiseAnonymousAccess()) {
+            return false;
+        }
+        if (clientAttestationRequired(as)) {
+            return false;
+        }
+        return parseCommaSeparatedValues(grantTypesSupported)
+                .contains(io.mosip.certify.core.constants.Constants.PRE_AUTHORIZED_CODE_GRANT_TYPE);
     }
 
     /**

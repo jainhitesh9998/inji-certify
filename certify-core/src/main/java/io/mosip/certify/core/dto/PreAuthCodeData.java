@@ -24,14 +24,16 @@ public class PreAuthCodeData implements Serializable {
     /** The surface the offer targeted ({@code oid4vci} or {@code legacy}): the access token is addressed to its endpoint. */
     private String issuer;
     /**
-     * The tenant that created the offer. The code may only be exchanged through that tenant's token endpoint; {@code null}
-     * (an entry written before this field existed) skips the check, as those entries predate any per-tenant audience.
+     * The tenant that created an {@code oid4vci} offer. That code may only be exchanged through the same tenant's token
+     * endpoint. {@code null} for a {@code legacy} offer, which is tenant-agnostic and redeemed anywhere, and for an
+     * {@code oid4vci} entry written before offers were bound (that build was never released), which belongs to
+     * {@code default}.
      */
     private String tenantId;
     /**
-     * The audience resolved when the offer was created (the targeted surface's credential endpoint for {@code oid4vci},
-     * the configured {@code mosip.certify.oauth.access-token.audience} for {@code legacy}). {@code null} for an entry
-     * written before this field existed, which keeps the legacy audience fallback.
+     * The audience resolved when an {@code oid4vci} offer was created (the tenant's credential endpoint). {@code null}
+     * for a {@code legacy} offer and for an entry written before this field existed: both keep the configured
+     * {@code mosip.certify.oauth.access-token.audience}, exactly as they did before the surface existed.
      */
     private String audience;
     private long createdAt;

@@ -55,6 +55,34 @@ public class PreAuthorizedCodeControllerTest {
     ObjectMapper objectMapper = new ObjectMapper();
 
     @Test
+    public void generatePreAuthorizedCode_BlankIssuer_IsTreatedAsAbsent() throws Exception {
+        Mockito.when(preAuthorizedCodeService.createCredentialOffer(Mockito.any(PreAuthorizedRequest.class)))
+                .thenReturn(new PreAuthorizedCodeService.CredentialOfferResult("openid-credential-offer://?credential_offer_uri=test", null));
+
+        mockMvc.perform(post("/pre-authorized-data")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"credential_configuration_id\":\"test-config\",\"claims\":{\"name\":\"John\"},\"issuer\":\"   \"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.errors").doesNotExist())
+                .andExpect(jsonPath("$.credential_offer_uri").value("openid-credential-offer://?credential_offer_uri=test"));
+
+        org.mockito.ArgumentCaptor<PreAuthorizedRequest> captured =
+                org.mockito.ArgumentCaptor.forClass(PreAuthorizedRequest.class);
+        Mockito.verify(preAuthorizedCodeService).createCredentialOffer(captured.capture());
+        org.junit.Assert.assertNull("a blank issuer reaches the service as absent", captured.getValue().getIssuer());
+    }
+
+    @Test
+    public void generatePreAuthorizedCode_UnknownIssuer_IsRefused() throws Exception {
+        mockMvc.perform(post("/pre-authorized-data")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"credential_configuration_id\":\"test-config\",\"claims\":{\"name\":\"John\"},\"issuer\":\"oid5vci\"}"))
+                .andExpect(status().isOk()) // ExceptionHandler returns 200 OK with errors
+                .andExpect(jsonPath("$.errors[0].errorCode").value("issuer must be 'oid4vci' or 'legacy'"));
+        Mockito.verifyNoInteractions(preAuthorizedCodeService);
+    }
+
+    @Test
     public void generatePreAuthorizedCode_Success() throws Exception {
         PreAuthorizedRequest request = new PreAuthorizedRequest();
         request.setCredentialConfigurationId("test-config");
