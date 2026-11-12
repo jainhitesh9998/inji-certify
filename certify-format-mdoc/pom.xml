@@ -57,5 +57,19 @@
             <version>${project.version}</version>
             <scope>test</scope>
         </dependency>
+        <!-- independent mDoc verifier (M-01): test-only, and the Kotlin runtime Multipaz needs is pinned to
+             Multipaz's version because Spring Boot's BOM would otherwise select 1.9.22 (no kotlin.time.Instant). -->
+        <dependency>
+            <groupId>io.inji.certify</groupId>
+            <artifactId>certify-testkit-mdoc</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.jetbrains.kotlin</groupId>
+            <artifactId>kotlin-stdlib</artifactId>
+            <version>${multipaz.kotlin.version}</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 </project>

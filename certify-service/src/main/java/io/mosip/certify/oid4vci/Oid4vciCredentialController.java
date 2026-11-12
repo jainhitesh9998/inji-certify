@@ -139,6 +139,8 @@ public class Oid4vciCredentialController {
         HttpStatus status = switch (e.getErrorCode()) {
             case IssuanceException.NOT_AUTHENTICATED -> HttpStatus.UNAUTHORIZED;
             case IssuanceException.ISSUANCE_FAILED -> HttpStatus.INTERNAL_SERVER_ERROR;
+            // 8.3.1.2: the request is valid, so this is a client error (400), not a server failure
+            case IssuanceException.CREDENTIAL_REQUEST_DENIED -> HttpStatus.BAD_REQUEST;
             default -> HttpStatus.BAD_REQUEST;
         };
         String error = status == HttpStatus.INTERNAL_SERVER_ERROR ? "server_error" : e.getErrorCode();

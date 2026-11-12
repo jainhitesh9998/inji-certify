@@ -165,9 +165,18 @@ class D13GoldenReplayTest {
     @Test
     void mdocReplayWithTheDocumentedDeviations() throws Exception {
         ECKey holder = new ECKeyGenerator(Curve.P_256).generate();
+        // the data provider answers after 2 ms, as a real one does: see IssuanceGoldenTest.answerAfterTwoMilliseconds
+        when(dataProviderPlugin.fetchData(any())).thenAnswer(inv -> {
+            Thread.sleep(2);
+            return new JSONObject(Map.of("fullName", "Golden Farmer", "dateOfBirth", "1990-01-01", "city", "Bengaluru"));
+        });
         MvcResult result = issue("/issuance/credential", Map.of("format", "mso_mdoc", "doctype", "org.iso.18013.5.1.mDL", "proof", proof(proofJwt(nonce(), holder))));
         JsonNode body = objectMapper.readTree(result.getResponse().getContentAsString());
         assertEquals(200, result.getResponse().getStatus(), body.toString());
+        // the draft-13 Document {docType, issuerSigned} exactly as received; certify-conformance-mdoc and the CI python
+        // verifier slice the IssuerSigned out of it and re-verify it with libraries Certify does not maintain (M-01)
+        MdocSampleWriter.write(getClass(), "d13", body.get("credential").asText(), holder, "org.iso.18013.5.1.mDL",
+                MdocSampleWriter.D13_GAPS);
         CBORObject decoded = CBORObject.DecodeFromBytes(Base64.getUrlDecoder().decode(body.get("credential").asText()));
         CBORObject issuerSigned = decoded.get("issuerSigned");
         CBORObject issuerAuth = issuerSigned.get("issuerAuth");
