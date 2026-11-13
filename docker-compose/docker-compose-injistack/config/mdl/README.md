@@ -234,8 +234,10 @@ The public host runs `mdl-operator` (never `mdl-dev`, whose keystore holds the I
   which Compose creates and removes, instead of the external `mosip_network` that every project on the host shares,
   so no other stack can register a `database`, `certify` or `certify-nginx` alias next to this one. A containerised
   tunnel connector joins it: `docker network connect certify-mdl_network <connector>`. A stack that ran on
-  `mosip_network` before moves to it on the next `up` of the start block below (Compose recreates the containers;
-  the database's volume, the keystores and the host-run connector's `127.0.0.1:8091` stay as they are).
+  `mosip_network` before moves to it with one `up --force-recreate` of the start block's services: a plain `up` does
+  not recreate containers whose own definition is unchanged (seen on 2026-11-13: only `certify` moved and failed with
+  `UnknownHostException: database`). The database's volume, the keystores and the host-run connector's
+  `127.0.0.1:8091` stay as they are.
 - The PostgreSQL password, the keymanager keystore password and the `issuer.p12` password come from files in
   `CERTIFY_SECRETS_DIR`, mounted as Compose secrets under `/run/secrets/`, never as environment variables. PostgreSQL
   reads its own with `POSTGRES_PASSWORD_FILE`; Certify reads the others with
