@@ -93,6 +93,16 @@ class MdocDscPolicyTest {
         refused(MdocDscPolicy.DSC_NO_TRUSTED_IACA, () -> policy.check(MdlFixtures.dsc().chain(), MdlFixtures.NOW));
     }
 
+    /** Review round 1: signed by a configured IACA but with an AKI that names another key is the Annex B rule, not "no IACA". */
+    @Test
+    void aDscAConfiguredIacaSignedWithAForeignAuthorityKeyIdentifierNamesTheAnnexBRule() {
+        X509Certificate foreign = AnnexBFixtures.dscWithForeignAki();
+        FormatException refused = assertThrows(FormatException.class, () -> enforcedBy(OTHER_IACA, IACA).check(CertificateChain.of(foreign), NOW));
+        assertEquals("certificate_chain_invalid", refused.getErrorCode());
+        assertTrue(refused.getMessage().startsWith("DS_AKI_MISMATCH: "), refused.getMessage());
+        assertFalse(refused.getMessage().contains(MdocDscPolicy.DSC_NO_TRUSTED_IACA), refused.getMessage());
+    }
+
     @Test
     void theSigningInstantMustLieInsideTheDscValidity() {
         MdocDscPolicy policy = enforcedBy(IACA);
@@ -152,6 +162,44 @@ class MdocDscPolicyTest {
         assertDoesNotThrow(() -> new MdocDscPolicy(other).check(CertificateChain.of(DSC), NOW), "another serial's revocation");
         TrustAnchorRegistry empty = AnnexBFixtures.registry(List.of(IACA), Map.of("iaca-0", AnnexBFixtures.crlRevoking()));
         assertDoesNotThrow(() -> new MdocDscPolicy(empty).check(CertificateChain.of(DSC), NOW), "an empty CRL");
+    }
+
+    /**
+     * Review round 1, item 2 (decision log 2026-11-13, refining D16): an IACA CRL more than the grace past its
+     * nextUpdate refuses signing; within it signing continues; a revocation it lists is named first.
+     */
+    @Test
+    void aCrlPastItsNextUpdateByMoreThanTheGraceRefusesSigning() {
+        java.security.cert.X509CRL crl = AnnexBFixtures.crlRevoking();
+        Instant nextUpdate = crl.getNextUpdate().toInstant();
+        Instant graceEnd = nextUpdate.plus(TrustAnchorRegistry.DEFAULT_STALE_CRL_GRACE);
+        MdocDscPolicy policy = new MdocDscPolicy(AnnexBFixtures.registry(List.of(IACA), Map.of("iaca-0", crl)));
+        assertDoesNotThrow(() -> policy.check(CertificateChain.of(DSC), graceEnd), "within the grace signing continues");
+        refused(MdocDscPolicy.CRL_STALE, () -> policy.check(CertificateChain.of(DSC), graceEnd.plusSeconds(1)));
+
+        TrustAnchorRegistry anchors = AnnexBFixtures.registry(List.of(IACA), Map.of("iaca-0", crl));
+        TrustAnchorRegistry strict = new TrustAnchorRegistry() {
+            @Override
+            public List<Anchor> entries(String purpose) {
+                return anchors.entries(purpose);
+            }
+
+            @Override
+            public java.util.Optional<java.security.cert.X509CRL> crl(String anchorId) {
+                return anchors.crl(anchorId);
+            }
+
+            @Override
+            public Duration staleCrlGrace() {
+                return Duration.ZERO;
+            }
+        };
+        assertDoesNotThrow(() -> new MdocDscPolicy(strict).check(CertificateChain.of(DSC), nextUpdate));
+        refused(MdocDscPolicy.CRL_STALE, () -> new MdocDscPolicy(strict).check(CertificateChain.of(DSC), nextUpdate.plusSeconds(1)));
+
+        TrustAnchorRegistry revoking = AnnexBFixtures.registry(List.of(IACA), Map.of("iaca-0", AnnexBFixtures.crlRevoking(DSC.getSerialNumber())));
+        Instant stale = revoking.crl("iaca-0").orElseThrow().getNextUpdate().toInstant().plus(Duration.ofDays(2));
+        refused(MdocDscPolicy.DSC_REVOKED, () -> new MdocDscPolicy(revoking).check(CertificateChain.of(DSC), stale));
     }
 
     // ---- x5chain rules, whatever is configured --------------------------------------------------------------------

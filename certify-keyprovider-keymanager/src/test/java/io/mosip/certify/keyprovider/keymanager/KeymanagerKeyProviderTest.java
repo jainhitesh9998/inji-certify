@@ -258,7 +258,10 @@ class KeymanagerKeyProviderTest {
         assertEquals(List.of(leaf), key.chain().withoutAnchor().leafFirst(), "the IssuerAuth still carries the DSC alone");
         assertEquals(kid, key.kid(), "the key id is keymanager's thumbprint of the DSC, as before");
         assertEquals(1, completing.resolve(R1.toKeyRef()).chain().leafFirst().size(), "keymanager's own certificate stays alone");
-        assertEquals(2, completing.publicKeys(dsc.toKeyRef()).get(0).chain().leafFirst().size());
+        // published (JWKS x5c, DID document) without the IACA, as before the completion: IACAs are trust anchors (M-05, M-08)
+        assertEquals(List.of(leaf), completing.publicKeys(dsc.toKeyRef()).get(0).chain().leafFirst());
+        assertEquals(List.of(leaf), completing.publicKeys(io.mosip.certify.signing.KeyFilter.ALL).stream()
+                .filter(d -> d.kid().equals(kid)).findFirst().orElseThrow().chain().leafFirst(), "the JWKS x5c is the DSC alone");
 
         KeymanagerKeyProvider unrelated = new KeymanagerKeyProvider(keymanager.keymanagerService, keymanager.signatureService,
                 aliases, clock, Duration.ofMinutes(1), () -> anchors(otherIaca));

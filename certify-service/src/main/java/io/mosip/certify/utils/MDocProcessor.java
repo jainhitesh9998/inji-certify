@@ -538,7 +538,7 @@ public class MDocProcessor {
      * stay those of the {@code legacy-develop} golden (CLAUDE.md rule 1).
      */
     private void requireTrustedDocumentSigner(SigningKey key) {
-        MdocFormatter formatter = mdocFormatter == null ? null : mdocFormatter.getIfAvailable();
+        MdocFormatter formatter = mdocFormatter == null ? null : mdocFormatter.getIfUnique();
         MdocDscPolicy policy = formatter == null ? null : formatter.dscPolicy();
         if (policy == null || !policy.enforced()) {
             return;

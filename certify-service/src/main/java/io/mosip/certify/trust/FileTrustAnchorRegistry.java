@@ -1,5 +1,7 @@
 package io.mosip.certify.trust;
 
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
 import io.mosip.certify.pki.AnnexBValidator;
 import io.mosip.certify.pki.Pem;
 import io.mosip.certify.signing.CertificateLinks;
@@ -21,6 +23,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
+import java.security.cert.CRLException;
 import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509CRL;
@@ -28,6 +31,7 @@ import java.security.cert.X509Certificate;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
@@ -49,15 +53,25 @@ import java.util.regex.Pattern;
  *
  * <p>An anchor's id names its downloads ({@code /mdoc/iaca/<id>.crl}): the configured {@code id}, else the
  * {@code <id>} of the IACA's own CRL distribution point when that point is {@code …/mdoc/iaca/<id>.crl} (so the URL an
- * IACA advertises is the one this issuer serves), else its subject key identifier in lower-case hex.
+ * IACA advertises is the one this issuer serves), else its subject key identifier in lower-case hex. An IACA whose CRL
+ * distribution point is {@code …/mdoc/iaca/<x>.crl} with an {@code <x>} that is not a valid id, or not its anchor id,
+ * refuses startup: verifiers would get a 404 at the advertised URL.
  *
  * <p>CRLs are refreshed every {@code crl-refresh-interval}: a configured file is re-read when its modification time or
- * size changed and replaces the current CRL only when it validates (a broken file is logged and the previous CRL kept);
+ * size changed and replaces the current CRL only when it validates and moves forward (a larger cRLNumber, a thisUpdate
+ * no earlier; a broken or older file is logged and the current CRL kept, since an older list could un-revoke a DSC);
  * for an IACA whose private key the x509-file provider holds in dev mode, an empty CRL is issued at startup and
- * re-issued once half its validity has passed, with a cRLNumber that never decreases (decision log 2026-11-13).
+ * re-issued once half its validity has passed, numbered after the last number recorded in a {@link CrlNumberStore}.
+ * Every tick, unchanged files included, logs a CRL past its nextUpdate: WARN within {@code certify.pki.stale-crl-grace}
+ * (signing continues), ERROR past it (the DSC policy refuses {@code CRL_STALE}); at startup a CRL past the grace
+ * refuses to start (decision log 2026-11-13). The gauge {@value #METRIC}{@code {anchor}} counts down to each CRL's
+ * nextUpdate, negative once it has passed.
  */
 @Slf4j
 public class FileTrustAnchorRegistry implements TrustAnchorRegistry, AutoCloseable {
+
+    /** Seconds until the anchor's current CRL reaches its nextUpdate; negative once it has. Tagged {@code anchor}. */
+    public static final String METRIC = "certify.pki.crl.seconds_to_next_update";
 
     /** Issues an empty CRL for an IACA whose key the caller holds; empty when it holds none (production). */
     @FunctionalInterface
@@ -73,23 +87,41 @@ public class FileTrustAnchorRegistry implements TrustAnchorRegistry, AutoCloseab
     private final Map<String, Path> crlFiles;
     private final Map<String, CrlState> crls = new ConcurrentHashMap<>();
     private final DevCrlIssuer devCrls;
+    private final CrlNumberStore crlNumbers;
     private final Duration devCrlValidity;
+    private final Duration staleCrlGrace;
     private final Clock clock;
+    /** The state behind each gauge, held here because Micrometer may hold it weakly (as {@code SigningKeyExpiry}). */
+    private final Map<String, CrlGauge> gauges = new ConcurrentHashMap<>();
+    private volatile MeterRegistry meters;
     private ScheduledExecutorService scheduler;
 
     /** What is current for one anchor: the CRL and, for a file, what the file looked like when it was read. */
     private record CrlState(X509CRL crl, FileTime modified, long size, boolean dev) {}
 
-    /**
-     * @param properties   {@code certify.pki}
-     * @param providerIacas the IACAs of the x509-file provider ({@code X509FileKeyProviders.iacaCertificates}), empty when
-     *                     it is not enabled
-     * @param devCrls      issues dev-mode CRLs for IACAs whose key is held in the application
-     */
+    private static final class CrlGauge {
+        volatile Instant nextUpdate;
+    }
+
+    /** A registry whose dev-mode CRL numbers live in memory only (tests). */
     public FileTrustAnchorRegistry(PkiProperties properties, List<X509Certificate> providerIacas, DevCrlIssuer devCrls, Clock clock) {
+        this(properties, providerIacas, devCrls, CrlNumberStore.inMemory(), clock);
+    }
+
+    /**
+     * @param properties    {@code certify.pki}
+     * @param providerIacas the IACAs of the x509-file provider ({@code X509FileKeyProviders.iacaCertificates}), empty when
+     *                      it is not enabled
+     * @param devCrls       issues dev-mode CRLs for IACAs whose key is held in the application
+     * @param crlNumbers    the last cRLNumber issued per IACA in dev mode, so a restart never reuses or lowers one
+     */
+    public FileTrustAnchorRegistry(PkiProperties properties, List<X509Certificate> providerIacas, DevCrlIssuer devCrls,
+                                   CrlNumberStore crlNumbers, Clock clock) {
         this.clock = clock;
         this.devCrls = devCrls == null ? DevCrlIssuer.NONE : devCrls;
+        this.crlNumbers = crlNumbers == null ? CrlNumberStore.inMemory() : crlNumbers;
         this.devCrlValidity = properties.trustAnchors().devCrlValidity();
+        this.staleCrlGrace = properties.staleCrlGrace();
         Map<String, Anchor> loaded = new LinkedHashMap<>();
         Map<String, Path> files = new LinkedHashMap<>();
         List<PkiProperties.AnchorSpec> specs = properties.trustAnchors().mdocIaca();
@@ -98,7 +130,8 @@ public class FileTrustAnchorRegistry implements TrustAnchorRegistry, AutoCloseab
             String where = "certify.pki.trust-anchors.mdoc-iaca[" + i + "]";
             X509Certificate iaca = readCertificate(spec.certificate(), where);
             requireIaca(iaca, where + " (" + spec.certificate() + ")");
-            String id = spec.id() == null || spec.id().isBlank() ? derivedId(iaca) : spec.id();
+            String configured = spec.id() == null || spec.id().isBlank() ? null : spec.id();
+            String id = anchorId(configured, iaca, where + (configured == null ? "" : " (id '" + configured + "')"));
             add(loaded, new Anchor(id, MDOC_IACA, iaca), where);
             if (spec.crl() != null) {
                 files.put(id, spec.crl());
@@ -110,17 +143,28 @@ public class FileTrustAnchorRegistry implements TrustAnchorRegistry, AutoCloseab
             }
             String where = "the x509-file IACA " + iaca.getSubjectX500Principal();
             requireIaca(iaca, where);
-            add(loaded, new Anchor(derivedId(iaca), MDOC_IACA, iaca), where);
+            add(loaded, new Anchor(anchorId(null, iaca, where), MDOC_IACA, iaca), where);
         }
         this.anchors = List.copyOf(loaded.values());
         this.crlFiles = Map.copyOf(files);
         for (Anchor anchor : anchors) {
             Path file = crlFiles.get(anchor.id());
             if (file != null) {
-                crls.put(anchor.id(), readCrlFile(anchor, file, true).orElseThrow());
+                current(anchor.id(), readCrlFile(anchor, file, true).orElseThrow());
             } else {
-                issueDevCrl(anchor, BigInteger.ZERO).ifPresent(state -> crls.put(anchor.id(), state));
+                issueDevCrl(anchor, BigInteger.ZERO, true).ifPresent(state -> current(anchor.id(), state));
             }
+        }
+        Instant now = clock.instant();
+        for (Anchor anchor : anchors) {
+            CrlState state = crls.get(anchor.id());
+            if (state != null && pastGrace(state.crl(), now)) {
+                throw new IllegalStateException("The CRL " + (crlFiles.containsKey(anchor.id()) ? crlFiles.get(anchor.id()) + " " : "")
+                        + "of the IACA " + anchor.id() + " passed its nextUpdate " + nextUpdate(state.crl()) + " more than "
+                        + staleCrlGrace + " ago (certify.pki.stale-crl-grace): every mDL signed under it would be"
+                        + " rejected by verifiers (RFC 5280 6.3.3); publish a new CRL before starting");
+            }
+            logFreshness(anchor, state, now);
         }
         if (!anchors.isEmpty()) {
             log.info("mdoc-iaca trust anchors: {}", anchors.stream().map(anchor -> anchor.id() + " ("
@@ -140,44 +184,70 @@ public class FileTrustAnchorRegistry implements TrustAnchorRegistry, AutoCloseab
         return Optional.ofNullable(crls.get(anchorId)).map(CrlState::crl);
     }
 
-    /** Re-reads changed CRL files and re-issues dev CRLs past half their validity; called by the refresh schedule. */
+    @Override
+    public Duration staleCrlGrace() {
+        return staleCrlGrace;
+    }
+
+    /**
+     * Registers the gauge {@value #METRIC}{@code {anchor}} for every anchor with a CRL, now and for a CRL that appears
+     * later. The value is computed on each scrape from the nextUpdate this registry holds strongly.
+     */
+    public void bindMetrics(MeterRegistry registry) {
+        if (registry == null) {
+            return;
+        }
+        meters = registry;
+        crls.forEach((anchorId, state) -> gauge(anchorId).nextUpdate = nextUpdate(state.crl()));
+    }
+
+    /**
+     * Re-reads changed CRL files, re-issues dev CRLs past half their validity and logs every CRL past its nextUpdate,
+     * unchanged ones included; called by the refresh schedule.
+     */
     public synchronized void refresh() {
         Instant now = clock.instant();
         for (Anchor anchor : anchors) {
             Path file = crlFiles.get(anchor.id());
             CrlState current = crls.get(anchor.id());
             if (file != null) {
+                boolean changed;
                 try {
-                    if (current != null && Files.getLastModifiedTime(file).equals(current.modified()) && Files.size(file) == current.size()) {
-                        continue;
-                    }
+                    changed = current == null || !Files.getLastModifiedTime(file).equals(current.modified())
+                            || Files.size(file) != current.size();
                 } catch (IOException e) {
                     log.error("CRL file {} of the IACA {} cannot be read ({}); the previous CRL stays in use", file, anchor.id(), e.getMessage());
-                    continue;
+                    changed = false;
                 }
-                readCrlFile(anchor, file, false).ifPresent(state -> {
-                    crls.put(anchor.id(), state);
-                    log.info("Reloaded the CRL of the IACA {} from {} (cRLNumber {}, nextUpdate {})", anchor.id(), file,
-                            crlNumber(state.crl()), state.crl().getNextUpdate().toInstant());
-                });
+                if (changed) {
+                    readCrlFile(anchor, file, false).ifPresent(candidate -> replace(anchor, file, current, candidate));
+                }
             } else if (current != null && current.dev()) {
                 Instant thisUpdate = current.crl().getThisUpdate().toInstant();
                 Instant nextUpdate = current.crl().getNextUpdate().toInstant();
                 if (!now.isBefore(thisUpdate.plus(Duration.between(thisUpdate, nextUpdate).dividedBy(2)))) {
-                    issueDevCrl(anchor, crlNumber(current.crl())).ifPresent(state -> crls.put(anchor.id(), state));
+                    issueDevCrl(anchor, crlNumber(current.crl()), false).ifPresent(state -> current(anchor.id(), state));
                 }
             }
-            CrlState state = crls.get(anchor.id());
-            if (state != null && state.crl().getNextUpdate() != null && now.isAfter(state.crl().getNextUpdate().toInstant())) {
-                log.warn("The CRL of the IACA {} passed its nextUpdate {}: publish a new one (revocations it lists still apply)",
-                        anchor.id(), state.crl().getNextUpdate().toInstant());
-            }
+            logFreshness(anchor, crls.get(anchor.id()), now);
         }
     }
 
-    /** Runs {@link #refresh} every {@code interval}; nothing for a zero or negative interval or without anchors. */
+    /**
+     * Runs {@link #refresh} every {@code interval}; nothing without anchors. A zero or negative interval turns the
+     * refresh off, and with it the re-reading of CRL files and the dev-mode CRL renewal: that is logged, because a
+     * dev CRL then goes stale after {@code dev-crl-validity} and signing stops once the grace has passed too.
+     */
     public synchronized void scheduleRefresh(Duration interval) {
-        if (interval == null || interval.isZero() || interval.isNegative() || anchors.isEmpty() || scheduler != null) {
+        if (anchors.isEmpty() || scheduler != null) {
+            return;
+        }
+        if (interval == null || interval.isZero() || interval.isNegative()) {
+            crls.forEach((anchorId, state) -> log.warn("certify.pki.trust-anchors.crl-refresh-interval is {}: the CRL of the IACA {}"
+                    + " is never {} and its freshness is not logged; once its nextUpdate {} is more than {} past, mDoc"
+                    + " signing under it is refused (CRL_STALE) until a restart {}", interval, anchorId,
+                    state.dev() ? "re-issued (dev mode)" : "re-read from " + crlFiles.get(anchorId), nextUpdate(state.crl()),
+                    staleCrlGrace, state.dev() ? "issues a new one" : "reads a new one"));
             return;
         }
         scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
@@ -202,10 +272,107 @@ public class FileTrustAnchorRegistry implements TrustAnchorRegistry, AutoCloseab
         }
     }
 
-    private Optional<CrlState> issueDevCrl(Anchor anchor, BigInteger previous) {
-        // CRL numbers must increase (RFC 5280 5.2.3) across restarts too: the issuing second, or one more than the last
-        Instant thisUpdate = clock.instant().truncatedTo(java.time.temporal.ChronoUnit.SECONDS);
-        BigInteger number = BigInteger.valueOf(thisUpdate.getEpochSecond()).max(previous.add(BigInteger.ONE));
+    private void current(String anchorId, CrlState state) {
+        crls.put(anchorId, state);
+        if (meters != null) {
+            gauge(anchorId).nextUpdate = nextUpdate(state.crl());
+        }
+    }
+
+    private CrlGauge gauge(String anchorId) {
+        return gauges.computeIfAbsent(anchorId, id -> {
+            CrlGauge state = new CrlGauge();
+            Gauge.builder(METRIC, state, this::secondsToNextUpdate)
+                    .tag("anchor", id)
+                    .description("Seconds until the IACA CRL's nextUpdate; negative once it passed (mDoc signing under"
+                            + " the IACA is refused once it is more than certify.pki.stale-crl-grace past)")
+                    .baseUnit("seconds")
+                    .strongReference(true)
+                    .register(meters);
+            return state;
+        });
+    }
+
+    private double secondsToNextUpdate(CrlGauge gauge) {
+        Instant nextUpdate = gauge.nextUpdate;
+        return nextUpdate == null ? Double.NaN : Duration.between(clock.instant(), nextUpdate).toMillis() / 1000.0;
+    }
+
+    /**
+     * A changed CRL file that validated replaces the current CRL only when it moves forward (RFC 5280 5.2.3): a larger
+     * cRLNumber and a thisUpdate no earlier. The same CRL written again changes nothing. Anything else (a lower number,
+     * the same number with other content, an earlier thisUpdate) is a rollback that could un-revoke a Document Signer:
+     * it is logged at ERROR on every tick until the file is fixed, and the current CRL stays.
+     */
+    private void replace(Anchor anchor, Path file, CrlState current, CrlState candidate) {
+        if (current == null) {
+            current(anchor.id(), candidate);
+            return;
+        }
+        BigInteger was = crlNumber(current.crl());
+        BigInteger is = crlNumber(candidate.crl());
+        int order = is.compareTo(was);
+        if (order == 0 && Arrays.equals(encoded(current.crl()), encoded(candidate.crl()))) {
+            crls.put(anchor.id(), new CrlState(current.crl(), candidate.modified(), candidate.size(), false));
+            log.debug("The CRL file {} of the IACA {} was rewritten with the same CRL (cRLNumber {})", file, anchor.id(), is);
+            return;
+        }
+        Instant wasThisUpdate = current.crl().getThisUpdate().toInstant();
+        Instant isThisUpdate = candidate.crl().getThisUpdate().toInstant();
+        String problem = order < 0 ? "its cRLNumber " + is + " is lower than the current " + was
+                : order == 0 ? "its cRLNumber " + is + " is the current one's, but its content differs"
+                : isThisUpdate.isBefore(wasThisUpdate) ? "its thisUpdate " + isThisUpdate + " is earlier than the current " + wasThisUpdate
+                : null;
+        if (problem != null) {
+            log.error("Refused the CRL {} of the IACA {}: {}. A replacement must carry a larger cRLNumber (RFC 5280"
+                    + " 5.2.3) and a thisUpdate no earlier than the current CRL's, since an older list could un-revoke a"
+                    + " Document Signer; the current CRL (cRLNumber {}, thisUpdate {}) stays in use", file, anchor.id(),
+                    problem, was, wasThisUpdate);
+            return;
+        }
+        current(anchor.id(), candidate);
+        log.info("Reloaded the CRL of the IACA {} from {} (cRLNumber {}, nextUpdate {})", anchor.id(), file, is,
+                nextUpdate(candidate.crl()));
+    }
+
+    /** WARN for a CRL past its nextUpdate within the grace (signing continues), ERROR past the grace (refused). */
+    private void logFreshness(Anchor anchor, CrlState state, Instant now) {
+        if (state == null) {
+            return;
+        }
+        Instant nextUpdate = nextUpdate(state.crl());
+        if (nextUpdate == null || !now.isAfter(nextUpdate)) {
+            return;
+        }
+        if (pastGrace(state.crl(), now)) {
+            log.error("The CRL of the IACA {} passed its nextUpdate {} more than {} ago (certify.pki.stale-crl-grace):"
+                    + " mDoc signing under it is refused (CRL_STALE) until a new CRL is {}", anchor.id(), nextUpdate,
+                    staleCrlGrace, state.dev() ? "issued" : "published");
+        } else {
+            log.warn("The CRL of the IACA {} passed its nextUpdate {}: {} a new one before {}, when mDoc signing under"
+                    + " it is refused (CRL_STALE, certify.pki.stale-crl-grace {}); until then signing continues and the"
+                    + " revocations it lists still apply", anchor.id(), nextUpdate, state.dev() ? "issue" : "publish",
+                    nextUpdate.plus(staleCrlGrace), staleCrlGrace);
+        }
+    }
+
+    private boolean pastGrace(X509CRL crl, Instant now) {
+        Instant nextUpdate = nextUpdate(crl);
+        return nextUpdate != null && now.isAfter(nextUpdate.plus(staleCrlGrace));
+    }
+
+    private static Instant nextUpdate(X509CRL crl) {
+        return crl.getNextUpdate() == null ? null : crl.getNextUpdate().toInstant();
+    }
+
+    /**
+     * An empty CRL for an IACA whose key the dev-mode provider holds. The number is one more than the last one recorded
+     * for the IACA (here or in the {@link CrlNumberStore}, which survives restarts) and at least the issuing epoch
+     * second, and it is recorded before the CRL is used: a restart within the same second, or after the clock was set
+     * back, never reuses or lowers a number (RFC 5280 5.2.3). A number that cannot be recorded leaves the CRL unused.
+     */
+    private Optional<CrlState> issueDevCrl(Anchor anchor, BigInteger previous, boolean startup) {
+        Instant thisUpdate = clock.instant().truncatedTo(ChronoUnit.SECONDS);
         Instant iacaEnd = anchor.certificate().getNotAfter().toInstant();
         Instant nextUpdate = thisUpdate.plus(devCrlValidity);
         if (nextUpdate.isAfter(iacaEnd)) {
@@ -214,10 +381,26 @@ public class FileTrustAnchorRegistry implements TrustAnchorRegistry, AutoCloseab
         if (!nextUpdate.isAfter(thisUpdate)) {
             return Optional.empty();
         }
+        BigInteger last = previous.max(crlNumbers.last(anchor.certificate()));
+        BigInteger number = BigInteger.valueOf(thisUpdate.getEpochSecond()).max(last.add(BigInteger.ONE));
         Optional<X509CRL> crl = devCrls.issue(anchor.certificate(), number, thisUpdate, nextUpdate);
-        crl.ifPresent(issued -> log.info("Issued the dev-mode CRL of the IACA {} (cRLNumber {}, nextUpdate {})",
-                anchor.id(), number, issued.getNextUpdate().toInstant()));
-        return crl.map(issued -> new CrlState(issued, null, -1, true));
+        if (crl.isEmpty()) {
+            return Optional.empty();
+        }
+        try {
+            crlNumbers.record(anchor.certificate(), number);
+        } catch (IOException | RuntimeException e) {
+            if (startup) {
+                throw new IllegalStateException("Cannot record the cRLNumber " + number + " of the dev-mode CRL of the IACA "
+                        + anchor.id() + ": " + e.getMessage(), e);
+            }
+            log.error("Cannot record the cRLNumber {} of the dev-mode CRL of the IACA {} ({}); the current CRL stays in use",
+                    number, anchor.id(), e.getMessage());
+            return Optional.empty();
+        }
+        log.info("Issued the dev-mode CRL of the IACA {} (cRLNumber {}, nextUpdate {})", anchor.id(), number,
+                crl.get().getNextUpdate().toInstant());
+        return Optional.of(new CrlState(crl.get(), null, -1, true));
     }
 
     /** Reads and validates a CRL file; at startup a problem refuses to start, later it keeps the previous CRL. */
@@ -234,7 +417,7 @@ public class FileTrustAnchorRegistry implements TrustAnchorRegistry, AutoCloseab
                 throw new IllegalStateException(where + " breaks ISO/IEC 18013-5 Annex B / RFC 5280: " + violations);
             }
             return Optional.of(new CrlState(crl, modified, size, false));
-        } catch (IOException | java.security.cert.CRLException | CertificateException | RuntimeException e) {
+        } catch (IOException | CRLException | CertificateException | RuntimeException e) {
             if (startup) {
                 throw e instanceof IllegalStateException state ? state
                         : new IllegalStateException("Cannot read " + where + ": " + e.getMessage(), e);
@@ -262,10 +445,44 @@ public class FileTrustAnchorRegistry implements TrustAnchorRegistry, AutoCloseab
     }
 
     /**
-     * The id of an anchor without a configured one: the {@code <id>} of a CRL distribution point
-     * {@code …/mdoc/iaca/<id>.crl}, so the advertised URL is the one served, else the subject key identifier in hex.
+     * The anchor's id: {@code configured} when set, else the {@code <id>} of a CRL distribution point
+     * {@code …/mdoc/iaca/<id>.crl} (so the advertised URL is the one served), else the subject key identifier in hex.
+     * Every distribution point of that form must name a valid id and this anchor's id; otherwise the publication would
+     * answer 404 where the IACA, and every DSC that copies its distribution point, sends verifiers, and startup is
+     * refused naming both.
      */
-    static String derivedId(X509Certificate iaca) {
+    static String anchorId(String configured, X509Certificate iaca, String where) {
+        List<String[]> published = publishedCrlIds(iaca);
+        for (String[] point : published) {
+            if (!PkiProperties.ID.matcher(point[1]).matches()) {
+                throw new IllegalStateException(where + ": the IACA " + iaca.getSubjectX500Principal() + " has the CRL"
+                        + " distribution point " + point[0] + ", whose '" + point[1] + "' is not a valid anchor id: an id is "
+                        + PkiProperties.ID_RULE + ", so /mdoc/iaca/" + point[1] + ".crl is never served. Issue the IACA"
+                        + " with a CRL distribution point https://<host>/v1/certify/mdoc/iaca/<id>.crl whose <id> follows"
+                        + " that rule (certify.keyprovider.x509-file.iaca.crl-uri, certify-cli pki iaca create --crl-uri)");
+            }
+        }
+        String id = configured != null ? configured : published.isEmpty()
+                ? CertificateLinks.subjectKeyIdentifierHex(iaca).orElseThrow(() -> new IllegalStateException(where
+                        + ": the IACA " + iaca.getSubjectX500Principal() + " has no subject key identifier to name it by;"
+                        + " set certify.pki.trust-anchors.mdoc-iaca[].id"))
+                : published.get(0)[1];
+        for (String[] point : published) {
+            if (!point[1].equals(id)) {
+                throw new IllegalStateException(where + ": the IACA " + iaca.getSubjectX500Principal() + " advertises its"
+                        + " CRL at " + point[0] + " (anchor id '" + point[1] + "'), but its anchor id is '" + id + "'"
+                        + (configured != null ? " (configured)" : "") + ", so this issuer serves that CRL at /mdoc/iaca/"
+                        + id + ".crl and the advertised URL would answer 404 to every verifier; "
+                        + (configured != null ? "set the id to '" + point[1] + "' or leave it unset"
+                        : "an IACA names one id in all its distribution points under /mdoc/iaca"));
+            }
+        }
+        return id;
+    }
+
+    /** {@code [uri, <id>]} for every CRL distribution point whose path is {@code …/mdoc/iaca/<id>.crl}. */
+    private static List<String[]> publishedCrlIds(X509Certificate iaca) {
+        List<String[]> ids = new ArrayList<>();
         for (String uri : crlDistributionPoints(iaca)) {
             String path;
             try {
@@ -274,13 +491,11 @@ public class FileTrustAnchorRegistry implements TrustAnchorRegistry, AutoCloseab
                 continue;
             }
             Matcher matcher = PUBLISHED_CRL.matcher(path == null ? "" : path);
-            if (matcher.matches() && PkiProperties.ID.matcher(matcher.group(1)).matches()) {
-                return matcher.group(1);
+            if (matcher.matches()) {
+                ids.add(new String[] {uri, matcher.group(1)});
             }
         }
-        return CertificateLinks.subjectKeyIdentifierHex(iaca)
-                .orElseThrow(() -> new IllegalStateException("The IACA " + iaca.getSubjectX500Principal()
-                        + " has no subject key identifier to name it by; set certify.pki.trust-anchors.mdoc-iaca[].id"));
+        return ids;
     }
 
     /** The URIs of the certificate's CRL distribution points, in order. */
@@ -326,6 +541,14 @@ public class FileTrustAnchorRegistry implements TrustAnchorRegistry, AutoCloseab
 
     private static boolean isPem(byte[] bytes) {
         return new String(bytes, 0, Math.min(bytes.length, 4096), StandardCharsets.US_ASCII).contains("-----BEGIN ");
+    }
+
+    private static byte[] encoded(X509CRL crl) {
+        try {
+            return crl.getEncoded();
+        } catch (CRLException e) {
+            throw new IllegalStateException("Cannot encode the CRL of " + crl.getIssuerX500Principal(), e);
+        }
     }
 
     static BigInteger crlNumber(X509CRL crl) {

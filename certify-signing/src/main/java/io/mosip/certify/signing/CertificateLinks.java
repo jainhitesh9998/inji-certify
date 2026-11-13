@@ -52,8 +52,22 @@ public final class CertificateLinks {
         return subjectKeyIdentifier(certificate).map(HexFormat.of()::formatHex);
     }
 
-    public static boolean selfSigned(X509Certificate certificate) {
+    /**
+     * Whether the certificate is self-issued (RFC 5280 6.1: subject and issuer names are equal). The signature is not
+     * verified; {@link #signedBy} says whether a key actually signed a certificate.
+     */
+    public static boolean selfIssued(X509Certificate certificate) {
         return certificate.getSubjectX500Principal().equals(certificate.getIssuerX500Principal());
+    }
+
+    /** Whether the certificate's signature verifies under {@code issuer}'s public key, whatever the names and key identifiers say. */
+    public static boolean signedBy(X509Certificate certificate, X509Certificate issuer) {
+        try {
+            certificate.verify(issuer.getPublicKey());
+            return true;
+        } catch (GeneralSecurityException | RuntimeException e) {
+            return false;
+        }
     }
 
     /**
@@ -67,15 +81,7 @@ public final class CertificateLinks {
         boolean named = aki.isPresent() && ski.isPresent()
                 ? Arrays.equals(aki.get(), ski.get())
                 : certificate.getIssuerX500Principal().equals(issuer.getSubjectX500Principal());
-        if (!named) {
-            return false;
-        }
-        try {
-            certificate.verify(issuer.getPublicKey());
-            return true;
-        } catch (GeneralSecurityException | RuntimeException e) {
-            return false;
-        }
+        return named && signedBy(certificate, issuer);
     }
 
     /** The first candidate that issued {@code certificate}, by {@link #issuedBy}. */

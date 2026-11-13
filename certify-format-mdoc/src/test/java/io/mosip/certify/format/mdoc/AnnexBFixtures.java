@@ -119,6 +119,24 @@ final class AnnexBFixtures {
         }
     }
 
+    /**
+     * The DSC re-signed by the IACA key with an authority key identifier that names another key (RFC 5280 4.2.1.1): the
+     * signature verifies under the IACA, the key identifiers do not link, so only the Annex B rule can name the fault.
+     */
+    static X509Certificate dscWithForeignAki() {
+        try {
+            byte[] foreign = new byte[20];
+            new java.security.SecureRandom().nextBytes(foreign);
+            JcaX509v3CertificateBuilder builder = new JcaX509v3CertificateBuilder(DSC);
+            builder.replaceExtension(org.bouncycastle.asn1.x509.Extension.authorityKeyIdentifier, false,
+                    new org.bouncycastle.asn1.x509.AuthorityKeyIdentifier(foreign));
+            return new JcaX509CertificateConverter().getCertificate(builder.build(
+                    new JcaContentSignerBuilder("SHA256withECDSA").build(IACA_KEYS.getPrivate())));
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
     static KeyPair p256() {
         try {
             KeyPairGenerator generator = KeyPairGenerator.getInstance("EC");

@@ -44,7 +44,8 @@ public class MdocAutoConfiguration {
             log.info("mso_mdoc DSC policy enforced on every surface: Document Signers must be issued by one of the IACAs {}",
                     registry.entries(TrustAnchorRegistry.MDOC_IACA).stream().map(TrustAnchorRegistry.Anchor::id).toList());
         } else {
-            log.warn("mso_mdoc DSC policy is not enforced: no IACA trust anchor is configured"
+            // INFO, not WARN: most deployments issue no mso_mdoc at all, and for them this is the expected state
+            log.info("mso_mdoc DSC policy is not enforced: no IACA trust anchor is configured"
                     + " (certify.pki.trust-anchors.mdoc-iaca, or an x509-file iaca); mDocs are signed without checking"
                     + " the Document Signer against an IACA");
         }

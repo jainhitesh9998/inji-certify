@@ -16,6 +16,7 @@ import java.security.cert.CertificateEncodingException;
 import java.security.cert.X509CRL;
 import java.security.cert.X509CRLEntry;
 import java.security.cert.X509Certificate;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.HexFormat;
 import java.util.List;
@@ -39,7 +40,8 @@ import java.util.stream.Collectors;
  *     <li>when a {@link TrustAnchorRegistry} holds {@value TrustAnchorRegistry#MDOC_IACA} anchors ({@link #enforced}),
  *     fail closed on every surface: one of those IACAs issued the DSC, the IACA is valid at the signing instant and
  *     passes {@link AnnexBValidator#validateIaca}, the DSC passes {@link AnnexBValidator#validateDs} against it, and
- *     the IACA's CRL, when one is configured, does not list the DSC.</li>
+ *     the IACA's CRL, when one is configured, does not list the DSC and is not past its {@code nextUpdate} by more
+ *     than {@link TrustAnchorRegistry#staleCrlGrace()} ({@value #CRL_STALE}; decision log 2026-11-13, refining D16).</li>
  * </ul>
  * Without anchors the second part is skipped, so a deployment that signs mDocs with keymanager's master-signed
  * certificates (the draft-13 and compatibility surfaces, the recorded goldens) keeps its bytes (CLAUDE.md rule 1;
@@ -60,13 +62,15 @@ public final class MdocDscPolicy {
     public static final String IACA_NOT_YET_VALID = "IACA_NOT_YET_VALID";
     public static final String IACA_EXPIRED = "IACA_EXPIRED";
     public static final String DSC_REVOKED = "DSC_REVOKED";
+    /** The IACA's CRL passed its nextUpdate more than the stale-CRL grace before the signing instant. */
+    public static final String CRL_STALE = "CRL_STALE";
     /** The dry run could not resolve the configured signing key, so no policy rule could be judged (fail closed). */
     public static final String KEY_UNRESOLVED = "KEY_UNRESOLVED";
 
     /** The rules this class names itself; the Annex B profile rules come from {@link AnnexBValidator#RULES}. */
     public static final Set<String> RULES = Set.of(X5CHAIN_MISSING, DSC_SELF_SIGNED, X5CHAIN_NONE,
             X5CHAIN_DROPS_INTERMEDIATES, X5CHAIN_CARRIES_ANCHOR, DSC_NOT_YET_VALID, DSC_EXPIRED, CHAIN_LINK_INVALID,
-            DSC_NO_TRUSTED_IACA, IACA_NOT_YET_VALID, IACA_EXPIRED, DSC_REVOKED, KEY_UNRESOLVED);
+            DSC_NO_TRUSTED_IACA, IACA_NOT_YET_VALID, IACA_EXPIRED, DSC_REVOKED, CRL_STALE, KEY_UNRESOLVED);
 
     /** Profile results per (DSC, IACA) pair: neither validator depends on the instant, so a pair is judged once. */
     private static final int PROFILE_CACHE_SIZE = 64;
@@ -102,8 +106,8 @@ public final class MdocDscPolicy {
                     + " 9.1.2.4 requires the IssuerAuth to carry the document signer certificate in x5chain (label 33)");
         }
         X509Certificate leaf = chain.leafFirst().get(0);
-        if (CertificateLinks.selfSigned(leaf)) {
-            // a lone self-signed certificate survives without-anchor (nothing above it to drop), so the IssuerAuth would
+        if (CertificateLinks.selfIssued(leaf)) {
+            // a lone self-issued certificate survives without-anchor (nothing above it to drop), so the IssuerAuth would
             // carry a self-signed signer; an ISO/IEC 18013-5 Annex B Document Signer is always issued by an IACA
             throw refuse(DSC_SELF_SIGNED, "the signing certificate " + leaf.getSubjectX500Principal()
                     + " is self-signed; an ISO/IEC 18013-5 Annex B document signer certificate is issued by an IACA,"
@@ -122,7 +126,7 @@ public final class MdocDscPolicy {
             }
             case FULL -> {
                 X509Certificate root = chain.root().orElseThrow();
-                if (CertificateLinks.selfSigned(root)) {
+                if (CertificateLinks.selfIssued(root)) {
                     // HAIP forbids carrying the trust anchor; the verifier must supply the IACA itself (D9, 9.1.2.4)
                     throw refuse(X5CHAIN_CARRIES_ANCHOR, "x5chain FULL would carry the self-signed trust anchor "
                             + root.getSubjectX500Principal() + " in the IssuerAuth; an mDL carries at most the DSC and its"
@@ -165,10 +169,7 @@ public final class MdocDscPolicy {
         TrustAnchorRegistry.Anchor anchor = anchors.stream()
                 .filter(candidate -> CertificateLinks.issuedBy(dsc, candidate.certificate()))
                 .findFirst()
-                .orElseThrow(() -> refuse(DSC_NO_TRUSTED_IACA, "the document signer certificate "
-                        + dsc.getSubjectX500Principal() + " (issuer " + dsc.getIssuerX500Principal() + ") was not issued"
-                        + " by any configured IACA " + anchors.stream().map(TrustAnchorRegistry.Anchor::id).toList()
-                        + "; mDocs are signed only under certify.pki.trust-anchors.mdoc-iaca (D16)"));
+                .orElseThrow(() -> notIssuedByAnAnchor(dsc, anchors));
         X509Certificate iaca = anchor.certificate();
         if (at.isBefore(iaca.getNotBefore().toInstant())) {
             throw refuse(IACA_NOT_YET_VALID, "the IACA " + anchor.id() + " is valid from "
@@ -178,13 +179,7 @@ public final class MdocDscPolicy {
             throw refuse(IACA_EXPIRED, "the IACA " + anchor.id() + " expired at " + iaca.getNotAfter().toInstant()
                     + ", before the signing instant " + at);
         }
-        List<AnnexBValidator.Violation> violations = profile(dsc, iaca);
-        if (!violations.isEmpty()) {
-            String rules = String.join(", ", AnnexBValidator.ruleIds(violations));
-            throw refuse(rules, "the document signer certificate " + dsc.getSubjectX500Principal() + " and the IACA "
-                    + anchor.id() + " break ISO/IEC 18013-5:2021 Annex B: " + violations.stream()
-                    .map(AnnexBValidator.Violation::toString).collect(Collectors.joining("; ")));
-        }
+        requireProfile(dsc, anchor);
         Optional<X509CRL> crl = registry.crl(anchor.id());
         if (crl.isPresent()) {
             BigInteger serial = dsc.getSerialNumber();
@@ -194,6 +189,60 @@ public final class MdocDscPolicy {
                         + " (serial " + serial.toString(16) + ") is revoked by the CRL of the IACA " + anchor.id()
                         + " since " + entry.getRevocationDate().toInstant());
             }
+            requireFresh(crl.get(), anchor, at);
+        }
+    }
+
+    /**
+     * A DSC no configured IACA issued by {@link CertificateLinks#issuedBy}. When one of them signed it all the same (its
+     * authority key identifier names another key, or neither the identifiers nor the names link), the Annex B rules it
+     * breaks against that IACA are named ({@code DS_AKI_MISMATCH}…), not "no IACA": the operator's fix is the certificate.
+     */
+    private FormatException notIssuedByAnAnchor(X509Certificate dsc, List<TrustAnchorRegistry.Anchor> anchors) {
+        for (TrustAnchorRegistry.Anchor candidate : anchors) {
+            if (CertificateLinks.signedBy(dsc, candidate.certificate())) {
+                List<AnnexBValidator.Violation> violations = profile(dsc, candidate.certificate());
+                if (!violations.isEmpty()) {
+                    return profileRefusal(dsc, candidate, violations);
+                }
+            }
+        }
+        return refuse(DSC_NO_TRUSTED_IACA, "the document signer certificate " + dsc.getSubjectX500Principal()
+                + " (issuer " + dsc.getIssuerX500Principal() + ") was not issued by any configured IACA "
+                + anchors.stream().map(TrustAnchorRegistry.Anchor::id).toList()
+                + "; mDocs are signed only under certify.pki.trust-anchors.mdoc-iaca (D16)");
+    }
+
+    private void requireProfile(X509Certificate dsc, TrustAnchorRegistry.Anchor anchor) {
+        List<AnnexBValidator.Violation> violations = profile(dsc, anchor.certificate());
+        if (!violations.isEmpty()) {
+            throw profileRefusal(dsc, anchor, violations);
+        }
+    }
+
+    private static FormatException profileRefusal(X509Certificate dsc, TrustAnchorRegistry.Anchor anchor,
+                                                  List<AnnexBValidator.Violation> violations) {
+        String rules = String.join(", ", AnnexBValidator.ruleIds(violations));
+        return refuse(rules, "the document signer certificate " + dsc.getSubjectX500Principal() + " and the IACA "
+                + anchor.id() + " break ISO/IEC 18013-5:2021 Annex B: " + violations.stream()
+                .map(AnnexBValidator.Violation::toString).collect(Collectors.joining("; ")));
+    }
+
+    /**
+     * RFC 5280 6.3.3: a verifier that finds the IACA's CRL past its nextUpdate cannot establish the DSC's status and
+     * rejects the mDL, so signing past {@link TrustAnchorRegistry#staleCrlGrace()} would only issue credentials that
+     * fail verification (decision log 2026-11-13). Within the grace the known revocations above still apply.
+     */
+    private void requireFresh(X509CRL crl, TrustAnchorRegistry.Anchor anchor, Instant at) {
+        if (crl.getNextUpdate() == null) {
+            return; // validateCrl refuses a CRL without nextUpdate before it reaches the registry
+        }
+        Instant nextUpdate = crl.getNextUpdate().toInstant();
+        Duration grace = registry.staleCrlGrace();
+        if (at.isAfter(nextUpdate.plus(grace))) {
+            throw refuse(CRL_STALE, "the CRL of the IACA " + anchor.id() + " passed its nextUpdate " + nextUpdate
+                    + ", more than the grace " + grace + " (certify.pki.stale-crl-grace) before the signing instant " + at
+                    + "; a verifier rejects an mDL whose IACA CRL is stale (RFC 5280 6.3.3): publish a new CRL");
         }
     }
 
