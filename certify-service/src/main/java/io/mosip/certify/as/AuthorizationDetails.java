@@ -1,11 +1,11 @@
 package io.mosip.certify.as;
 
-import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 
 /**
  * The {@code authorization_details} parameter (RFC 9396 as OpenID4VCI 1.0 section 5.1.1 uses it): a JSON array of
@@ -18,7 +18,9 @@ import java.util.Map;
  */
 final class AuthorizationDetails {
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    /** Strict about what follows the array: {@code [...]x} is not a JSON array, it is a malformed value. */
+    private static final ObjectMapper MAPPER = new ObjectMapper()
+            .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
 
     /** The longest {@code authorization_details} value a pushed request may carry (the entries are ids, not documents). */
     static final int MAX_LENGTH = 4096;
@@ -28,35 +30,51 @@ final class AuthorizationDetails {
 
     private AuthorizationDetails() {}
 
+    /**
+     * The {@code credential_configuration_id} of every entry. RFC 9396 section 2 makes the parameter a JSON array of
+     * objects, each with a string {@code type}; OpenID4VCI 1.0 section 5.1.1 makes {@code type} {@code openid_credential}
+     * and {@code credential_configuration_id} a string. Anything else - {@code null}, {@code [null]}, an entry that is
+     * not an object, an id that is a number or an object - is {@code invalid_request} (F-21 review round 2: those were a
+     * NullPointerException, a 500, or an id coerced through {@code toString()}).
+     */
     static List<String> credentialConfigurationIds(String json) {
         if (json == null || json.isBlank()) {
             return List.of();
         }
         if (json.length() > MAX_LENGTH) {
-            throw new AsException(400, "invalid_request",
-                    "authorization_details is longer than " + MAX_LENGTH + " characters");
+            throw invalid("authorization_details is longer than " + MAX_LENGTH + " characters");
         }
-        List<Map<String, Object>> entries;
+        JsonNode entries;
         try {
-            entries = MAPPER.readValue(json, new TypeReference<List<Map<String, Object>>>() {});
+            entries = MAPPER.readTree(json);
         } catch (Exception e) {
-            throw new AsException(400, "invalid_request", "authorization_details is not a JSON array: " + e.getMessage());
+            throw invalid("authorization_details is not JSON: " + e.getMessage());
+        }
+        if (entries == null || !entries.isArray()) {
+            throw invalid("authorization_details must be a JSON array of objects");
         }
         if (entries.size() > MAX_ENTRIES) {
-            throw new AsException(400, "invalid_request",
-                    "authorization_details names more than " + MAX_ENTRIES + " entries");
+            throw invalid("authorization_details names more than " + MAX_ENTRIES + " entries");
         }
         List<String> ids = new ArrayList<>();
-        for (Map<String, Object> entry : entries) {
-            if (!AuthorizationCodeService.AUTHORIZATION_DETAILS_TYPE.equals(entry.get("type"))) {
-                throw new AsException(400, "invalid_request", "authorization_details entries must be of type openid_credential");
+        for (JsonNode entry : entries) {
+            if (!entry.isObject()) {
+                throw invalid("authorization_details entries must be JSON objects");
             }
-            Object id = entry.get("credential_configuration_id");
-            if (id == null || id.toString().isBlank()) {
-                throw new AsException(400, "invalid_request", "authorization_details entries must name credential_configuration_id");
+            JsonNode type = entry.get("type");
+            if (type == null || !type.isTextual() || !AuthorizationCodeService.AUTHORIZATION_DETAILS_TYPE.equals(type.textValue())) {
+                throw invalid("authorization_details entries must be of type openid_credential");
             }
-            ids.add(id.toString());
+            JsonNode id = entry.get("credential_configuration_id");
+            if (id == null || !id.isTextual() || id.textValue().isBlank()) {
+                throw invalid("authorization_details entries must name credential_configuration_id as a string");
+            }
+            ids.add(id.textValue());
         }
         return ids;
+    }
+
+    private static AsException invalid(String description) {
+        return new AsException(400, "invalid_request", description);
     }
 }

@@ -49,7 +49,27 @@ the pre-authorized grant, which needs no client, no redirect and no user interac
 endpoint of the farmer profiles stays out (`interactive_authorization_endpoint` and its `require_…` member are absent).
 
 nginx passes both endpoints to the public host (`docs/design/tools/check-public-guard.sh`) and rate limits them with the
-offer and token endpoints; a PAR body above 8 KiB is refused there with 413.
+offer and token endpoints; a PAR body above 8 KiB is refused there with 413, an offer or token body above 32 KiB too.
+
+## What a public offer may hold
+
+Offer minting (`POST /v1/certify/pre-authorized-data`) is public on this demo (D12), and every offer is cached until it
+is redeemed or lapses, so what one caller can park there is bounded (F-21 review round 2, decision log 2026-11-14):
+
+| Bound | Value here | Where |
+| --- | --- | --- |
+| request body | 32 KiB, then 413 | `certify-nginx.conf` (offer minting, token and authorization endpoints) |
+| `claims` | 1 KiB as UTF-8 JSON and 32 JSON values at any depth (shared default 8 KiB / 256), then `invalid_request` | `certify.protocol.oid4vci-v1.offers.max-claims-bytes` / `max-claims-values` |
+| `subject` | 512 characters, then `invalid_request` | `PreAuthorizedCodeService` |
+| `expires_in` | 60 to 900 s (the page asks for 600) | `mosip.certify.pre-auth.max-expiry-seconds` |
+| live offers | 5000 codes and 5000 offer documents, each kept for 900 s | `mosip.certify.pre-auth.cache-size`, `credential-offer.cache-size` |
+| rate | 30 a minute with a burst of 20 per client, an IPv4 address or an IPv6 /64 | `certify-nginx.conf` |
+
+This stack issues by `subject` (the file data source resolves the token's `sub`), so offer claims are never the mDL's
+data; claims given next to a subject are still validated as claims alone are (no unknown element, every mandatory one present). One client at the
+limit keeps at most 0.5/s x 900 s + 21 = 471 offers live, so more than ten clients flooding at full rate are needed to
+evict a visitor's offer early (the residual risk next to D12 in `docs/design/20-mdl-issuer.md`); an offer costs at most
+~7 KB of heap, ~35 MB for all 5000.
 
 **Which Talao profile the demo is for.** Talao's wallet asks for the AS metadata, then probes
 `<as>/.well-known/openid-configuration` and uses it if it parses as OpenID Connect Discovery; Certify serves no such
@@ -244,7 +264,9 @@ metadata say. It covers:
   privilege dates as tag 1004 full-dates, `sex` an unsigned integer (never `true`), `age_over_18` a boolean, the
   portrait's bytes, and the whole `driving_privileges`;
 - the status entry: **none on this demo** - the MSO carries no `status` until M-11 (F-21, gap G23), and the run
-  reports that as a PASS. A configuration that asks for one again keeps every list check: the list's signature, `sub`
+  reports that as a PASS. Only a missing member is absent: a `status` that is present but is not a well-formed
+  `{status_list: {idx, uri}}` (`null`, a string, `{}`, `status_list: null`) fails under either `--expect-status`
+  (F-21 review round 2). A configuration that asks for one again keeps every list check: the list's signature, `sub`
   equal to the MSO's `uri`, `iat` not in the future, `exp` not passed, the bit clear;
 - `docs/design/tools/verify_mdoc.py` (pymdoccbor) with `--doctype`, `--holder` and `--iaca`: the IACA taken from
   `/v1/certify/mdoc/iaca/<id>.pem`, or with `--iaca <file>` the operator's offline IACA, which the published one must
@@ -416,6 +438,12 @@ mdl_public up -d --no-build database certify certify-nginx mdl-seed
 cd "$(git rev-parse --show-toplevel)" && .venv/bin/python docs/design/tools/smoke.py --mdl "$CERTIFY_PUBLIC_URL" --iaca "$MDL_PKI_DIR/iaca.pem"
 ```
 
+**Before announcing a deploy** that changes what the authorization server or the credential advertises: one real
+redemption each with **Paradym** and **Talao** against the public host, scanning an offer from the offer page with
+each wallet and accepting the mDL (F-21 review round 2). `smoke.py --mdl` plays a wallet built from the specifications;
+it is not either wallet, and both have refused documents this smoke accepted (G23, G29). Record the wallet versions and
+the result in `docs/design/wp/PROGRESS.md`.
+
 Name only these four services: `mimoto-service` and `inji-web` are not part of the mDL stack (the public overlay
 removes their ports, but nothing else of theirs is hardened). `CERTIFY_KEYSTORE_PASSWORD` must not be in the shell:
 the public overlay leaves it out of the container's environment (`mdl_public config` shows no such variable, and the
@@ -472,10 +500,11 @@ secret-file passwords and the Document Signer key). Nothing in the stack calls a
 is not a readiness signal here: `certify-default.properties` permits `**/actuator/**`, an Ant pattern that actuator's
 `PathPattern` handler mapping never matches, so health requires authentication, and Certify answers that refusal with
 `200` and an error body.) Public calls to `POST /v1/certify/pre-authorized-data` and `/v1/certify/oauth/token`
-are rate limited per client address (`CF-Connecting-IP`): 30 a minute with a burst of 20, then `429`; local requests
-are never counted. The key is the single address, so an IPv6 client, which usually holds a whole /64, can rotate
-addresses and is limited only by Cloudflare's own rules; add a Cloudflare rate-limiting rule keyed on the client if
-that matters. The guard and the limit both trust `CF-Ray`, which is why 8091 must not be reachable
+(and the pushed authorization and authorization endpoints) are rate limited per client (`CF-Connecting-IP`): 30 a
+minute with a burst of 20, then `429`; local requests are never counted. The key is an IPv4 address, or an IPv6
+address's /64 (F-21 review round 2): an IPv6 subscriber usually holds a whole /64 and could otherwise rotate through
+it. Many distinct clients are still limited only by Cloudflare's own rules; add a Cloudflare rate-limiting rule if that
+matters ("What a public offer may hold" above). The guard and the limit both trust `CF-Ray`, which is why 8091 must not be reachable
 from anywhere but the host and the tunnel. The seed talks to `certify:8090` inside the network, so the guard does not
 apply to it. Access tokens are verified against Certify's own JWKS over loopback (`certify-mdl.properties`), so the
 container never has to reach its public URL.

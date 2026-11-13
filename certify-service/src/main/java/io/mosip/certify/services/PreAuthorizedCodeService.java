@@ -102,6 +102,16 @@ public class PreAuthorizedCodeService {
     private static final SecureRandom secureRandom = new SecureRandom();
     private static final String ALPHANUMERIC = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
+    /**
+     * The longest {@code subject} an offer may name: an identifier the data provider resolves (a CSV row id, an
+     * individual id, a {@code did:jwk}), cached with the offer until it is redeemed, so it is bounded like every other
+     * stored field of a public request (F-21 review round 2; the PAR endpoint caps {@code state} the same way).
+     */
+    static final int MAX_SUBJECT_LENGTH = 512;
+
+    /** Measures the claims as JSON; a mapper of its own, so the size does not depend on the injected one's modules. */
+    private static final ObjectMapper CLAIMS_SIZE = new ObjectMapper();
+
     /** The deep link a QR code carries and, when the caller asked for the offer by value, the offer itself. */
     public record CredentialOfferResult(String deepLink, CredentialOfferResponse offer) {}
 
@@ -200,11 +210,67 @@ public class PreAuthorizedCodeService {
         }
 
         CredentialConfigurationSupportedDTO config = supportedConfigs.get(request.getCredentialConfigurationId());
-        // a subject names the record the data provider resolves; otherwise the claims are the identity data and are
-        // validated as before (bean validation already refused an offer with neither)
-        if (blankToNull(request.getSubject()) == null) {
-            validateClaims(config, request.getClaims() == null ? Map.of() : request.getClaims());
+        String subject = blankToNull(request.getSubject());
+        if (subject != null && subject.length() > MAX_SUBJECT_LENGTH) {
+            log.error("subject of {} characters refused (at most {})", subject.length(), MAX_SUBJECT_LENGTH);
+            throw new CertifyException(ErrorConstants.INVALID_REQUEST,
+                    "subject is longer than " + MAX_SUBJECT_LENGTH + " characters");
         }
+        Map<String, Object> claims = request.getClaims();
+        boolean claimsPresent = claims != null && !claims.isEmpty();
+        if (claimsPresent) {
+            requireBoundedClaims(claims);
+        }
+        // A subject names the record the data provider resolves; claims, whenever they are given, are identity data and
+        // are validated (bean validation already refused an offer with neither). Validated next to a subject too (F-21
+        // review round 2): they are cached with the offer and copied into the token's transaction either way, and
+        // PreAuthDataProviderPlugin issues them as the credential's data even when a subject is present, so skipping the
+        // check there let unknown claims through to a credential and let any caller park them in the cache.
+        if (subject == null || claimsPresent) {
+            validateClaims(config, claimsPresent ? claims : Map.of());
+        }
+    }
+
+    /**
+     * {@code invalid_request} unless the claims fit {@code certify.protocol.oid4vci-v1.offers.max-claims-values} and
+     * {@code max-claims-bytes} (see {@link Oid4vciProperties.Offers}): every value counts, at any depth, so the heap a
+     * cached offer can cost is bounded by both numbers, not just by its length.
+     */
+    private void requireBoundedClaims(Map<String, Object> claims) {
+        Oid4vciProperties.Offers offers = oid4vciProperties.offers();
+        int values = countValues(claims, offers.maxClaimsValues());
+        if (values > offers.maxClaimsValues()) {
+            log.error("claims with more than {} values refused", offers.maxClaimsValues());
+            throw new CertifyException(ErrorConstants.INVALID_REQUEST,
+                    "claims hold more than " + offers.maxClaimsValues() + " JSON values");
+        }
+        int bytes;
+        try {
+            bytes = CLAIMS_SIZE.writeValueAsBytes(claims).length;
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            throw new CertifyException(ErrorConstants.INVALID_REQUEST, "claims cannot be written as JSON");
+        }
+        if (bytes > offers.maxClaimsBytes()) {
+            log.error("claims of {} bytes as JSON refused (at most {})", bytes, offers.maxClaimsBytes());
+            throw new CertifyException(ErrorConstants.INVALID_REQUEST,
+                    "claims are larger than " + offers.maxClaimsBytes() + " bytes as JSON");
+        }
+    }
+
+    /** The JSON values inside {@code claims} at any depth (objects, arrays and scalars), counted up to {@code limit} + 1. */
+    static int countValues(Map<String, Object> claims, int limit) {
+        List<Object> pending = new ArrayList<>(claims.values()); // a JSON null is a value too, so no ArrayDeque
+        int count = 0;
+        while (!pending.isEmpty() && count <= limit) {
+            Object value = pending.remove(pending.size() - 1);
+            count++;
+            if (value instanceof Map<?, ?> map) {
+                pending.addAll(map.values());
+            } else if (value instanceof Collection<?> list) {
+                pending.addAll(list);
+            }
+        }
+        return count;
     }
 
     private static String blankToNull(String value) {

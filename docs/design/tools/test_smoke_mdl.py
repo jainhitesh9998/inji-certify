@@ -157,21 +157,19 @@ class StatusListProblems(unittest.TestCase):
 class StatusEntry(unittest.TestCase):
     """The MSO's status entry is optional (ISO/IEC 18013-5 9.1.2.4); the demo issues none until M-11 (F-21)."""
 
-    def test_an_mso_without_a_status_has_none(self):
+    def test_an_mso_without_a_status_member_has_none(self):
         self.assertFalse(s.has_status({"docType": s.MDL_DOCTYPE, "valueDigests": {}}))
-        self.assertFalse(s.has_status({"status": None}))
 
-    def test_a_status_with_only_an_identifier_list_carries_no_status_list_entry(self):
-        # ISO2 12.3.6: Status = { ? status_list, ? identifier_list, * tstr => RFU }
-        self.assertFalse(s.has_status({"status": {}}))
-        self.assertFalse(s.has_status({"status": {"identifier_list": {}}}))
-
-    def test_a_status_list_entry_is_seen_whatever_it_holds(self):
-        self.assertTrue(s.has_status({"status": {"status_list": {}}}))
-        self.assertTrue(s.has_status({"status": {"status_list": {"idx": 3, "uri": "https://i/v1/certify/status/1"}}}))
+    def test_a_status_member_is_present_whatever_it_holds(self):
+        # absent is the member not being there (F-21 review round 2): null, a string, an empty map, an IdentifierList
+        # only (ISO2 12.3.6: Status = { ? status_list, ? identifier_list, * tstr => RFU }) and a null status_list are
+        # present, and malformed for a Token Status List entry
+        for status in (None, "broken", {}, {"identifier_list": {}}, {"status_list": None}, {"status_list": {}},
+                       {"status_list": {"idx": 3, "uri": "https://i/v1/certify/status/1"}}):
+            self.assertTrue(s.has_status({"status": status}), status)
 
     def test_values_that_are_not_an_mso_have_none(self):
-        for mso in (None, [], "status", {"status": "status_list"}):
+        for mso in (None, [], "status"):
             self.assertFalse(s.has_status(mso), mso)
 
     def test_the_run_reports_the_missing_entry_as_a_pass_and_makes_no_request(self):
@@ -236,12 +234,27 @@ class StatusExpectation(unittest.TestCase):
             steps = self.status(self.mso(entry), "present")
             self.assertEqual(("MSO status.status_list {idx: uint, uri: tstr} (Token Status List)", False), steps[-1], entry)
 
-    def test_a_status_map_without_a_status_list_is_absent(self):
-        # ISO2 12.3.6: Status = { ? status_list, ? identifier_list, * tstr => RFU }; an IdentifierList-only status (or
-        # one with RFU members only) carries no status_list entry, so it is absent rather than malformed
-        self.assertEqual([], s.status_entry_problems({"status": {}}))
+    def test_a_present_but_malformed_status_fails_both_expectations(self):
+        # F-21 review round 2: {"status": {"status_list": null}} and {"status": "broken"} passed --expect-status absent
+        # because they carried no usable entry; a present member is malformed content, not an absent one
+        for status in (None, "broken", 7, [], {}, {"identifier_list": {"id": b"x", "uri": self.URI}},
+                       {"status_list": None}, {"status_list": "nope"}, {"status_list": {}}):
+            mso = {"docType": s.MDL_DOCTYPE, "status": status}
+            self.assertTrue(s.status_entry_problems(mso), status)
+            for expect in ("absent", "present"):
+                steps = self.status(mso, expect)
+                self.assertTrue(steps and not all(ok for _, ok in steps), (status, expect, steps))
+                self.assertEqual(("MSO status.status_list {idx: uint, uri: tstr} (Token Status List)", False), steps[-1],
+                                 (status, expect, steps))
+
+    def test_only_a_missing_member_passes_the_default_expectation(self):
         self.assertEqual([("MSO carries no status entry (status disabled on this demo until M-11)", True)],
-                         self.status({"status": {}}, "absent"))
+                         self.status({"docType": s.MDL_DOCTYPE}, "absent"))
+        self.assertEqual([], s.status_entry_problems({"docType": s.MDL_DOCTYPE}))
+
+    def test_an_mso_that_is_not_a_map_fails(self):
+        for mso in (None, [], "x"):
+            self.assertEqual([("MSO status entry: the MSO is a map", False)], self.status(mso, "absent"), mso)
 
 
 class TalaoPath(unittest.TestCase):

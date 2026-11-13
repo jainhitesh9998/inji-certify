@@ -35,15 +35,20 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * property files to the rule that a code outlives the longest offer, that a pushed request outlives
  * {@code certify.as.par.expires-in}, and that no cache in {@code mosip.certify.cache.names} silently takes the default;
  * the last one proves by measurement that the map is the effective TTL.
+ *
+ * <p>Review round 2: the issuer-metadata view must be cached in compose too (every pushed request rebuilt it from the
+ * database), and the mDL profile, whose offer minting is public, caps an offer at 900 s and sizes both offer caches to
+ * outlast a minting flood (see certify-mdl.properties).
  */
 class CacheExpiryCoverageTest {
 
     private static final SpelExpressionParser SPEL = new SpelExpressionParser();
 
+    /** The farmer stack (default, csvdp-farmer, rebuild): the shared default offer cap of 3600 s and its cache TTL. */
     @Test
     void theComposeStackLetsAPreAuthorizedCodeOutliveTheLongestOffer() throws Exception {
-        Map<String, Object> values = composeValues();
-        assertLevels(values, "the compose profile");
+        Map<String, Object> values = composeValues("default", "csvdp-farmer", "rebuild");
+        assertLevels(values, "the compose farmer profile");
 
         long maxOfferExpiry = Long.parseLong(String.valueOf(values.get("mosip.certify.pre-auth.max-expiry-seconds")));
         assertEquals(3600, maxOfferExpiry, "the offer service's cap (PreAuthorizedCodeService)");
@@ -52,6 +57,35 @@ class CacheExpiryCoverageTest {
         assertTrue(((Number) expiry(values).get("parRequestCache")).longValue() >= (Long) values.get(PAR_LIFETIME),
                 "a pushed authorization request must live at least as long as certify.as.par.expires-in ("
                         + values.get(PAR_LIFETIME) + " s)");
+        assertEquals(1000, ((Number) sizes(values).get("preAuthCodeCache")).intValue(), "the shared default size");
+        assertEquals(1000, ((Number) sizes(values).get("credentialOfferCache")).intValue(), "the shared default size");
+    }
+
+    /**
+     * The public mDL stack (F-21 review round 2): an offer lives at most 900 s, the code cache's TTL follows that, the
+     * offer document lives as long, and both caches hold 5000 entries - at certify-nginx's 30 a minute with a burst of
+     * 20 one client keeps 0.5 * 900 + 21 = 471 offers live, so 5000 outlast ten flooding clients. Offer claims are
+     * capped at 1 KiB / 32 values there (the stack issues by subject), 8 KiB / 256 values by default.
+     */
+    @Test
+    void theMdlStackCapsTheOfferLifetimeAndSizesTheOfferCachesForAFlood() throws Exception {
+        Map<String, Object> values = composeValues("default", "csvdp-farmer", "rebuild", "mdl", "mdl-dev");
+        assertLevels(values, "the compose mDL profile");
+
+        long maxOfferExpiry = Long.parseLong(String.valueOf(values.get("mosip.certify.pre-auth.max-expiry-seconds")));
+        assertEquals(900, maxOfferExpiry, "the mDL profile's offer cap");
+        assertEquals(900, ((Number) expiry(values).get("preAuthCodeCache")).longValue(), "the code cache follows the cap");
+        assertEquals(900, ((Number) expiry(values).get("credentialOfferCache")).longValue(),
+                "an offer by reference can be fetched for as long as its code can be redeemed");
+        long perClient = 900 / 2 + 21;
+        for (String cache : List.of("preAuthCodeCache", "credentialOfferCache")) {
+            int size = ((Number) sizes(values).get(cache)).intValue();
+            assertEquals(5000, size, cache);
+            assertTrue(size >= 10 * perClient, cache + ": outlasts ten clients flooding at the proxy's rate");
+        }
+        assertEquals(List.of(1024, 32), offerClaimCaps("default", "csvdp-farmer", "rebuild", "mdl", "mdl-dev"));
+        assertEquals(List.of(8192, 256), offerClaimCaps("default", "csvdp-farmer", "rebuild"),
+                "the shared default (Oid4vciProperties.Offers)");
     }
 
     @Test
@@ -70,7 +104,8 @@ class CacheExpiryCoverageTest {
     /** The keys the offer service reads: the compose file carried `pre-auth-code.*`, which nothing ever read. */
     @Test
     void theOfferExpiryPropertiesAreTheNamesTheServiceReads() throws Exception {
-        for (Map<String, Object> values : List.<Map<String, Object>>of(composeValues(), localValues())) {
+        for (Map<String, Object> values : List.<Map<String, Object>>of(composeValues("default", "csvdp-farmer", "rebuild",
+                "mdl", "mdl-dev"), localValues())) {
             for (String key : List.of("mosip.certify.pre-auth.default-expiry-seconds",
                     "mosip.certify.pre-auth.min-expiry-seconds", "mosip.certify.pre-auth.max-expiry-seconds")) {
                 assertTrue(values.containsKey(key), "missing " + key + " (PreAuthorizedCodeService reads it)");
@@ -121,8 +156,11 @@ class CacheExpiryCoverageTest {
         assertTrue(names.contains("preAuthCodeCache"), where + ": " + names);
         assertTrue(names.contains("parRequestCache"), where + ": " + names);
         assertTrue(names.contains("clientAttestationJtiCache"), where + ": " + names);
+        // the issuer-metadata view (CredentialRegistry): without it every offer, pushed request and credential request
+        // rebuilt it from credential_config (F-21 review round 2)
+        assertTrue(names.contains("issuerMetadataCache"), where + ": " + names);
         assertTrue(sizes(values).keySet().containsAll(Set.of("preAuthCodeCache", "parRequestCache",
-                        "clientAttestationJtiCache")),
+                        "clientAttestationJtiCache", "credentialOfferCache", "issuerMetadataCache")),
                 where + ": every cache an unauthenticated or attested caller writes is bounded (" + sizes(values) + ")");
         // the replay cache must outlive a proof: pop-max-age PT5M plus clock-skew PT60S
         assertTrue(((Number) expiry(values).get("clientAttestationJtiCache")).longValue() >= 360,
@@ -141,10 +179,21 @@ class CacheExpiryCoverageTest {
         return as == null ? 90 : as.par().expiresIn().toSeconds();
     }
 
-    private static Map<String, Object> composeValues() throws IOException {
-        // default, csvdp-farmer, rebuild, mdl and mdl-dev, as the container merges them (the PKI profiles add no cache key)
+    /** The offer claim caps the profiles bind ({@code certify.protocol.oid4vci-v1.offers.*}, typed with its defaults). */
+    private static List<Integer> offerClaimCaps(String... profiles) throws IOException {
+        var binder = ComposeProperties.binder(ComposeProperties.sources(Map.of("mosip.certify.domain.url", "https://example.org"), profiles));
+        io.mosip.certify.oid4vci.Oid4vciProperties.Offers offers = binder.bind("certify.protocol.oid4vci-v1",
+                        org.springframework.boot.context.properties.bind.Bindable.of(io.mosip.certify.oid4vci.Oid4vciProperties.class))
+                .map(io.mosip.certify.oid4vci.Oid4vciProperties::offers)
+                .orElseGet(() -> binder.bindOrCreate("certify.protocol.oid4vci-v1.offers",
+                        io.mosip.certify.oid4vci.Oid4vciProperties.Offers.class));
+        return List.of(offers.maxClaimsBytes(), offers.maxClaimsValues());
+    }
+
+    private static Map<String, Object> composeValues(String... profiles) throws IOException {
+        // the profiles in the order the container activates them (the PKI profiles add no cache key)
         MutablePropertySources sources = ComposeProperties.sources(Map.of("mosip.certify.domain.url", "https://example.org"),
-                "default", "csvdp-farmer", "rebuild", "mdl", "mdl-dev");
+                profiles);
         var binder = ComposeProperties.binder(sources);
         Map<String, Object> values = new LinkedHashMap<>();
         for (String key : KEYS) {

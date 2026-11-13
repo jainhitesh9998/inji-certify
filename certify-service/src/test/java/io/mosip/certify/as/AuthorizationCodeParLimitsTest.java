@@ -127,6 +127,39 @@ class AuthorizationCodeParLimitsTest {
     }
 
     /**
+     * RFC 9396 section 2 and OpenID4VCI 1.0 section 5.1.1: an array of objects, {@code type} the string
+     * {@code openid_credential}, {@code credential_configuration_id} a string. {@code null} and {@code [null]} were a
+     * NullPointerException (500) and an object or number id was coerced through {@code toString()} (F-21 review round
+     * 2); each is now {@code invalid_request}, also next to a valid scope, which alone would have decided the request.
+     */
+    @Test
+    void malformedAuthorizationDetailsAreInvalidRequestsNextToAValidScope() throws Exception {
+        String entry = "{\"type\": \"openid_credential\", \"credential_configuration_id\": \"" + CONFIG_ID + "\"}";
+        for (String details : List.of("null", "[null]", "[1]", "[\"openid_credential\"]", "[[]]", "true", "\"x\"",
+                "[" + entry + ", null]",
+                "[{\"type\": \"openid_credential\", \"credential_configuration_id\": {\"id\": \"" + CONFIG_ID + "\"}}]",
+                "[{\"type\": \"openid_credential\", \"credential_configuration_id\": 7}]",
+                "[{\"type\": \"openid_credential\", \"credential_configuration_id\": [\"" + CONFIG_ID + "\"]}]",
+                "[{\"type\": [\"openid_credential\"], \"credential_configuration_id\": \"" + CONFIG_ID + "\"}]",
+                "[" + entry + "] trailing", "[" + entry + "]]")) {
+            MvcResult result = push(CONFIG_ID, SCOPE, Map.of("authorization_details", details));
+            assertInvalidRequest(result);
+            assertTrue(result.getResponse().getContentAsString().contains("authorization_details"), details + ": "
+                    + result.getResponse().getContentAsString());
+        }
+        // and alone, where the details decide the scope: the same answer, never a 500
+        for (String details : List.of("null", "[null]", "[{\"type\": \"openid_credential\", \"credential_configuration_id\": 7}]")) {
+            assertInvalidRequest(mockMvc.perform(post("/oauth/par").contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                    .param("client_id", "demo-wallet").param("response_type", "code").param("redirect_uri", REDIRECT)
+                    .param("code_challenge", challenge(VERIFIER)).param("code_challenge_method", "S256")
+                    .param("authorization_details", details)).andReturn());
+        }
+        // the well-formed value is still accepted on its own, with whitespace around it
+        assertEquals(201, push(CONFIG_ID, null, Map.of()).getResponse().getStatus());
+        assertEquals(201, push(CONFIG_ID, SCOPE, Map.of("authorization_details", "  [" + entry + "]\n")).getResponse().getStatus());
+    }
+
+    /**
      * The scopes a pushed request may name come from the cached issuer-metadata view, not from a query per request; a
      * configuration written after the context started is visible (the registry drops the view on every write).
      */
@@ -197,7 +230,7 @@ class AuthorizationCodeParLimitsTest {
                 .encodeToString(MessageDigest.getInstance("SHA-256").digest(verifier.getBytes(StandardCharsets.US_ASCII)));
     }
 
-    private static CredentialConfigurationDTO config(String id, String scope) throws Exception {
+    static CredentialConfigurationDTO config(String id, String scope) throws Exception {
         Path path = Path.of("src/test/resources/goldens/templates/golden-ldp.vm");
         if (!Files.exists(path)) {
             path = Path.of("certify-service").resolve(path);

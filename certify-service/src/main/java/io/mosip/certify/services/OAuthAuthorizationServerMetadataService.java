@@ -122,23 +122,23 @@ public class OAuthAuthorizationServerMetadataService {
         // at `.../oauth/token` from Certify's own endpoint, and such a document must stay exactly as configured. The
         // pre-existing features keep their historical condition on purpose: changing when they appear would change
         // documents existing deployments serve.
-        if (as != null && describesOwnTokenEndpoint()) {
+        boolean own = as != null && describesOwnTokenEndpoint();
+        if (own) {
             advertiseOnlyCompletableGrants(metadata, as);
         }
+        // The code-flow endpoints keep their historical `/oauth/token` suffix condition (P3-05): an external AS at that
+        // path with clients registered here gets them too, which gap G39 records rather than this change moving it.
         if (ownTokenEndpoint && as.enabled()) {
             String base = tokenEndpoint.substring(0, tokenEndpoint.length() - "/oauth/token".length());
             metadata.setAuthorizationEndpoint(base + "/oauth/authorize");
             metadata.setPushedAuthorizationRequestEndpoint(base + "/oauth/par");
             metadata.setRequirePushedAuthorizationRequests(Boolean.TRUE);
-            // RFC 8414 section 2: an omitted token_endpoint_auth_methods_supported means client_secret_basic, and a client
-            // of this flow is a public client - `certify.as.clients.<id>` holds redirect URIs and no secret, so there is
-            // no credential a Basic header could carry (RFC 7591 section 2, RFC 9126 section 2). Say so, or a wallet that
-            // reads the default refuses the code flow it is told to use (F-21 review round 1). With attestation configured
-            // the method is the attested one, published exactly as before.
-            if (clientAttestationConfigured(as)) {
+            if (own) {
+                metadata.setTokenEndpointAuthMethodsSupported(ownTokenEndpointAuthMethods(as));
+            } else if (clientAttestationConfigured(as)) {
+                // not Certify's own token URL (F-17's identity rule): the attested method as P3-06 published it, and
+                // nothing new - this service cannot know how another server authenticates its clients
                 metadata.setTokenEndpointAuthMethodsSupported(List.of(ClientAttestationValidator.AUTH_METHOD));
-            } else {
-                metadata.setTokenEndpointAuthMethodsSupported(List.of(TOKEN_ENDPOINT_AUTH_METHOD_NONE));
             }
         }
         // OID4VCI 1.0 section 12.3: a Token Request with a pre-authorized code and no client_id is answered here, so an
@@ -346,6 +346,24 @@ public class OAuthAuthorizationServerMetadataService {
         }
         String trimmed = url.trim();
         return trimmed.endsWith("/") ? trimmed.substring(0, trimmed.length() - 1) : trimmed;
+    }
+
+    /**
+     * How Certify's own token endpoint authenticates the clients of its code flow, which is what the document must say:
+     * RFC 8414 section 2 reads an omitted {@code token_endpoint_auth_methods_supported} as {@code client_secret_basic},
+     * and a client registered under {@code certify.as.clients.<id>} is a public client - redirect URIs and no secret,
+     * so there is nothing a Basic header could carry (RFC 7591 section 2, RFC 9126 section 2; F-21 review round 1).
+     * {@code none} for those clients; with attesters configured the attested method (draft-ietf-oauth-attestation-based-
+     * client-auth), and {@code none} beside it unless {@code certify.as.client-attestation.required} refuses a request
+     * without attestation - an unattested public client is accepted then, and the document says so (F-21 review round
+     * 2). Only for an own document: another server's methods are not this service's to describe.
+     */
+    private static List<String> ownTokenEndpointAuthMethods(AsProperties as) {
+        if (!clientAttestationConfigured(as)) {
+            return List.of(TOKEN_ENDPOINT_AUTH_METHOD_NONE);
+        }
+        return clientAttestationRequired(as) ? List.of(ClientAttestationValidator.AUTH_METHOD)
+                : List.of(ClientAttestationValidator.AUTH_METHOD, TOKEN_ENDPOINT_AUTH_METHOD_NONE);
     }
 
     /** {@code true} when {@code certify.as.client-attestation.attesters} names at least one attester. */

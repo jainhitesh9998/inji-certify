@@ -19,8 +19,9 @@ metadata say:
      bool, uint, bstr, the whole driving_privileges), MSO docType, x5chain without the anchor, and the status entry:
      the demo issues none until M-11 (F-21: an MSO's status is optional, and the only list the stack can write is signed
      by a key outside the IACA, G23), which is a PASS under the default `--expect-status absent` and skips the list
-     checks; `--expect-status present` (the M-11 runbook's step) fails when the entry is missing, and an entry that is
-     there is held to `{idx: uint, uri: tstr}` before anything is fetched. With an entry, every list check runs - the
+     checks; `--expect-status present` (the M-11 runbook's step) fails when the entry is missing, and a `status`
+     member that is there - whatever it holds - is held to `{status_list: {idx: uint, uri: tstr}}` before anything is
+     fetched or decided, so `status: null` or `{status_list: null}` fails either way. With an entry, every list check runs - the
      list served, its bit clear, sub equal to the MSO's uri, iat not in the future and exp not passed (exp is
      RECOMMENDED by draft-ietf-oauth-status-list; requiring it is Certify policy); then
      docs/design/tools/verify_mdoc.py (pymdoccbor, a verifier Certify does not maintain) with --doctype, --holder (the
@@ -375,23 +376,27 @@ def status_list_problems(payload, uri, index, now):
 
 
 def has_status(mso):
-    """Whether the MSO carries a status entry at all. ISO/IEC 18013-5 9.1.2.4 makes `status` OPTIONAL, and the demo
-    issues no status until M-11 (F-21): the only list the compose stack can write is a statuslist+jwt signed by
+    """Whether the MSO has a `status` member at all, whatever it holds. ISO/IEC 18013-5 9.1.2.4 makes `status` OPTIONAL,
+    and the demo issues none until M-11 (F-21): the only list the compose stack can write is a statuslist+jwt signed by
     keymanager's key, which does not chain to the IACA (G23), so a wallet that requires that chain rejects the mDL.
-    A `status` map with no `status_list` (an IdentifierList only, ISO2 12.3.6) carries no entry either."""
-    status = mso.get("status") if isinstance(mso, dict) else None
-    return isinstance(status, dict) and "status_list" in status
+    Absent means the member is not there (F-21 review round 2): `status: null`, `status: "broken"`, `status: {}` and
+    `status: {status_list: null}` are present and malformed, never absent, so `--expect-status absent` cannot pass
+    them. A value that is not a map (the MSO did not decode) has no member."""
+    return isinstance(mso, dict) and "status" in mso
 
 
 def status_entry_problems(mso):
-    """Every way a PRESENT status entry is malformed, as a list of problems: ISO/IEC 18013-5 9.1.2.4 makes the MSO's
-    `status` a map carrying `status_list`, and draft-ietf-oauth-status-list gives that entry `{idx: uint, uri: tstr}`.
-    [] for a well-formed entry and for an MSO without one (see has_status)."""
+    """Every way a present `status` member falls short of a Token Status List entry, as a list of problems: ISO/IEC
+    18013-5 9.1.2.4 makes it a map, Certify writes `status_list` in it, and draft-ietf-oauth-status-list gives that
+    entry `{idx: uint, uri: tstr}`. [] for a well-formed entry and for an MSO without a `status` (see has_status), so a
+    present member is validated before anything decides on it."""
     if not has_status(mso):
         return []
     status = mso["status"]
     if not isinstance(status, dict):
         return [f"status is not a map: {status!r}"]
+    if "status_list" not in status:
+        return [f"status carries no status_list entry (members {sorted(map(str, status))})"]
     entry = status["status_list"]
     if not isinstance(entry, dict):
         return [f"status.status_list is not a map: {entry!r}"]
@@ -738,24 +743,26 @@ class Smoke:
         rejects, G23; ISO/IEC 18013-5 makes `status` optional), so `--expect-status absent` is the default - and a run
         against a stack that restored the block says `present`, which fails here if the restore did not take. A present
         entry is shape-checked before anything is fetched, so a malformed one is a failure and not a skip."""
-        entry = mso["status"]["status_list"] if has_status(mso) else None
-        if entry is None:
+        if not isinstance(mso, dict):
+            check("MSO status entry: the MSO is a map", False, mso)
+            return
+        problems = status_entry_problems(mso)  # validated before the expectation decides (F-21 review round 2)
+        if not has_status(mso):
             if self.expect_status == "present":
                 check("MSO status entry matches --expect-status present (M-11 restored)", False,
-                      {"expect-status": "present", "status": mso.get("status") if isinstance(mso, dict) else mso})
+                      {"expect-status": "present", "status": "no status member"})
             else:
-                check("MSO carries no status entry (status disabled on this demo until M-11)", True,
-                      mso.get("status") if isinstance(mso, dict) else mso)
+                check("MSO carries no status entry (status disabled on this demo until M-11)", True, sorted(mso))
             return
         if self.expect_status != "present":
             check("MSO status entry matches --expect-status absent (status disabled on this demo until M-11)", False,
-                  {"expect-status": self.expect_status, "status": mso["status"]})
+                  {"expect-status": self.expect_status, "status": mso["status"], "problems": problems})
         else:
-            check("MSO status entry matches --expect-status present (M-11 restored)", True, entry)
-        problems = status_entry_problems(mso)
+            check("MSO status entry matches --expect-status present (M-11 restored)", True, mso["status"])
         if not check("MSO status.status_list {idx: uint, uri: tstr} (Token Status List)", not problems,
-                     problems or entry):
+                     problems or mso["status"]["status_list"]):
             return
+        entry = mso["status"]["status_list"]
         name = ("status list served as statuslist+jwt, signature verifies with its x5c, sub is the uri, iat, "
                 "exp (Certify policy), bit clear")
         s, h, token = call("GET", entry["uri"])

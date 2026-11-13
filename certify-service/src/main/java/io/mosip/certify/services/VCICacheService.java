@@ -35,16 +35,18 @@ public class VCICacheService {
      * endpoint is unauthenticated and writes one entry per request, and the pre-authorized codes an offer is redeemed
      * with live in {@code preAuthCodeCache}. Sharing it let a PAR flood evict every live offer (F-21 review round 1);
      * this cache is bounded and expired by its own {@code mosip.certify.cache.size} / {@code cache.expire-in-seconds}
-     * entries, which must cover {@code certify.as.par.expires-in}.
+     * entries, which must cover {@code certify.as.par.expires-in} ({@code io.mosip.certify.as.AsCacheRequirements} refuses
+     * to start otherwise).
      */
-    private static final String PAR_REQUEST_CACHE = "parRequestCache";
+    public static final String PAR_REQUEST_CACHE = "parRequestCache";
     private static final String PAR_PREFIX = "par:";
     /**
      * The client-attestation proof-of-possession replay cache: one entry per accepted proof, bounded and expired by its
      * own entries. It is not in {@code preAuthCodeCache} either, for the reason PAR is not: an authenticated caller
-     * writing it must never be able to evict an offer (F-21 review round 1).
+     * writing it must never be able to evict an offer (F-21 review round 1). Required at startup once an attester is
+     * configured ({@code io.mosip.certify.as.AsCacheRequirements}).
      */
-    private static final String CLIENT_ATTESTATION_JTI_CACHE = "clientAttestationJtiCache";
+    public static final String CLIENT_ATTESTATION_JTI_CACHE = "clientAttestationJtiCache";
 
     @PostConstruct
     public void validateCacheConfiguration() {
