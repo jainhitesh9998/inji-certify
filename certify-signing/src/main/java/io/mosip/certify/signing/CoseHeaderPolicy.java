@@ -6,6 +6,12 @@ import java.util.regex.Pattern;
  * Header rules for a COSE_Sign1: whether the chain travels as {@code x5chain} (label 33), whether a
  * {@code kid} (label 4) is set, whether the result is tagged (tag 18), and — for the COSE profile of a
  * Status List Token — the {@code typ} (label 16) and whether the chain is integrity protected.
+ *
+ * <p>A {@code typ} is only meaningful together with a protected chain: draft-ietf-oauth-status-list-21 section 5.2
+ * makes the protected {@code typ} and the protected {@code x5chain} one profile, and a token that names its type but
+ * leaves the signer chain unprotected would be identified as a Status List Token while failing the header rules the
+ * verifier applies to it (ISO/IEC 18013-5 second edition 12.3.6.3 requires the chain in the protected header).
+ * {@code typ != null} with {@code x5chainInProtected == false} is therefore refused rather than silently encoded.
  */
 public record CoseHeaderPolicy(JwsHeaderPolicy.ChainInclusion x5chain, KidStrategy kid, boolean tagged,
                                boolean kidInProtected, String typ, boolean x5chainInProtected) {
@@ -21,6 +27,11 @@ public record CoseHeaderPolicy(JwsHeaderPolicy.ChainInclusion x5chain, KidStrate
         x5chain = x5chain == null ? JwsHeaderPolicy.ChainInclusion.NONE : x5chain;
         if (x5chainInProtected && x5chain == JwsHeaderPolicy.ChainInclusion.NONE) {
             throw new IllegalArgumentException("x5chainInProtected needs x5chain to be included, not NONE");
+        }
+        if (typ != null && !x5chainInProtected) {
+            throw new IllegalArgumentException("typ " + typ + " needs the chain in the protected header: the COSE profile of"
+                    + " a Status List Token pairs the protected typ with the protected x5chain"
+                    + " (draft-ietf-oauth-status-list-21 section 5.2, ISO/IEC 18013-5 second edition 12.3.6.3)");
         }
         if (typ != null && !MEDIA_TYPE.matcher(typ).matches()) {
             throw new IllegalArgumentException("typ is not a media type (RFC 9596 section 2): " + typ);
@@ -62,6 +73,10 @@ public record CoseHeaderPolicy(JwsHeaderPolicy.ChainInclusion x5chain, KidStrate
      * through the same {@code x5chain} the Referenced Token uses, so no {@code kid} is set and the chain — the signer
      * chain without the IACA (HAIP forbids carrying the anchor, and ISO/IEC 18013-5 12.3.6.3 puts the chain used to
      * verify the signature in the protected header) — travels integrity protected.
+     *
+     * <p>This policy is refused at signing time ({@link SigningException}) when the key has no certificate or when the
+     * chain it would carry is a self-signed certificate, rather than emitting a token no verifier can anchor: a Status
+     * List Token's {@code x5chain} is the only statement of who signed it.
      */
     public static CoseHeaderPolicy statusListCwt() {
         return new CoseHeaderPolicy(JwsHeaderPolicy.ChainInclusion.WITHOUT_ANCHOR, null, true, false,

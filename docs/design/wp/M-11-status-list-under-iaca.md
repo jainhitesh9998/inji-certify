@@ -503,11 +503,17 @@ Branch `wp/m-11a-cose-status-headers`. Depends on nothing. About 250 lines.
 
 **Negative tests.**
 
-- `x5chainInProtected` with `NONE` is refused.
+- `x5chainInProtected` with `NONE` is refused, and so is a `typ` without a protected chain: draft-21 §5.2 pairs the
+  protected `typ` with the protected `x5chain`, and the encoder would otherwise put 33 in the protected header against
+  the caller's instruction.
 - `typ` values `"statuslist+cwt"` (no type) and `"a b/c"` are refused.
-- A chain with only a self-signed certificate under `WITHOUT_ANCHOR` emits no `x5chain` at all (the existing
-  `withoutAnchor()` behaviour), and a test asserts it.
-- `signOrdered` output never starts with `d8 3d` (tag 61).
+- A key with no chain, and a chain that is a lone self-signed certificate under `WITHOUT_ANCHOR`, are **refused when
+  the token is signed** (`SigningException`, `STATUS_SIGNER_NO_CHAIN` / `STATUS_SIGNER_SELF_SIGNED`). The legacy
+  `withoutAnchor()` keeps a lone self-signed certificate, and `mdocIssuerAuth()` keeps forwarding it — a test proves
+  that is unchanged (I2) — so the status-list header path refuses it instead of emitting a token that carries its own
+  trust anchor; `[DSC, IACA]` emits the DSC alone and `[DSC, intermediate, IACA]` emits `[DSC, intermediate]`.
+- `signOrdered` refuses claim keys that break RFC 8949 §4.2.1's bytewise lexicographic order of the encoded keys,
+  refuses an untagged status-list policy, and its output never starts with `d8 3d` (tag 61).
 
 **Non-goals:** any change to how mDoc IssuerAuth or claim-169 are built.
 
@@ -619,6 +625,8 @@ Branch `wp/m-11c-status-cwt-codec`. Depends on M-11a. About 450 lines.
    `TrustAnchorRegistry` bean (`TrustAnchorRegistry.EMPTY` when absent) and `AnnexBValidator.CLOCK_SKEW`.
    - `Mode` is `DOCUMENT_SIGNER` or `DEDICATED`.
    - Each rule is a distinct message prefix.
+   - `StatusListSignerPolicy` must still run before every `signOrdered`: the envelope refuses only an empty chain and a
+     self-signed one (`M-11a`), and checks no EKU, validity, revocation or IACA.
 
 **Acceptance checklist.**
 

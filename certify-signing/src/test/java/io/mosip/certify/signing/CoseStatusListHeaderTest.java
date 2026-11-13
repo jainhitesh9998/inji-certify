@@ -50,6 +50,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p>The fixture is fixed: an EC P-256 key and three certificates generated once with OpenSSL (IACA self-signed,
  * an intermediate, and a Document Signer leaf issued by the intermediate), embedded as DER here so every header byte
  * this test compares is reproducible. Only the ECDSA signature itself is random.
+ *
+ * <p>RFC 8949 section 4.2.1 orders map entries by the bytewise lexicographic order of the encoded keys; the claims and
+ * the nested StatusList map are asserted against that order. The status-list header path refuses a signer chain that
+ * would be empty or carry a self-signed certificate, while the legacy IssuerAuth path keeps forwarding whatever chain
+ * the provider holds — both are asserted here.
  */
 class CoseStatusListHeaderTest {
 
@@ -84,6 +89,8 @@ class CoseStatusListHeaderTest {
     private static final SigningKey ONE_CERT = key(CertificateChain.of(LEAF, IACA));
     /** {@code [leaf, intermediate]}: no self-signed certificate at the top, so both are emitted. */
     private static final SigningKey TWO_CERTS = key(CertificateChain.of(LEAF, INTERMEDIATE));
+    /** {@code [leaf, intermediate, IACA]}: the IACA is dropped and the intermediate stays. */
+    private static final SigningKey THREE_CERTS = key(CertificateChain.of(LEAF, INTERMEDIATE, IACA));
     /** A key whose chain is just a self-signed certificate. */
     private static final SigningKey SELF_SIGNED = key(CertificateChain.of(IACA));
     /** A key a provider reports without any certificate. */
@@ -127,6 +134,9 @@ class CoseStatusListHeaderTest {
 
     /** {@code cwt()} protected header of {@code 4f1ebcf1}: {@code {1: -7, 4: "m11a"}} in the protected header. */
     private static final String CLAIM_169_PROTECTED_RECORDED = "a2012604446d313161";
+
+    /** {@code cwt()} unprotected header of {@code 4f1ebcf1}: empty. */
+    private static final String CLAIM_169_UNPROTECTED_RECORDED = "a0";
 
     /** The claim-169 payload of {@code 4f1ebcf1} for {@code {1: iss, 169: "claim-169"}}. */
     private static final String CLAIM_169_PAYLOAD_RECORDED =
@@ -207,6 +217,14 @@ class CoseStatusListHeaderTest {
             keys.add(key.AsInt32());
         }
         assertEquals(List.of(2, 4, 6, 65533, 65534), keys);
+
+        // the nested StatusList map follows section 4.2.1 too: a2, "lst" -> bstr(2) b9a3, "bits" -> 1
+        assertTrue(payloadHex.contains("19fffd" + "a2636c7374" + "42b9a3" + "6462697473" + "01"),
+                "65533 encodes {lst: h'b9a3', bits: 1} with lst first, got " + payloadHex);
+        List<String> statusListKeys = new ArrayList<>();
+        CBORObject.DecodeFromBytes(payload).get(CBORObject.FromObject(65533)).getKeys()
+                .forEach(key -> statusListKeys.add(key.AsString()));
+        assertEquals(List.of("lst", "bits"), statusListKeys);
     }
 
     @Test
@@ -238,9 +256,8 @@ class CoseStatusListHeaderTest {
 
     @Test
     void theSignatureVerifiesWithAuthleteCose() throws Exception {
-        // the two-certificate form: RFC 9360 allows one bstr, but Authlete 1.19 only decodes the array form of
-        // x5chain, and this test asks a second implementation to read the whole header, not just the signature
-        byte[] token = CwtEnvelope.signOrdered(statusListClaims(), CoseHeaderPolicy.statusListCwt(), TWO_CERTS, SIGNER);
+        // the production shape: the DSC alone under the IACA, one certificate as a single bstr (RFC 9360 section 2)
+        byte[] token = CwtEnvelope.signOrdered(statusListClaims(), CoseHeaderPolicy.statusListCwt(), ONE_CERT, SIGNER);
         CBORItem item = new CBORDecoder(token).next();
         assertTrue(item instanceof CBORTaggedItem);
         CBORTaggedItem tagged = (CBORTaggedItem) item;
@@ -248,10 +265,17 @@ class CoseStatusListHeaderTest {
         COSESign1 coseSign1 = COSESign1.build(tagged.getTagContent());
         assertEquals(STATUS_LIST_MEDIA_TYPE, coseSign1.getProtectedHeader().getParameters().get(CoseEnvelope.LABEL_TYP),
                 "Authlete reads typ (16) as the media type; its getContentType() is the deprecated label 3");
-        assertEquals(List.of(LEAF, INTERMEDIATE), coseSign1.getProtectedHeader().getX5Chain(),
-                "Authlete finds the chain in the protected header, end-entity first");
+        assertEquals(List.of(LEAF), coseSign1.getProtectedHeader().getX5Chain(),
+                "Authlete reads a one-certificate protected x5chain as [leaf], end-entity first");
         assertTrue(new COSEVerifier(LEAF.getPublicKey()).verify(coseSign1),
-                "a second, independent COSE implementation accepts the signature");
+                "a second, independent COSE implementation accepts the signature and the protected chain");
+
+        // and the array form, which a signer with an intermediate emits
+        byte[] twoCertificates = CwtEnvelope.signOrdered(statusListClaims(), CoseHeaderPolicy.statusListCwt(),
+                THREE_CERTS, SIGNER);
+        COSESign1 withIntermediate = COSESign1.build(((CBORTaggedItem) new CBORDecoder(twoCertificates).next()).getTagContent());
+        assertEquals(List.of(LEAF, INTERMEDIATE), withIntermediate.getProtectedHeader().getX5Chain());
+        assertTrue(new COSEVerifier(LEAF.getPublicKey()).verify(withIntermediate));
     }
 
     // ---- I2: what mDoc IssuerAuth and claim 169 emit must not move ----------------------------------------------
@@ -289,7 +313,8 @@ class CoseStatusListHeaderTest {
         CBORObject sign1 = untag(outer.UntagOne().EncodeToBytes(), CoseEnvelope.TAG_COSE_SIGN1);
         assertEquals(CLAIM_169_PROTECTED_RECORDED, hex(sign1.get(0).GetByteString()),
                 "I2: the claim-169 protected header [alg, kid] is unchanged");
-        assertEquals("a0", hex(sign1.get(1).EncodeToBytes()), "I2: no unprotected header on claim 169");
+        assertEquals(CLAIM_169_UNPROTECTED_RECORDED, hex(sign1.get(1).EncodeToBytes()),
+                "I2: no unprotected header on claim 169");
         assertEquals(CLAIM_169_PAYLOAD_RECORDED, hex(sign1.get(2).GetByteString()), "I2: the claim map is unchanged");
     }
 
@@ -303,8 +328,22 @@ class CoseStatusListHeaderTest {
                 null, true, false, STATUS_LIST_MEDIA_TYPE, true));
         assertThrows(IllegalArgumentException.class, () -> new CoseHeaderPolicy(JwsHeaderPolicy.ChainInclusion.NONE,
                 null, true, false, null, true));
-        // the unprotected form keeps working with NONE
-        assertNotNull(new CoseHeaderPolicy(JwsHeaderPolicy.ChainInclusion.NONE, null, true, true, STATUS_LIST_MEDIA_TYPE, false));
+        // the legacy header shapes keep working with NONE
+        assertNotNull(new CoseHeaderPolicy(JwsHeaderPolicy.ChainInclusion.NONE, null, true, true));
+        assertNotNull(new CoseHeaderPolicy(JwsHeaderPolicy.ChainInclusion.NONE, null, true, true, null, false));
+    }
+
+    @Test
+    void aTypNeedsTheProtectedChain() {
+        // draft-ietf-oauth-status-list-21 section 5.2 pairs the protected typ with the protected x5chain: a token that
+        // names its type and leaves the chain unprotected would be identified as a Status List Token and fail the
+        // header rules applied to it, so the policy is refused instead of silently encoding 33 protected while the
+        // caller asked for the opposite
+        IllegalArgumentException refused = assertThrows(IllegalArgumentException.class, () -> new CoseHeaderPolicy(
+                JwsHeaderPolicy.ChainInclusion.WITHOUT_ANCHOR, null, true, false, STATUS_LIST_MEDIA_TYPE, false));
+        assertTrue(refused.getMessage().contains("protected header"), refused.getMessage());
+        assertTrue(new CoseHeaderPolicy(JwsHeaderPolicy.ChainInclusion.WITHOUT_ANCHOR, null, true, false,
+                STATUS_LIST_MEDIA_TYPE, true).x5chainInProtected(), "the same policy with the chain protected is accepted");
     }
 
     @Test
@@ -320,34 +359,101 @@ class CoseStatusListHeaderTest {
     }
 
     @Test
-    void aSelfSignedCertificateIsNeverCarriedAsTheChainUnderWithoutAnchor() throws Exception {
-        // [leaf, IACA]: withoutAnchor() drops the self-signed trust anchor, so only the leaf is emitted (unchanged
-        // behaviour, CertificateChain.withoutAnchor()); a verifier supplies the IACA it trusts
+    void aStatusListTokenRefusesAKeyWithoutAChain() {
+        SigningException refused = assertThrows(SigningException.class,
+                () -> CoseEnvelope.sign1(PAYLOAD, CoseHeaderPolicy.statusListCwt(), NO_CHAIN, SIGNER));
+        assertTrue(refused.getMessage().startsWith("STATUS_SIGNER_NO_CHAIN: "), refused.getMessage());
+        // the same token under a signer with a certificate is issued: the refusal is about the missing chain only
+        assertNotNull(CoseEnvelope.sign1(PAYLOAD, CoseHeaderPolicy.statusListCwt(), ONE_CERT, SIGNER));
+    }
+
+    @Test
+    void aStatusListTokenRefusesASelfSignedSigner() {
+        // CertificateChain.withoutAnchor() keeps a lone self-signed certificate; the Status List Token header path must
+        // refuse it rather than carry the signer's own trust anchor (the verifier supplies the IACA, ISO2 12.3.6.2)
+        SigningException refused = assertThrows(SigningException.class,
+                () -> CoseEnvelope.sign1(PAYLOAD, CoseHeaderPolicy.statusListCwt(), SELF_SIGNED, SIGNER));
+        assertTrue(refused.getMessage().startsWith("STATUS_SIGNER_SELF_SIGNED: "), refused.getMessage());
+        assertTrue(refused.getMessage().contains("CN=M-11a Test IACA"), refused.getMessage());
+
+        // and a full chain is refused for the same reason: it would carry the self-signed anchor
+        CoseHeaderPolicy full = new CoseHeaderPolicy(JwsHeaderPolicy.ChainInclusion.FULL, null, true, false,
+                STATUS_LIST_MEDIA_TYPE, true);
+        SigningException carriesAnchor = assertThrows(SigningException.class,
+                () -> CoseEnvelope.sign1(PAYLOAD, full, THREE_CERTS, SIGNER));
+        assertTrue(carriesAnchor.getMessage().startsWith("STATUS_SIGNER_SELF_SIGNED: "), carriesAnchor.getMessage());
+    }
+
+    @Test
+    void theProtectedChainIsTheSignerChainWithoutTheAnchor() throws Exception {
+        // [leaf, IACA] -> the leaf alone: withoutAnchor() drops the self-signed trust anchor
         CBORObject sign1 = untag(CoseEnvelope.sign1(PAYLOAD, CoseHeaderPolicy.statusListCwt(), ONE_CERT, SIGNER),
                 CoseEnvelope.TAG_COSE_SIGN1);
         CBORObject x5chain = CBORObject.DecodeFromBytes(sign1.get(0).GetByteString())
                 .get(CBORObject.FromObject(CoseEnvelope.LABEL_X5CHAIN));
+        assertEquals(CBORType.ByteString, x5chain.getType());
         assertArrayEquals(LEAF.getEncoded(), x5chain.GetByteString());
         assertFalse(hex(x5chain.GetByteString()).contains(hex(IACA.getEncoded())), "the IACA is absent");
 
-        // a lone self-signed certificate is kept, never dropped, by CertificateChain.withoutAnchor (the contract
-        // MdocDscPolicy relies on: it refuses a self-signed signer rather than quietly emitting nothing)
-        CBORObject lone = untag(CoseEnvelope.sign1(PAYLOAD, CoseHeaderPolicy.statusListCwt(), SELF_SIGNED, SIGNER),
+        // [leaf, intermediate, IACA] -> [leaf, intermediate], end-entity first
+        CBORObject withIntermediate = untag(
+                CoseEnvelope.sign1(PAYLOAD, CoseHeaderPolicy.statusListCwt(), THREE_CERTS, SIGNER),
                 CoseEnvelope.TAG_COSE_SIGN1);
-        CBORObject loneChain = CBORObject.DecodeFromBytes(lone.get(0).GetByteString())
+        CBORObject chain = CBORObject.DecodeFromBytes(withIntermediate.get(0).GetByteString())
                 .get(CBORObject.FromObject(CoseEnvelope.LABEL_X5CHAIN));
-        assertArrayEquals(IACA.getEncoded(), loneChain.GetByteString());
+        assertEquals(CBORType.Array, chain.getType());
+        assertEquals(2, chain.size());
+        assertArrayEquals(LEAF.getEncoded(), chain.get(0).GetByteString());
+        assertArrayEquals(INTERMEDIATE.getEncoded(), chain.get(1).GetByteString());
     }
 
     @Test
-    void aKeyWithoutAChainEmitsNoX5chain() throws Exception {
-        CBORObject sign1 = untag(CoseEnvelope.sign1(PAYLOAD, CoseHeaderPolicy.statusListCwt(), NO_CHAIN, SIGNER),
+    void theLegacyIssuerAuthStillKeepsALoneSelfSignedCertificate() throws Exception {
+        // the refusal above is scoped to the protected status-list form: the mdoc IssuerAuth and the claim-169 CWT
+        // paths are untouched (I2), including for a lone self-signed certificate, where withoutAnchor() keeps it
+        CBORObject sign1 = untag(CoseEnvelope.sign1(PAYLOAD, CoseHeaderPolicy.mdocIssuerAuth(), SELF_SIGNED, SIGNER),
                 CoseEnvelope.TAG_COSE_SIGN1);
-        CBORObject protectedHeader = CBORObject.DecodeFromBytes(sign1.get(0).GetByteString());
-        assertFalse(protectedHeader.ContainsKey(CBORObject.FromObject(CoseEnvelope.LABEL_X5CHAIN)),
-                "no certificate on the key, no x5chain claim");
-        assertEquals(STATUS_LIST_MEDIA_TYPE, protectedHeader.get(CBORObject.FromObject(CoseEnvelope.LABEL_TYP)).AsString());
-        assertEquals("a0", hex(sign1.get(1).EncodeToBytes()));
+        CBORObject x5chain = sign1.get(1).get(CBORObject.FromObject(CoseEnvelope.LABEL_X5CHAIN));
+        assertEquals(CBORType.ByteString, x5chain.getType());
+        assertArrayEquals(IACA.getEncoded(), x5chain.GetByteString());
+        assertEquals(MDOC_ISSUERAUTH_PROTECTED_RECORDED, hex(sign1.get(0).GetByteString()),
+                "and the protected header is still {1: -7} alone");
+
+        CBORObject withoutChain = untag(
+                CoseEnvelope.sign1(PAYLOAD, CoseHeaderPolicy.mdocIssuerAuth(), NO_CHAIN, SIGNER),
+                CoseEnvelope.TAG_COSE_SIGN1);
+        assertEquals("a0", hex(withoutChain.get(1).EncodeToBytes()), "a key without a certificate still emits no x5chain");
+    }
+
+    @Test
+    void signOrderedRefusesClaimsOutOfRfc8949Order() {
+        LinkedHashMap<Integer, CBORObject> reversed = new LinkedHashMap<>();
+        reversed.put(4, CBORObject.FromObject(1767225600L));
+        reversed.put(2, CBORObject.FromObject(STATUS_LIST_URI));
+        IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
+                () -> CwtEnvelope.signOrdered(reversed, CoseHeaderPolicy.statusListCwt(), ONE_CERT, SIGNER));
+        assertTrue(refused.getMessage().contains("bytewise lexicographic"), refused.getMessage());
+
+        // 65533 and 65534 encode as 19 fffd and 19 fffe: reversing them breaks the same rule
+        LinkedHashMap<Integer, CBORObject> tail = new LinkedHashMap<>();
+        tail.put(2, CBORObject.FromObject(STATUS_LIST_URI));
+        tail.put(4, CBORObject.FromObject(1767225600L));
+        tail.put(6, CBORObject.FromObject(1767139200L));
+        tail.put(65534, CBORObject.FromObject(3600));
+        tail.put(65533, CBORObject.NewOrderedMap()
+                .Add("lst", CBORObject.FromObject(new byte[]{(byte) 0xb9, (byte) 0xa3}))
+                .Add("bits", CBORObject.FromObject(1)));
+        assertThrows(IllegalArgumentException.class,
+                () -> CwtEnvelope.signOrdered(tail, CoseHeaderPolicy.statusListCwt(), ONE_CERT, SIGNER));
+    }
+
+    @Test
+    void signOrderedRefusesAnUntaggedStatusListPolicy() {
+        CoseHeaderPolicy untagged = new CoseHeaderPolicy(JwsHeaderPolicy.ChainInclusion.WITHOUT_ANCHOR, null, false,
+                false, STATUS_LIST_MEDIA_TYPE, true);
+        IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
+                () -> CwtEnvelope.signOrdered(statusListClaims(), untagged, ONE_CERT, SIGNER));
+        assertTrue(refused.getMessage().contains("never untagged"), refused.getMessage());
     }
 
     // ---- helpers ---------------------------------------------------------------------------------------------
@@ -357,9 +463,10 @@ class CoseStatusListHeaderTest {
         claims.put(2, CBORObject.FromObject(STATUS_LIST_URI));
         claims.put(4, CBORObject.FromObject(1767225600L));
         claims.put(6, CBORObject.FromObject(1767139200L));
+        // RFC 8949 section 4.2.1: "lst" (63 6c 73 74) sorts before "bits" (64 62 69 74 73), bytewise lexicographic
         claims.put(65533, CBORObject.NewOrderedMap()
-                .Add("bits", CBORObject.FromObject(1))
-                .Add("lst", CBORObject.FromObject(new byte[]{(byte) 0xb9, (byte) 0xa3})));
+                .Add("lst", CBORObject.FromObject(new byte[]{(byte) 0xb9, (byte) 0xa3}))
+                .Add("bits", CBORObject.FromObject(1)));
         claims.put(65534, CBORObject.FromObject(3600));
         return claims;
     }
