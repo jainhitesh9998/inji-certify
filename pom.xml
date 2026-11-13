@@ -47,6 +47,12 @@
 			<name>MavenCentralRepository</name>
 			<url>https://central.sonatype.com/repository/maven-snapshots</url>
 			<layout>default</layout>
+			<!-- Snapshot host: it serves snapshots only, and it throttles (429 Too Many Requests). With releases
+			     enabled it was asked for every missing RELEASE artifact before `central` below and a single 429 failed
+			     the build, so releases are refused here and every release artifact goes to `central`. -->
+			<releases>
+				<enabled>false</enabled>
+			</releases>
 			<snapshots>
 				<enabled>true</enabled>
 			</snapshots>
