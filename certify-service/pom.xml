@@ -336,6 +336,10 @@
     </dependencies>
 
     <build>
+        <!-- One deterministic artifact for the Dockerfile (COPY ./target/certify-service.jar): the parent also attaches
+             -javadoc and -sources jars, which a certify-service-*.jar glob matched too. Install and deploy name the
+             artifact by its coordinates, so the repository layout is unchanged. -->
+        <finalName>certify-service</finalName>
         <plugins>
             <plugin>
                 <groupId>org.springframework.boot</groupId>

@@ -152,6 +152,8 @@ An issuer can name the ISO/IEC 18013-5 IACAs its mDoc Document Signers chain to 
 
 - mDL text elements. An `org.iso.18013.5.1.mDL` whose mandatory Table 5 text element (`family_name`, `given_name`, `issuing_authority`, `document_number`, ...) is empty, or is a Velocity reference the template left unrendered because the data source had no value (`$name`, `${name}`, `$!name`, `$!{name}`), is refused before signing with `mdoc_data_model_invalid` naming the element (the v2 dry run and preview report it the same way), instead of being signed with `${family_name}` as the holder's name. Text that merely contains a `$` is issued as before. The legacy `POST /issuance/credential` path with compat-core off is unchanged.
 
+- Service jar name. `mvn package` now writes the executable service jar as `certify-service/target/certify-service.jar` (no version in the file name; the `-javadoc`/`-sources` jars beside it are `certify-service-javadoc.jar`/`certify-service-sources.jar`), and the Dockerfile copies exactly that file. The former `COPY ./target/certify-service-*.jar` matched the javadoc and sources jars too: the classic builder refuses that, and BuildKit copies whichever match sorts last, so a stale jar of another version in `target/` could end up in the image. Repository coordinates (install, deploy) are unchanged; scripts that pick the jar up by its versioned file name should use `certify-service.jar`.
+
 ## Removal of  Artifactory dependency
 
 ```text
