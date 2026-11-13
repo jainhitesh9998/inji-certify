@@ -13,8 +13,8 @@ classpath of `certify-service`.
 
 | Sample (`<module>/<TestClass>-<surface>`) | Written by |
 | --- | --- |
-| `certify-format-mdoc/MdocIndependentVerificationTest-formatter` | the formatter's own output (JCA dev key) |
-| `certify-format-mdoc/MdocIndependentVerificationTest-ed25519-fixture` | the same, re-signed with an Ed25519 deviceKey (the formatter cannot bind one yet, G6) |
+| `certify-format-mdoc/MdocIndependentVerificationTest-formatter` | the formatter's own output: the Table 5 mDL of `MdlFixtures`, a P-256 holder, a JCA DSC issued by a test IACA (`without-anchor`) |
+| `certify-format-mdoc/MdocIndependentVerificationTest-ed25519` | the same for an Ed25519 holder, bound as the OKP deviceKey (G6, fixed by M-02) |
 | `certify-service/IssuanceGoldenTest-legacy` | `POST /issuance/credential` on the legacy service |
 | `certify-service/IssuanceGoldenTest-oid4vci` | `POST /oid4vci/credential` |
 | `certify-service/IssuanceGoldenCoreTest-legacy`, `-oid4vci` | both paths with the compatibility path served by the core |
@@ -45,7 +45,8 @@ it fails.
 - every current sample, verified as received (`Options.strict`), reports exactly the problem codes its `.gaps`
   sidecar declares: a reported `<check>:<code>` the sidecar does not list fails, a listed one no longer reported fails
   with "gap no longer present, remove ... from <sample>.gaps", and a skipped check fails. One accepted problem cannot
-  hide another in the same check (an expired credential fails with G8's `signedAfterValidFrom` declared);
+  hide another in the same check (an expired credential fails with G8's `signedAfterValidFrom` declared). The
+  declared gaps per sample are listed in `docs/design/20-mdl-issuer.md` M-01;
 - a draft-13 sample declares its two 0.14.0 shape deviations, `credential.shape:documentWrapper` and
   `issuerAuth.untagged:tagged`, and its `Document.docType` must equal the MSO's (`mso.docType:documentMismatch`
   otherwise); the legacy and `/oid4vci` samples pass both shape checks;

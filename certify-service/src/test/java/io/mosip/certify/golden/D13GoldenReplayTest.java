@@ -214,6 +214,19 @@ class D13GoldenReplayTest {
         summary.put("deviceKeyKty", deviceKey.get(CBORObject.FromObject(1)).AsInt32());
         summary.put("deviceKeyCrv", deviceKey.get(CBORObject.FromObject(-1)).AsInt32());
         summary.put("validityInfoKeys", mso.get("validityInfo").getKeys().toString());
+        // ISO/IEC 18013-5 9.1.2.4/9.1.2.5 on the draft-13 surface too (decision D1): seconds-only tdate, random distinct digestIDs
+        CBORObject signedAt = mso.get("validityInfo").get("signed");
+        assertTrue(signedAt.HasMostOuterTag(0), "validityInfo.signed is #6.0(tstr)");
+        assertEquals(20, signedAt.Untag().AsString().length(), "20-character RFC 3339: " + signedAt.Untag().AsString());
+        java.util.TreeSet<Integer> digestIds = new java.util.TreeSet<>();
+        CBORObject namespaceItems = issuerSigned.get("nameSpaces").get("org.iso.18013.5.1");
+        for (int i = 0; i < namespaceItems.size(); i++) {
+            digestIds.add(CBORObject.DecodeFromBytes(namespaceItems.get(i).Untag().GetByteString()).get("digestID").AsInt32());
+        }
+        assertEquals(IssuanceGoldenTest.MDL_ELEMENT_COUNT, digestIds.size(), "digestIDs are unique within the namespace");
+        summary.put("digestIdCount", digestIds.size());
+        summary.put("digestIdsUnique", digestIds.size() == namespaceItems.size());
+        summary.put("validityInfoSignedLength", signedAt.Untag().AsString().length());
         // Documented deviations from 0.14.0 (P0-02-notes.md, decision log): ISO/IEC 18013-5 requires the tag-24 MSO
         // wrapper and validityInfo.signed; the adapter keeps both and the golden is compared with them folded back.
         assertTrue(summary.get("msoTaggedCbor").asBoolean(), "MSO payload wrapped in tag 24");

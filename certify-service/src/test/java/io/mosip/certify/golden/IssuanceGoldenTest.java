@@ -99,6 +99,8 @@ class IssuanceGoldenTest {
     static final String EC_K1_ID = "GoldenEcK1Credential";
     static final String ED_2018_ID = "GoldenEd2018Credential";
     static final String MDOC_ID = "GoldenMdlCredential";
+    /** The elements of goldens/templates/golden-mdoc.vm: every mandatory ISO/IEC 18013-5 Table 5 element plus one optional. */
+    static final int MDL_ELEMENT_COUNT = 12;
     static final String QR_ID = "GoldenQrCredential";
     static final String STATUS_ID = "GoldenStatusCredential";
     static final String SCOPE = "sample_vc_ldp"; // the scope LocalAccessTokenValidationFilter injects
@@ -440,7 +442,7 @@ class IssuanceGoldenTest {
         assertEquals("org.iso.18013.5.1.mDL", mso.get("docType").AsString());
         assertEquals("SHA-256", mso.get("digestAlgorithm").AsString());
         com.upokecenter.cbor.CBORObject digests = mso.get("valueDigests").get("org.iso.18013.5.1");
-        assertEquals(3, digests.size(), "one digest per namespace element");
+        assertEquals(MDL_ELEMENT_COUNT, digests.size(), "one digest per namespace element");
         com.upokecenter.cbor.CBORObject deviceKey = mso.get("deviceKeyInfo").get("deviceKey");
         assertEquals(2, deviceKey.get(com.upokecenter.cbor.CBORObject.FromObject(1)).AsInt32(), "kty EC2");
         assertEquals(1, deviceKey.get(com.upokecenter.cbor.CBORObject.FromObject(-1)).AsInt32(), "crv P-256");
@@ -450,7 +452,7 @@ class IssuanceGoldenTest {
             assertTrue(mso.get("validityInfo").ContainsKey(field), "validityInfo." + field);
         }
         com.upokecenter.cbor.CBORObject items = issuerSigned.get("nameSpaces").get("org.iso.18013.5.1");
-        assertEquals(3, items.size(), "three IssuerSignedItems");
+        assertEquals(MDL_ELEMENT_COUNT, items.size(), "one IssuerSignedItem per element");
 
         com.fasterxml.jackson.databind.node.ObjectNode summary = objectMapper.createObjectNode();
         summary.put("docType", mso.get("docType").AsString());
@@ -463,6 +465,18 @@ class IssuanceGoldenTest {
         summary.put("deviceKeyKty", deviceKey.get(com.upokecenter.cbor.CBORObject.FromObject(1)).AsInt32());
         summary.put("deviceKeyCrv", deviceKey.get(com.upokecenter.cbor.CBORObject.FromObject(-1)).AsInt32());
         summary.put("validityInfoKeys", mso.get("validityInfo").getKeys().toString());
+        // M-03 fixture change: golden-mdoc.vm is a complete Table 5 mDL now, so the legacy summary records 12 elements where
+        // design/extensibility recorded 3. Every non-count field is still exactly what that branch recorded (decision log).
+        com.fasterxml.jackson.databind.JsonNode before = designExtensibilityMdocSummary();
+        for (java.util.Iterator<String> names = summary.fieldNames(); names.hasNext(); ) {
+            String field = names.next();
+            if ("digests".equals(field) || "issuerSignedItems".equals(field)) {
+                continue;
+            }
+            assertTrue(before.has(field), "design/extensibility recorded no field " + field);
+            assertEquals(before.get(field).asText(), summary.get(field).asText(),
+                    "legacy mDoc summary field " + field + " must equal the design/extensibility recording");
+        }
         com.fasterxml.jackson.databind.node.ObjectNode responseShape = body.deepCopy();
         ((com.fasterxml.jackson.databind.node.ObjectNode) responseShape.get("credentials").get(0)).put("credential", "<mso_mdoc>");
         Goldens.assertGolden("legacy-develop/issuance/mso_mdoc-response", responseShape);
@@ -609,13 +623,32 @@ class IssuanceGoldenTest {
         assertEquals("org.iso.18013.5.1.mDL", mso.get("docType").AsString());
         com.upokecenter.cbor.CBORObject deviceKey = mso.get("deviceKeyInfo").get("deviceKey");
         assertArrayEquals(holder.getX().decode(), deviceKey.get(com.upokecenter.cbor.CBORObject.FromObject(-2)).GetByteString(), "device key is the holder's");
+        // ISO/IEC 18013-5 9.1.2.4: the validity timestamps are tag-0 tdate strings without fractional seconds
+        com.upokecenter.cbor.CBORObject signedAt = mso.get("validityInfo").get("signed");
+        assertTrue(signedAt.HasMostOuterTag(0), "validityInfo.signed is #6.0(tstr)");
+        assertEquals(20, signedAt.Untag().AsString().length(), "20-character RFC 3339: " + signedAt.Untag().AsString());
+        assertEquals(mso.get("validityInfo").get("validFrom").Untag().AsString(), signedAt.Untag().AsString(), "validFrom is the signing instant");
+        // 9.1.2.5: digestIDs are random distinct uints in 0..2^31-1 (not a permutation of 0..n-1), so they reveal nothing
+        // about the template's order or the element count
+        java.util.TreeSet<Integer> digestIds = new java.util.TreeSet<>();
+        com.upokecenter.cbor.CBORObject namespaceItems = issuerSigned.get("nameSpaces").get("org.iso.18013.5.1");
+        for (int i = 0; i < namespaceItems.size(); i++) {
+            com.upokecenter.cbor.CBORObject item = com.upokecenter.cbor.CBORObject.DecodeFromBytes(namespaceItems.get(i).Untag().GetByteString());
+            digestIds.add(item.get("digestID").AsInt32());
+            assertTrue(namespaceItems.get(i).HasMostOuterTag(24), "IssuerSignedItem is #6.24(bstr .cbor)");
+        }
+        assertEquals(MDL_ELEMENT_COUNT, digestIds.size(), "digestIDs are unique within the namespace");
+
         com.fasterxml.jackson.databind.node.ObjectNode summary = objectMapper.createObjectNode();
         summary.put("docType", mso.get("docType").AsString());
         summary.put("digests", mso.get("valueDigests").get("org.iso.18013.5.1").size());
         summary.put("issuerSignedItems", issuerSigned.get("nameSpaces").get("org.iso.18013.5.1").size());
+        summary.put("digestIdCount", digestIds.size());
+        summary.put("digestIdsUnique", digestIds.size() == namespaceItems.size());
+        summary.put("validityInfoKeys", mso.get("validityInfo").getKeys().toString());
+        summary.put("validityInfoSignedLength", signedAt.Untag().AsString().length());
         summary.put("protectedLabels", protectedHeader.getKeys().toString());
         summary.put("unprotectedLabels", issuerAuth.get(1).getKeys().toString());
-        summary.put("validityInfoKeys", mso.get("validityInfo").getKeys().toString());
         Goldens.assertGolden("oid4vci-1.0/oid4vci/mso_mdoc-summary", summary);
     }
 
@@ -867,6 +900,32 @@ class IssuanceGoldenTest {
     }
 
     /**
+     * The {@code mso_mdoc-summary} recorded on {@code design/extensibility} (copied from
+     * {@code git show design/extensibility:certify-service/src/test/resources/goldens/legacy-develop/issuance/mso_mdoc-summary.json}).
+     * When that ref is available the copy is checked against git, so it cannot drift silently.
+     */
+    private com.fasterxml.jackson.databind.JsonNode designExtensibilityMdocSummary() throws Exception {
+        Path copy = Path.of("src/test/resources/goldens/legacy-develop/issuance/mso_mdoc-summary.design-extensibility.json");
+        if (!Files.exists(copy)) {
+            copy = Path.of("certify-service").resolve(copy);
+        }
+        String recorded = Files.readString(copy, StandardCharsets.UTF_8);
+        try {
+            Process git = new ProcessBuilder("git", "show",
+                    "design/extensibility:certify-service/src/test/resources/goldens/legacy-develop/issuance/mso_mdoc-summary.json")
+                    .redirectErrorStream(true).start();
+            String fromGit = new String(git.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            if (git.waitFor() == 0 && !fromGit.isBlank()) {
+                assertEquals(objectMapper.readTree(fromGit), objectMapper.readTree(recorded),
+                        "the checked-in baseline must be the design/extensibility recording");
+            }
+        } catch (Exception ignored) {
+            // no git or no such ref (a CI checkout of this branch): the checked-in copy is the baseline
+        }
+        return objectMapper.readTree(recorded);
+    }
+
+    /**
      * The checks the mDoc from {@code POST /issuance/credential} is known not to pass yet: on the legacy service it is
      * signed at its validFrom; {@link IssuanceGoldenCoreTest} serves the same path through the core and overrides this.
      */
@@ -875,9 +934,10 @@ class IssuanceGoldenTest {
     }
 
     /**
-     * The data provider answers after 2 ms, as any real one does, so the core path's validFrom (the request instant)
-     * and signed (the formatter's wall clock) always differ: the G8 gap the core samples declare then reproduces on
-     * every run instead of all but the runs where both fall in one millisecond.
+     * The data provider answers after 2 ms, as any real one does, so time passes between the request instant and the
+     * signing step on every run. Before M-02 that made the core path's signed (the formatter's wall clock) later than
+     * its validFrom (the request instant), G8; the formatter now decides both in {@code sign()} as one instant, and the
+     * core samples declaring no {@code mso.validityInfo} gap is the proof that the delay no longer matters.
      */
     void answerAfterTwoMilliseconds() throws Exception {
         when(dataProviderPlugin.fetchData(any())).thenAnswer(inv -> {
