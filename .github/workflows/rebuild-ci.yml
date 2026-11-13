@@ -20,7 +20,9 @@ jobs:
   build-and-test:
     name: Build, unit tests, gates
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # 75, not 60: the resolution step below may legitimately spend up to 60+120+240+480 s waiting before its fifth
+    # attempt, on top of the build and the gates.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
         with:
@@ -47,14 +49,18 @@ jobs:
         run: mvn -v
 
       - name: Restore the Maven repository cache
-        # Keyed on the pom hashes with a `-v2` suffix so these keys cannot collide with the `setup-java` ones, and
-        # restored through the prefix so a pom change still starts from the previous run's repository instead of an
-        # empty ~/.m2 (a cold repository is what makes the snapshot fetches below fail on a 429).
+        id: maven-cache
+        # Keyed on the pom hashes with a `-v3` suffix so these keys cannot collide with the `setup-java` ones or with
+        # the older `-v2` generation, plus the run id: a save at the end of the job must never have to overwrite the key
+        # it restored (a re-run of the same run id aside). Restored through the prefixes, so a pom change still starts
+        # from the previous run's repository instead of an empty ~/.m2 (a cold repository is what makes the snapshot
+        # fetches below fail on a 429).
         uses: actions/cache/restore@v4
         with:
           path: ~/.m2/repository
-          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}-v2
+          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}-v3-${{ github.run_id }}
           restore-keys: |
+            maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}-v3-
             maven-${{ runner.os }}-
 
       - name: Docker is available for Testcontainers
@@ -65,7 +71,12 @@ jobs:
         # io.inji.verify:verify-core:1.0.0-beta.1-SNAPSHOT (pom, maven-metadata.xml), and Maven then caches the failure
         # in ~/.m2 (`... will not be reattempted until the update interval ... has elapsed or updates are forced`), so a
         # cold repository fails the job before a single test runs. Hence: up to 5 attempts with backoff, `-U` from the
-        # second attempt on (to force past the cached failure), and the repository saved below even when this fails.
+        # second attempt on (to force past the cached failure), and the repository saved at the end of the job even when
+        # this step fails.
+        #
+        # Each attempt asks for the throttled artifact alone first (`-N dependency:get`, seconds) and only then builds
+        # the reactor, so a 429 is reported in seconds instead of after the minutes `test-compile` spends compiling
+        # before reaching the same fetch. Both commands are classified the same way.
         #
         # Goal: `test-compile`, not `install` and not `dependency:go-offline`.
         #  - `test-compile` builds the whole reactor, so no module has to fetch a sibling snapshot from a remote
@@ -75,6 +86,10 @@ jobs:
         #    snapshots into the cache saved below, where a later run could resolve a stale sibling instead of building
         #    it. (The cleanup at the top of this step also drops anything an older cache carried in.)
         #  - `dependency:go-offline` alone is known to leave plugin and test-scope dependencies unresolved.
+        #
+        # The runner executes this as `bash --noprofile --norc -eo pipefail`, so `-e` is already on: an untended
+        # `mvn ... | tee` would end the step on the first failing attempt and the retries would never run. Hence
+        # `set +e` around each pipeline and `PIPESTATUS[0]` for Maven's own status rather than tee's.
         shell: bash
         run: |
           set -uo pipefail
@@ -83,51 +98,65 @@ jobs:
           # install, so this only has to remove reactor artifacts an older cache restored.
           rm -rf "$HOME/.m2/repository/io/inji/certify"
 
-          waits=(60 120 240 480)          # the wait before attempt 2, 3, 4 and 5
-          attempts=$(( ${#waits[@]} + 1 ))
+          artifact=io.inji.verify:verify-core:1.0.0-beta.1-SNAPSHOT
+          delays=(60 120 240 480)         # the delay before attempt 2, 3, 4 and 5
+          attempts=$(( ${#delays[@]} + 1 ))
           log="$RUNNER_TEMP/resolve-dependencies.log"
 
+          # Only a transport problem is worth retrying: a compile error, a missing artifact or a bad pom fails
+          # identically five times and four delays later. One grep, over Maven's own `[ERROR]` lines only — a bare
+          # `429` also matches `[WARNING] Could not transfer metadata ... (429)` and a source line such as `[429,17]` —
+          # and never `grep | grep`, whose first grep takes SIGPIPE under `pipefail`.
+          retryable() {
+            grep -Eq '^\[ERROR\].*(status code: (429|5[0-9]{2})|Too Many Requests|Could not transfer|Connection reset|(Connect|Read) timed out)' "$log"
+          }
+
           for attempt in $(seq 1 "$attempts"); do
-            goal=(-B -ntp -Dgpg.skip=true -DskipTests test-compile)
+            fetch=(mvn -B -ntp -N)
             if [ "$attempt" -gt 1 ]; then
-              goal=(-U "${goal[@]}")       # force the snapshot recheck the first attempt left cached as failed
+              fetch+=(-U)                # force the snapshot recheck the first attempt left cached as failed
             fi
-            echo "dependency resolution attempt ${attempt}/${attempts}: mvn ${goal[*]}"
-            mvn "${goal[@]}" 2>&1 | tee "$log"
+            fetch+=(-Dartifact="$artifact" dependency:get)
+            echo "attempt ${attempt}/${attempts}: ${fetch[*]}"
+            set +e
+            "${fetch[@]}" 2>&1 | tee "$log"
             status=${PIPESTATUS[0]}
+            set -e
+
+            if [ "$status" -eq 0 ]; then
+              build=(mvn)
+              if [ "$attempt" -gt 1 ]; then
+                build+=(-U)
+              fi
+              build+=(-B -ntp -Dgpg.skip=true test-compile)
+              echo "attempt ${attempt}/${attempts}: ${build[*]}"
+              set +e
+              "${build[@]}" 2>&1 | tee "$log"
+              status=${PIPESTATUS[0]}
+              set -e
+            fi
+
             if [ "$status" -eq 0 ]; then
               echo "dependency resolution succeeded on attempt ${attempt}/${attempts}"
               exit 0
             fi
-            # Only a transport problem is worth retrying. A compile error, a missing artifact or a bad pom would fail
-            # identically five times and five waits later, so it fails the step here and now.
-            if ! grep -Eq '429|Too Many Requests|Could not transfer|Connection reset|timed out' "$log"; then
+
+            if ! retryable; then
               echo "::error::mvn exited ${status} without a transport error in the log; not retrying"
               exit "$status"
             fi
+
             if [ "$attempt" -eq "$attempts" ]; then
               break
             fi
-            wait="${waits[$(( attempt - 1 ))]}"
-            echo "transport error on attempt ${attempt}/${attempts}; waiting ${wait}s before attempt $(( attempt + 1 ))"
-            sleep "$wait"
+
+            delay="${delays[$(( attempt - 1 ))]}"
+            echo "transport error on attempt ${attempt}/${attempts}; waiting ${delay}s before attempt $(( attempt + 1 ))"
+            sleep "$delay"
           done
 
           echo "::error::dependency resolution failed after ${attempts} attempts (see the log above); the snapshot repository kept answering 429 or the network kept dropping"
           exit 1
-
-      - name: Save the Maven repository cache
-        # Right after resolution and unconditionally: a repository that resolved on attempt 3 must be kept even if the
-        # build step below fails, and so must a partial one (both are far better than the cold start that caused the
-        # 429 in the first place). `continue-on-error` because the cache is best-effort: a re-run of the same commit
-        # restores this exact key, and reserving an existing key is an error in actions/cache/save — a build that
-        # resolved fine must not go red over it.
-        if: always()
-        continue-on-error: true
-        uses: actions/cache/save@v4
-        with:
-          path: ~/.m2/repository
-          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}-v2
 
       - name: Build and verify
         # Runs unit tests today; golden replay, signature vectors, ArchUnit and
@@ -233,3 +262,30 @@ jobs:
           name: surefire-reports
           path: '**/target/surefire-reports/*.xml'
           if-no-files-found: ignore
+
+      - name: Strip failure markers from the Maven repository
+        # Maven records a failed fetch in ~/.m2 as `*.lastUpdated` and `resolver-status.properties`, and honours them
+        # for the update interval (`will not be reattempted until ... updates are forced`). Caching those would hand the
+        # 429 back to every later run that restores this cache, so they are deleted before the save. Reactor artifacts
+        # are dropped for the same reason `install` is not used: a later run must build its siblings, not resolve them.
+        if: always()
+        shell: bash
+        run: |
+          # Nothing to strip if no attempt ever created the repository (and `find` on a missing path would fail the job).
+          [ -d ~/.m2/repository ] || exit 0
+          rm -rf ~/.m2/repository/io/inji/certify
+          find ~/.m2/repository \( -name '*.lastUpdated' -o -name resolver-status.properties \) -delete
+
+      - name: Save the Maven repository cache
+        # At the end of the job and unconditionally: a repository that resolved on attempt 3 must be kept even if a
+        # later step fails, and so must a partial one (both are far better than the cold start that caused the 429 in
+        # the first place). The key is the restore step's (`steps.maven-cache`), i.e. this run's own key.
+        # `continue-on-error` is belt and braces: reserving a key that already exists is only a warning in
+        # actions/cache/save (it happens on a re-run of the same run id), and a best-effort cache must never turn a green
+        # build red.
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}-v3-${{ github.run_id }}
