@@ -384,7 +384,13 @@ public class TokenStatusListService {
         return ((bits[(int) (idx / 8)] >> (int) (idx % 8)) & 1) == 1;
     }
 
-    static String encode(byte[] bits) {
+    /**
+     * The zlib-compressed bit array, undecorated: what the JWT form carries base64url encoded in
+     * {@code status_list.lst} and what the CWT form ({@link TokenStatusListCwt}) carries as the raw {@code bstr} of
+     * claim 65533 (draft-ietf-oauth-status-list-21 section 4.3). {@code Deflater.BEST_COMPRESSION} as before, so both
+     * forms of one list hold the same bytes.
+     */
+    static byte[] zlib(byte[] bits) {
         Deflater deflater = new Deflater(Deflater.BEST_COMPRESSION);
         deflater.setInput(bits);
         deflater.finish();
@@ -394,12 +400,21 @@ public class TokenStatusListService {
             out.write(buffer, 0, deflater.deflate(buffer));
         }
         deflater.end();
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(out.toByteArray());
+        return out.toByteArray();
+    }
+
+    static String encode(byte[] bits) {
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(zlib(bits));
     }
 
     public static byte[] decode(String lst) {
+        return inflate(Base64.getUrlDecoder().decode(lst));
+    }
+
+    /** The bit array a zlib stream inflates to, for both the JWT and the CWT {@code lst} of one list. */
+    static byte[] inflate(byte[] compressed) {
         Inflater inflater = new Inflater();
-        inflater.setInput(Base64.getUrlDecoder().decode(lst));
+        inflater.setInput(compressed);
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         byte[] buffer = new byte[4096];
         try {
