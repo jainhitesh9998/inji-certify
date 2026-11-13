@@ -1,67 +1,137 @@
 #!/bin/sh
 # One-shot seed of the mDL credential configuration (docs/design/20-mdl-issuer.md, M-10), run by the mdl-seed service of
-# docker-compose.mdl.yaml in curlimages/curl: waits until Certify is up, then posts mdl-configuration.json with mdl.vm
-# as its template to the v2 configuration API. It talks to certify:8090 inside the compose network, not through
-# certify-nginx, whose admin guard (M-12a) is for requests from the public host.
+# docker-compose.mdl.yaml in curlimages/curl (POSIX sh, BusyBox sed and awk, no jq): waits until Certify is up, then
+# posts mdl-configuration.json with mdl.vm as its template to the v2 configuration API. It talks to certify:8090 inside
+# the compose network, not through certify-nginx, whose admin guard (M-12a) is for requests from the public host.
 #
-#   201         seeded
-#   409         a configuration with this id or doctype exists: left as it is (MDL_SEED_UPDATE=true replaces it by PUT)
-#   otherwise   the response is printed and the service exits 1
+#   POST 201                       seeded
+#   POST 409, GET <id> 200         a configuration with this id exists: left as it is (MDL_SEED_UPDATE=true replaces it
+#                                  by PUT, which must answer 200 with the same id)
+#   POST 409, GET <id> otherwise   the conflict is another configuration (the doctype is taken under another id): exit 1
+#   otherwise                      the response is printed and the service exits 1
 set -eu
 
 CERTIFY_URL=${CERTIFY_URL:-http://certify:8090/v1/certify}
 DIR=${MDL_SEED_DIR:-/mdl}
 WAIT_SECONDS=${MDL_SEED_WAIT_SECONDS:-600}
 BODY=/tmp/mdl-configuration.json
+RESPONSE=/tmp/response.json
+
+fail() {
+  echo "mdl-seed: $*" >&2
+  exit 1
+}
+
+# The top-level "id" of a JSON document, whatever its layout: a small scanner that skips strings (and their escapes)
+# and tracks the nesting depth, so an "id" inside a nested object or a string value is never taken for it. Prints
+# nothing when there is none. Ids with escapes are not supported (printed raw); the configuration id has none.
+json_top_level_id() {
+  tr -d '\r\n' < "$1" | awk '
+    {
+      depth = 0; in_string = 0; escaped = 0; token = ""; last = ""; want = 0
+      n = length($0)
+      for (i = 1; i <= n; i++) {
+        c = substr($0, i, 1)
+        if (in_string) {
+          if (escaped) { escaped = 0; token = token c }
+          else if (c == "\\") { escaped = 1; token = token c }
+          else if (c == "\"") {
+            in_string = 0
+            if (depth == 1) {
+              if (want == 1) { print token; exit }
+              last = token
+            }
+          } else token = token c
+          continue
+        }
+        if (c == "\"") { in_string = 1; token = ""; continue }
+        if (c == "{" || c == "[") { depth++; want = 0; continue }
+        if (c == "}" || c == "]") { depth--; want = 0; continue }
+        if (depth == 1 && c == ":") { want = (last == "id") ? 1 : 0; last = ""; continue }
+        if (depth == 1 && c == ",") { want = 0; last = ""; continue }
+        if (c != " " && c != "\t" && want == 1) want = 0
+      }
+    }'
+}
+
+# True when the JSON response names the configuration id as "id" (compared with all whitespace removed, which the
+# id itself never contains).
+response_has_id() {
+  tr -d ' \t\r\n' < "$RESPONSE" | grep -qF "\"id\":\"$id\""
+}
 
 # The configuration with the template text inserted as a JSON string at the "@@mdl.vm@@" placeholder: backslashes and
-# double quotes escaped, tabs and newlines as \t and \n. printf '%s' writes the parts without interpreting them.
-template=$(sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e "s/$(printf '\t')/\\\\t/g" "$DIR/mdl.vm" | sed -e ':a' -e 'N' -e '$!ba' -e 's/\n/\\n/g')
+# double quotes escaped, tabs, carriage returns and newlines as \t, \r and \n. printf '%s' writes the parts without
+# interpreting them.
+tab=$(printf '\t')
+cr=$(printf '\r')
+template=$(sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e "s/$tab/\\\\t/g" -e "s/$cr/\\\\r/g" "$DIR/mdl.vm" \
+  | sed -e ':a' -e 'N' -e '$!ba' -e 's/\n/\\n/g')
 json=$(cat "$DIR/mdl-configuration.json")
 case "$json" in
   *@@mdl.vm@@*) ;;
-  *) echo "mdl-seed: $DIR/mdl-configuration.json has no \"@@mdl.vm@@\" placeholder for the template" >&2; exit 1 ;;
+  *) fail "$DIR/mdl-configuration.json has no \"@@mdl.vm@@\" placeholder for the template" ;;
 esac
 printf '%s%s%s\n' "${json%%@@mdl.vm@@*}" "$template" "${json#*@@mdl.vm@@}" > "$BODY"
-id=$(sed -n 's/^  "id": "\([^"]*\)".*/\1/p' "$DIR/mdl-configuration.json")
+id=$(json_top_level_id "$DIR/mdl-configuration.json")
+[ -n "$id" ] || fail "$DIR/mdl-configuration.json has no top-level \"id\""
+case "$id" in
+  *[!A-Za-z0-9._-]*) fail "unexpected characters in the configuration id \"$id\"" ;;
+esac
 
 echo "mdl-seed: waiting for $CERTIFY_URL/actuator/health (up to ${WAIT_SECONDS}s)"
 waited=0
 until curl -fsS -o /dev/null "$CERTIFY_URL/actuator/health"; do
   if [ "$waited" -ge "$WAIT_SECONDS" ]; then
-    echo "mdl-seed: Certify did not become healthy in ${WAIT_SECONDS}s" >&2
-    exit 1
+    fail "Certify did not become healthy in ${WAIT_SECONDS}s"
   fi
   sleep 5
   waited=$((waited + 5))
 done
 
-post() {
-  curl -sS -o /tmp/response.json -w '%{http_code}' -X "$1" "$2" -H 'Content-Type: application/json' --data-binary @"$BODY"
+# send METHOD URL [body]: the HTTP status on stdout, the response body in $RESPONSE
+send() {
+  if [ $# -ge 3 ]; then
+    curl -sS -o "$RESPONSE" -w '%{http_code}' -X "$1" "$2" -H 'Content-Type: application/json' --data-binary @"$3"
+  else
+    curl -sS -o "$RESPONSE" -w '%{http_code}' -X "$1" "$2" -H 'Accept: application/json'
+  fi
 }
 
-status=$(post POST "$CERTIFY_URL/v2/credential-configurations")
+answered() {
+  echo "mdl-seed: $1 answered $2:" >&2
+  cat "$RESPONSE" >&2
+  echo >&2
+  exit 1
+}
+
+status=$(send POST "$CERTIFY_URL/v2/credential-configurations" "$BODY")
 case "$status" in
   201)
+    response_has_id || answered "POST (201 without \"id\":\"$id\")" "$status"
     echo "mdl-seed: created the credential configuration $id"
     ;;
   409)
+    conflict=$(cat "$RESPONSE")
+    status=$(send GET "$CERTIFY_URL/v2/credential-configurations/$id")
+    if [ "$status" != "200" ] || ! response_has_id; then
+      echo "mdl-seed: POST answered 409 ($conflict), but GET $id answered $status: the conflict is another" \
+        "configuration (the doctype taken under another id?)" >&2
+      cat "$RESPONSE" >&2
+      echo >&2
+      exit 1
+    fi
     if [ "${MDL_SEED_UPDATE:-false}" = "true" ]; then
-      status=$(post PUT "$CERTIFY_URL/v2/credential-configurations/$id")
-      if [ "$status" != "200" ]; then
-        echo "mdl-seed: PUT $id answered $status:" >&2
-        cat /tmp/response.json >&2
-        exit 1
+      status=$(send PUT "$CERTIFY_URL/v2/credential-configurations/$id" "$BODY")
+      if [ "$status" != "200" ] || ! response_has_id; then
+        answered "PUT $id" "$status"
       fi
       echo "mdl-seed: replaced the credential configuration $id (MDL_SEED_UPDATE=true)"
     else
-      echo "mdl-seed: already seeded, left as it is: $(cat /tmp/response.json)"
+      echo "mdl-seed: already seeded, left as it is: $id (MDL_SEED_UPDATE=true replaces it)"
     fi
     ;;
   *)
-    echo "mdl-seed: POST answered $status:" >&2
-    cat /tmp/response.json >&2
-    echo >&2
-    exit 1
+    answered POST "$status"
     ;;
 esac

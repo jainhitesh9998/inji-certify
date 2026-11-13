@@ -233,20 +233,27 @@ defects that the unit suite could not see (F-02 to F-05 in `docs/design/wp/PROGR
 ## 6f. The mDL issuer
 
 The ISO/IEC 18013-5 mDL of `docs/design/20-mdl-issuer.md` (M-10) runs on the same stack through a third overlay,
-`docker-compose.mdl.yaml`. It adds profile `mdl` plus `mdl-dev` (a generated dev IACA, the default) or `mdl-operator`
-(the offline `certify-cli` PKI), the demo holders, and the `mdl-seed` service that writes the configuration
-`org.iso.18013.5.1.mDL` through the v2 API. `docker-compose/docker-compose-injistack/config/mdl/README.md` is the
-runbook. In short:
+`docker-compose.mdl.yaml`. It adds profile `mdl` plus the PKI profile `MDL_PKI_PROFILE` names, which has no default:
+`mdl-dev` (a generated dev IACA; local runs and demos) or `mdl-operator` (the offline `certify-cli` PKI; the public
+host). It also adds the demo holders and the `mdl-seed` service that writes the configuration `org.iso.18013.5.1.mDL`
+through the v2 API. `docker-compose/docker-compose-injistack/config/mdl/README.md` is the runbook. Locally, in short:
 
 ```bash
-cd docker-compose/docker-compose-injistack
+cd "$(git rev-parse --show-toplevel)/docker-compose/docker-compose-injistack"
 mkdir -p loader_path/certify-mdl && cp loader_path/certify/mock-certify-plugin.jar loader_path/certify-mdl/
 zip -q -d loader_path/certify-mdl/mock-certify-plugin.jar 'org/bouncycastle/*' 'META-INF/versions/*/org/bouncycastle/*'
-docker compose -f docker-compose.yaml -f docker-compose.rebuild.yaml -f docker-compose.mdl.yaml \
+MDL_PKI_PROFILE=mdl-dev docker compose -f docker-compose.yaml -f docker-compose.rebuild.yaml -f docker-compose.mdl.yaml \
     up -d --no-build database certify certify-nginx mdl-seed
-cd ../.. && python3.12 -m venv .venv && .venv/bin/pip install -r docs/design/tools/requirements-verify.txt pyjwt
+cd ../.. && python3.12 -m venv .venv && .venv/bin/pip install -r docs/design/tools/requirements-smoke.txt
 .venv/bin/python docs/design/tools/smoke.py --mdl http://localhost:8091
 ```
+
+A public host (or any machine others can reach) runs `MDL_PKI_PROFILE=mdl-operator MDL_PKI_DIR=<dir>` with
+`docker-compose.public.yaml` as the last file: certify and certify-nginx on `127.0.0.1` only, no PostgreSQL port, and
+the PostgreSQL, keymanager and issuer keystore passwords from Compose secret files in `CERTIFY_SECRETS_DIR` (Compose
+2.24.4 or later; README "The public host"). Its smoke run passes the public URL and pins the offline IACA:
+`smoke.py --mdl "$CERTIFY_PUBLIC_URL" --iaca "$MDL_PKI_DIR/iaca.pem"`. Changing `CERTIFY_PUBLIC_URL` needs a fresh
+database (status lists keep the old `sub` until F-10) and, in `mdl-dev`, a fresh `data/MDL_PKI`.
 
 The plugin jars of step 2 bundle BouncyCastle 1.69 unshaded. On `loader.path` they shadow the service's 1.78, and
 since M-04 that stops the service at startup (`certify-pki`, `NoSuchMethodError`). The mDL overlay therefore mounts
@@ -256,7 +263,12 @@ The smoke plays a wallet through certify-nginx: offers by reference and by value
 and a P-256 holder (Bearer) and an Ed25519 holder (DPoP) through the token, nonce and credential endpoints. It then
 runs `verify_mdoc.py` with the IACA downloaded from `/v1/certify/mdoc/iaca/<id>.pem`, `openssl crl -CAfile` over the
 CRL at the Document Signer's distribution point, and `openssl verify -x509_strict -crl_check` over the Document
-Signer. Last come the status list and three refusals. All 29 checks passed in both PKI modes on 2026-11-13.
+Signer. Last come the status list and three refusals. All 29 checks passed in both PKI modes on 2026-11-13. The
+review round after that added a 30th (the `holders.json` record exists) and, with `--iaca`, a 31st (the published IACA
+is the pinned one), and made the element and status checks strict: CBOR types (tag 1004 full-dates, uint, bool, the
+whole `driving_privileges`) and the list's `sub`, `iat` and `exp`. `test_smoke_mdl.py` covers those helpers; the
+stricter run has not been repeated against a stack yet, and its `exp` check fails on a list older than two ttl until
+F-10 re-signs stale lists.
 
 ## 7. Verify the credential independently
 

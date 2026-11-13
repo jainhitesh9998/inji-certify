@@ -10,17 +10,26 @@ metadata say:
   3. a P-256 holder: token (anonymous pre-authorized grant, Bearer), nonce, credential with an ES256 jwt proof,
      notification, nonce replay refused;
   4. an Ed25519 holder: a DPoP-bound token, nonce, credential with an EdDSA jwt proof (ISO/IEC 18013-5 9.1.5.2);
-  5. every mDL read back: elements equal the holders.json record, MSO docType, x5chain without the anchor, the Token
-     Status List entry served with its bit clear; then docs/design/tools/verify_mdoc.py (pymdoccbor, a verifier
-     Certify does not maintain) with --doctype, --holder (the proof key) and --iaca downloaded from
-     /v1/certify/mdoc/iaca/<id>.pem, the IACA named by the Document Signer's CRL distribution point;
+  5. every mDL read back: each element equals the holders.json record in value and CBOR type (full-date as tag 1004,
+     bool, uint, bstr, the whole driving_privileges), MSO docType, x5chain without the anchor, the Token Status List
+     entry served with its bit clear, sub equal to the MSO's uri, iat not in the future and exp not passed; then
+     docs/design/tools/verify_mdoc.py (pymdoccbor, a verifier Certify does not maintain) with --doctype, --holder (the
+     proof key) and --iaca: the IACA named by the Document Signer's CRL distribution point, downloaded from
+     /v1/certify/mdoc/iaca/<id>.pem, or with --iaca <file> the operator's offline IACA, which the published one must
+     equal;
   6. the CRL at that distribution point verified with `openssl crl -CAfile`, and the Document Signer with
      `openssl verify -x509_strict -crl_check`;
   7. refusals: an offer for a subject holders.json does not know ends in credential_request_denied, and an admin API
      is refused for a request that looks public (the nginx guard of M-12a).
 
-    python3.12 -m venv .venv && .venv/bin/pip install -r docs/design/tools/requirements-verify.txt pyjwt
+From the repository root:
+
+    python3.12 -m venv .venv && .venv/bin/pip install -r docs/design/tools/requirements-smoke.txt
     .venv/bin/python docs/design/tools/smoke.py --mdl http://localhost:8091
+    .venv/bin/python docs/design/tools/smoke.py --mdl "$CERTIFY_PUBLIC_URL" --iaca /path/to/deploy/iaca.pem
+
+The base URL must be the one the stack was started with (CERTIFY_PUBLIC_URL): the offer's credential_issuer and every
+endpoint derive from it.
 
 Exit status 0 when every check passes. The credentials, holder keys, IACA and CRL are kept in --out (a new temporary
 directory by default) for a second look.
@@ -40,6 +49,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
+from datetime import date
 from pathlib import Path
 
 # Behind Cloudflare the IPv6 addresses of a host can stall for 20 s each before urllib falls back to IPv4
@@ -63,6 +73,13 @@ MANDATORY = ["family_name", "given_name", "birth_date", "issue_date", "expiry_da
 PRE_AUTH = "urn:ietf:params:oauth:grant-type:pre-authorized_code"
 X5CHAIN = 33
 TX_CODE = "1234"
+# ISO/IEC 18013-5 Table 5 types of the elements holders.json carries; full-date is CBOR tag 1004 over "YYYY-MM-DD"
+# (RFC 8943), decoded by cbor2 to datetime.date
+FULL_DATES = ["birth_date", "issue_date", "expiry_date"]
+TEXTS = ["family_name", "given_name", "issuing_country", "issuing_authority", "document_number", "un_distinguishing_sign",
+         "nationality", "resident_city"]
+PRIVILEGE_DATES = ["issue_date", "expiry_date"]
+CLOCK_SKEW = 60  # seconds a status list's iat may lie ahead of this machine's clock
 
 results = []
 
@@ -163,7 +180,8 @@ def query_param(link, name):
 
 
 def decode_mdoc(encoded):
-    """IssuerSigned -> (raw CBOR, elements by identifier, MSO, x5chain certificates as received)."""
+    """IssuerSigned -> (raw CBOR, elements by identifier, the IssuerSignedItem bytes by identifier, MSO, x5chain
+    certificates as received)."""
     raw = b64url_decode(encoded)
     issuer_signed = cbor2.loads(raw)
     issuer_auth = issuer_signed["issuerAuth"]
@@ -171,13 +189,105 @@ def decode_mdoc(encoded):
         issuer_auth = issuer_auth.value
     payload = cbor2.loads(issuer_auth[2])
     mso = cbor2.loads(payload.value if isinstance(payload, cbor2.CBORTag) else payload)
-    elements = {}
+    elements, items = {}, {}
     for item in issuer_signed["nameSpaces"].get(MDL_NAMESPACE, []):
         decoded = cbor2.loads(item.value)
         elements[decoded["elementIdentifier"]] = decoded["elementValue"]
+        items[decoded["elementIdentifier"]] = item.value
     chain = issuer_auth[1].get(X5CHAIN)
     chain = [chain] if isinstance(chain, bytes) else list(chain or [])
-    return raw, elements, mso, [x509.load_der_x509_certificate(c) for c in chain]
+    return raw, elements, items, mso, [x509.load_der_x509_certificate(c) for c in chain]
+
+
+def same(actual, expected):
+    """Equal in value and in type, recursively: True is not 1, a date is not its text, a list keeps its order."""
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(same(actual[k], expected[k]) for k in expected)
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(same(a, e) for a, e in zip(actual, expected))
+    return actual == expected
+
+
+def tagged_full_date(item, value):
+    """The IssuerSignedItem bytes hold this date as tag 1004 over its text (d9 03ec 6a "YYYY-MM-DD"), not as tag 100
+    (days since the epoch) or a bare string, both of which cbor2 would also hand back as a date or a str."""
+    return isinstance(value, date) and b"\xd9\x03\xec\x6a" + value.isoformat().encode() in item
+
+
+def element_problems(record, elements, items, portrait):
+    """What differs between a holders.json record and the elements of an issued mDL: [problem, ...], empty when every
+    element the record has is present with the record's value and the Table 5 type."""
+    problems = []
+    for name in TEXTS:
+        if name in record and not same(elements.get(name), record[name]):
+            problems.append(f"{name}: {elements.get(name)!r} != {record[name]!r}")
+    for name in FULL_DATES:
+        try:
+            expected = date.fromisoformat(record[name])
+        except (KeyError, TypeError, ValueError):
+            problems.append(f"{name}: holders.json has no full-date {record.get(name)!r}")
+            continue
+        if not same(elements.get(name), expected):
+            problems.append(f"{name}: {elements.get(name)!r} != {expected!r}")
+        elif not tagged_full_date(items.get(name, b""), expected):
+            problems.append(f"{name}: not a tag 1004 full-date")
+    if "sex" in record and not same(elements.get("sex"), record["sex"]):
+        problems.append(f"sex: {elements.get('sex')!r} != {record['sex']!r} (uint)")
+    if "age_over_18" in record and not same(elements.get("age_over_18"), record["age_over_18"]):
+        problems.append(f"age_over_18: {elements.get('age_over_18')!r} != {record['age_over_18']!r} (bool)")
+    if portrait is not None and not same(elements.get("portrait"), portrait):
+        problems.append("portrait: not the bytes of " + str(record.get("portrait")))
+    expected_privileges = []
+    for privilege in record.get("driving_privileges", []):
+        privilege = dict(privilege)
+        for name in PRIVILEGE_DATES:
+            if name in privilege:
+                try:
+                    privilege[name] = date.fromisoformat(privilege[name])
+                except (TypeError, ValueError):
+                    problems.append(f"driving_privileges: holders.json has no full-date {privilege[name]!r}")
+        expected_privileges.append(privilege)
+    if not same(elements.get("driving_privileges"), expected_privileges):
+        problems.append(f"driving_privileges: {elements.get('driving_privileges')!r} != {expected_privileges!r}")
+    else:
+        item = items.get("driving_privileges", b"")
+        untagged = [f"{p['vehicle_category_code']}.{name}" for p in expected_privileges for name in PRIVILEGE_DATES
+                    if name in p and not tagged_full_date(item, p[name])]
+        if untagged:
+            problems.append("driving_privileges: not a tag 1004 full-date: " + ", ".join(untagged))
+    return problems
+
+
+def status_list_problems(payload, uri, index, now):
+    """The Token Status List JWT claims (draft-ietf-oauth-status-list): sub is the uri the MSO names, iat not in the
+    future, exp not passed, and the credential's bit clear. [problem, ...]."""
+    problems = []
+    if payload.get("sub") != uri:
+        problems.append(f"sub {payload.get('sub')!r} is not the MSO's uri {uri!r}")
+    iat, exp = payload.get("iat"), payload.get("exp")
+    if not isinstance(iat, (int, float)) or isinstance(iat, bool) or iat > now + CLOCK_SKEW:
+        problems.append(f"iat {iat!r} missing or in the future (now {int(now)})")
+    if not isinstance(exp, (int, float)) or isinstance(exp, bool) or exp <= now:
+        problems.append(f"exp {exp!r} missing or passed (now {int(now)})")
+    try:
+        bit = token_status_bit(payload["status_list"]["lst"], index)
+    except Exception as e:  # noqa: BLE001 - reported as a problem
+        problems.append(f"status_list.lst unreadable: {e}")
+    else:
+        if bit != 0:
+            problems.append(f"bit {index} is {bit}, not 0 (valid)")
+    return problems
+
+
+def issuer_hint(base, issuer):
+    """The run's base URL must be the stack's CERTIFY_PUBLIC_URL, the origin of credential_issuer."""
+    if not issuer or issuer.startswith(base.rstrip("/") + "/"):
+        return None
+    u = urllib.parse.urlparse(issuer)
+    return (f"credential_issuer {issuer} is not under {base}: pass the stack's public URL (CERTIFY_PUBLIC_URL) as the "
+            f"base, smoke.py --mdl {u.scheme}://{u.netloc}")
 
 
 def crl_distribution_point(certificate):
@@ -206,13 +316,15 @@ def run_openssl(*args):
 
 
 class Smoke:
-    def __init__(self, base, configuration, subject, out):
+    def __init__(self, base, configuration, subject, out, pinned_iaca=None, holders=HOLDERS):
         self.base = base.rstrip("/")
         self.certify = self.base + "/v1/certify"
         self.configuration = configuration
         self.subject = subject
         self.out = out
-        self.holders = json.loads(HOLDERS.read_text()) if HOLDERS.exists() else {}
+        self.holders_path = holders
+        self.holders = json.loads(holders.read_text()) if holders.exists() else None
+        self.pinned_iaca = pinned_iaca
         self.metadata = self.as_metadata = self.issuer = None
         self.iaca_path = self.dsc = None
 
@@ -240,9 +352,10 @@ class Smoke:
         code_ok = isinstance(by_reference, dict) and self.configuration in by_reference.get("credential_configuration_ids", []) \
             and by_reference.get("grants", {}).get(PRE_AUTH, {}).get("pre-authorized_code")
         self.issuer = by_reference.get("credential_issuer") if isinstance(by_reference, dict) else None
+        hint = issuer_hint(self.base, self.issuer)
         check("offer by reference: credential_issuer is the /oid4vci identifier",
-              ok and code_ok and (self.issuer or "").endswith("/v1/certify/oid4vci") and self.issuer.startswith(self.base),
-              {"credential_issuer": self.issuer, "offer": detail} if ok else detail)
+              ok and code_ok and (self.issuer or "").endswith("/v1/certify/oid4vci") and hint is None,
+              hint or ({"credential_issuer": self.issuer, "offer": detail} if ok else detail))
         ok, by_value, detail = self.offer(True)
         check("offer by value: the same issuer, its own pre-authorized code",
               ok and by_value.get("credential_issuer") == self.issuer
@@ -329,24 +442,23 @@ class Smoke:
     # ---------------------------------------------------------------------------------------------- the mDL itself
     def inspect(self, issued):
         label = issued["label"]
-        raw, elements, mso, chain = decode_mdoc(issued["encoded"])
+        raw, elements, items, mso, chain = decode_mdoc(issued["encoded"])
         name = label.split(" ")[0].lower()
         mdoc_path = self.out / f"{name}.mdoc"
         holder_path = self.out / f"{name}.holder.jwk"
         mdoc_path.write_bytes(raw)
         holder_path.write_text(json.dumps(public_jwk(issued["holder"])))
-        record = self.holders.get(self.subject, {})
-        portrait = HOLDERS.parent / record["portrait"] if record.get("portrait") else None
-        mismatched = [k for k in ("family_name", "given_name", "document_number", "issuing_country", "issuing_authority",
-                                  "un_distinguishing_sign", "nationality", "resident_city", "sex", "age_over_18")
-                      if k in record and elements.get(k) != record[k]]
-        if portrait and portrait.exists() and elements.get("portrait") != portrait.read_bytes():
-            mismatched.append("portrait")
-        privileges = [p.get("vehicle_category_code") for p in elements.get("driving_privileges") or []]
-        if record and privileges != [p["vehicle_category_code"] for p in record.get("driving_privileges", [])]:
-            mismatched.append("driving_privileges")
+        record = (self.holders or {}).get(self.subject)
         missing = [e for e in MANDATORY if e not in elements]
-        check(f"{label}: every Table 5 mandatory element, values equal holders.json[{self.subject}]",
+        if record is None:
+            mismatched = [f"no record {self.subject} in {self.holders_path}"]
+        else:
+            portrait_file = self.holders_path.parent / record["portrait"] if record.get("portrait") else None
+            portrait = portrait_file.read_bytes() if portrait_file and portrait_file.is_file() else None
+            mismatched = element_problems(record, elements, items, portrait)
+            if record.get("portrait") and portrait is None:
+                mismatched.append(f"portrait: {portrait_file} not found")
+        check(f"{label}: every Table 5 mandatory element, values and CBOR types equal holders.json[{self.subject}]",
               not missing and not mismatched and elements.get("issuing_country") == "IN" and elements.get("un_distinguishing_sign") == "IND"
               and isinstance(elements.get("portrait"), bytes) and elements["portrait"][:2] == b"\xff\xd8",
               {"missing": missing, "mismatched": mismatched} if missing or mismatched else sorted(elements))
@@ -387,6 +499,18 @@ class Smoke:
             return
         self.iaca_path = self.out / "iaca.pem"
         self.iaca_path.write_bytes(pem)
+        if self.pinned_iaca is not None:
+            # The operator's offline IACA (D3) is the trust anchor; the published copy must be that certificate, or a
+            # wallet that fetched it would trust something else.
+            pinned = x509.load_pem_x509_certificate(self.pinned_iaca.read_bytes())
+            same_certificate = pinned.public_bytes(serialization.Encoding.DER) == iaca.public_bytes(serialization.Encoding.DER)
+            check(f"published IACA equals the pinned --iaca {self.pinned_iaca}", same_certificate,
+                  {"pinned sha256": pinned.fingerprint(hashes.SHA256()).hex(), "published sha256": fingerprint})
+            if not same_certificate:
+                self.iaca_path = None
+                return
+            self.iaca_path = self.out / "iaca.pinned.pem"
+            self.iaca_path.write_bytes(pinned.public_bytes(serialization.Encoding.PEM))
         dsc_path = self.out / "dsc.pem"
         dsc_path.write_bytes(self.dsc.public_bytes(serialization.Encoding.PEM))
         # An operator IACA names the public host in its CRL distribution point; a run against another URL (a local stack
@@ -412,18 +536,21 @@ class Smoke:
         entry = mso.get("status", {}).get("status_list", {}) if isinstance(mso.get("status"), dict) else {}
         if not check("MSO status.status_list {idx, uri} (Token Status List)", isinstance(entry.get("idx"), int) and isinstance(entry.get("uri"), str), entry):
             return
+        name = "status list served as statuslist+jwt, signature verifies with its x5c, sub is the uri, iat/exp, bit clear"
         s, h, token = call("GET", entry["uri"])
         try:
             header = jwt.get_unverified_header(token)
             leaf = x509.load_der_x509_certificate(base64.b64decode(header["x5c"][0]))
-            payload = jwt.decode(token, leaf.public_key(), algorithms=[header["alg"]], options={"verify_aud": False})
-            bit = token_status_bit(payload["status_list"]["lst"], entry["idx"])
+            # time claims are checked below, against one clock, with their values in the report
+            payload = jwt.decode(token, leaf.public_key(), algorithms=[header["alg"]],
+                                 options={"verify_aud": False, "verify_exp": False, "verify_iat": False, "verify_nbf": False})
         except Exception as e:  # noqa: BLE001 - reported as the check's detail
-            check("status list served as statuslist+jwt, signature verifies with its x5c, bit clear", False, {"status": s, "error": str(e)})
+            check(name, False, {"status": s, "error": str(e)})
             return
-        check("status list served as statuslist+jwt, signature verifies with its x5c, bit clear",
-              s == 200 and header.get("typ") == "statuslist+jwt" and payload.get("sub") == entry["uri"] and bit == 0,
-              {"content-type": h.get("content-type"), "typ": header.get("typ"), "bit": bit})
+        problems = status_list_problems(payload, entry["uri"], entry["idx"], time.time())
+        check(name, s == 200 and header.get("typ") == "statuslist+jwt" and not problems,
+              {"content-type": h.get("content-type"), "typ": header.get("typ"), "problems": problems} if problems or s != 200
+              else {"typ": header.get("typ"), "sub": payload.get("sub"), "iat": payload.get("iat"), "exp": payload.get("exp")})
 
     # ---------------------------------------------------------------------------------------------- the rest
     def notification(self, issued):
@@ -452,6 +579,9 @@ class Smoke:
         check("admin API refused for a public request (certify-nginx, M-12a)", s == 403, {"status": s})
 
     def run(self):
+        if not check(f"holders.json has the record {self.subject}", self.holders is not None and self.subject in self.holders,
+                     f"{self.holders_path} " + ("not found" if self.holders is None else f"has {sorted(self.holders)}")):
+            return
         by_reference, by_value = self.offers()
         if not (by_reference and by_value and self.discovery()):
             return
@@ -489,11 +619,16 @@ def main(argv=None):
     parser.add_argument("--configuration", default=MDL_DOCTYPE, help="credential configuration id (default org.iso.18013.5.1.mDL)")
     parser.add_argument("--subject", default="mdl-demo-1", help="holders.json record (default mdl-demo-1)")
     parser.add_argument("--out", help="directory for the credentials, holder keys, IACA and CRL (default: a new temporary one)")
+    parser.add_argument("--iaca", type=Path, help="the operator's offline IACA (PEM, mdl-operator): the published IACA must be "
+                                                   "this certificate, and the mDLs are verified against it")
+    parser.add_argument("--holders", type=Path, default=HOLDERS, help=f"the holders.json the stack serves (default {HOLDERS})")
     args = parser.parse_args(argv)
+    if args.iaca is not None and not args.iaca.is_file():
+        parser.error(f"--iaca {args.iaca}: no such file")
     out = Path(args.out) if args.out else Path(tempfile.mkdtemp(prefix="mdl-smoke-"))
     out.mkdir(parents=True, exist_ok=True)
     print(f"mDL smoke against {args.base}, configuration {args.configuration}, subject {args.subject}; files in {out}")
-    Smoke(args.base, args.configuration, args.subject, out).run()
+    Smoke(args.base, args.configuration, args.subject, out, args.iaca, args.holders).run()
     return 1 if table() or not results else 0
 
 

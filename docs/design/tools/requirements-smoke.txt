@@ -1,0 +1,6 @@
+# Python environment for the mDL smoke run, docs/design/tools/smoke.py --mdl (smoke_mdl.py; VALIDATE.md 6f): the
+# verifier's exact pins (it runs verify_mdoc.py) plus PyJWT for the offers, proofs, DPoP and the status list.
+#
+#   python3.12 -m venv .venv && .venv/bin/pip install -r docs/design/tools/requirements-smoke.txt
+-r requirements-verify.txt
+pyjwt==2.10.1

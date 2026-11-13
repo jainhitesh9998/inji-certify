@@ -9,8 +9,9 @@ the v2 configuration API and did.json.
 The mDL run of the compose mdl profile (docs/design/20-mdl-issuer.md M-10; smoke_mdl.py, VALIDATE.md 6f) takes the
 public URL instead and needs the verifier's environment too:
 
-    python3.12 -m venv .venv && .venv/bin/pip install -r docs/design/tools/requirements-verify.txt pyjwt
+    python3.12 -m venv .venv && .venv/bin/pip install -r docs/design/tools/requirements-smoke.txt
     .venv/bin/python docs/design/tools/smoke.py --mdl http://localhost:8091
+    .venv/bin/python docs/design/tools/smoke.py --mdl "$CERTIFY_PUBLIC_URL" --iaca "$MDL_PKI_DIR/iaca.pem"   # mdl-operator
 """
 import json, sys, time, urllib.request, urllib.parse, urllib.error
 
