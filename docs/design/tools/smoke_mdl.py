@@ -20,8 +20,8 @@ metadata say:
      equal;
   6. the CRL at that distribution point verified with `openssl crl -CAfile`, and the Document Signer with
      `openssl verify -x509_strict -crl_check`;
-  7. refusals: an offer for a subject holders.json does not know ends in credential_request_denied, and an admin API
-     is refused for a request that looks public (the nginx guard of M-12a).
+  7. refusals: an offer for a subject holders.json does not know ends in credential_request_denied, and an admin API,
+     a keymanager controller and springdoc are refused for a request that looks public (the nginx allow-list, M-12).
 
 From the repository root:
 
@@ -290,7 +290,7 @@ def element_value_tagged(item):
     """The elementValue of an IssuerSignedItem's bytes, tags kept; None when the bytes cannot be read."""
     try:
         decoded = cbor_tagged(item)
-    except (ValueError, IndexError, UnicodeDecodeError):
+    except (ValueError, IndexError, UnicodeDecodeError, TypeError):  # TypeError: an unhashable map key
         return None
     return decoded.get("elementValue") if isinstance(decoded, dict) else None
 
@@ -660,8 +660,14 @@ class Smoke:
               and body.get("error") == "credential_request_denied", {"status": s, "body": body})
 
     def admin_guard(self):
-        s, _, _ = call("GET", self.certify + "/v2/credential-configurations", headers={"CF-Ray": "mdl-smoke"})
-        check("admin API refused for a public request (certify-nginx, M-12a)", s == 403, {"status": s})
+        # certify-nginx's allow-list (M-12): an admin API, a keymanager controller and springdoc, as from the public
+        # host; docs/design/tools/check-public-guard.sh covers the whole list against a stub upstream
+        statuses = {}
+        for method, path in (("GET", "/v2/credential-configurations"), ("POST", "/jwtSign"), ("GET", "/v3/api-docs")):
+            statuses[f"{method} {path}"], _, _ = call(method, self.certify + path, headers={"CF-Ray": "mdl-smoke"},
+                                                     **({"body": {}} if method == "POST" else {}))
+        check("admin, keymanager and springdoc paths refused for a public request (certify-nginx, M-12)",
+              all(s == 403 for s in statuses.values()), statuses)
 
     def run(self):
         if not check(f"holders.json has the record {self.subject}", self.holders is not None and self.subject in self.holders,

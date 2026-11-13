@@ -46,6 +46,7 @@ authorization server, which is what the pre-authorized code flow needs.
 
 ```bash
 docker network inspect mosip_network >/dev/null 2>&1 || docker network create mosip_network   # the compose file expects it
+# never a second project of this stack on mosip_network next to a running one: section 6f
 docker compose -f docker-compose.yaml -f docker-compose.rebuild.yaml up -d --build
 docker compose logs -f certify | grep -m1 'INJI Certify -- Started'
 curl -s http://localhost:8090/v1/certify/.well-known/openid-credential-issuer | jq '.credential_configurations_supported | keys'
@@ -252,8 +253,38 @@ A public host (or any machine others can reach) runs `MDL_PKI_PROFILE=mdl-operat
 `docker-compose.public.yaml` as the last file: certify and certify-nginx on `127.0.0.1` only, no PostgreSQL port, and
 the PostgreSQL, keymanager and issuer keystore passwords from Compose secret files in `CERTIFY_SECRETS_DIR` (Compose
 2.24.4 or later; README "The public host"). That overlay also leaves `CERTIFY_KEYSTORE_PASSWORD` out of the container's
-environment even when the shell has it, exposes only actuator `health`, and removes the mimoto and inji-web ports;
-certify-nginx refuses `/v1/certify/actuator` to public requests. Its smoke run passes the public URL and pins the
+environment even when the shell has it, exposes only actuator `health`, removes the mimoto and inji-web ports, and
+puts the project on a network of its own (`<project>_network`) instead of the shared `mosip_network`. For a public
+(`CF-Ray`) request certify-nginx passes only an allow-list of wallet and verifier paths under `/v1/certify/` and
+refuses everything else with `403`: admin APIs, actuator, springdoc and the keymanager controllers the service scans
+in (`/sign`, `/jwtSign`, `/coseSign1`, `/encrypt`, ...). CI runs `docs/design/tools/check-public-guard.sh` (the nginx
+file against a stub upstream, on a docker network of its own) and `docs/design/tools/check-public-overlay.sh`
+(`docker compose config` with and without the public overlay, both PKI profiles: certify's environment differs only
+by the expected keys).
+
+**One project per network.** `docker-compose.yaml` joins every service to the external `mosip_network`, which all
+projects on the Docker host share. Never start a second project of this stack (another checkout, another `-p`, a
+throwaway run) on `mosip_network` while one is running: its `database`, `certify` and `certify-nginx` would register
+the same aliases there and Docker's DNS would mix the two stacks' connections. A second copy runs with
+`docker-compose.public.yaml` last (project-private network) and its own host ports, as the throwaway run below does:
+
+```bash
+cd "$(git rev-parse --show-toplevel)/docker-compose/docker-compose-injistack"
+cp docker-compose.public.yaml "$SCRATCH/public-28.yaml"      # the same overlay with the ports moved to 28090/28091
+sed -i.bak 's/127.0.0.1:8090:8090/127.0.0.1:28090:8090/; s/127.0.0.1:8091:80/127.0.0.1:28091:80/' "$SCRATCH/public-28.yaml"
+export MDL_PKI_PROFILE=mdl-dev CERTIFY_PUBLIC_URL=http://localhost:28091 CERTIFY_SECRETS_DIR="$SCRATCH/secrets"
+throwaway() { docker compose -p mdl-throwaway -f docker-compose.yaml -f docker-compose.rebuild.yaml \
+    -f docker-compose.mdl.yaml -f "$SCRATCH/public-28.yaml" "$@"; }
+throwaway up -d --no-build database certify certify-nginx mdl-seed   # network mdl-throwaway_network, not mosip_network
+(cd ../.. && .venv/bin/python docs/design/tools/smoke.py --mdl http://localhost:28091)
+throwaway down -v
+```
+
+`$SCRATCH/secrets` holds the three files of the README's secrets block (`keystore_password` too, which `mdl-dev` never
+reads). The ports-only copy can live anywhere: Compose resolves relative paths against the first file's directory.
+The bind mounts (`./data/MDL_PKI`, `./data/CERTIFY_PKCS12`, `./loader_path/certify-mdl/`) are this checkout's, so a
+throwaway run belongs in a checkout (or worktree) no running stack uses: `mdl-dev` writes its dev PKI into
+`./data/MDL_PKI` for one `CERTIFY_PUBLIC_URL`, and keymanager its keystore into `./data/CERTIFY_PKCS12`. Its smoke run passes the public URL and pins the
 offline IACA: `smoke.py --mdl "$CERTIFY_PUBLIC_URL" --iaca "$MDL_PKI_DIR/iaca.pem"`. Changing `CERTIFY_PUBLIC_URL`
 needs a fresh database and, in `mdl-dev`, a fresh `data/MDL_PKI`. With F-10 a status list's `sub` follows the current
 URL, so mDLs issued under the old one (whose MSO names the old list URI) must be reissued.

@@ -45,6 +45,18 @@ jobs:
         run: docs/design/tools/check-runtime-classpath.sh
         shell: bash
 
+      - name: Public host guards (certify-nginx allow-list, public overlay)
+        # M-12, D12: certify-nginx.conf in a throwaway nginx:stable on its own docker network, in front of a stub
+        # upstream: every wallet path passes for a CF-Ray request and every keymanager, springdoc, actuator and admin
+        # path (and the known evasions) is refused. Then `docker compose config` with and without
+        # docker-compose.public.yaml, in both PKI profiles: certify's environment differs only by the expected keys
+        # (its `environment: !override` list must follow the other files) and the network is project-private.
+        run: |
+          docker compose version
+          docs/design/tools/check-public-guard.sh
+          docs/design/tools/check-public-overlay.sh
+        shell: bash
+
       - uses: actions/setup-python@v5
         # verify_mdoc.py and its pinned requirements are tested on this interpreter, not whatever the runner ships
         with:

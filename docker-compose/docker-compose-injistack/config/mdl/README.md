@@ -71,8 +71,14 @@ checkout.
    # mdl-seed: created the credential configuration org.iso.18013.5.1.mDL   (or: already seeded, left as it is)
    ```
 
-   Add `-p <name>` to run it as a project of its own next to another copy of the injistack; the host ports (8090,
-   8091, 5433) are the same, so only one of them runs at a time.
+   `docker-compose.yaml` puts every service on the external network `mosip_network`, which all projects on the Docker
+   host share. **Never start a second project of this stack on `mosip_network` next to a running one** (another
+   checkout, a different `-p`, a throwaway smoke run): its `database`, `certify` and `certify-nginx` would register
+   the same aliases there, and Docker's DNS would then send either stack's connections to either copy (the running
+   stack's Certify talking to the other database, the other nginx proxying to this Certify). A second copy, on a
+   machine where another one already runs, adds `docker-compose.public.yaml` last, which moves the project onto a
+   network of its own (`<project>_network`), and uses host ports of its own (`docs/design/VALIDATE.md` 6f shows a
+   throwaway run on 28090/28091).
 
 **Ports.** `docker-compose.yaml` publishes certify on 8090, certify-nginx on 8091 and PostgreSQL on 5433 on every
 interface. On a laptop behind a firewall that is the farmer stack's behaviour; on a shared machine or a LAN anyone can
@@ -218,12 +224,18 @@ lines to swap are at the end of `certify-mdl-operator.properties`.
 
 The public host runs `mdl-operator` (never `mdl-dev`, whose keystore holds the IACA's private key) with
 `docker-compose.public.yaml` last in the file list. That overlay needs Docker Compose 2.24.4 or later
-(`docker compose version`; it uses `!override` and `!reset`) and does four things:
+(`docker compose version`; it uses `!override` and `!reset`) and does five things:
 
 - certify (8090) and certify-nginx (8091) listen on `127.0.0.1` only, and PostgreSQL (and mimoto and inji-web, which
   the mDL stack does not start) is not published at all. The
   tunnel connector runs on the host and forwards the public host to `http://127.0.0.1:8091` (M-12); a connector that
-  runs as a container instead joins `mosip_network` and forwards to `http://certify-nginx:80`.
+  runs as a container instead joins the project's network (below) and forwards to `http://certify-nginx:80`.
+- The stack runs on a network of its own project, `<project>_network` (`certify-mdl_network` for `-p certify-mdl`),
+  which Compose creates and removes, instead of the external `mosip_network` that every project on the host shares,
+  so no other stack can register a `database`, `certify` or `certify-nginx` alias next to this one. A containerised
+  tunnel connector joins it: `docker network connect certify-mdl_network <connector>`. A stack that ran on
+  `mosip_network` before moves to it on the next `up` of the start block below (Compose recreates the containers;
+  the database's volume, the keystores and the host-run connector's `127.0.0.1:8091` stay as they are).
 - The PostgreSQL password, the keymanager keystore password and the `issuer.p12` password come from files in
   `CERTIFY_SECRETS_DIR`, mounted as Compose secrets under `/run/secrets/`, never as environment variables. PostgreSQL
   reads its own with `POSTGRES_PASSWORD_FILE`; Certify reads the others with
@@ -241,22 +253,33 @@ The public host runs `mdl-operator` (never `mdl-dev`, whose keystore holds the I
   would otherwise reach the container (`docker inspect`) and, as an environment variable, outrank the secret file.
 - Actuator exposes only `health` and never shows environment values (`MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE=health`,
   `MANAGEMENT_ENDPOINT_ENV_SHOW_VALUES=NEVER`), since the secrets are part of Certify's Environment.
-- Nothing else changes: the same profiles, mounts and seed.
+- Nothing else changes: the same profiles, mounts and seed. `docs/design/tools/check-public-overlay.sh` (CI) renders
+  `docker compose config` with and without the overlay in both PKI profiles and fails when certify's environment
+  differs by anything but the four keys above (`CERTIFY_KEYSTORE_PASSWORD` removed; `SPRING_CONFIG_IMPORT` and the two
+  actuator keys added) or the network is not the project's own.
 
 Make the secrets once, outside the checkout, readable by the deploying user alone. The subshell keeps `umask 077` (and
 the password variable) out of your shell; `printf '%s'` and `tr -d '\n'` write no trailing newline (Certify and
-PostgreSQL would drop one anyway):
+PostgreSQL would drop one anyway). Each file is written only when it does not exist yet (`[ -e ] ||`, and `set -C` so
+a redirection never overwrites one), so pasting the block a second time keeps the passwords a running stack already
+uses; a new `db_password` or `keymanager_keystore_password` would lock it out of its database and keystore:
 
 ```bash
 (
-  umask 077
-  mkdir -p "$HOME/certify-mdl-secrets"
-  openssl rand -base64 24 | tr -d '\n' > "$HOME/certify-mdl-secrets/db_password"
-  openssl rand -base64 24 | tr -d '\n' > "$HOME/certify-mdl-secrets/keymanager_keystore_password"
+  umask 077; set -C
+  d="$HOME/certify-mdl-secrets"
+  mkdir -p "$d"
+  [ -e "$d/db_password" ] || openssl rand -base64 24 | tr -d '\n' > "$d/db_password"
+  [ -e "$d/keymanager_keystore_password" ] || openssl rand -base64 24 | tr -d '\n' > "$d/keymanager_keystore_password"
   # the issuer.p12 password from certify-cli; bash; in zsh: read -rs 'p?issuer.p12 password: '
-  read -rs -p 'issuer.p12 password: ' p; echo; printf '%s' "$p" > "$HOME/certify-mdl-secrets/keystore_password"
+  [ -e "$d/keystore_password" ] || { read -rs -p 'issuer.p12 password: ' p; echo; printf '%s' "$p" > "$d/keystore_password"; }
+  ls -l "$d"
 )
 ```
+
+The overlay names all three files whatever the PKI profile, and Compose refuses to start without each of them: a
+throwaway `mdl-dev` stack with the public overlay (`docs/design/VALIDATE.md` 6f) needs a `keystore_password` file too,
+whose content `mdl-dev` never reads (any value, for example the output of `openssl rand -base64 24`).
 
 Start (or restart, or update) the public stack. The block is safe to paste again at any time: it changes nothing a
 running stack keeps (database, keystores). The compose project is named on every command (`-p certify-mdl`, the public
@@ -307,9 +330,21 @@ Then run the start block.
 
 Switching it later needs a fresh database (and in dev mode a fresh `data/MDL_PKI`): "Changing CERTIFY_PUBLIC_URL".
 
-certify-nginx refuses the admin APIs (`v2/credential-configurations`, `system-info`, `credentials/status`,
-`ledger-search`, `vc-api`) and Spring Boot actuator (`/v1/certify/actuator`, health included) to requests that arrive
-through Cloudflare (`CF-Ray`, D12). `/pre-authorized-data`, the offer page and `/mdoc/iaca` (GET only) stay public.
+For requests that arrive through Cloudflare (`CF-Ray`, D12), certify-nginx passes only an **allow-list** of paths
+under `/v1/certify/`, each with its methods (`map $certify_public_allowed` in `certify-nginx.conf`): the issuer,
+did:web, JWKS and authorization server metadata (GET); the legacy and draft-13 credential endpoints (`issuance/credential`,
+`issuance/vd11/credential`, `issuance/vd12/credential`), the OpenID4VCI 1.0 `oid4vci/` (and `t/<tenant>/oid4vci/`)
+`credential`, `nonce` and `notification`, the legacy `nonce`, `oauth/token`, `oauth/par`, `oauth/iae` and
+`pre-authorized-data` (POST); `oauth/authorize`, the offer page, `credential-offer-data/<id>`, both status lists,
+`rendering-template/<id>` and `mdoc/iaca` (GET and HEAD); and CORS preflight (OPTIONS) on those. Everything else under
+`/v1/certify/` is refused with `403`: the admin APIs (v1 `credential-configurations`, `v2/credential-configurations`,
+`system-info`, `credentials/status`, `ledger-search`, `vc-api`), Spring Boot actuator (`/v1/certify/actuator`, health
+included), springdoc (`swagger-ui`, `v3/api-docs`) and the keymanager controllers the service scans in (`/sign`,
+`/jwtSign`, `/coseSign1`, `/encrypt`, `/decrypt` and the rest), as well as a wrong method, a trailing slash and an
+extra path segment. The admin locations keep their own refusal as a second layer, and a `;` (or `%3b`) in a public
+request's path is refused before any of it. `docs/design/tools/check-public-guard.sh` (CI) runs `certify-nginx.conf`
+against a stub upstream and asserts both lists; a new wallet endpoint goes into the map and the script together. The
+root-level `/.well-known/*` and `/oid4vci/` locations are public as before.
 The public overlay also exposes only `health` from actuator and never shows environment values
 (`certify-default.properties` exposes every endpoint, and `/actuator/env` or `/actuator/heapdump` would carry the
 secret-file passwords and the Document Signer key). Nothing in the stack calls actuator: the seed waits until

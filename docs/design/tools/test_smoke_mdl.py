@@ -122,6 +122,11 @@ class CborTagged(unittest.TestCase):
             with self.assertRaises((ValueError, IndexError)):
                 s.cbor_tagged(bad)
 
+    def test_unreadable_element_bytes_give_none(self):
+        # truncated, trailing, and a map with an array key (unhashable: TypeError)
+        for bad in (bytes.fromhex("82 01"), bytes.fromhex("01 02"), bytes.fromhex("a1 80 01")):
+            self.assertIsNone(s.element_value_tagged(bad))
+
 
 class StatusListProblems(unittest.TestCase):
     URI = "https://issuer.example/v1/certify/status/1"

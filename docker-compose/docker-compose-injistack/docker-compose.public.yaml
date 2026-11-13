@@ -8,6 +8,9 @@
 # mimoto-service and inji-web are not part of the mDL stack; their ports are removed here too, so starting one by
 # mistake publishes nothing (they would still run on the defaults of docker-compose.yaml, which is not hardened).
 #
+# The stack runs on a network of its own project (4. below), never on the shared mosip_network.
+# docs/design/tools/check-public-overlay.sh (CI) asserts what this file changes in certify's environment and network.
+#
 # Needs Docker Compose 2.24.4 or later (`!override` and `!reset`); an older Compose fails on the tags instead of
 # silently keeping the base file's ports.
 #
@@ -95,3 +98,14 @@ secrets:
     file: ${CERTIFY_SECRETS_DIR:?set CERTIFY_SECRETS_DIR}/keymanager_keystore_password
   keystore_password:
     file: ${CERTIFY_SECRETS_DIR:?set CERTIFY_SECRETS_DIR}/keystore_password
+
+# 4. Network. docker-compose.yaml joins every service to the external network mosip_network, shared by every project on
+#    the Docker host. A second copy of this stack on it (another checkout, a throwaway smoke run, a different -p) would
+#    register a second `database`, `certify` and `certify-nginx` alias there, and Docker's DNS would then send this
+#    stack's connections to either copy at random. Here the network is the project's own (`<project>_network`, created
+#    and removed by Compose), so two projects never share an alias. A tunnel connector that runs as a container instead
+#    of on the host joins that network (`docker network connect certify-mdl_network <connector>` for project
+#    certify-mdl) and forwards to http://certify-nginx:80.
+networks:
+  network: !override
+    driver: bridge
