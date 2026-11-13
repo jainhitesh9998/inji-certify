@@ -445,7 +445,7 @@ Every package below shares these:
   ```bash
   export JAVA_HOME=$(/usr/libexec/java_home -v 21)
   M="mvn -B -ntp -s .mvn/settings-local.xml -Dmaven.legacyLocalRepo=true -Dgpg.skip=true -Dmaven.gitcommitid.skip=true"
-  $M -DskipTests install && $M test
+  $M verify      # from the repo root; never `install` from a worktree (the ~/.m2 is shared)
   ```
 
 - Each package ends with its acceptance checklist ticked, with the test or command that proves each item.
