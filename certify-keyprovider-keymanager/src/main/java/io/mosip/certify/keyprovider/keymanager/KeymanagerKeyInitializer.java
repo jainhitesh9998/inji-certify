@@ -85,6 +85,8 @@ public class KeymanagerKeyInitializer implements ApplicationRunner {
         }
         log.info("===================== CERTIFY_PARTNER MASTER KEY CHECK ========================");
         keymanagerService.generateMasterKey(OBJECT_TYPE_CSR, KeymanagerKeyProvider.request(CERTIFY_PARTNER_APP_ID, ""));
+        // anything read before the master keys existed (e.g. CERTIFY_SERVICE for the JWKS) is read again
+        keyProvider.evict();
     }
 
     /** The legacy four in their historical order, then mapper entries not already covered. */

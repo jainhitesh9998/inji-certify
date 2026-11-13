@@ -900,10 +900,14 @@ class IssuanceGoldenTest {
     }
 
     /**
-     * The {@code mso_mdoc-summary} recorded on {@code design/extensibility} (copied from
-     * {@code git show design/extensibility:certify-service/src/test/resources/goldens/legacy-develop/issuance/mso_mdoc-summary.json}).
-     * When that ref is available the copy is checked against git, so it cannot drift silently.
+     * The {@code mso_mdoc-summary} recorded on {@code design/extensibility} before M-03 changed the shared template (copied
+     * from {@code git show ce1211ef:certify-service/src/test/resources/goldens/legacy-develop/issuance/mso_mdoc-summary.json},
+     * the integration commit just before the M-02/M-03 merge). The commit is pinned: the branch ref moved past the recording
+     * once M-03 merged. When that commit is available the copy is checked against git, so it cannot drift silently.
      */
+    /** The integration commit holding the pre-M-03 {@code legacy-develop} mDoc recording (see the decision log, 2026-11-13). */
+    private static final String BASELINE_COMMIT = "ce1211ef";
+
     private com.fasterxml.jackson.databind.JsonNode designExtensibilityMdocSummary() throws Exception {
         Path copy = Path.of("src/test/resources/goldens/legacy-develop/issuance/mso_mdoc-summary.design-extensibility.json");
         if (!Files.exists(copy)) {
@@ -912,7 +916,7 @@ class IssuanceGoldenTest {
         String recorded = Files.readString(copy, StandardCharsets.UTF_8);
         try {
             Process git = new ProcessBuilder("git", "show",
-                    "design/extensibility:certify-service/src/test/resources/goldens/legacy-develop/issuance/mso_mdoc-summary.json")
+                    BASELINE_COMMIT + ":certify-service/src/test/resources/goldens/legacy-develop/issuance/mso_mdoc-summary.json")
                     .redirectErrorStream(true).start();
             String fromGit = new String(git.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
             if (git.waitFor() == 0 && !fromGit.isBlank()) {
@@ -920,7 +924,7 @@ class IssuanceGoldenTest {
                         "the checked-in baseline must be the design/extensibility recording");
             }
         } catch (Exception ignored) {
-            // no git or no such ref (a CI checkout of this branch): the checked-in copy is the baseline
+            // no git or no such commit (a shallow CI checkout): the checked-in copy is the baseline
         }
         return objectMapper.readTree(recorded);
     }

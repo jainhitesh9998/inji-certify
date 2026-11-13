@@ -1,5 +1,6 @@
 package io.mosip.certify.keyprovider.jca;
 
+import io.mosip.certify.pki.IsoMdocProfiles;
 import io.mosip.certify.signing.SignatureAlgorithm;
 import io.mosip.certify.signing.SigningException;
 import org.bouncycastle.asn1.x500.X500Name;
@@ -24,6 +25,7 @@ import java.security.cert.X509Certificate;
 import java.security.interfaces.ECPublicKey;
 import java.security.interfaces.RSAPublicKey;
 import java.security.spec.ECGenParameterSpec;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Date;
@@ -99,6 +101,55 @@ final class DevKeys {
         } catch (GeneralSecurityException | org.bouncycastle.operator.OperatorCreationException
                  | org.bouncycastle.cert.CertIOException e) {
             throw new SigningException("Cannot generate a dev key signed by " + caCertificate.getSubjectX500Principal(), e);
+        }
+    }
+
+    /**
+     * An ISO/IEC 18013-5:2021 Annex B IACA (decision D3: dev mode generates one for local runs) from
+     * {@code certify-pki}, so the certificate is the one {@code AnnexBValidator} accepts.
+     */
+    static Generated generateIaca(MdocIacaSpec spec) {
+        try {
+            KeyPair keyPair = keyPair(spec.algorithm());
+            IsoMdocProfiles.IacaBuilder builder = IsoMdocProfiles.iaca(keyPair)
+                    .country(spec.country())
+                    .commonName(spec.commonName())
+                    .crlDistributionPoint(spec.crlUri());
+            if (spec.state() != null && !spec.state().isBlank()) {
+                builder.state(spec.state());
+            }
+            if (spec.issuerAltUri() != null) {
+                builder.issuerAltUri(spec.issuerAltUri());
+            }
+            if (spec.issuerAltEmail() != null) {
+                builder.issuerAltEmail(spec.issuerAltEmail());
+            }
+            if (spec.validityYears() != null) {
+                builder.validity(Duration.ofDays(365L * spec.validityYears()));
+            }
+            return new Generated(keyPair.getPrivate(), builder.build());
+        } catch (GeneralSecurityException e) {
+            throw new SigningException("Cannot generate an Annex B IACA for " + spec.commonName(), e);
+        }
+    }
+
+    /**
+     * An ISO/IEC 18013-5:2021 Annex B Document Signer signed by {@code iaca}: country, state, issuerAltName and CRL
+     * distribution point come from the IACA, the keyUsage/EKU profile from {@code certify-pki}.
+     */
+    static Generated generateDsc(SignatureAlgorithm algorithm, String commonName, Integer validityDays,
+                                 PrivateKey iacaKey, X509Certificate iaca) {
+        try {
+            KeyPair keyPair = keyPair(algorithm);
+            IsoMdocProfiles.DsBuilder builder = IsoMdocProfiles
+                    .ds(keyPair, iaca, new KeyPair(iaca.getPublicKey(), iacaKey))
+                    .commonName(commonName);
+            if (validityDays != null) {
+                builder.validity(Duration.ofDays(validityDays));
+            }
+            return new Generated(keyPair.getPrivate(), builder.build());
+        } catch (GeneralSecurityException e) {
+            throw new SigningException("Cannot generate an Annex B Document Signer for " + commonName, e);
         }
     }
 
