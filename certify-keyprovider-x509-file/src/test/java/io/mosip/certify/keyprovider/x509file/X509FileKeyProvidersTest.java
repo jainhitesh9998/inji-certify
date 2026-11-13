@@ -49,6 +49,39 @@ class X509FileKeyProvidersTest {
         assertEquals(64, signature.length, "ES256 concatenated R||S");
     }
 
+    /**
+     * F-10: the dev-mode keystore holds private keys, so it is created rw------- whatever the umask (the JVM cannot set
+     * its own; the test first shows the umask in force would leave a plain file readable by group or others, as 022
+     * does), and a keystore written by an older release with rw-r--r-- becomes rw------- when dev mode adds a key to it.
+     */
+    @Test
+    void theDevModeKeystoreIsOwnerOnlyUnderAPermissiveUmask() throws Exception {
+        Path keys = Files.createDirectories(dir.resolve("perm"));
+        org.junit.jupiter.api.Assumptions.assumeTrue(Files.getFileStore(keys).supportsFileAttributeView(java.nio.file.attribute.PosixFileAttributeView.class),
+                "POSIX permissions");
+        Path plain = keys.resolve("plain.bin");
+        Files.write(plain, new byte[] {1});
+        java.util.Set<java.nio.file.attribute.PosixFilePermission> umasked = Files.getPosixFilePermissions(plain);
+        org.junit.jupiter.api.Assumptions.assumeTrue(umasked.contains(java.nio.file.attribute.PosixFilePermission.GROUP_READ)
+                || umasked.contains(java.nio.file.attribute.PosixFilePermission.OTHERS_READ), "a umask such as 022 that leaves new files readable: " + umasked);
+        java.util.Set<java.nio.file.attribute.PosixFilePermission> ownerOnly = java.nio.file.attribute.PosixFilePermissions.fromString("rw-------");
+
+        Path file = keys.resolve("issuer.p12");
+        X509FileKeyProviders.open(props(file, true, List.of(new X509FileProperties.KeySpec("a", "ES256", "CN=a"))));
+        assertEquals(ownerOnly, Files.getPosixFilePermissions(file), "created owner-only");
+
+        Files.setPosixFilePermissions(file, java.nio.file.attribute.PosixFilePermissions.fromString("rw-r--r--")); // as an older release left it
+        JcaKeyProvider grown = X509FileKeyProviders.open(props(file, true, List.of(new X509FileProperties.KeySpec("a", "ES256", "CN=a"),
+                new X509FileProperties.KeySpec("b", "EdDSA", "CN=b"))));
+        assertEquals(ownerOnly, Files.getPosixFilePermissions(file), "replaced owner-only");
+        assertTrue(grown.aliases().containsAll(List.of("a", "b")));
+        assertTrue(X509FileKeyProviders.open(props(file, false, List.of(new X509FileProperties.KeySpec("b", "EdDSA", "CN=b")))).aliases().contains("b"),
+                "the replaced keystore loads");
+        try (var listing = Files.list(keys)) {
+            assertEquals(List.of("issuer.p12", "plain.bin"), listing.map(p -> p.getFileName().toString()).sorted().toList(), "no temporary file left");
+        }
+    }
+
     @Test
     void productionRefusesMissingFilesAndMissingKeys() {
         Path file = dir.resolve("prod.p12");

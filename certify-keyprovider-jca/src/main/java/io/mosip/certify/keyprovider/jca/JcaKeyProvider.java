@@ -18,8 +18,13 @@ import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.math.BigInteger;
 import java.security.GeneralSecurityException;
 import java.security.KeyPair;
@@ -302,7 +307,10 @@ public class JcaKeyProvider implements KeyProvider {
         entries.put(alias, new Entry(alias, privateKey, descriptor));
     }
 
-    /** Writes every key into a PKCS#12 keystore, e.g. to persist dev-mode keys between runs. */
+    /**
+     * Writes every key into a PKCS#12 keystore, e.g. to persist dev-mode keys between runs. The file holds private keys,
+     * so it is written owner-only ({@link #writeOwnerOnly}), whatever the process umask.
+     */
     public void saveAsPkcs12(Path path, char[] password) {
         try {
             KeyStore keyStore = KeyStore.getInstance("PKCS12");
@@ -311,11 +319,49 @@ public class JcaKeyProvider implements KeyProvider {
                 keyStore.setKeyEntry(entry.alias(), entry.privateKey(), password,
                         entry.descriptor().chain().leafFirst().toArray(new Certificate[0]));
             }
-            try (OutputStream out = Files.newOutputStream(path)) {
-                keyStore.store(out, password);
-            }
+            writeOwnerOnly(path, out -> keyStore.store(out, password));
         } catch (IOException | GeneralSecurityException e) {
             throw new SigningException("Cannot write PKCS#12 keystore " + path, e);
+        }
+    }
+
+    /** What {@link #writeOwnerOnly} writes into the file. */
+    @FunctionalInterface
+    public interface FileContent {
+        void writeTo(OutputStream out) throws IOException, GeneralSecurityException;
+    }
+
+    static final Set<PosixFilePermission> OWNER_ONLY = PosixFilePermissions.fromString("rw-------");
+
+    /**
+     * Writes a file that holds key material: into a temporary file in the same directory created {@code rw-------}
+     * (POSIX; the mode is set at creation, so the umask can only narrow it and the keys are never readable by others,
+     * not even while being written), then moved over the target atomically, so a crash leaves the previous file whole.
+     * A replaced file takes the new file's {@code rw-------}. On a file system without POSIX permissions the file is
+     * written all the same and a warning asks the operator to restrict it.
+     */
+    public static void writeOwnerOnly(Path path, FileContent content) throws IOException, GeneralSecurityException {
+        Path target = path.toAbsolutePath();
+        Path directory = target.getParent();
+        boolean posix = Files.getFileStore(directory).supportsFileAttributeView(PosixFileAttributeView.class);
+        Path temporary = posix
+                ? Files.createTempFile(directory, target.getFileName().toString(), ".tmp", PosixFilePermissions.asFileAttribute(OWNER_ONLY))
+                : Files.createTempFile(directory, target.getFileName().toString(), ".tmp");
+        if (!posix) {
+            System.getLogger(JcaKeyProvider.class.getName()).log(System.Logger.Level.WARNING,
+                    "{0} holds private keys but its file system has no POSIX permissions; restrict access to it", target);
+        }
+        try {
+            try (OutputStream out = Files.newOutputStream(temporary)) {
+                content.writeTo(out);
+            }
+            try {
+                Files.move(temporary, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(temporary, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+        } finally {
+            Files.deleteIfExists(temporary);
         }
     }
 

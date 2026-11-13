@@ -148,6 +148,8 @@ An issuer can name the ISO/IEC 18013-5 IACAs its mDoc Document Signers chain to 
 
 - v2 configuration API errors. `POST`/`PUT /v2/credential-configurations` now require `scope`, `display.display` and `display.order` (empty lists are allowed) and answer `400 invalid_configuration` naming the missing field; a body without `display.order` used to reach the database and come back as HTTP 200 with the MOSIP error envelope and the SQL statement. Whatever else fails on the v2 API is answered with a 4xx or 5xx status and `{error, error_description}`, without SQL text: a unique-key conflict is `409 configuration_exists`, another database constraint `400 invalid_configuration`, an unreadable body `400`, an unexpected failure `500 server_error`. The v1 API is unchanged.
 
+- Generated keystores are owner-only. The `x509-file` provider's dev-mode PKCS#12 (and any keystore `JcaKeyProvider.saveAsPkcs12` writes) is created `rw-------` through a temporary file in the same directory and an atomic move, so it is never readable by other users, whatever the umask, not even while it is written; a keystore an earlier release left `rw-r--r--` becomes `rw-------` the next time dev mode adds a key to it (otherwise run `chmod 600` on it). On a file system without POSIX permissions a warning asks the operator to restrict the file. Keymanager's own PKCS#12 (`mosip.kernel.keymanager.hsm.config-path`) is created by kernel-keymanager and is unchanged.
+
 ## Removal of  Artifactory dependency
 
 ```text
