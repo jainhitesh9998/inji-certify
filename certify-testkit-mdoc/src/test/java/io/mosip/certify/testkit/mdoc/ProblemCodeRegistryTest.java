@@ -43,7 +43,8 @@ class ProblemCodeRegistryTest {
         Map<String, List<String>> expected = new LinkedHashMap<>();
         expected.put("statusList.mso", List.of("malformed"));
         expected.put("statusList.http", List.of("contentType"));
-        expected.put("statusList.envelope", List.of("notTagged18", "cwtTag61", "mac0", "detachedPayload"));
+        expected.put("statusList.envelope", List.of("notTagged18", "cwtTag61", "mac0", "detachedPayload",
+                "duplicateKey"));
         expected.put("statusList.typ", List.of("missing", "unprotected", "notText", "wrong"));
         expected.put("statusList.x5chain", List.of("missing", "unprotectedOnly", "carriesAnchor", "serialNumber"));
         expected.put("statusList.signature", List.of("invalid:multipaz", "invalid:authlete"));

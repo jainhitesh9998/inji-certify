@@ -5,8 +5,13 @@
  */
 package io.mosip.certify.testkit.mdoc;
 
+import com.authlete.cbor.CBORByteArray;
 import com.authlete.cbor.CBORDecoder;
+import com.authlete.cbor.CBORDecoderOptions;
 import com.authlete.cbor.CBORItem;
+import com.authlete.cbor.CBORItemList;
+import com.authlete.cbor.CBORPair;
+import com.authlete.cbor.CBORPairList;
 import com.authlete.cbor.CBORTaggedItem;
 import com.authlete.cose.COSESign1;
 import com.authlete.cose.COSEVerifier;
@@ -43,6 +48,7 @@ import java.security.cert.X509Certificate;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -78,7 +84,8 @@ import java.util.regex.Pattern;
  *       {uri: tstr, idx: uint} that points at the list)</td></tr>
  *   <tr><td>{@code statusList.http}</td><td>TSL 8.2 (content type)</td></tr>
  *   <tr><td>{@code statusList.envelope}</td><td>TSL 5.2, RFC 9052 4.2 (tag 18, never CWT tag 61; no MAC0; no
- *       detached payload)</td></tr>
+ *       detached payload); RFC 9052 3, RFC 8392 7.2 steps 1 and 7, RFC 8949 5.3.1 and 5.6.1 (no map of the headers
+ *       or the claims carries a key twice)</td></tr>
  *   <tr><td>{@code statusList.typ}</td><td>TSL 5.2, RFC 9596 (protected {@code typ} =
  *       {@code application/statuslist+cwt})</td></tr>
  *   <tr><td>{@code statusList.x5chain}</td><td>ISO/IEC 18013-5 second edition 12.3.6.3 (protected {@code x5chain}),
@@ -87,7 +94,8 @@ import java.util.regex.Pattern;
  *   <tr><td>{@code statusList.chain}</td><td>ISO/IEC 18013-5 second edition 12.3.6.2 (trust point = IACA)</td></tr>
  *   <tr><td>{@code statusList.issuanceChain}</td><td>Credo {@code mdocUtil.ts:76-115}</td></tr>
  *   <tr><td>{@code statusList.claims}</td><td>TSL 5.2, 8.3 steps 4a/4c; ISO/IEC 18013-5 second edition 12.3.6.3
- *       ({@code exp} shall be present)</td></tr>
+ *       ({@code exp} shall be present); RFC 8392 3.1.4 and RFC 7519 4.1.4 (the evaluation time must be before
+ *       {@code exp})</td></tr>
  *   <tr><td>{@code statusList.list}</td><td>TSL 4.1, 8.3 step 6; ISO/IEC 18013-5 second edition 12.3.6.5
  *       ({@code bits} = 1)</td></tr>
  *   <tr><td>{@code statusList.signerPurpose}</td><td>Credo {@code assertStatusListSignerKeyPurpose.ts:14-25}</td></tr>
@@ -162,8 +170,12 @@ public final class IndependentStatusListVerifier {
     static final long IAT_FUTURE_SKEW_SECONDS = 5;
     /** Multipaz's {@code fromCwt} default {@code maxValidity} (365 days), which {@code CachingRevocationChecker} uses. */
     static final long MAX_VALIDITY_SECONDS = 365L * 24 * 3600;
-    /** The {@code bits} values Multipaz's {@code CompressedStatusList} constructor accepts (ISO2 12.3.6.5 wants 1). */
-    static final Set<Long> FROM_CWT_BITS = Set.of(1L, 2L, 4L, 8L);
+    /**
+     * The {@code bits} values Multipaz's {@code CompressedStatusList} constructor accepts (ISO2 12.3.6.5 wants 1),
+     * compared after {@code fromStatusListClaim}'s own narrowing of the {@code Uint} to an {@code int}
+     * ({@code Uint.getValue}, then {@code l2i} in the 0.102.0 bytecode), so {@code 4294967297} reads as 1 there.
+     */
+    static final Set<Integer> FROM_CWT_BITS = Set.of(1, 2, 4, 8);
     static final int MAX_SERIAL_OCTETS = 20;
 
     private static final Pattern CODE = Pattern.compile("([A-Za-z][A-Za-z0-9]*)(?::([A-Za-z0-9_./-]+))?");
@@ -172,7 +184,7 @@ public final class IndependentStatusListVerifier {
         Map<String, List<String>> codes = new LinkedHashMap<>();
         codes.put(CHECK_MSO, List.of("malformed"));
         codes.put(CHECK_HTTP, List.of("contentType"));
-        codes.put(CHECK_ENVELOPE, List.of("notTagged18", "cwtTag61", "mac0", "detachedPayload"));
+        codes.put(CHECK_ENVELOPE, List.of("notTagged18", "cwtTag61", "mac0", "detachedPayload", "duplicateKey"));
         codes.put(CHECK_TYP, List.of("missing", "unprotected", "notText", "wrong"));
         codes.put(CHECK_X5CHAIN, List.of("missing", "unprotectedOnly", "carriesAnchor", "serialNumber"));
         codes.put(CHECK_SIGNATURE, List.of("invalid:multipaz", "invalid:authlete"));
@@ -307,6 +319,11 @@ public final class IndependentStatusListVerifier {
         private final byte[] body;
         /** Non-null when the body is not a COSE_Sign1 CWT at all; every check that needs it reports notRun. */
         private String parseError;
+        /**
+         * Non-null when a map of the headers or the claims carries a key twice: the token is malformed (RFC 9052 3,
+         * RFC 8392 7.2), so nothing is read from its maps and every check that needs them reports notRun.
+         */
+        private String duplicateKeys;
         /** Every tag the body carried, outermost first: {@code 18} alone is the only shape TSL 5.2 allows. */
         private List<Long> tags = List.of();
         private Map<CoseLabel, DataItem> protectedHeaders = new LinkedHashMap<>();
@@ -348,6 +365,14 @@ public final class IndependentStatusListVerifier {
                 }
                 List<DataItem> array = item.getAsArray();
                 token.coseArray = item;
+                // Multipaz's decoder already kept one value per key (the last); the wire is read again, before any
+                // header or claim is looked at, so a key sent twice is refused instead of resolved by that choice.
+                String duplicates = DuplicateKeys.find(body);
+                if (duplicates != null) {
+                    token.duplicateKeys = duplicates;
+                    token.detached = array.get(2).getMajorType() == MajorType.SPECIAL;
+                    return token;
+                }
                 if (array.get(0).getMajorType() != MajorType.BYTE_STRING) {
                     token.parseError = "the COSE_Sign1 protected header is not a bstr";
                     return token;
@@ -407,6 +432,13 @@ public final class IndependentStatusListVerifier {
             if (parseError != null) {
                 problems.add("notTagged18", "not a status-list CWT: " + parseError);
                 return null;
+            }
+            if (duplicateKeys != null) {
+                problems.add("duplicateKey", duplicateKeys + "; RFC 8949 5.3.1 makes a map with a key twice invalid "
+                        + "CBOR whose decoders keep one value or the other (Multipaz keeps the last, Authlete both), "
+                        + "RFC 9052 3: \"if a label appears multiple times, the message MUST be rejected as "
+                        + "malformed\", and RFC 8392 7.2 steps 1 and 7 reject a CWT that is not valid CBOR or whose "
+                        + "claims are not a valid CBOR map — so no claim or header of this token is read");
             }
             if (tags.isEmpty()) {
                 problems.add("notTagged18", "the COSE_Sign1 is untagged; TSL 5.2 requires COSE_Sign1_Tagged (18) "
@@ -657,14 +689,17 @@ public final class IndependentStatusListVerifier {
                 return "the x5chain validates to " + iaca.getSubjectX500Principal() + "; fromCwt refused for a reason one "
                         + "of the checks it also makes already reports (" + describe(fromCwtRefusal) + ")";
             }
-            Long exp = claims == null ? null : numeric(claims, CLAIM_EXP);
-            boolean beyondMaxValidity = exp != null && exp > at.getEpochSecond() + MAX_VALIDITY_SECONDS;
+            if (beyondMaxValidity(at)) {
+                problems.add("untrusted", fromCwtReason + ": maxValidity — exp " + numericDate(numeric(claims, CLAIM_EXP))
+                        + " is more than 365 days after " + at + ", the wallet default in CachingRevocationChecker, and "
+                        + "validateCwt refuses that before it looks at typ, sub, the signature or the list, so this is "
+                        + "the reason whatever else is reported; the chain itself validates to "
+                        + iaca.getSubjectX500Principal());
+                return null;
+            }
             problems.add("untrusted", fromCwtReason + ", and no defect fromCwt refuses on is reported by another check: "
-                    + (beyondMaxValidity
-                            ? "most likely maxValidity — exp " + Instant.ofEpochSecond(exp) + " is more than 365 days after "
-                                    + at + ", the wallet default in CachingRevocationChecker"
-                            : "the refusal comes from a rule no check names")
-                    + "; the chain itself validates to " + iaca.getSubjectX500Principal());
+                    + "the refusal comes from a rule no check names; the chain itself validates to "
+                    + iaca.getSubjectX500Principal());
             return null;
         }
 
@@ -721,9 +756,14 @@ public final class IndependentStatusListVerifier {
                 problems.add("expMissing", "the CWT has no integer exp (claim 4); ISO/IEC 18013-5 second edition 12.3.6.3: "
                         + "\"The exp claim shall be present.\" (TSL 5.2 only RECOMMENDS it; an mdoc list always has one)");
             } else {
-                if (exp < at.getEpochSecond()) {
-                    problems.add("expired", "exp is " + Instant.ofEpochSecond(exp) + ", before " + at + "; TSL 8.3 step 4c "
-                            + "checks the expiration time");
+                // at >= exp at full precision: exp is whole seconds and getEpochSecond() floors, so for an exp of S
+                // the token is expired from S.000000000 on, and at S - 1 ns it is not
+                if (exp <= at.getEpochSecond()) {
+                    problems.add("expired", "exp is " + numericDate(exp) + ", and " + at + " is not before it; TSL 5.2 "
+                            + "takes exp from RFC 8392 3.1.4, whose RFC 7519 4.1.4 rule is that \"the current date/time "
+                            + "MUST be before the expiration date/time\" (the token is not accepted on or after exp), and "
+                            + "TSL 8.3 step 4c checks it. Multipaz 0.102.0's validateCwt refuses only exp < now, so exactly "
+                            + "at exp this check alone refuses");
                 }
                 X509Certificate leaf = chain.isEmpty() ? null : chain.get(0);
                 if (leaf != null && exp > leaf.getNotAfter().toInstant().getEpochSecond()) {
@@ -805,73 +845,99 @@ public final class IndependentStatusListVerifier {
 
         /**
          * Whether {@code CompressedStatusList.fromCwt} refuses this token for a defect one of our checks reports, read
-         * from the token's own state rather than from check names. Verified against the Multipaz 0.102.0 bytecode:
+         * from the token's own state rather than from check names, and in the order Multipaz itself decides. Verified
+         * against the Multipaz 0.102.0 bytecode:
          * <ul>
-         *     <li>{@code ValidateCwtKt.validateCwt-efNRYWU} unwraps at most one tag 18 (an untagged COSE_Sign1 and
-         *     exactly {@code [18]} are accepted; a second tag, or any other tag, fails {@code getAsCoseSign1}), so
-         *     {@code notTagged18} explains a refusal only for a parse failure or such a tag stack, never for an
-         *     untagged token;</li>
+         *     <li>{@code ValidateCwtKt.validateCwt-efNRYWU} first decodes the body, unwraps at most one tag 18 (an
+         *     untagged COSE_Sign1 and exactly {@code [18]} are accepted; a second tag, or any other tag, fails
+         *     {@code getAsCoseSign1}) and decodes the payload as a map — so a parse failure, a detached payload and
+         *     such a tag stack explain a refusal, never an untagged token. A duplicate key is not one of its refusals
+         *     (its decoder keeps the last value), but such a token never gets here: the chain check is notRun;</li>
+         *     <li>it then reads {@code exp} ({@code WebTokenClaim.get}): a present non-integer {@code exp} refuses;
+         *     {@code exp} present refuses when it is before now ({@code exp == now} is accepted, so {@code expired} at
+         *     exactly {@code exp} explains nothing) and, <b>before typ, sub, the signature or the list are looked at</b>,
+         *     when it is more than {@code maxValidity} (365 days) after now — no check of ours names that, so it is
+         *     decided here, and a token past it is never explained by anything checked later; {@code exp} absent reads
+         *     {@code iat} ({@code "either 'exp' or 'iat' is required"}, {@code "'iat' is in future"} beyond 5 s) and
+         *     derives {@code exp} from it, which cannot exceed maxValidity;</li>
          *     <li>its {@code checks} map carries TYP and SUB, and it verifies the COSE signature — so any
          *     {@code statusList.typ}, {@code statusList.signature} or {@code subMismatch} failure explains one;</li>
-         *     <li>{@code exp} is read first ({@code WebTokenClaim.get}), so a present non-integer {@code exp} refuses;
-         *     {@code exp} absent reads {@code iat} ({@code "either 'exp' or 'iat' is required"}, {@code "'iat' is in
-         *     future"} beyond 5 s) and then computes {@code iat + maxValidity} — so {@code iatMissing}/{@code iatFuture}
-         *     explain only when {@code exp} is absent, {@code expired} explains always, and maxValidity (no code of
-         *     ours) never does;</li>
          *     <li>{@code CompressedStatusList$Companion.fromCborMap} reads {@code ttl} only in its exp-absent branch
-         *     ({@code ttl.asNumber}), so a non-integer {@code ttl} refuses only without {@code exp}; with {@code exp}
-         *     present {@code ttl} is not read at all;</li>
+         *     ({@code ttl.asNumber}), so a non-integer {@code ttl} refuses only without {@code exp};</li>
          *     <li>{@code fromCborMap} requires the {@code status_list} key, {@code fromStatusListClaim} requires
-         *     {@code bits} to be a {@code Uint} and {@code lst} a {@code Bstr} (it never inflates {@code lst}), and the
-         *     {@code CompressedStatusList} constructor requires {@code bits in 1,2,4,8} — so {@code list:missing},
-         *     a missing/non-uint/out-of-set {@code bits} ({@code bitsNotOne} for bits 2,4,8 are accepted) and a
-         *     missing/non-bstr {@code lst} ({@code lstNotZlib} for a garbage bstr is not) explain one.</li>
+         *     {@code lst} a {@code Bstr} (it never inflates it) and {@code bits} a {@code Uint} narrowed to an
+         *     {@code int} ({@code l2i}), and the {@code CompressedStatusList} constructor requires that int in 1, 2, 4,
+         *     8 — so {@code list:missing}, a missing/non-uint {@code bits} or one whose low 32 bits are not 1, 2, 4 or 8
+         *     ({@code bitsNotOne} for 2, 4, 8 or 4294967297 is accepted) and a missing/non-bstr {@code lst}
+         *     ({@code lstNotZlib} for a garbage bstr is not) explain one.</li>
          * </ul>
+         * Times are compared as {@code fromCwt} receives them: {@code at} at millisecond precision.
          */
         boolean fromCwtRefusesOnAReportedDefect(String uri, Instant at, VerificationReport.Check typ,
                                                 VerificationReport.Check signature) {
-            if (parseError != null || detached) {
-                return true;
+            if (parseError != null || duplicateKeys != null || detached) {
+                return true; // duplicateKeys: unreachable from verify(), whose chain check is notRun for such a token
             }
             if (!tags.isEmpty() && !tags.equals(List.of(TAG_COSE_SIGN1))) {
-                return true;
-            }
-            if (!typ.passed() || !signature.passed()) {
                 return true;
             }
             if (claims == null) {
                 return false;
             }
+            long now = at.toEpochMilli();
+            DataItem expItem = claims.getOrNull(CLAIM_EXP);
+            if (expItem != null) {
+                if (!isInteger(expItem)) {
+                    return true;
+                }
+                if (compareSecondsWithMillis(expItem.getAsNumber(), now) < 0) {
+                    return true;
+                }
+                if (beyondMaxValidity(at)) {
+                    // refused here, before every check below: whatever else is reported, maxValidity is the reason
+                    return false;
+                }
+            } else {
+                DataItem iatItem = claims.getOrNull(CLAIM_IAT);
+                if (!isInteger(iatItem)
+                        || compareSecondsWithMillis(iatItem.getAsNumber(), now + IAT_FUTURE_SKEW_SECONDS * 1000) > 0) {
+                    return true;
+                }
+            }
+            if (!typ.passed() || !signature.passed()) {
+                return true;
+            }
             DataItem sub = claims.getOrNull(CLAIM_SUB);
             if (sub == null || sub.getMajorType() != MajorType.UNICODE_STRING || !sub.getAsTstr().equals(uri)) {
                 return true;
             }
-            DataItem expItem = claims.getOrNull(CLAIM_EXP);
-            if (expItem != null && !isInteger(expItem)) {
-                return true;
-            }
             if (expItem == null) {
-                DataItem iatItem = claims.getOrNull(CLAIM_IAT);
-                if (!isInteger(iatItem) || iatItem.getAsNumber() > at.getEpochSecond() + IAT_FUTURE_SKEW_SECONDS) {
-                    return true;
-                }
                 DataItem ttlItem = claims.getOrNull(CLAIM_TTL);
                 if (ttlItem != null && !isInteger(ttlItem)) {
                     return true;
                 }
-            } else if (expItem.getAsNumber() < at.getEpochSecond()) {
-                return true;
             }
             DataItem statusList = claims.getOrNull(CLAIM_STATUS_LIST);
             if (statusList == null || statusList.getMajorType() != MajorType.MAP) {
                 return true;
             }
-            DataItem bits = statusList.getOrNull("bits");
-            if (!isInteger(bits) || !FROM_CWT_BITS.contains(bits.getAsNumber())) {
+            DataItem lst = statusList.getOrNull("lst");
+            if (lst == null || lst.getMajorType() != MajorType.BYTE_STRING) {
                 return true;
             }
-            DataItem lst = statusList.getOrNull("lst");
-            return lst == null || lst.getMajorType() != MajorType.BYTE_STRING;
+            DataItem bits = statusList.getOrNull("bits");
+            return bits == null || bits.getMajorType() != MajorType.UNSIGNED_INTEGER
+                    || !FROM_CWT_BITS.contains((int) bits.getAsNumber());
+        }
+
+        /**
+         * {@code validateCwt}'s maxValidity refusal: an integer {@code exp} more than 365 days after {@code at}, the
+         * {@code CachingRevocationChecker} default, compared as {@code fromCwt} receives {@code at} (milliseconds).
+         */
+        boolean beyondMaxValidity(Instant at) {
+            DataItem expItem = claims == null ? null : claims.getOrNull(CLAIM_EXP);
+            return isInteger(expItem)
+                    && compareSecondsWithMillis(expItem.getAsNumber(), at.toEpochMilli() + MAX_VALIDITY_SECONDS * 1000) > 0;
         }
 
         /**
@@ -916,12 +982,17 @@ public final class IndependentStatusListVerifier {
             return "the dedicated signer carries " + STATUS_SIGNING_EKU + " and digitalSignature";
         }
 
-        /** Reports notRun when the body did not parse, and answers true so the caller returns. */
+        /**
+         * Reports notRun when the body did not parse or a map in it carries a key twice, and answers true so the
+         * caller returns.
+         */
         private boolean notRun(Problems problems) {
-            if (parseError == null) {
+            if (parseError == null && duplicateKeys == null) {
                 return false;
             }
-            problems.add(NOT_RUN, "not run: " + parseError + " (reported by " + CHECK_ENVELOPE + ")");
+            problems.add(NOT_RUN, "not run: " + (parseError != null ? parseError
+                    : duplicateKeys + ", so the token is malformed and none of its maps is read") + " (reported by "
+                    + CHECK_ENVELOPE + ")");
             return true;
         }
     }
@@ -1079,6 +1150,99 @@ public final class IndependentStatusListVerifier {
         }
     }
 
+    /** A NumericDate for a message: the seconds, and the instant when {@link Instant} can hold it. */
+    private static String numericDate(long seconds) {
+        return seconds + (seconds >= Instant.MIN.getEpochSecond() && seconds <= Instant.MAX.getEpochSecond()
+                ? " (" + Instant.ofEpochSecond(seconds) + ")" : "");
+    }
+
+    /**
+     * A NumericDate in whole seconds against an instant in epoch milliseconds, as {@code kotlin.time.Instant} compares
+     * them inside {@code fromCwt}; exact, and without overflow for any {@code long} of seconds.
+     */
+    static int compareSecondsWithMillis(long seconds, long millis) {
+        long floor = Math.floorDiv(millis, 1000);
+        if (seconds != floor) {
+            return Long.compare(seconds, floor);
+        }
+        return Math.floorMod(millis, 1000) == 0 ? 0 : -1;
+    }
+
+    /**
+     * Finds the keys a map of the token carries more than once (RFC 8949 5.3.1, 5.6), on the wire and before any
+     * decoder has chosen between them. The maps are the unprotected header, the protected header and the CWT claims,
+     * with every map nested in them ({@code status_list}).
+     *
+     * <p>The walk is Authlete's decoder, with no tag processor so the COSE structure arrives as plain items: a map
+     * comes back as a {@code CBORPairList} holding every pair in wire order, never collapsed (Multipaz's decoder keeps
+     * the last value of a key instead). Two keys are the same key when Authlete encodes the decoded keys to the same
+     * bytes: that encoding is preferred serialization ({@code 18 02} and {@code 02} are both the integer 2; an
+     * indefinite-length text is re-encoded definite), which is RFC 8949 5.6.1's data-model equivalence for the
+     * integer and text labels COSE and CWT use. Nothing else is interpreted.
+     */
+    static final class DuplicateKeys {
+
+        private DuplicateKeys() {}
+
+        /** What carries a key twice, or {@code null}; throws when Authlete cannot read a part Multipaz could. */
+        static String find(byte[] body) {
+            CBORItem item = decode(body, "the body");
+            while (item instanceof CBORTaggedItem tagged) {
+                item = tagged.getTagContent();
+            }
+            if (!(item instanceof CBORItemList sign1) || sign1.getItems().size() != 4) {
+                throw new IllegalStateException("Authlete does not read the body as the array(4) Multipaz read");
+            }
+            List<? extends CBORItem> array = sign1.getItems();
+            List<String> found = new ArrayList<>();
+            if (array.get(0) instanceof CBORByteArray protectedBytes) {
+                walk(decode(protectedBytes.getValue(), "the protected header"), "the protected header", found);
+            }
+            walk(array.get(1), "the unprotected header", found);
+            if (array.get(2) instanceof CBORByteArray payload) {
+                walk(decode(payload.getValue(), "the CWT claims"), "the CWT claims", found);
+            }
+            return found.isEmpty() ? null : String.join("; ", found);
+        }
+
+        private static CBORItem decode(byte[] cbor, String what) {
+            try {
+                return new CBORDecoder(cbor, new CBORDecoderOptions()).next();
+            } catch (Exception e) {
+                throw new IllegalStateException("Authlete cannot decode " + what + " to check its map keys (RFC 8949 "
+                        + "5.6): " + describe(e), e);
+            }
+        }
+
+        private static void walk(CBORItem item, String where, List<String> found) {
+            if (item instanceof CBORPairList map) {
+                Map<String, Integer> counts = new LinkedHashMap<>();
+                Map<String, CBORItem> keys = new HashMap<>();
+                for (CBORPair pair : map.getPairs()) {
+                    String key = pair.getKey().encodeToHex();
+                    counts.merge(key, 1, Integer::sum);
+                    keys.putIfAbsent(key, pair.getKey());
+                }
+                counts.forEach((key, count) -> {
+                    if (count > 1) {
+                        found.add(where + " carries the key " + keys.get(key) + (count == 2 ? " twice" : " " + count
+                                + " times"));
+                    }
+                });
+                for (CBORPair pair : map.getPairs()) {
+                    walk(pair.getKey(), where + " (in a key)", found);
+                    walk(pair.getValue(), where + " → " + pair.getKey(), found);
+                }
+            } else if (item instanceof CBORItemList list) {
+                for (int i = 0; i < list.getItems().size(); i++) {
+                    walk(list.getItems().get(i), where + "[" + i + "]", found);
+                }
+            } else if (item instanceof CBORTaggedItem tagged) {
+                walk(tagged.getTagContent(), where, found);
+            }
+        }
+    }
+
     private static boolean isInteger(DataItem value) {
         return value != null && (value.getMajorType() == MajorType.UNSIGNED_INTEGER
                 || value.getMajorType() == MajorType.NEGATIVE_INTEGER);
@@ -1185,6 +1349,19 @@ public final class IndependentStatusListVerifier {
      */
     static Method multipazFromCwtBridge() {
         return MultipazFromCwt.bridge();
+    }
+
+    /**
+     * The {@code fromCwt} mirror on its own — whether {@code fromCwt} refuses this token for a defect a check reports —
+     * so a test can hold it to {@code fromCwt} itself token by token. Package private, like the bridge above.
+     */
+    static boolean fromCwtRefusesOnAReportedDefect(byte[] body, String uri, Instant at) {
+        Token token = Token.parse(body);
+        VerificationReport.Check envelope = run(CHECK_ENVELOPE, token::envelope);
+        VerificationReport.Check typ = run(CHECK_TYP, token::typ);
+        VerificationReport.Check signature = run(CHECK_SIGNATURE,
+                problems -> token.signature(problems, !envelope.passed()));
+        return token.fromCwtRefusesOnAReportedDefect(uri, at, typ, signature);
     }
 
     /** Test seam for the adapter's failure path; {@code resetMultipazFromCwtAdapterForTest} clears it. */

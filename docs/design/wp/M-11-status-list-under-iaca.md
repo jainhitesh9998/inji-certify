@@ -564,13 +564,13 @@ days.
 | --- | --- | --- |
 | `statusList.mso` | `malformed` (the MSO's `status.status_list` is present but not `{uri: tstr, idx: uint}`: typed `uri`, negative/text `idx`, `status_list` not a map; a `status` that is not a map. A `status` map without `status_list` — an `identifier_list` only, or RFU keys — is valid and absent) | ISO2 12.3.6 |
 | `statusList.http` | `contentType` (not `application/statuslist+cwt`, parameters ignored) | TSL §8.2 |
-| `statusList.envelope` | `notTagged18` (untagged, a tag other than 17/18/61, or any tag stack other than exactly `[18]` — `18(18(…))` and the self-describe `55799(18(…))` included), `cwtTag61`, `mac0`, `detachedPayload` | TSL §5.2, RFC 9052 §4.2; RFC 8949 §3.4.6; `@owf/cose` 0.6.0 |
+| `statusList.envelope` | `notTagged18` (untagged, a tag other than 17/18/61, or any tag stack other than exactly `[18]` — `18(18(…))` and the self-describe `55799(18(…))` included), `cwtTag61`, `mac0`, `detachedPayload`, `duplicateKey` (a map of the protected header, the unprotected header or the claims, or a map nested in them such as `status_list`, carries a key twice; read on the wire with Authlete's decoder, which keeps every pair, before any header or claim is read, keys compared as RFC 8949 §5.6.1 data items so `02` and `18 02` are one key; every other token check is then `notRun`, because a decoder keeps one value or the other — Multipaz the last) | TSL §5.2, RFC 9052 §4.2; RFC 8949 §3.4.6; `@owf/cose` 0.6.0; RFC 9052 §3 ("if a label appears multiple times, the message MUST be rejected as malformed"), RFC 8392 §7.2 steps 1 and 7, RFC 8949 §5.3.1 |
 | `statusList.typ` | `missing`, `unprotected`, `notText`, `wrong` | TSL §5.2 |
 | `statusList.x5chain` | `missing`, `unprotectedOnly`, `carriesAnchor` (any self-signed certificate), `serialNumber` (≤ 0 or > 20 octets) | ISO2 12.3.6.3; HAIP §6.1 analogue; RFC 5280 §4.1.2.2 |
 | `statusList.signature` | `invalid:multipaz`, `invalid:authlete` | TSL §5.2 rule 2 |
-| `statusList.chain` | `untrusted` (Multipaz `fromCwt` against `iaca` refuses, reported when the token's state is not defective in a way `fromCwt` itself refuses on — its rule set, read from `ValidateCwtKt.validateCwt-efNRYWU`, `CompressedStatusList$Companion.fromCborMap`/`fromStatusListClaim` and the `CompressedStatusList` constructor: at most one tag 18 (an untagged COSE_Sign1 is accepted), protected `typ`, the SUB check, the signature, `exp`/`iat`/`ttl` with `iat` and `ttl` read only when `exp` is absent, and the presence/type/range of `status_list`/`bits` (1,2,4,8)/`lst` (bstr, never inflated). maxValidity, which no check names, is therefore never suppressed, so `ttlInvalid` with an `exp`, `expAfterSigner`, `iatAfterExp`, `idxOutOfRange` and `statusMismatch` next to it cannot hide it), `noAnchorSupplied` | ISO2 12.3.6.2 |
+| `statusList.chain` | `untrusted` (Multipaz `fromCwt` against `iaca` refuses, reported when the token's state is not defective in a way `fromCwt` itself refuses on — its rule set, in its own order, read from `ValidateCwtKt.validateCwt-efNRYWU`, `CompressedStatusList$Companion.fromCborMap`/`fromStatusListClaim` and the `CompressedStatusList` constructor: the body decodes, at most one tag 18 (an untagged COSE_Sign1 is accepted), the payload is a map; then `exp` (an integer, refused when before `at`, `exp == at` accepted) and **maxValidity** (`exp` more than 365 days after `at`), both decided before anything below; without `exp`, `iat` present and at most 5 s ahead; then protected `typ`, the SUB check, the signature; `ttl` an integer only when `exp` is absent; and the presence/type of `status_list`, `lst` (bstr, never inflated) and `bits` (a `Uint` narrowed to an `int` by `l2i`, then 1, 2, 4 or 8 — so `4294967297` is accepted as 1). `at` is compared at the millisecond precision `fromCwt` receives. maxValidity, which no check names, is suppressed only when `fromCwt` never reaches it — a parse failure, a duplicate key, a detached payload, a tag stack other than none or `[18]`, a non-integer `exp` — so `typ`, `sub`, the signature, `bits`, `lst`, `ttlInvalid`, `expAfterSigner`, `iatAfterExp`, `idxOutOfRange` and `statusMismatch` next to it cannot hide it, and the message names it), `noAnchorSupplied` | ISO2 12.3.6.2 |
 | `statusList.issuanceChain` | `differs` (the token `x5chain` is not certificate-for-certificate equal to `issuerAuthX5chain`) | Credo `mdocUtil.ts:76-115` |
-| `statusList.claims` | `subMismatch`, `iatMissing`, `iatFuture` (> `at` + 5 s, Multipaz `validateCwt`'s own clock allowance), `iatAfterExp`, `expMissing`, `expired`, `expAfterSigner` (exp > leaf `notAfter`), `ttlInvalid` | TSL §5.2, §8.3 4a/4c; ISO2 12.3.6.3 |
+| `statusList.claims` | `subMismatch`, `iatMissing`, `iatFuture` (> `at` + 5 s, Multipaz `validateCwt`'s own clock allowance), `iatAfterExp`, `expMissing`, `expired` (`at` ≥ `exp`, `at` at full precision: RFC 8392 §3.1.4 takes RFC 7519 §4.1.4, "the current date/time MUST be before the expiration date/time"; Multipaz 0.102.0 refuses only `exp < at`, so exactly at `exp` only this check refuses), `expAfterSigner` (exp > leaf `notAfter`), `ttlInvalid` | TSL §5.2, §8.3 4a/4c; ISO2 12.3.6.3; RFC 8392 §3.1.4, RFC 7519 §4.1.4 |
 | `statusList.list` | `missing` (no `status_list` claim, or not a map), `bitsNotOne`, `lstNotZlib` (including raw DEFLATE without the zlib wrapper), `idxOutOfRange`, `statusMismatch:<n>` (read with Multipaz's `StatusList.get`) | ISO2 12.3.6.5; TSL §4.3, §4.1, §8.3 step 6 |
 | `statusList.signerPurpose` | `ekuMissing`, `kuMissing`: only when the token leaf's public key differs from the IssuerAuth leaf's | Credo `assertStatusListSignerKeyPurpose.ts:14-25` with `requireStatusSigningKeyPurpose` |
 
@@ -619,7 +619,34 @@ explains only in the exp-absent branch `fromCborMap` reads); the `untrusted` mes
 maxValidity" and names it only when `exp > at + 365 days`; the test seam is `volatile`. Probes are one test each
 (`aBitsValueMultipazAcceptsDoesNotHideItsMaxValidityRefusal`, `anUntaggedCoseSign1DoesNotHideMultipazsMaxValidityRefusal`,
 `aFutureIatNextToAnExpDoesNotHideMultipazsMaxValidityRefusal`, `aGarbageLstBstrDoesNotHideMultipazsMaxValidityRefusal`,
-`aTextTtlExplainsMultipazsRefusal`). **Open (unchanged):** an algorithm allow-list (isomdl accepts only ES256/ES384) —
+`aTextTtlExplainsMultipazsRefusal`, renamed in round 4).
+
+**Review round 4 (2026-11-13, GPT-6.1 Sol two blockers, Opus one minor and nits; fixed on `wp/m-11b-r5`).**
+(1) Duplicate map keys passed: a correctly signed payload with `sub` twice — a wrong uri first, the expected one second
+— passed every check, because Multipaz's decoder keeps the last value and Authlete checks bytes only. RFC 8949 §5.3.1
+makes such a map invalid, RFC 9052 §3 requires a repeated header label to be "rejected as malformed", and RFC 8392
+§7.2 steps 1 and 7 reject a CWT that is not valid CBOR or whose claims are not a valid CBOR map; the verifier now reads
+the wire again with Authlete's decoder (no tag processor, every pair kept) right after the COSE_Sign1 array is
+recognised and before any header or claim is read, compares keys as RFC 8949 §5.6.1 data items (Authlete's preferred
+re-encoding of each decoded key), and reports `statusList.envelope:duplicateKey` with every other token check `notRun`.
+Without the walk, three of the signed mutations pass every check (claims `sub`, the `18 02` duplicate, `bits` 2 then 1)
+and the header duplicates are misreported as signature failures. (2) `expired` fired only for `exp < at`; RFC 7519
+§4.1.4 (through RFC 8392 §3.1.4 and TSL §5.2) makes the token invalid on and after `exp`, so it now fires for
+`at ≥ exp`, `at` at full precision. Multipaz 0.102.0 shares the off-by-one (`exp.compareTo(now) >= 0` passes), so at
+exactly `exp` `fromCwt` accepts and no chain code is added. (3) maxValidity is decided where `validateCwt` decides it,
+right after `exp` and before typ, sub, the signature and the list, so a wrong `typ` or `sub` next to an `exp` 400 days
+out is `{typ:[wrong], chain:[untrusted]}` / `{claims:[subMismatch], chain:[untrusted]}` and the chain message names
+maxValidity as the reason. (4) `bits` is mirrored as Multipaz reads it — `Uint`, `l2i`, then 1/2/4/8 — so
+`4294967297` is `bitsNotOne` here and accepted by `fromCwt`; the mirror's `exp`/`iat` comparisons use the millisecond
+`at` `fromCwt` receives (a whole-second mirror charges `fromCwt`'s "expired" half a second after `exp` to the chain as
+`untrusted`). A differential test, `theFromCwtMirrorAgreesWithFromCwtTokenByToken`, holds the mirror (package-private
+`fromCwtRefusesOnAReportedDefect(body, uri, at)`) to `fromCwt` itself over 20 token shapes at three instants (`at`,
+`at` + 500 ms, `at` + 100 ns).
+(5) `aTextTtlExplainsMultipazsRefusal` became `aTextTtlNextToAnExpIsOnlyTtlInvalid` (no refusal happens with `exp`
+present), and the exp-absent branch has its own tests (text `ttl`: `{claims:[expMissing, ttlInvalid]}`; future `iat`:
+`{claims:[iatFuture, expMissing]}`; no chain code).
+
+**Open (unchanged):** an algorithm allow-list (isomdl accepts only ES256/ES384) —
 owner decision later.
 
 **Acceptance checklist.**
@@ -640,7 +667,11 @@ owner decision later.
 - a DSC valid for the Annex B 457 days with `exp` 400 days out (`statusList.chain:untrusted`: `fromCwt`'s
   `maxValidity`);
 - `18(18(…))` and `55799(18(…))` (`statusList.envelope:notTagged18`);
-- every malformed `status.status_list` shape (`statusList.mso:malformed`).
+- every malformed `status.status_list` shape (`statusList.mso:malformed`);
+- a correctly signed token whose claims (`sub`), nested `status_list` (`bits`), protected header (`typ`) or unprotected
+  header (`kid`) carries a key twice, with the conflicting values in both orders, and a key repeated in a
+  non-preferred encoding (`statusList.envelope:duplicateKey`, every other token check `notRun`);
+- a token evaluated exactly at its `exp`, and a nanosecond after it (`statusList.claims:expired`, `fromCwt` accepting).
 
 ### M-11c CWT codec, signer pinning, signer policy (certify-service, certify-issuance)
 

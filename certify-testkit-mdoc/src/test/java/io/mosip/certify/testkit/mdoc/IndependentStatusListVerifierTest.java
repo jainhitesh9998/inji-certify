@@ -276,6 +276,142 @@ class IndependentStatusListVerifierTest {
                 "the signature cannot be checked without the detached payload");
     }
 
+    /**
+     * Review round 4, 1: a correctly signed payload whose claims map carries {@code sub} twice is invalid CBOR (RFC
+     * 8949 5.3.1) and a malformed CWT (RFC 8392 7.2 steps 1 and 7). Multipaz keeps the last value and Authlete
+     * verifies bytes only, so with the expected uri second the token used to pass every check; in both orders it is now
+     * {@code duplicateKey} and nothing is read from its maps.
+     */
+    @Test
+    void aClaimsMapWithSubTwiceIsMalformedInBothOrders() {
+        Fixture fixture = new Fixture();
+        for (List<String> subs : List.of(List.of("https://issuer.example/other", URI), List.of(URI, "https://issuer.example/other"))) {
+            byte[] payload = rawMap(
+                    enc(claim(2)), enc(new Tstr(subs.get(0))),
+                    enc(claim(2)), enc(new Tstr(subs.get(1))),
+                    enc(claim(4)), enc(DataItemExtensionsKt.toDataItem(NOW.plusSeconds(TTL).getEpochSecond())),
+                    enc(claim(6)), enc(DataItemExtensionsKt.toDataItem(NOW.getEpochSecond())),
+                    enc(claim(65533)), enc(statusListClaim(1, fixture.zlib(STATUSES))),
+                    enc(claim(65534)), enc(DataItemExtensionsKt.toDataItem(TTL)));
+            assertMalformedByDuplicateKey(verify(fixture, fixture.builder().rawPayload(payload).build(),
+                    IndependentStatusListVerifier.StatusListOptions.strictMode()), "the CWT claims carries the key 2 twice");
+        }
+    }
+
+    /** The nested {@code status_list} map, both orders: bits 2 then 1 (Multipaz reads 1) and 1 then 2. */
+    @Test
+    void aStatusListMapWithBitsTwiceIsMalformedInBothOrders() {
+        Fixture fixture = new Fixture();
+        for (long[] bits : new long[][] {{2, 1}, {1, 2}}) {
+            byte[] statusList = rawMap(
+                    enc(new Tstr("bits")), enc(DataItemExtensionsKt.toDataItem(bits[0])),
+                    enc(new Tstr("bits")), enc(DataItemExtensionsKt.toDataItem(bits[1])),
+                    enc(new Tstr("lst")), enc(new Bstr(fixture.zlib(STATUSES))));
+            byte[] payload = rawMap(
+                    enc(claim(2)), enc(new Tstr(URI)),
+                    enc(claim(4)), enc(DataItemExtensionsKt.toDataItem(NOW.plusSeconds(TTL).getEpochSecond())),
+                    enc(claim(6)), enc(DataItemExtensionsKt.toDataItem(NOW.getEpochSecond())),
+                    enc(claim(65533)), statusList,
+                    enc(claim(65534)), enc(DataItemExtensionsKt.toDataItem(TTL)));
+            assertMalformedByDuplicateKey(verify(fixture, fixture.builder().rawPayload(payload).build(),
+                    IndependentStatusListVerifier.StatusListOptions.strictMode()),
+                    "the CWT claims → 65533 carries the key \"bits\" twice");
+        }
+    }
+
+    /** The protected header, both orders: a wrong typ then the media type (Multipaz reads the media type), and back. */
+    @Test
+    void aProtectedHeaderWithTypTwiceIsMalformedInBothOrders() {
+        Fixture fixture = new Fixture();
+        for (List<String> typs : List.of(List.of("statuslist+cwt", IndependentStatusListVerifier.MEDIA_TYPE),
+                List.of(IndependentStatusListVerifier.MEDIA_TYPE, "statuslist+cwt"))) {
+            byte[] protectedHeader = rawMap(
+                    enc(claim(1)), enc(DataItemExtensionsKt.toDataItem(-7L)),
+                    enc(claim(16)), enc(new Tstr(typs.get(0))),
+                    enc(claim(16)), enc(new Tstr(typs.get(1))),
+                    enc(claim(33)), enc(new X509CertChain(List.of(fixture.dsc)).toCoseX5Chain(false)));
+            byte[] token = fixture.signRaw(protectedHeader, rawMap(), fixture.canonicalPayload(), fixture.dscKey);
+            assertMalformedByDuplicateKey(verify(fixture, token, IndependentStatusListVerifier.StatusListOptions.strictMode()),
+                    "the protected header carries the key 16 twice");
+        }
+    }
+
+    /** The unprotected header, both orders of two different kid values (RFC 9052 3 covers both buckets). */
+    @Test
+    void anUnprotectedHeaderWithALabelTwiceIsMalformedInBothOrders() {
+        Fixture fixture = new Fixture();
+        for (List<byte[]> kids : List.of(List.of(new byte[] {1}, new byte[] {2}), List.of(new byte[] {2}, new byte[] {1}))) {
+            byte[] unprotectedHeader = rawMap(enc(claim(4)), enc(new Bstr(kids.get(0))), enc(claim(4)), enc(new Bstr(kids.get(1))));
+            byte[] token = fixture.signRaw(fixture.canonicalProtectedHeader(), unprotectedHeader, fixture.canonicalPayload(),
+                    fixture.dscKey);
+            assertMalformedByDuplicateKey(verify(fixture, token, IndependentStatusListVerifier.StatusListOptions.strictMode()),
+                    "the unprotected header carries the key 4 twice");
+        }
+    }
+
+    /**
+     * RFC 8949 5.6.1 compares keys at the data-model level, not as bytes: {@code 02} and the non-preferred
+     * {@code 18 02} are the same integer 2 and so the same claim, which Multipaz's decoder also collapses into one.
+     */
+    @Test
+    void aKeyRepeatedInANonPreferredEncodingIsStillADuplicate() {
+        Fixture fixture = new Fixture();
+        byte[] payload = rawMap(
+                enc(claim(2)), enc(new Tstr("https://issuer.example/other")),
+                new byte[] {0x18, 0x02}, enc(new Tstr(URI)),
+                enc(claim(4)), enc(DataItemExtensionsKt.toDataItem(NOW.plusSeconds(TTL).getEpochSecond())),
+                enc(claim(6)), enc(DataItemExtensionsKt.toDataItem(NOW.getEpochSecond())),
+                enc(claim(65533)), enc(statusListClaim(1, fixture.zlib(STATUSES))),
+                enc(claim(65534)), enc(DataItemExtensionsKt.toDataItem(TTL)));
+        assertEquals(1, Cbor.INSTANCE.decode(payload).getAsMap().keySet().stream()
+                .filter(key -> key.equals(claim(2))).count(), "Multipaz keeps one claim 2 out of the two encodings");
+        assertMalformedByDuplicateKey(verify(fixture, fixture.builder().rawPayload(payload).build(),
+                IndependentStatusListVerifier.StatusListOptions.strictMode()), "the CWT claims carries the key 2 twice");
+    }
+
+    /**
+     * The control for the hand-built tokens above: the same raw encoding and hand signing, without a repeated key,
+     * passes every check — so the duplicate is the only defect those tokens carry.
+     */
+    @Test
+    void aHandSignedTokenWithoutARepeatedKeyPassesEveryCheck() {
+        Fixture fixture = new Fixture();
+        byte[] protectedHeader = rawMap(
+                enc(claim(1)), enc(DataItemExtensionsKt.toDataItem(-7L)),
+                enc(claim(16)), enc(new Tstr(IndependentStatusListVerifier.MEDIA_TYPE)),
+                enc(claim(33)), enc(new X509CertChain(List.of(fixture.dsc)).toCoseX5Chain(false)));
+        byte[] unprotectedHeader = rawMap(enc(claim(4)), enc(new Bstr(new byte[] {1})));
+        byte[] payload = rawMap(
+                enc(claim(2)), enc(new Tstr(URI)),
+                enc(claim(4)), enc(DataItemExtensionsKt.toDataItem(NOW.plusSeconds(TTL).getEpochSecond())),
+                enc(claim(6)), enc(DataItemExtensionsKt.toDataItem(NOW.getEpochSecond())),
+                enc(claim(65533)), rawMap(enc(new Tstr("bits")), enc(DataItemExtensionsKt.toDataItem(1L)),
+                        enc(new Tstr("lst")), enc(new Bstr(fixture.zlib(STATUSES)))),
+                enc(claim(65534)), enc(DataItemExtensionsKt.toDataItem(TTL)));
+        VerificationReport report = verify(fixture, fixture.signRaw(protectedHeader, unprotectedHeader, payload, fixture.dscKey),
+                IndependentStatusListVerifier.StatusListOptions.strictMode());
+        assertEquals(List.of(), report.failures(), () -> "the hand-signed token is valid: " + report);
+        VerificationReport viaBuilder = verify(fixture, fixture.builder().rawPayload(payload).build(),
+                IndependentStatusListVerifier.StatusListOptions.strictMode());
+        assertEquals(List.of(), viaBuilder.failures(), () -> "the raw payload signed by Multipaz is valid: " + viaBuilder);
+    }
+
+    /** {@code duplicateKey} and nothing else but notRun: no check reads a map one decoder or another has chosen from. */
+    private static void assertMalformedByDuplicateKey(VerificationReport report, String where) {
+        Map<String, List<String>> expected = new LinkedHashMap<>();
+        expected.put(IndependentStatusListVerifier.CHECK_ENVELOPE, List.of("duplicateKey"));
+        for (String check : List.of(IndependentStatusListVerifier.CHECK_TYP, IndependentStatusListVerifier.CHECK_X5CHAIN,
+                IndependentStatusListVerifier.CHECK_SIGNATURE, IndependentStatusListVerifier.CHECK_CHAIN,
+                IndependentStatusListVerifier.CHECK_ISSUANCE_CHAIN, IndependentStatusListVerifier.CHECK_CLAIMS,
+                IndependentStatusListVerifier.CHECK_LIST, IndependentStatusListVerifier.CHECK_SIGNER_PURPOSE)) {
+            expected.put(check, List.of("notRun"));
+        }
+        assertProblems(report, expected);
+        assertTrue(report.check(IndependentStatusListVerifier.CHECK_ENVELOPE).message().contains(where),
+                () -> "the report names the map and the key (" + where + "): "
+                        + report.check(IndependentStatusListVerifier.CHECK_ENVELOPE).message());
+    }
+
     // ---- statusList.typ --------------------------------------------------------------------------------------------
 
     @Test
@@ -513,20 +649,179 @@ class IndependentStatusListVerifierTest {
                 NOW.plusSeconds(457L * 24 * 3600));
     }
 
-    /** Review round 3, 1: a non-integer ttl is a fromCwt refusal (its exp-absent branch), so it owns the outcome. */
+    /**
+     * Review round 3, 1 (renamed in round 4): with {@code exp} present {@code fromCborMap} never reads {@code ttl}, so
+     * {@code fromCwt} accepts a text ttl and only the claims check refuses it — there is no refusal to explain.
+     */
     @Test
-    void aTextTtlExplainsMultipazsRefusal() {
+    void aTextTtlNextToAnExpIsOnlyTtlInvalid() {
         Fixture fixture = new Fixture();
-        X509Cert longLived = fixture.issuedValid(fixture.statusKey, "Long-Lived Status Signer", 26L,
-                List.of(IndependentStatusListVerifier.STATUS_SIGNING_EKU), true, NOW.minusSeconds(86_400),
-                NOW.plusSeconds(457L * 24 * 3600));
-        long exp = NOW.plusSeconds(400L * 24 * 3600).getEpochSecond();
-        Map<DataItem, DataItem> claims = claimsOf(fixture, exp);
-        claims.put(claim(4), DataItemExtensionsKt.toDataItem(NOW.plusSeconds(TTL).getEpochSecond()));
-        claims.put(claim(65534), new Tstr("3600"));
-        VerificationReport report = verify(fixture, fixture.builder().signer(longLived, fixture.statusKey).claims(claims).build(),
-                new IndependentStatusListVerifier.StatusListOptions(true, 0, true), longLived);
+        VerificationReport report = verify(fixture, fixture.tokenWithClaims(claims -> claims.put(claim(65534), new Tstr("3600"))),
+                IndependentStatusListVerifier.StatusListOptions.strictMode());
         assertProblems(report, Map.of(IndependentStatusListVerifier.CHECK_CLAIMS, List.of("ttlInvalid")));
+        assertTrue(report.check(IndependentStatusListVerifier.CHECK_CHAIN).message().startsWith(
+                "CompressedStatusList.fromCwt accepts"), () -> "fromCwt reads no ttl next to an exp: " + report);
+    }
+
+    /**
+     * Review round 4, nit: the exp-absent branch. {@code fromCborMap} reads {@code ttl.asNumber} only without
+     * {@code exp}, so there a text ttl is {@code fromCwt}'s own refusal and is explained by {@code ttlInvalid}: no
+     * chain code.
+     */
+    @Test
+    void withoutAnExpATextTtlIsFromCwtsOwnRefusalAndExplainsIt() {
+        Fixture fixture = new Fixture();
+        VerificationReport report = verify(fixture, fixture.tokenWithClaims(claims -> {
+                    claims.remove(claim(4));
+                    claims.put(claim(65534), new Tstr("3600"));
+                }), IndependentStatusListVerifier.StatusListOptions.strictMode());
+        assertProblems(report, Map.of(IndependentStatusListVerifier.CHECK_CLAIMS, List.of("expMissing", "ttlInvalid")));
+        assertTrue(report.check(IndependentStatusListVerifier.CHECK_CHAIN).message().contains("fromCwt refused"),
+                () -> "fromCwt refuses, for the reason ttlInvalid reports: " + report.check(IndependentStatusListVerifier.CHECK_CHAIN));
+    }
+
+    /** The same branch for {@code iat}: without {@code exp}, validateCwt refuses an iat more than 5 s ahead itself. */
+    @Test
+    void withoutAnExpAFutureIatIsFromCwtsOwnRefusalAndExplainsIt() {
+        Fixture fixture = new Fixture();
+        VerificationReport report = verify(fixture, fixture.tokenWithClaims(claims -> {
+                    claims.remove(claim(4));
+                    claims.put(claim(6), DataItemExtensionsKt.toDataItem(NOW.plusSeconds(3600).getEpochSecond()));
+                }), IndependentStatusListVerifier.StatusListOptions.strictMode());
+        assertProblems(report, Map.of(IndependentStatusListVerifier.CHECK_CLAIMS, List.of("iatFuture", "expMissing")));
+        assertTrue(report.check(IndependentStatusListVerifier.CHECK_CHAIN).message().contains("fromCwt refused"),
+                () -> "fromCwt refuses, for the reason iatFuture reports: " + report.check(IndependentStatusListVerifier.CHECK_CHAIN));
+    }
+
+    /**
+     * Review round 4, 3: validateCwt decides maxValidity right after reading exp, before typ, sub, the signature and
+     * the list, so a token past it is refused for maxValidity whatever else is wrong with it, and the chain says so
+     * next to the other check's code.
+     */
+    @Test
+    void aWrongTypDoesNotHideAMaxValidityRefusalThatComesFirst() {
+        Fixture fixture = new Fixture();
+        X509Cert longLived = longLived(fixture, 29L);
+        long exp = NOW.plusSeconds(400L * 24 * 3600).getEpochSecond();
+        VerificationReport report = verify(fixture, fixture.builder().signer(longLived, fixture.statusKey)
+                        .claims(claimsOf(fixture, exp)).protectedTyp(new Tstr("statuslist+cwt")).build(),
+                new IndependentStatusListVerifier.StatusListOptions(true, 0, true), longLived);
+        assertProblems(report, Map.of(
+                IndependentStatusListVerifier.CHECK_TYP, List.of("wrong"),
+                IndependentStatusListVerifier.CHECK_CHAIN, List.of("untrusted")));
+        assertTrue(report.check(IndependentStatusListVerifier.CHECK_CHAIN).message().contains("maxValidity"),
+                () -> "the chain names the refusal fromCwt actually made: " + report.check(IndependentStatusListVerifier.CHECK_CHAIN));
+    }
+
+    @Test
+    void aWrongSubDoesNotHideAMaxValidityRefusalThatComesFirst() {
+        Fixture fixture = new Fixture();
+        X509Cert longLived = longLived(fixture, 30L);
+        long exp = NOW.plusSeconds(400L * 24 * 3600).getEpochSecond();
+        VerificationReport report = multipazRefusal(fixture, longLived, exp,
+                claims -> claims.put(claim(2), new Tstr("https://issuer.example/other")));
+        assertProblems(report, Map.of(
+                IndependentStatusListVerifier.CHECK_CLAIMS, List.of("subMismatch"),
+                IndependentStatusListVerifier.CHECK_CHAIN, List.of("untrusted")));
+        assertTrue(report.check(IndependentStatusListVerifier.CHECK_CHAIN).message().contains("maxValidity"),
+                () -> "the chain names the refusal fromCwt actually made: " + report.check(IndependentStatusListVerifier.CHECK_CHAIN));
+    }
+
+    /**
+     * Review round 4, 4: {@code fromStatusListClaim} narrows the {@code Uint} bits to an int ({@code l2i}), so
+     * {@code 4294967297} is 1 to Multipaz. ISO2 12.3.6.5 still refuses it ({@code bitsNotOne}); next to an exp past
+     * maxValidity the chain reports that refusal too.
+     */
+    @Test
+    void aBitsValueMultipazNarrowsToOneIsBitsNotOneAndDoesNotHideMaxValidity() {
+        Fixture fixture = new Fixture();
+        VerificationReport accepted = verify(fixture, fixture.tokenWithClaims(claims -> claims.put(claim(65533),
+                        statusListClaim(4_294_967_297L, fixture.zlib(STATUSES)))),
+                IndependentStatusListVerifier.StatusListOptions.strictMode());
+        assertProblems(accepted, Map.of(IndependentStatusListVerifier.CHECK_LIST, List.of("bitsNotOne")));
+        assertTrue(accepted.check(IndependentStatusListVerifier.CHECK_CHAIN).message().startsWith(
+                "CompressedStatusList.fromCwt accepts"), () -> "Multipaz reads bits 2^32 + 1 as 1: " + accepted);
+
+        X509Cert longLived = longLived(fixture, 31L);
+        long exp = NOW.plusSeconds(400L * 24 * 3600).getEpochSecond();
+        assertProblems(multipazRefusal(fixture, longLived, exp, claims -> claims.put(claim(65533),
+                        statusListClaim(4_294_967_297L, fixture.zlib(STATUSES)))),
+                Map.of(IndependentStatusListVerifier.CHECK_LIST, List.of("bitsNotOne"),
+                        IndependentStatusListVerifier.CHECK_CHAIN, List.of("untrusted")));
+    }
+
+    /**
+     * Review round 4: the mirror of {@code fromCwt}'s rules held to {@code fromCwt} itself, token by token. Every
+     * token here is within maxValidity and signed by the trusted Document Signer, so {@code fromCwt} refuses exactly
+     * when the mirror says a reported defect makes it refuse — including the int narrowing of {@code bits} and the
+     * millisecond {@code at} it is handed, which no report shows unless {@code fromCwt} also refuses for a reason no
+     * check names.
+     */
+    @Test
+    void theFromCwtMirrorAgreesWithFromCwtTokenByToken() {
+        Fixture fixture = new Fixture();
+        Map<String, java.util.function.Consumer<Map<DataItem, DataItem>>> mutations = new LinkedHashMap<>();
+        for (long bits : new long[] {1, 2, 3, 4, 8, 0, 16, 4_294_967_297L, 4_294_967_298L, 4_294_967_299L, -1}) {
+            mutations.put("bits " + bits, claims -> claims.put(claim(65533), statusListClaim(bits, fixture.zlib(STATUSES))));
+        }
+        mutations.put("bits as text", claims -> {
+            Map<DataItem, DataItem> list = new LinkedHashMap<>();
+            list.put(new Tstr("bits"), new Tstr("1"));
+            list.put(new Tstr("lst"), new Bstr(fixture.zlib(STATUSES)));
+            claims.put(claim(65533), new CborMap(list, false));
+        });
+        mutations.put("garbage lst", claims -> claims.put(claim(65533), statusListClaim(1, new byte[] {(byte) 0xb9})));
+        mutations.put("exp at the evaluation instant", claims -> {
+            claims.put(claim(4), DataItemExtensionsKt.toDataItem(NOW.getEpochSecond()));
+            claims.put(claim(6), DataItemExtensionsKt.toDataItem(NOW.minusSeconds(60).getEpochSecond()));
+        });
+        mutations.put("exp a second before", claims -> {
+            claims.put(claim(4), DataItemExtensionsKt.toDataItem(NOW.minusSeconds(1).getEpochSecond()));
+            claims.put(claim(6), DataItemExtensionsKt.toDataItem(NOW.minusSeconds(60).getEpochSecond()));
+        });
+        mutations.put("no exp, iat 5 s ahead", claims -> {
+            claims.remove(claim(4));
+            claims.put(claim(6), DataItemExtensionsKt.toDataItem(NOW.plusSeconds(5).getEpochSecond()));
+        });
+        mutations.put("no exp, iat 6 s ahead", claims -> {
+            claims.remove(claim(4));
+            claims.put(claim(6), DataItemExtensionsKt.toDataItem(NOW.plusSeconds(6).getEpochSecond()));
+        });
+        mutations.put("no exp, text ttl", claims -> {
+            claims.remove(claim(4));
+            claims.put(claim(65534), new Tstr("3600"));
+        });
+        mutations.put("text ttl next to exp", claims -> claims.put(claim(65534), new Tstr("3600")));
+        mutations.put("wrong sub", claims -> claims.put(claim(2), new Tstr("https://issuer.example/other")));
+
+        Map<String, Instant> instants = new LinkedHashMap<>();
+        instants.put("at", NOW);
+        instants.put("at + 500 ms", NOW.plusMillis(500));
+        instants.put("at + 100 ns", NOW.plusNanos(100));
+        List<String> disagreements = new ArrayList<>();
+        mutations.forEach((name, mutation) -> instants.forEach((when, at) -> {
+            byte[] token = fixture.tokenWithClaims(mutation);
+            VerificationReport report = IndependentStatusListVerifier.verify(token, IndependentStatusListVerifier.MEDIA_TYPE,
+                    URI, 3, javaCerts(List.of(fixture.dsc)), fixture.iacaJava, at,
+                    IndependentStatusListVerifier.StatusListOptions.strictMode());
+            VerificationReport.Check chain = report.check(IndependentStatusListVerifier.CHECK_CHAIN);
+            assertEquals(VerificationReport.State.PASS, chain.state(), () -> name + " " + when + ": no refusal is "
+                    + "unexplained within maxValidity: " + chain);
+            boolean refused = !chain.message().startsWith("CompressedStatusList.fromCwt accepts");
+            boolean mirror = IndependentStatusListVerifier.fromCwtRefusesOnAReportedDefect(token, URI, at);
+            if (refused != mirror) {
+                disagreements.add(name + " " + when + ": fromCwt " + (refused ? "refuses" : "accepts") + ", the mirror says "
+                        + (mirror ? "it refuses" : "it accepts"));
+            }
+        }));
+        assertEquals(List.of(), disagreements);
+        // the expectations the mirror encodes, spelled out
+        assertTrue(!IndependentStatusListVerifier.fromCwtRefusesOnAReportedDefect(fixture.tokenWithClaims(
+                mutations.get("bits 4294967297")), URI, NOW), "Multipaz narrows bits 2^32 + 1 to 1");
+        assertTrue(!IndependentStatusListVerifier.fromCwtRefusesOnAReportedDefect(fixture.tokenWithClaims(
+                mutations.get("exp at the evaluation instant")), URI, NOW), "Multipaz accepts exp == at");
+        assertTrue(IndependentStatusListVerifier.fromCwtRefusesOnAReportedDefect(fixture.tokenWithClaims(
+                mutations.get("exp at the evaluation instant")), URI, NOW.plusMillis(500)), "and refuses it 500 ms later");
     }
 
     private static VerificationReport multipazRefusal(Fixture fixture, X509Cert signer, long exp,
@@ -617,6 +912,52 @@ class IndependentStatusListVerifierTest {
                     claims.put(claim(6), DataItemExtensionsKt.toDataItem(NOW.minusSeconds(120).getEpochSecond()));
                 }), IndependentStatusListVerifier.StatusListOptions.strictMode());
         assertProblems(report, Map.of(IndependentStatusListVerifier.CHECK_CLAIMS, List.of("expired")));
+    }
+
+    /**
+     * Review round 4, 2: TSL 5.2 takes exp from RFC 8392 3.1.4, which is RFC 7519 4.1.4: "the current date/time MUST
+     * be before the expiration date/time", so a token is expired from its exp instant on. Multipaz 0.102.0 refuses
+     * only {@code exp < now}, so exactly at exp only this check refuses and {@code fromCwt} accepts (no chain code).
+     */
+    @Test
+    void aTokenIsExpiredAtItsExpInstantAndNotASecondBefore() {
+        Fixture fixture = new Fixture();
+        VerificationReport atExp = verify(fixture, tokenExpiringAt(fixture, NOW), NOW);
+        assertProblems(atExp, Map.of(IndependentStatusListVerifier.CHECK_CLAIMS, List.of("expired")));
+        assertTrue(atExp.check(IndependentStatusListVerifier.CHECK_CHAIN).message().startsWith(
+                "CompressedStatusList.fromCwt accepts"), () -> "Multipaz accepts exp == at: " + atExp);
+
+        VerificationReport secondBefore = verify(fixture, tokenExpiringAt(fixture, NOW.plusSeconds(1)), NOW);
+        assertEquals(List.of(), secondBefore.failures(), () -> "one second before exp the token is valid: " + secondBefore);
+
+        VerificationReport secondAfter = verify(fixture, tokenExpiringAt(fixture, NOW.minusSeconds(1)), NOW);
+        assertProblems(secondAfter, Map.of(IndependentStatusListVerifier.CHECK_CLAIMS, List.of("expired")));
+    }
+
+    /**
+     * A fractional evaluation instant is compared at full precision: expired when {@code at >= exp}, so half a second
+     * after exp is expired and half a second before is not.
+     */
+    @Test
+    void aFractionalEvaluationInstantIsComparedWithExpAtFullPrecision() {
+        Fixture fixture = new Fixture();
+        byte[] token = tokenExpiringAt(fixture, NOW);
+        assertProblems(verify(fixture, token, NOW.plusMillis(500)),
+                Map.of(IndependentStatusListVerifier.CHECK_CLAIMS, List.of("expired")));
+        assertProblems(verify(fixture, token, NOW.plusNanos(1)),
+                Map.of(IndependentStatusListVerifier.CHECK_CLAIMS, List.of("expired")));
+        VerificationReport before = verify(fixture, token, NOW.minusMillis(500));
+        assertEquals(List.of(), before.failures(), () -> "half a second before exp the token is valid: " + before);
+        VerificationReport nanoBefore = verify(fixture, token, NOW.minusNanos(1));
+        assertEquals(List.of(), nanoBefore.failures(), () -> "1 ns before exp the token is valid: " + nanoBefore);
+    }
+
+    /** A token whose exp is {@code exp}, issued a minute before it. */
+    private static byte[] tokenExpiringAt(Fixture fixture, Instant exp) {
+        return fixture.tokenWithClaims(claims -> {
+            claims.put(claim(4), DataItemExtensionsKt.toDataItem(exp.getEpochSecond()));
+            claims.put(claim(6), DataItemExtensionsKt.toDataItem(exp.minusSeconds(60).getEpochSecond()));
+        });
     }
 
     @Test
@@ -918,6 +1259,33 @@ class IndependentStatusListVerifierTest {
                 javaCerts(List.of(issuanceLeaf)), iaca, NOW, options);
     }
 
+    /** The verifier at a caller-chosen evaluation instant, otherwise as {@link #verify(Fixture, byte[], IndependentStatusListVerifier.StatusListOptions)}. */
+    private static VerificationReport verify(Fixture fixture, byte[] body, Instant at) {
+        return IndependentStatusListVerifier.verify(body, IndependentStatusListVerifier.MEDIA_TYPE, URI, 3,
+                javaCerts(List.of(fixture.dsc)), fixture.iacaJava, at, IndependentStatusListVerifier.StatusListOptions.strictMode());
+    }
+
+    private static byte[] enc(DataItem item) {
+        return Cbor.INSTANCE.encode(item);
+    }
+
+    /**
+     * A definite-length CBOR map written byte for byte from already-encoded keys and values, alternating — the only
+     * way to put a key on the wire twice, since every encoder builds its map from a map.
+     */
+    private static byte[] rawMap(byte[]... keysAndValues) {
+        int entries = keysAndValues.length / 2;
+        if (keysAndValues.length % 2 != 0 || entries > 23) {
+            throw new IllegalArgumentException("key/value pairs, at most 23");
+        }
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        out.write(0xa0 | entries);
+        for (byte[] encoded : keysAndValues) {
+            out.writeBytes(encoded);
+        }
+        return out.toByteArray();
+    }
+
     private static boolean assertThrowsIllegalArgument(Runnable runnable) {
         try {
             runnable.run();
@@ -1089,6 +1457,41 @@ class IndependentStatusListVerifierTest {
             return new Builder(this);
         }
 
+        /** The canonical claims as the encoded payload a signer signs. */
+        byte[] canonicalPayload() {
+            return Cbor.INSTANCE.encode(new CborMap(canonicalClaims(), false));
+        }
+
+        /** The canonical protected header {1: -7, 16: typ, 33: [DSC]}, encoded. */
+        byte[] canonicalProtectedHeader() {
+            Map<DataItem, DataItem> headers = new LinkedHashMap<>();
+            headers.put(claim(1), DataItemExtensionsKt.toDataItem(-7L));
+            headers.put(claim(16), new Tstr(IndependentStatusListVerifier.MEDIA_TYPE));
+            headers.put(claim(33), new X509CertChain(List.of(dsc)).toCoseX5Chain(false));
+            return Cbor.INSTANCE.encode(new CborMap(headers, false));
+        }
+
+        /**
+         * A tag-18 COSE_Sign1 over raw header bytes, signed by hand (RFC 9052 4.4: Sig_structure =
+         * ["Signature1", protected, external_aad h'', payload], ES256 with Multipaz's own {@code Crypto.sign}), for the
+         * headers no encoder can produce because they carry a label twice. The bytes of {@code protectedHeader},
+         * {@code unprotectedMap} and {@code payload} go on the wire exactly as given.
+         */
+        byte[] signRaw(byte[] protectedHeader, byte[] unprotectedMap, byte[] payload, EcPrivateKey key) {
+            byte[] toBeSigned = Cbor.INSTANCE.encode(new org.multipaz.cbor.CborArray(List.of(new Tstr("Signature1"),
+                    new Bstr(protectedHeader), new Bstr(new byte[0]), new Bstr(payload)), false));
+            org.multipaz.crypto.EcSignature signature = await(continuation -> org.multipaz.crypto.Crypto.INSTANCE.sign(key,
+                    Algorithm.ES256, toBeSigned, continuation));
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            out.write(0xd2); // tag 18
+            out.write(0x84); // array(4)
+            out.writeBytes(Cbor.INSTANCE.encode(new Bstr(protectedHeader)));
+            out.writeBytes(unprotectedMap);
+            out.writeBytes(Cbor.INSTANCE.encode(new Bstr(payload)));
+            out.writeBytes(Cbor.INSTANCE.encode(new Bstr(signature.toCoseEncoded())));
+            return out.toByteArray();
+        }
+
         /** The positive token with the last signature byte flipped, so both oracles must reject it. */
         byte[] tamperedSignature() {
             DataItem decoded = Cbor.INSTANCE.decode(token());
@@ -1187,6 +1590,8 @@ class IndependentStatusListVerifierTest {
         private boolean noChain;
         private DataItem alg = DataItemExtensionsKt.toDataItem(-7L);
         private Map<DataItem, DataItem> claims;
+        /** The payload bytes as signed, when a mutation needs an encoding no map can produce (a key twice). */
+        private byte[] rawPayload;
         private Long tag = 18L;
         private boolean detached;
         private EcPrivateKey signerKey;
@@ -1240,6 +1645,11 @@ class IndependentStatusListVerifierTest {
             return this;
         }
 
+        Builder rawPayload(byte[] payload) {
+            this.rawPayload = payload;
+            return this;
+        }
+
         Builder signer(X509Cert certificate, EcPrivateKey key) {
             this.signerCertificate = certificate;
             this.signerKey = key;
@@ -1266,7 +1676,7 @@ class IndependentStatusListVerifierTest {
                     protectedHeaders.put(new CoseNumberLabel(33), new X509CertChain(protectedChain).toCoseX5Chain(false));
                 }
             }
-            byte[] message = Cbor.INSTANCE.encode(new CborMap(claims, false));
+            byte[] message = rawPayload != null ? rawPayload : Cbor.INSTANCE.encode(new CborMap(claims, false));
             CoseSign1 sign1 = await(continuation -> Cose.INSTANCE.coseSign1Sign(
                     AsymmetricKey.Companion.anonymous(signerKey, Algorithm.ES256), message, !detached,
                     protectedHeaders, unprotectedHeaders, continuation));
