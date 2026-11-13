@@ -43,9 +43,9 @@ The page fetches them from `GET {servlet path}/offer/demo-subjects`, which answe
 the data source, so no holder is enumerable: remove a block to hide that subject, and a deployment that configures none
 keeps the free-text field and the claims-JSON path exactly as they were. The entries are validated at startup — a
 blank, over-long, non-conforming or duplicate id, an over-long label and more than 50 subjects refuse the start with a
-message naming the entry — and a label is written into the page as text, never as HTML, so a name containing `<` or
-`"` is harmless. nginx publishes that one exact path to the public host, for GET and HEAD (and the CORS preflight
-(`docs/design/20-mdl-issuer.md` D12).
+message naming the entry; the records are bound only because `certify.offer-page.enabled` is on — and a label is
+written into the page as text, never as HTML, so a name containing `<` or `"` is harmless. nginx publishes that one
+exact path to the public host, for GET and HEAD (and the CORS preflight; `docs/design/20-mdl-issuer.md` D12).
 
 ## Run it locally (dev PKI)
 

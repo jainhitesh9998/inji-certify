@@ -103,9 +103,9 @@ public record OfferPageProperties(@DefaultValue("false") boolean enabled,
             credentialConfigurationIds = List.copyOf(configurations);
         }
 
-        /** The text the page shows for this subject: its label, else its id. */
+        /** The text the page shows for this subject: its label, trimmed, else its id. */
         public String labelOrId() {
-            return label == null || label.isBlank() ? id : label;
+            return label == null || label.isBlank() ? id : label.trim();
         }
     }
 }

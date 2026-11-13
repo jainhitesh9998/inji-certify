@@ -136,6 +136,14 @@ class OfferPageDemoSubjectsBindingTest {
     }
 
     @Test
+    void aLabelIsTrimmedForDisplayAndABlankOneFallsBackToTheId() {
+        // the binder trims an inlined test property, so the trimming is checked on the record itself
+        assertEquals("Asha Demo", new OfferPageProperties.DemoSubject("mdl-demo-1", "  Asha Demo  ", List.of()).labelOrId());
+        assertEquals("mdl-demo-1", new OfferPageProperties.DemoSubject("mdl-demo-1", "   ", List.of()).labelOrId());
+        assertEquals("mdl-demo-1", new OfferPageProperties.DemoSubject("mdl-demo-1", null, List.of()).labelOrId());
+    }
+
+    @Test
     void anEmptyConfigurationListAppliesToEveryConfiguration() {
         OfferPageProperties properties = bound(P + "[0].id=mdl-demo-1", P + "[0].credential-configuration-ids=");
         assertTrue(properties.demoSubjects().get(0).credentialConfigurationIds().isEmpty(),

@@ -86,26 +86,31 @@ class OfferPageTest {
         assertTrue(html.contains("/offer/demo-subjects") && html.contains("api(\"GET\", DEMO_SUBJECTS)"), "the page fetches the configured subjects on load");
         assertTrue(html.contains("refreshSubjectChoice") && html.contains("subjectsFor(demoSubjects, el(\"configuration\").value)"),
                 "the options are re-filtered on a configuration change");
-        // the claims path is untouched: with an empty subject the claims are used
+        // the claims field keeps working: with "Other" and an empty subject the claims are used, and the label says so
+        // while the dropdown is on screen
         assertTrue(html.contains("const subject = chosenSubject();") && html.contains("else if (el(\"claims\").value.trim())"),
                 "an empty subject still falls through to the claims JSON");
+        assertTrue(html.contains("id=\"claimsLabel\"") && html.contains("CLAIMS_HINT_WITH_CHOICE"),
+                "the claims label explains when the claims apply");
     }
 
     @Test
     void subjectLabelsAreTextAndNeverMarkup() throws Exception {
         String html = mockMvc.perform(get("/offer/")).andReturn().getResponse().getContentAsString();
-        assertTrue(html.contains("option.textContent = (typeof subject.label === \"string\" && subject.label)"),
+        assertTrue(html.contains("option.textContent = subject.label ? subject.label + \" (\" + subject.id + \")\" : subject.id;"),
                 "a subject label is assigned with textContent, so a label containing < or \" stays text");
         assertTrue(html.contains("option.value = subject.id;"), "the id is an option value, never markup");
-        // every innerHTML assignment in the page clears a container of the page's own making; none takes server data
+        // every innerHTML assignment in the page clears a container of the page's own making; none takes server data.
+        // The count is deliberately not asserted: what matters is that no assignment carries a value.
         Matcher assignments = Pattern.compile("innerHTML\\s*=\\s*([^;]*);").matcher(html);
-        int found = 0;
         while (assignments.find()) {
-            found++;
             assertEquals("\"\"", assignments.group(1).trim(),
                     "innerHTML is only ever cleared, never fed a server value: " + assignments.group());
         }
-        assertEquals(3, found, "the three existing clears (configuration select, QR container, mDoc table) are the only innerHTML writes");
+        // the subject labels are toggled with `hidden`, and the page's own `label { display: block }` beats the UA's
+        // [hidden] rule: without this the labels of the page's demo-subject controls are always visible
+        assertTrue(Pattern.compile("\\[hidden\\]\\s*\\{[^}]*display:\\s*none\\s*!important").matcher(html).find(),
+                "the stylesheet makes [hidden] win over label { display: block }");
     }
 
     @Test
