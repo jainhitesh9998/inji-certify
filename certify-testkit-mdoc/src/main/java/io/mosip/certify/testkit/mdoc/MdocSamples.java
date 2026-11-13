@@ -13,6 +13,7 @@ import org.multipaz.cose.CoseNumberLabel;
 import org.multipaz.cose.CoseSign1;
 import org.multipaz.crypto.X509Cert;
 import org.multipaz.crypto.X509CertChain;
+import org.multipaz.crypto.X509CertChainJvmKt;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -56,6 +57,10 @@ public final class MdocSamples {
     public static final String DOCTYPE = ".doctype";
     public static final String GAPS = ".gaps";
     public static final String IACA_PEM = ".iaca.pem";
+    /** The status list the MSO's {@code status.status_list.uri} names, byte for byte as the endpoint answered it. */
+    public static final String STATUSLIST_CWT = ".statuslist.cwt";
+    /** The {@code Content-Type} the status list was served with (M-11b: both sidecars are required together). */
+    public static final String STATUSLIST_CONTENT_TYPE = ".statuslist.ct";
 
     /** Producers whose earlier samples this JVM already removed. */
     private static final Set<String> CLEANED = ConcurrentHashMap.newKeySet();
@@ -68,7 +73,66 @@ public final class MdocSamples {
      * @param documentDocType the {@code Document.docType} when the credential is a draft-13 {@code Document}
      */
     public record Sample(String name, Path path, byte[] received, byte[] issuerSigned, Optional<String> documentDocType,
-                         JWK holder, String docType, AcceptedGaps gaps, Optional<X509Certificate> iaca) {}
+                         JWK holder, String docType, AcceptedGaps gaps, Optional<X509Certificate> iaca,
+                         Optional<StatusListToken> statusList, StatusListReference statusListReference,
+                         List<X509Certificate> issuerAuthX5chain) {
+
+        /** The MSO's {@code {uri, idx}} when it is present and well formed. */
+        public Optional<StatusListInfo> statusListInfo() {
+            return statusListReference.info();
+        }
+
+        /** Why the MSO's {@code status.status_list} cannot be used, when it is present but malformed. */
+        public Optional<String> statusListMalformed() {
+            return statusListReference.malformed();
+        }
+    }
+
+    /**
+     * A status list as the endpoint served it: the body as received and the {@code Content-Type}. M-11b's verifier
+     * takes both, because a JWT body with the right media type and a CWT body with the wrong one are two different
+     * defects (TSL 8.2).
+     */
+    public record StatusListToken(byte[] body, String contentType) {}
+
+    /**
+     * The MSO's {@code status.status_list}: {@code uri} and {@code idx} (ISO/IEC 18013-5 second edition 12.3.6,
+     * TSL 6.3). A sample whose MSO carries one must also record the list itself, in the two sidecars above.
+     */
+    public record StatusListInfo(String uri, long idx) {}
+
+    /**
+     * What the MSO says about the status list: <b>absent</b> (no {@code status.status_list}), <b>present</b> as
+     * {@code {uri: tstr, idx: uint}}, or <b>malformed</b> with the reason — present but not usable, for example
+     * {@code idx} as text or negative, a missing {@code uri}, or {@code status_list} as an array. The distinction is
+     * the point: a malformed reference must fail the sample rather than silently skip the list, because a wallet
+     * cannot fetch a list it cannot address. An IssuerAuth or MSO that cannot be read at all is M-01's problem, and
+     * answers absent here.
+     */
+    public record StatusListReference(Optional<StatusListInfo> info, Optional<String> malformed) {
+
+        public StatusListReference {
+            if (info.isPresent() && malformed.isPresent()) {
+                throw new IllegalArgumentException("a status_list reference is either present or malformed, not both");
+            }
+        }
+
+        public static StatusListReference absent() {
+            return new StatusListReference(Optional.empty(), Optional.empty());
+        }
+
+        public static StatusListReference present(StatusListInfo info) {
+            return new StatusListReference(Optional.of(info), Optional.empty());
+        }
+
+        public static StatusListReference malformed(String reason) {
+            return new StatusListReference(Optional.empty(), Optional.of(reason));
+        }
+
+        public boolean isMalformed() {
+            return malformed.isPresent();
+        }
+    }
 
     private MdocSamples() {}
 
@@ -119,6 +183,26 @@ public final class MdocSamples {
         }
     }
 
+    /**
+     * Writes the status list a sample's MSO points at, beside its {@code .mdoc}: the body exactly as the endpoint
+     * answered it ({@code <name>.statuslist.cwt}) and its {@code Content-Type} ({@code <name>.statuslist.ct}). The
+     * producer of a sample whose MSO carries {@code status.status_list} writes both; the conformance run requires
+     * them together (M-11b).
+     */
+    public static void writeStatusList(Path mdoc, byte[] body, String contentType) {
+        String file = mdoc.getFileName().toString();
+        if (!file.endsWith(MDOC)) {
+            throw new IllegalArgumentException(mdoc + " is not a " + MDOC + " sample");
+        }
+        String name = file.substring(0, file.length() - MDOC.length());
+        try {
+            Files.write(mdoc.resolveSibling(name + STATUSLIST_CWT), body);
+            Files.writeString(mdoc.resolveSibling(name + STATUSLIST_CONTENT_TYPE), contentType, StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot write the status list of the mDoc sample " + name, e);
+        }
+    }
+
     /** Reads a sample back from its {@code .mdoc} file and the sidecars next to it; every sidecar but the IACA is required. */
     public static Sample read(Path mdoc) {
         String file = mdoc.getFileName().toString();
@@ -137,8 +221,21 @@ public final class MdocSamples {
             Path gapsFile = sidecar(directory, name, GAPS);
             AcceptedGaps gaps = AcceptedGaps.parse(Files.readString(gapsFile), gapsFile.toString());
             Path iaca = directory.resolve(name + IACA_PEM);
+            Path statusListBody = directory.resolve(name + STATUSLIST_CWT);
+            Path statusListType = directory.resolve(name + STATUSLIST_CONTENT_TYPE);
+            Optional<StatusListToken> statusList = Optional.empty();
+            if (Files.isRegularFile(statusListBody) || Files.isRegularFile(statusListType)) {
+                if (!Files.isRegularFile(statusListBody) || !Files.isRegularFile(statusListType)) {
+                    throw new IllegalStateException("the mDoc sample " + name + " records " + STATUSLIST_CWT + " and "
+                            + STATUSLIST_CONTENT_TYPE + " together: the body without its Content-Type cannot be held to "
+                            + "TSL 8.2, and a Content-Type without a body says nothing");
+                }
+                statusList = Optional.of(new StatusListToken(Files.readAllBytes(statusListBody),
+                        Files.readString(statusListType).trim()));
+            }
             return new Sample(name, mdoc, received, issuerSigned, documentDocType, holder, docType, gaps,
-                    Files.isRegularFile(iaca) ? Optional.of(readPem(iaca)) : Optional.empty());
+                    Files.isRegularFile(iaca) ? Optional.of(readPem(iaca)) : Optional.empty(),
+                    statusList, statusListReferenceOf(issuerSigned), issuerAuthX5chainOf(issuerSigned));
         } catch (IOException e) {
             throw new UncheckedIOException("cannot read the mDoc sample " + mdoc, e);
         } catch (ParseException e) {
@@ -150,7 +247,7 @@ public final class MdocSamples {
     public static List<Path> files(Path mdoc) {
         String file = mdoc.getFileName().toString();
         String name = file.substring(0, file.length() - MDOC.length());
-        return Stream.of(MDOC, HOLDER_JWK, DOCTYPE, GAPS, IACA_PEM)
+        return Stream.of(MDOC, HOLDER_JWK, DOCTYPE, GAPS, IACA_PEM, STATUSLIST_CWT, STATUSLIST_CONTENT_TYPE)
                 .map(suffix -> mdoc.resolveSibling(name + suffix))
                 .filter(Files::isRegularFile)
                 .toList();
@@ -175,6 +272,125 @@ public final class MdocSamples {
             return WireIssuerSignedItems.valueOf(credential, "issuerSigned");
         }
         return credential;
+    }
+
+    /**
+     * The MSO's {@code status.status_list}, read from the bytes as received, in three outcomes: absent, present as
+     * {@code {uri: tstr, idx: uint}}, or malformed with the reason ({@link StatusListReference}). An IssuerAuth or MSO
+     * that cannot be read at all answers absent: that is M-01's check, not this one. Once the MSO map is read, a
+     * {@code status} that is there but unusable is malformed, never absent — a gate that skipped those silently would
+     * let a wallet-facing defect through.
+     */
+    public static StatusListReference statusListReferenceOf(byte[] issuerSignedCbor) {
+        DataItem mso;
+        try {
+            DataItem issuerSigned = Cbor.INSTANCE.decode(issuerSignedCbor);
+            DataItem issuerAuthItem = issuerSigned.get("issuerAuth");
+            if (issuerAuthItem.getMajorType() == MajorType.TAG) {
+                issuerAuthItem = issuerAuthItem.getAsTagged();
+            }
+            CoseSign1 issuerAuth = CoseSign1.Companion.fromDataItem(issuerAuthItem);
+            byte[] payload = issuerAuth.getPayload();
+            if (payload == null) {
+                return StatusListReference.absent();
+            }
+            mso = Cbor.INSTANCE.decode(payload);
+            if (mso.getMajorType() == MajorType.TAG) {
+                mso = mso.getAsTaggedEncodedCbor();
+            }
+            if (mso.getMajorType() != MajorType.MAP) {
+                return StatusListReference.absent();
+            }
+        } catch (Throwable e) {
+            if (e instanceof VirtualMachineError fatal && !(e instanceof StackOverflowError)) {
+                throw fatal;
+            }
+            return StatusListReference.absent();
+        }
+        try {
+            DataItem status = mso.getOrNull("status");
+            if (status == null) {
+                return StatusListReference.absent();
+            }
+            if (status.getMajorType() != MajorType.MAP) {
+                return StatusListReference.malformed("status is " + describe(status) + ", not the map ISO/IEC 18013-5 "
+                        + "second edition 12.3.6 defines ({status_list: StatusListInfo})");
+            }
+            DataItem statusList = status.getOrNull("status_list");
+            if (statusList == null) {
+                // ISO/IEC 18013-5 second edition 12.3.6: Status = { ? "status_list", ? "identifier_list", * tstr => RFU },
+                // so a status map without status_list (identifier_list only, or RFU keys) is valid and has no list.
+                return StatusListReference.absent();
+            }
+            if (statusList.getMajorType() != MajorType.MAP) {
+                return StatusListReference.malformed("status_list is " + describe(statusList) + ", not the map "
+                        + "{uri: tstr, idx: uint} of ISO/IEC 18013-5 second edition 12.3.6");
+            }
+            DataItem uri = statusList.getOrNull("uri");
+            if (uri == null) {
+                return StatusListReference.malformed("status_list has no uri; it is the URL TSL 8.1 has the wallet GET");
+            }
+            if (uri.getMajorType() != MajorType.UNICODE_STRING) {
+                return StatusListReference.malformed("status_list.uri is " + describe(uri) + ", not a tstr");
+            }
+            DataItem idx = statusList.getOrNull("idx");
+            if (idx == null) {
+                return StatusListReference.malformed("status_list has no idx; TSL 6.3 makes it the index of this "
+                        + "credential in the list");
+            }
+            if (idx.getMajorType() != MajorType.UNSIGNED_INTEGER) {
+                return StatusListReference.malformed("status_list.idx is " + describe(idx) + ", not the unsigned integer "
+                        + "TSL 6.3 requires");
+            }
+            long number;
+            try {
+                number = idx.getAsNumber();
+            } catch (RuntimeException e) {
+                return StatusListReference.malformed("status_list.idx " + describe(idx) + " cannot be read as an index: "
+                        + e.getMessage());
+            }
+            return StatusListReference.present(new StatusListInfo(uri.getAsTstr(), number));
+        } catch (Throwable e) {
+            if (e instanceof VirtualMachineError fatal && !(e instanceof StackOverflowError)) {
+                throw fatal;
+            }
+            return StatusListReference.malformed("the MSO's status.status_list cannot be read: " + e.getMessage());
+        }
+    }
+
+    /** A CBOR value as the malformed reasons spell it: its type and at most 60 characters of it. */
+    private static String describe(DataItem value) {
+        String text = value.getMajorType() + " " + value;
+        return text.length() <= 60 ? text : text.substring(0, 57) + "...";
+    }
+
+    /**
+     * The credential's IssuerAuth {@code x5chain} as received, leaf first: what the status list's own chain has to
+     * equal for Credo and Paradym to accept it (M-11b {@code statusList.issuanceChain}).
+     */
+    public static List<X509Certificate> issuerAuthX5chainOf(byte[] issuerSignedCbor) {
+        try {
+            DataItem issuerSigned = Cbor.INSTANCE.decode(issuerSignedCbor);
+            DataItem issuerAuthItem = issuerSigned.get("issuerAuth");
+            if (issuerAuthItem.getMajorType() == MajorType.TAG) {
+                issuerAuthItem = issuerAuthItem.getAsTagged();
+            }
+            CoseSign1 issuerAuth = CoseSign1.Companion.fromDataItem(issuerAuthItem);
+            DataItem x5chain = issuerAuth.getUnprotectedHeaders().get(new CoseNumberLabel(33));
+            if (x5chain == null) {
+                x5chain = issuerAuth.getProtectedHeaders().get(new CoseNumberLabel(33));
+            }
+            if (x5chain == null) {
+                return List.of();
+            }
+            X509CertChain chain = X509CertChain.Companion.fromDataItem(x5chain);
+            return X509CertChainJvmKt.getJavaX509Certificates(chain);
+        } catch (Throwable e) {
+            if (e instanceof VirtualMachineError fatal && !(e instanceof StackOverflowError)) {
+                throw fatal;
+            }
+            return List.of();
+        }
     }
 
     /**

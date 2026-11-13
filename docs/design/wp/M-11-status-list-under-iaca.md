@@ -544,36 +544,140 @@ token.
 ```java
 public static VerificationReport verify(byte[] body, String contentType, String uri, long idx,
         List<X509Certificate> issuerAuthX5chain, X509Certificate iaca /* nullable */, Instant at, StatusListOptions options)
-public record StatusListOptions(boolean strict, int expectedStatus /* 0 */, boolean requireIssuanceChain /* true */) {}
+public record StatusListOptions(boolean strict, int expectedStatus /* 0, or 1 for a revoked sample */,
+                                boolean requireIssuanceChain /* true */) {}
+public static VerificationReport.Check mso(String malformed /* null when absent or well formed */)
 ```
+
+`expectedStatus` is 0 or 1 only: ISO2 12.3.6.1 allows an mdoc no status besides revoked, and `bits` is 1 (12.3.6.5).
+
+`verify` runs `TOKEN_CHECKS` over the token; `mso` runs `statusList.mso` over the sample's own
+`status.status_list` reference (present, absent, or present-but-malformed). `CHECKS` is the two together, in report
+order. The conformance run puts the credential's checks and these in **one** report, matched against the sample's one
+`.gaps` sidecar (review round 1).
 
 Call Multipaz's `suspend` functions through the existing `IndependentMdocVerifier.await` pattern
 (`IndependentMdocVerifier.java:1524`).
+
+**Merge gate.** `statusList.chain` runs Multipaz's own `CompressedStatusList.fromCwt(cwt, iaca, {SUB: uri}, at)` —
+the reader `CachingRevocationChecker` uses, and the gate §4.9 names — not a reimplementation of its rules. Kotlin
+mangles the method name because `maxValidity: Duration` is a value class (`fromCwt-myKFqkg`), so the synthetic
+`$default` bridge is called through one reflective adapter that passes mask 16 (keeping Multipaz's 365-day
+`maxValidity`) and fails loudly if a Multipaz upgrade changes the signature. Its refusal is `statusList.chain:untrusted`
+per the table, but only when no more specific check (envelope, `typ`, signature, claims, list) already failed, so one
+mutation still fires one code; the direct `trustedRootCertificateChainValidator` call stays as the trust decision on its
+own, so a `fromCwt` refusal caused by a claim does not also fail the chain and a genuine chain failure is reported even
+when a claim is wrong. This is what refuses an `exp` more than 365 days after `at` on a DSC valid for the Annex B 457
+days.
 
 **Checks and problem codes** (registered beside `IndependentMdocVerifier.PROBLEM_CODES`; a failed check carries
 **every** problem it found):
 
 | Check | Codes | Clause |
 | --- | --- | --- |
+| `statusList.mso` | `malformed` (the MSO's `status.status_list` is present but not `{uri: tstr, idx: uint}`: typed `uri`, negative/text `idx`, `status_list` not a map; a `status` that is not a map. A `status` map without `status_list` — an `identifier_list` only, or RFU keys — is valid and absent) | ISO2 12.3.6 |
 | `statusList.http` | `contentType` (not `application/statuslist+cwt`, parameters ignored) | TSL §8.2 |
-| `statusList.envelope` | `notTagged18`, `cwtTag61`, `mac0`, `detachedPayload` | TSL §5.2, RFC 9052 §4.2 |
+| `statusList.envelope` | `notTagged18` (untagged, a tag other than 17/18/61, or any tag stack other than exactly `[18]` — `18(18(…))` and the self-describe `55799(18(…))` included), `cwtTag61`, `mac0`, `detachedPayload`, `duplicateKey` (a map of the protected header, the unprotected header or the claims, or a map nested in them such as `status_list`, carries a key twice; read on the wire with Authlete's decoder, which keeps every pair, before any header or claim is read; keys compared recursively as RFC 8949 §5.6.1 data items — integers by value at any width, strings by content, arrays element-wise, maps as unordered pair sets, tags by number and content, simple values by value, floats by numeric value at any width with `-0.0` = `0.0` and every NaN one key (stricter than §5.6.1's significand rule) — so `02` and `18 02`, or `{1: 1, 2: 2}` and `{2: 2, 1: 1}`, are one key; every other token check is then `notRun`, because a decoder keeps one value or the other — Multipaz the last. A part Authlete cannot decode though Multipaz did, such as a text string that is not UTF-8, makes the token `notTagged18`) | TSL §5.2, RFC 9052 §4.2; RFC 8949 §3.4.6; `@owf/cose` 0.6.0; RFC 9052 §3 ("if a label appears multiple times, the message MUST be rejected as malformed"), RFC 8392 §7.2 steps 1 and 7, RFC 8949 §5.3.1 |
 | `statusList.typ` | `missing`, `unprotected`, `notText`, `wrong` | TSL §5.2 |
 | `statusList.x5chain` | `missing`, `unprotectedOnly`, `carriesAnchor` (any self-signed certificate), `serialNumber` (≤ 0 or > 20 octets) | ISO2 12.3.6.3; HAIP §6.1 analogue; RFC 5280 §4.1.2.2 |
 | `statusList.signature` | `invalid:multipaz`, `invalid:authlete` | TSL §5.2 rule 2 |
-| `statusList.chain` | `untrusted` (Multipaz `fromCwt` against `iaca` refuses), `noAnchorSupplied` | ISO2 12.3.6.2 |
+| `statusList.chain` | `untrusted` (Multipaz `fromCwt` against `iaca` refuses, reported when the token's state is not defective in a way `fromCwt` itself refuses on — its rule set, in its own order, read from `ValidateCwtKt.validateCwt-efNRYWU`, `CompressedStatusList$Companion.fromCborMap`/`fromStatusListClaim` and the `CompressedStatusList` constructor: the body decodes, at most one tag 18 (an untagged COSE_Sign1 is accepted), the payload is a map; then `exp` (an integer, refused when before `at`, `exp == at` accepted) and **maxValidity** (`exp` more than 365 days after `at`), both decided before anything below; without `exp`, `iat` present and at most 5 s ahead; then protected `typ`, the SUB check, the signature; `ttl` an integer only when `exp` is absent; and the presence/type of `status_list`, `lst` (bstr, never inflated) and `bits` (a `Uint` narrowed to an `int` by `l2i`, then 1, 2, 4 or 8 — so `4294967297` is accepted as 1). `at` is compared at the millisecond precision `fromCwt` receives. maxValidity, which no check names, is suppressed only when `fromCwt` never reaches it — a parse failure, a duplicate key, a detached payload, a tag stack other than none or `[18]`, a non-integer `exp` — so `typ`, `sub`, the signature, `bits`, `lst`, `ttlInvalid`, `expAfterSigner`, `iatAfterExp`, `idxOutOfRange` and `statusMismatch` next to it cannot hide it, and the message names it), `noAnchorSupplied` | ISO2 12.3.6.2 |
 | `statusList.issuanceChain` | `differs` (the token `x5chain` is not certificate-for-certificate equal to `issuerAuthX5chain`) | Credo `mdocUtil.ts:76-115` |
-| `statusList.claims` | `subMismatch`, `iatMissing`, `iatFuture` (> `at` + 60 s), `expMissing`, `expired`, `expAfterSigner` (exp > leaf `notAfter`), `ttlInvalid` | TSL §5.2, §8.3 4a/4c; ISO2 12.3.6.3 |
-| `statusList.list` | `bitsNotOne`, `lstNotZlib`, `idxOutOfRange`, `statusMismatch:<n>` | ISO2 12.3.6.5; TSL §4.1, §8.3 step 6 |
+| `statusList.claims` | `subMismatch`, `iatMissing`, `iatFuture` (> `at` + 5 s, Multipaz `validateCwt`'s own clock allowance), `iatAfterExp`, `expMissing`, `expired` (`at` ≥ `exp`, `at` at full precision: RFC 8392 §3.1.4 takes RFC 7519 §4.1.4, "the current date/time MUST be before the expiration date/time"; Multipaz 0.102.0 refuses only `exp < at`, so exactly at `exp` only this check refuses), `expAfterSigner` (exp > leaf `notAfter`), `ttlInvalid` | TSL §5.2, §8.3 4a/4c; ISO2 12.3.6.3; RFC 8392 §3.1.4, RFC 7519 §4.1.4 |
+| `statusList.list` | `missing` (no `status_list` claim, or not a map), `bitsNotOne`, `lstNotZlib` (including raw DEFLATE without the zlib wrapper), `idxOutOfRange`, `statusMismatch:<n>` (read with Multipaz's `StatusList.get`) | ISO2 12.3.6.5; TSL §4.3, §4.1, §8.3 step 6 |
 | `statusList.signerPurpose` | `ekuMissing`, `kuMissing`: only when the token leaf's public key differs from the IssuerAuth leaf's | Credo `assertStatusListSignerKeyPurpose.ts:14-25` with `requireStatusSigningKeyPurpose` |
 
 **Samples.**
 
 - A producer writes `<sample>.statuslist.cwt` (the response body as received) and `<sample>.statuslist.ct` (the
   `Content-Type`) beside `<sample>.mdoc`.
-- `MdocSampleConformanceTest`: when the MSO carries `status.status_list`, both sidecars are required (failing with
-  `CI` set, reported locally). The list is verified with `iaca` = the sample's `.iaca.pem` (when present) and
-  `issuerAuthX5chain` = the sample's IssuerAuth `x5chain`, and held to the sample's `.gaps` exactly like M-01.
-- No producer writes these sidecars yet (M-11e does).
+- `MdocSamples` reads three outcomes of the MSO's `status.status_list`: absent (including a `status` map without
+  `status_list`, e.g. `identifier_list` only, which 12.3.6 makes valid), `{uri: tstr, idx: uint}`, or
+  present-but-malformed with the reason (an unreadable IssuerAuth or MSO answers absent, which is M-01's check).
+- `MdocSampleConformanceTest`: the credential's checks and the status list's join one report, held to the sample's one
+  `.gaps` sidecar exactly both ways like M-01 — an undeclared problem fails, a declared one no longer reported fails
+  ("gap no longer present"). Of the status-list checks only `statusList.mso:malformed` may be declared; every other
+  `statusList.*` line is refused when the sidecar is parsed, because M-11e's samples must pass those (a status list
+  that fails any other check is a defect the sample must not ship). When the MSO carries a well-formed
+  `status.status_list`, both sidecars are required and the list is verified with `iaca` = the sample's `.iaca.pem`
+  (when present) and `issuerAuthX5chain` = the sample's IssuerAuth `x5chain`; a present-but-malformed reference fails as
+  `statusList.mso:malformed` instead of being skipped.
+- No producer writes these sidecars yet (M-11e does; its samples must pass with no `statusList.*` gap other than a
+  declared `statusList.mso:malformed`).
+
+**Review round 1 (2026-11-13).** Fixed here: `fromCwt` is actually run (the major above); the malformed-MSO skip
+became `statusList.mso:malformed`; the gap set is one per sample across both reports; the whole tag stack is recorded
+and only exactly `[18]` is accepted (`55799` refused, as `@owf/cose` 0.6.0's `Cwt.decodeCoseStructure` refuses
+anything that is not the `Sign1`/`Mac0` tag itself; RFC 8949 §3.4.6 only permits, does not require, tolerance);
+`iatFuture` aligned to Multipaz's 5 s; `iatAfterExp`, `statusList.list:missing` and `statusList.mso:malformed` added;
+`expectedStatus` restricted to 0/1; the bit at `idx` read with Multipaz's `StatusList`.
+
+**Review round 2 (2026-11-13, approved with minors).** Fixed here: the `fromCwt` refusal is suppressed only by the
+codes `fromCwt` itself decides, so a maxValidity breach next to a `ttlInvalid`/`expAfterSigner`/`iatAfterExp`/
+`idxOutOfRange`/`statusMismatch` is still `chain:untrusted`; only `statusList.mso:malformed` may be declared as a
+`statusList.*` gap and any other line is refused when the sidecar is parsed; a broken or unrecognised `fromCwt` adapter
+(the mangled Kotlin name, a changed Multipaz) is resolved lazily and reported as the non-declarable `error` code with
+the descriptive message, never as `chain:untrusted`; a `status` map without `status_list` (IdentifierList-only) is
+valid and absent, not malformed; Authlete is handed the wire bytes (it decodes tag 18, `61(18)` and `55799(18(…))`
+itself) and falls back to the unwrapped array only for a tag stack whose envelope check already failed
+(`18(18(…))`). Tests: `aMaxValidityRefusalIsNotHiddenByACodeFromCwtNeverChecks`,
+`oneGapSetCoversBothReportsAndOnlyTheMalformedMsoGapIsDeclarable`,
+`theFromCwtAdapterResolvesAgainstThePinnedMultipazJar`, `aBrokenFromCwtAdapterIsAnErrorNotAnUntrustedChain`,
+`authleteVerifiesTheWireBytesOfAMultipazBuiltToken`, and the IdentifierList-only absent case. **Review round 3 (2026-11-13, approved with one minor and two nits).** Fixed here: the suppression is decided from
+the token's state (tags, payload, `sub`/`exp`/`iat`/`ttl`/`status_list`/`bits`/`lst`) against the bytecode of
+`validateCwt`/`fromCborMap`/`fromStatusListClaim`/the constructor, not from check names, because several codes also
+cover shapes `fromCwt` accepts — an untagged COSE_Sign1, `bits` 2/4/8, a `iat` with `exp` present, a garbage `lst` bstr
+and a `ttl` with `exp` present all used to suppress its maxValidity refusal and no longer do (a non-integer `ttl`
+explains only in the exp-absent branch `fromCborMap` reads); the `untrusted` message now says "most likely
+maxValidity" and names it only when `exp > at + 365 days`; the test seam is `volatile`. Probes are one test each
+(`aBitsValueMultipazAcceptsDoesNotHideItsMaxValidityRefusal`, `anUntaggedCoseSign1DoesNotHideMultipazsMaxValidityRefusal`,
+`aFutureIatNextToAnExpDoesNotHideMultipazsMaxValidityRefusal`, `aGarbageLstBstrDoesNotHideMultipazsMaxValidityRefusal`,
+`aTextTtlExplainsMultipazsRefusal`, renamed in round 4).
+
+**Review round 4 (2026-11-13, GPT-6.1 Sol two blockers, Opus one minor and nits; fixed on `wp/m-11b-r5`).**
+(1) Duplicate map keys passed: a correctly signed payload with `sub` twice — a wrong uri first, the expected one second
+— passed every check, because Multipaz's decoder keeps the last value and Authlete checks bytes only. RFC 8949 §5.3.1
+makes such a map invalid, RFC 9052 §3 requires a repeated header label to be "rejected as malformed", and RFC 8392
+§7.2 steps 1 and 7 reject a CWT that is not valid CBOR or whose claims are not a valid CBOR map; the verifier now reads
+the wire again with Authlete's decoder (no tag processor, every pair kept) right after the COSE_Sign1 array is
+recognised and before any header or claim is read, compares keys as RFC 8949 §5.6.1 data items (Authlete's preferred
+re-encoding of each decoded key), and reports `statusList.envelope:duplicateKey` with every other token check `notRun`.
+Without the walk, three of the signed mutations pass every check (claims `sub`, the `18 02` duplicate, `bits` 2 then 1)
+and the header duplicates are misreported as signature failures. (2) `expired` fired only for `exp < at`; RFC 7519
+§4.1.4 (through RFC 8392 §3.1.4 and TSL §5.2) makes the token invalid on and after `exp`, so it now fires for
+`at ≥ exp`, `at` at full precision. Multipaz 0.102.0 shares the off-by-one (`exp.compareTo(now) >= 0` passes), so at
+exactly `exp` `fromCwt` accepts and no chain code is added. (3) maxValidity is decided where `validateCwt` decides it,
+right after `exp` and before typ, sub, the signature and the list, so a wrong `typ` or `sub` next to an `exp` 400 days
+out is `{typ:[wrong], chain:[untrusted]}` / `{claims:[subMismatch], chain:[untrusted]}` and the chain message names
+maxValidity as the reason. (4) `bits` is mirrored as Multipaz reads it — `Uint`, `l2i`, then 1/2/4/8 — so
+`4294967297` is `bitsNotOne` here and accepted by `fromCwt`; the mirror's `exp`/`iat` comparisons use the millisecond
+`at` `fromCwt` receives (a whole-second mirror charges `fromCwt`'s "expired" half a second after `exp` to the chain as
+`untrusted`). A differential test, `theFromCwtMirrorAgreesWithFromCwtTokenByToken`, holds the mirror (package-private
+`fromCwtRefusesOnAReportedDefect(body, uri, at)`) to `fromCwt` itself over 20 token shapes at three instants (`at`,
+`at` + 500 ms, `at` + 100 ns).
+(5) `aTextTtlExplainsMultipazsRefusal` became `aTextTtlNextToAnExpIsOnlyTtlInvalid` (no refusal happens with `exp`
+present), and the exp-absent branch has its own tests (text `ttl`: `{claims:[expMissing, ttlInvalid]}`; future `iat`:
+`{claims:[iatFuture, expMissing]}`; no chain code).
+
+**Review round 5 (2026-11-13, Opus approved with one minor and three nits; GPT-6.1 Sol one major; fixed on
+`wp/m-11b-r5`).** (1) Keys were compared as Authlete's re-encoded bytes, which RFC 8949 §5.6.1 does not do for maps
+("the same set of pairs regardless of their order"): claim 999 = `{ {1: 1, 2: 2}: 1, {2: 2, 1: 1}: 2 }` passed every
+check, Multipaz `fromCwt` included. Keys are now compared by `DuplicateKeys.dataItem`, a recursive generic-data-model
+identity (integers by value, strings by content, arrays element-wise, maps as pair multisets, tags by number and
+content, simple values by value, floats by numeric value across widths with `-0.0` = `0.0`). NaN: §5.6.1 makes NaNs
+equivalent when their significands zero-extended to 64 bits are equal; every NaN is one key here, which is stricter,
+because Authlete decodes every half-precision NaN to one canonical NaN (the significand is gone) and JavaScript's
+SameValueZero `Map` and Java's `Double.equals` collapse NaN keys anyway. Without it the map-keyed and float-keyed tokens
+pass every check. (2) The `fromCwt` mirror now has the "expired" `validateCwt` derives without `exp`: `exp` = `iat` +
+maxValidity for an `iat` at or before now, refused when before now, which `expMissing` explains; without it an `iat` 366
+days old with no `exp` was `{claims:[expMissing], chain:[untrusted]}`. The differential test gained `iat` 364/365/366
+days ago. (3) The branch where Authlete cannot decode what Multipaz decoded is reached by a real token: a claim holding a
+text string that is not UTF-8 (`61 ff`), which Multipaz decodes to U+FFFD and Authlete refuses, is `notTagged18` with
+every other check `notRun`; ignoring the branch lets it pass. (4) The `expired` message says "exactly at exp this check
+alone refuses" only when Multipaz, handed `at` in milliseconds, accepts `exp`.
+
+**Open (unchanged):** an algorithm allow-list (isomdl accepts only ES256/ES384) —
+owner decision later.
 
 **Acceptance checklist.**
 
@@ -589,7 +693,19 @@ Call Multipaz's `suspend` functions through the existing `IndependentMdocVerifie
 - a token signed by a key whose certificate chains to a different IACA (`statusList.chain:untrusted`);
 - a token with the right signer but `x5chain` only in the unprotected header (`statusList.x5chain:unprotectedOnly`);
 - a JWT body with `Content-Type` `application/statuslist+jwt` (`statusList.http:contentType`, and the envelope check
-  reports that it is not CBOR).
+  reports that it is not CBOR);
+- a DSC valid for the Annex B 457 days with `exp` 400 days out (`statusList.chain:untrusted`: `fromCwt`'s
+  `maxValidity`);
+- `18(18(…))` and `55799(18(…))` (`statusList.envelope:notTagged18`);
+- every malformed `status.status_list` shape (`statusList.mso:malformed`);
+- a correctly signed token whose claims (`sub`), nested `status_list` (`bits`), protected header (`typ`) or unprotected
+  header (`kid`) carries a key twice, with the conflicting values in both orders, and a key repeated in a
+  non-preferred encoding, a map key repeated with its pairs in another order, float keys of one value in two widths,
+  `0.0`/`-0.0`, two NaNs and array keys of other integer widths (`statusList.envelope:duplicateKey`, every other token
+  check `notRun`), while an integer, its tagged form, a bignum, a float and a simple value of one number stay distinct;
+- a claim holding a text string that is not UTF-8 (`statusList.envelope:notTagged18`: Multipaz reads U+FFFD, Authlete
+  refuses);
+- a token evaluated exactly at its `exp`, and a nanosecond after it (`statusList.claims:expired`, `fromCwt` accepting).
 
 ### M-11c CWT codec, signer pinning, signer policy (certify-service, certify-issuance)
 
