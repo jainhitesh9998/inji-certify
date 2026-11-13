@@ -115,6 +115,8 @@ class MdlDemoAuthorizationServerTest {
                 "RFC 8414 section 2: response_types_supported is REQUIRED");
         assertEquals(List.of("S256"), objectMapper.convertValue(document.get("code_challenge_methods_supported"), List.class),
                 "RFC 7636: PKCE S256");
+        assertEquals(List.of("none"), objectMapper.convertValue(document.get("token_endpoint_auth_methods_supported"), List.class),
+                "RFC 8414 section 2 + RFC 7591 section 2: demo-wallet is a public client and sends no secret");
         assertTrue(document.get("pre-authorized_grant_anonymous_access_supported").asBoolean());
         // RFC 8414 section 2: the code grant is listed with the endpoint that issues a code, and PAR is required
         assertTrue(document.get("authorization_endpoint").asText().endsWith("/oauth/authorize"), document.toString());
@@ -125,7 +127,7 @@ class MdlDemoAuthorizationServerTest {
         document.fieldNames().forEachRemaining(members::add);
         assertEquals(new TreeSet<>(List.of("issuer", "token_endpoint", "jwks_uri", "grant_types_supported",
                         "response_types_supported", "code_challenge_methods_supported",
-                        "dpop_signing_alg_values_supported", "authorization_endpoint",
+                        "dpop_signing_alg_values_supported", "token_endpoint_auth_methods_supported", "authorization_endpoint",
                         "pushed_authorization_request_endpoint", "require_pushed_authorization_requests",
                         "pre-authorized_grant_anonymous_access_supported")),
                 members, "only the members of the two flows this stack serves: " + document);
@@ -207,6 +209,28 @@ class MdlDemoAuthorizationServerTest {
         // the request_uri is single use even when refused
         assertEquals(400, mockMvc.perform(get("/oauth/authorize").param("client_id", CLIENT_ID)
                 .param("request_uri", requestUri)).andReturn().getResponse().getStatus());
+    }
+
+    /**
+     * The registered redirect URI is matched as data, never by prefix or case: RFC 9126 section 2.2 makes
+     * {@code redirect_uri} at PAR a comparison against the registered value, and the offer page is exactly
+     * {@code .../offer/}. A near miss is refused with {@code invalid_request} and nothing is redirected (a prefix match
+     * would let a caller put its own host or path in the code's destination).
+     */
+    @Test
+    void aNearMissRedirectUriIsRefused() throws Exception {
+        for (String redirect : List.of("/offer", "/offer/x", "/offer/?next=1", "/Offer/", "/offer%2F",
+                                       "http://localhost:8091/v1/certify/offer/", "https://credentials.example.org:443/v1/certify/offer/")) {
+            String uri = redirect.startsWith("/") ? "https://credentials.example.org/v1/certify" + redirect : redirect;
+            MvcResult par = mockMvc.perform(post("/oauth/par").contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                    .param("client_id", CLIENT_ID).param("response_type", "code").param("redirect_uri", uri)
+                    .param("scope", SCOPE).param("code_challenge", challenge(VERIFIER)).param("code_challenge_method", "S256"))
+                    .andReturn();
+            JsonNode body = objectMapper.readTree(par.getResponse().getContentAsString());
+            assertEquals(400, par.getResponse().getStatus(), uri + ": " + body);
+            assertEquals("invalid_request", body.get("error").asText(), uri + ": " + body);
+            assertNull(par.getResponse().getHeader("Location"), uri + ": nothing is redirected");
+        }
     }
 
     /** The subject mode the demo runs with is {@code none}, never {@code fixed}: one synthetic holder's mDL for anyone. */

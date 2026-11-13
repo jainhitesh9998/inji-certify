@@ -18,9 +18,11 @@ metadata say:
   5. every mDL read back: each element equals the holders.json record in value and CBOR type (full-date as tag 1004,
      bool, uint, bstr, the whole driving_privileges), MSO docType, x5chain without the anchor, and the status entry:
      the demo issues none until M-11 (F-21: an MSO's status is optional, and the only list the stack can write is signed
-     by a key outside the IACA, G23), which is a PASS and skips the list checks; a configuration that asks for one keeps
-     them all - the list served, its bit clear, sub equal to the MSO's uri, iat not in the future and exp not passed
-     (exp is RECOMMENDED by draft-ietf-oauth-status-list; requiring it is Certify policy); then
+     by a key outside the IACA, G23), which is a PASS under the default `--expect-status absent` and skips the list
+     checks; `--expect-status present` (the M-11 runbook's step) fails when the entry is missing, and an entry that is
+     there is held to `{idx: uint, uri: tstr}` before anything is fetched. With an entry, every list check runs - the
+     list served, its bit clear, sub equal to the MSO's uri, iat not in the future and exp not passed (exp is
+     RECOMMENDED by draft-ietf-oauth-status-list; requiring it is Certify policy); then
      docs/design/tools/verify_mdoc.py (pymdoccbor, a verifier Certify does not maintain) with --doctype, --holder (the
      proof key) and --iaca: the IACA named by the Document Signer's CRL distribution point, downloaded from
      /v1/certify/mdoc/iaca/<id>.pem, or with --iaca <file> the operator's offline IACA, which the published one must
@@ -381,6 +383,30 @@ def has_status(mso):
     return isinstance(status, dict) and "status_list" in status
 
 
+def status_entry_problems(mso):
+    """Every way a PRESENT status entry is malformed, as a list of problems: ISO/IEC 18013-5 9.1.2.4 makes the MSO's
+    `status` a map carrying `status_list`, and draft-ietf-oauth-status-list gives that entry `{idx: uint, uri: tstr}`.
+    [] for a well-formed entry and for an MSO without one (see has_status)."""
+    if not has_status(mso):
+        return []
+    status = mso["status"]
+    if not isinstance(status, dict):
+        return [f"status is not a map: {status!r}"]
+    entry = status["status_list"]
+    if not isinstance(entry, dict):
+        return [f"status.status_list is not a map: {entry!r}"]
+    problems = []
+    idx, uri = entry.get("idx"), entry.get("uri")
+    if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0:
+        problems.append(f"status_list.idx {idx!r} is not an unsigned integer")
+    if not isinstance(uri, str) or not uri.strip():
+        problems.append(f"status_list.uri {uri!r} is not a non-blank string")
+    extra = sorted(set(entry) - {"idx", "uri"})
+    if extra:
+        problems.append(f"status_list carries unknown members {extra}")
+    return problems
+
+
 def talao_path_problems(as_metadata):
     """What a wallet that looks for an authorization endpoint even on a pre-authorized offer needs (Talao, F-21), and
     RFC 8414 section 2 with it: a non-blank authorization_endpoint and token_endpoint, and authorization_code listed
@@ -435,7 +461,7 @@ def run_openssl(*args):
 
 
 class Smoke:
-    def __init__(self, base, configuration, subject, out, pinned_iaca=None, holders=HOLDERS):
+    def __init__(self, base, configuration, subject, out, pinned_iaca=None, holders=HOLDERS, expect_status="absent"):
         self.base = base.rstrip("/")
         self.certify = self.base + "/v1/certify"
         self.configuration = configuration
@@ -444,6 +470,7 @@ class Smoke:
         self.holders_path = holders
         self.holders = json.loads(holders.read_text()) if holders.exists() else None
         self.pinned_iaca = pinned_iaca
+        self.expect_status = expect_status
         self.metadata = self.as_metadata = self.issuer = None
         self.iaca_path = self.dsc = None
 
@@ -544,6 +571,15 @@ class Smoke:
               {"authorization_endpoint": self.as_metadata.get("authorization_endpoint"),
                "token_endpoint": self.as_metadata.get("token_endpoint"),
                "problems": problems} if problems else self.as_metadata.get("authorization_endpoint"))
+        # Talao reads <as>/.well-known/openid-configuration before the RFC 8414 document and uses it if it parses as
+        # OpenID Connect Discovery. This issuer serves no such document, so the path must stay 404/non-JSON: one that
+        # parsed with other members would be believed instead of the RFC 8414 document checked above (F-21 review 1).
+        oidc_url = well_known(servers[0], "openid-configuration")
+        oidc_status, _, oidc = call("GET", oidc_url)
+        oidc_parses = isinstance(oidc, dict) and "issuer" in oidc
+        check("authorization server metadata: the OIDC discovery path is 404/non-JSON (Talao tries it first)",
+              not oidc_parses or all(oidc.get(k) == value for k, value in self.as_metadata.items()),
+              {"url": oidc_url, "status": oidc_status, "parses as OIDC discovery": oidc_parses})
         # OpenID4VCI 1.0 section 12.2.2: the unsigned form is the one this issuer serves and its Content-Type must say
         # so. A wallet that prefers the signed form (Accept: application/jwt) or a browser (text/html) must still get the
         # document, not a 406, at the root-mapped location the proxy serves; HEAD answers the same way (G30).
@@ -696,16 +732,29 @@ class Smoke:
         check("Document Signer: openssl verify -x509_strict -crl_check under the IACA and its CRL", code == 0 and output.endswith("OK"), output)
 
     def status(self, mso):
-        """The MSO's status entry and its Token Status List, when the configuration asks for one (F-21). The demo asks
-        for none until M-11: the only list it can write is signed outside the IACA, which Paradym rejects (G23), and
-        ISO/IEC 18013-5 makes `status` optional, so an MSO without one is compliant and is reported as a PASS."""
-        if not has_status(mso):
-            check("MSO carries no status entry (status disabled on this demo until M-11)", True,
-                  mso.get("status") if isinstance(mso, dict) else mso)
+        """The MSO's status entry and its Token Status List, held to `--expect-status` (F-21 review round 1).
+
+        The demo issues no status until M-11 (the only list it can write is signed outside the IACA, which Paradym
+        rejects, G23; ISO/IEC 18013-5 makes `status` optional), so `--expect-status absent` is the default - and a run
+        against a stack that restored the block says `present`, which fails here if the restore did not take. A present
+        entry is shape-checked before anything is fetched, so a malformed one is a failure and not a skip."""
+        entry = mso["status"]["status_list"] if has_status(mso) else None
+        if entry is None:
+            if self.expect_status == "present":
+                check("MSO status entry matches --expect-status present (M-11 restored)", False,
+                      {"expect-status": "present", "status": mso.get("status") if isinstance(mso, dict) else mso})
+            else:
+                check("MSO carries no status entry (status disabled on this demo until M-11)", True,
+                      mso.get("status") if isinstance(mso, dict) else mso)
             return
-        entry = mso["status"]["status_list"]
-        if not check("MSO status.status_list {idx, uri} (Token Status List)",
-                     isinstance(entry, dict) and isinstance(entry.get("idx"), int) and isinstance(entry.get("uri"), str), entry):
+        if self.expect_status != "present":
+            check("MSO status entry matches --expect-status absent (status disabled on this demo until M-11)", False,
+                  {"expect-status": self.expect_status, "status": mso["status"]})
+        else:
+            check("MSO status entry matches --expect-status present (M-11 restored)", True, entry)
+        problems = status_entry_problems(mso)
+        if not check("MSO status.status_list {idx: uint, uri: tstr} (Token Status List)", not problems,
+                     problems or entry):
             return
         name = ("status list served as statuslist+jwt, signature verifies with its x5c, sub is the uri, iat, "
                 "exp (Certify policy), bit clear")
@@ -796,6 +845,9 @@ def main(argv=None):
     parser.add_argument("base", nargs="?", default="http://localhost:8091", help="CERTIFY_PUBLIC_URL (default http://localhost:8091)")
     parser.add_argument("--configuration", default=MDL_DOCTYPE, help="credential configuration id (default org.iso.18013.5.1.mDL)")
     parser.add_argument("--subject", default="mdl-demo-1", help="holders.json record (default mdl-demo-1)")
+    parser.add_argument("--expect-status", choices=("absent", "present"), default="absent",
+                        help="the MSO's status entry the configuration is expected to produce: absent until the M-11 "
+                             "restore lands (the demo's default), present on a stack that restored the block")
     parser.add_argument("--out", help="directory for the credentials, holder keys, IACA and CRL (default: a new temporary one)")
     parser.add_argument("--iaca", type=Path, help="the operator's offline IACA (PEM, mdl-operator): the published IACA must be "
                                                    "this certificate, and the mDLs are verified against it")
@@ -806,7 +858,7 @@ def main(argv=None):
     out = Path(args.out) if args.out else Path(tempfile.mkdtemp(prefix="mdl-smoke-"))
     out.mkdir(parents=True, exist_ok=True)
     print(f"mDL smoke against {args.base}, configuration {args.configuration}, subject {args.subject}; files in {out}")
-    Smoke(args.base, args.configuration, args.subject, out, args.iaca, args.holders).run()
+    Smoke(args.base, args.configuration, args.subject, out, args.iaca, args.holders, args.expect_status).run()
     return 1 if table() or not results else 0
 
 

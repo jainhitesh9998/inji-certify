@@ -30,7 +30,21 @@ public class VCICacheService {
     private static final String VCISSUANCE_CACHE = "vcissuance";
     private static final String PRE_AUTH_TXN_CACHE = "preAuthCacheTxn";
     private static final String NONCE_CACHE = "nonce";
+    /**
+     * Pushed authorization requests (RFC 9126) live in a cache of their own, never in {@code preAuthCodeCache}: the PAR
+     * endpoint is unauthenticated and writes one entry per request, and the pre-authorized codes an offer is redeemed
+     * with live in {@code preAuthCodeCache}. Sharing it let a PAR flood evict every live offer (F-21 review round 1);
+     * this cache is bounded and expired by its own {@code mosip.certify.cache.size} / {@code cache.expire-in-seconds}
+     * entries, which must cover {@code certify.as.par.expires-in}.
+     */
+    private static final String PAR_REQUEST_CACHE = "parRequestCache";
     private static final String PAR_PREFIX = "par:";
+    /**
+     * The client-attestation proof-of-possession replay cache: one entry per accepted proof, bounded and expired by its
+     * own entries. It is not in {@code preAuthCodeCache} either, for the reason PAR is not: an authenticated caller
+     * writing it must never be able to evict an offer (F-21 review round 1).
+     */
+    private static final String CLIENT_ATTESTATION_JTI_CACHE = "clientAttestationJtiCache";
 
     @PostConstruct
     public void validateCacheConfiguration() {
@@ -106,24 +120,37 @@ public class VCICacheService {
         cacheManager.getCache("preAuthCodeCache").put(key, data);
     }
 
-    /** Pushed authorization requests (RFC 9126) share the pre-authorized code cache under their own prefix. */
+    /** A pushed authorization request (RFC 9126), in the bounded {@link #PAR_REQUEST_CACHE}, never in the offer cache. */
     public void setPushedAuthorizationRequest(String id, io.mosip.certify.as.PushedAuthorizationRequest request) {
-        cacheManager.getCache("preAuthCodeCache").put(PAR_PREFIX + id, request);
+        cacheManager.getCache(PAR_REQUEST_CACHE).put(PAR_PREFIX + id, request);
     }
 
     public io.mosip.certify.as.PushedAuthorizationRequest getPushedAuthorizationRequest(String id) {
-        Cache.ValueWrapper wrapper = cacheManager.getCache("preAuthCodeCache").get(PAR_PREFIX + id);
+        Cache cache = cacheManager.getCache(PAR_REQUEST_CACHE);
+        if (cache == null) {
+            log.error("Cache {} not available. Please verify cache configuration.", PAR_REQUEST_CACHE);
+            return null;
+        }
+        Cache.ValueWrapper wrapper = cache.get(PAR_PREFIX + id);
         return wrapper != null ? (io.mosip.certify.as.PushedAuthorizationRequest) wrapper.get() : null;
     }
 
     /** Records a client attestation PoP jti; false when it was seen before (replay). The entry lives as long as the cache does. */
     public boolean claimClientAttestationJti(String jti, long windowSeconds) {
-        Cache c = cacheManager.getCache("preAuthCodeCache");
+        Cache c = cacheManager.getCache(CLIENT_ATTESTATION_JTI_CACHE);
+        if (c == null) {
+            log.error("Cache {} not available: a client attestation proof cannot be checked for replay. Add it to "
+                    + "mosip.certify.cache.names.", CLIENT_ATTESTATION_JTI_CACHE);
+            return false;
+        }
         return c.putIfAbsent("capop:" + jti, Long.valueOf(windowSeconds)) == null;
     }
 
     public void evictPushedAuthorizationRequest(String id) {
-        cacheManager.getCache("preAuthCodeCache").evict(PAR_PREFIX + id);
+        Cache cache = cacheManager.getCache(PAR_REQUEST_CACHE);
+        if (cache != null) {
+            cache.evict(PAR_PREFIX + id);
+        }
     }
 
     public PreAuthCodeData getPreAuthCodeData(String code) {

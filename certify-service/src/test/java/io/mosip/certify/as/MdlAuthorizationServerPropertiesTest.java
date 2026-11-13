@@ -9,7 +9,6 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -44,6 +43,7 @@ class MdlAuthorizationServerPropertiesTest {
             + "\"response_types_supported\":[\"code\"],"
             + "\"code_challenge_methods_supported\":[\"S256\"],"
             + "\"dpop_signing_alg_values_supported\":[\"ES256\",\"ES384\",\"ES512\",\"RS256\",\"PS256\",\"EdDSA\"],"
+            + "\"token_endpoint_auth_methods_supported\":[\"none\"],"
             + "\"authorization_endpoint\":\"" + PUBLIC_URL + "/v1/certify/oauth/authorize\","
             + "\"pushed_authorization_request_endpoint\":\"" + PUBLIC_URL + "/v1/certify/oauth/par\","
             + "\"require_pushed_authorization_requests\":true,"
@@ -74,11 +74,15 @@ class MdlAuthorizationServerPropertiesTest {
             assertEquals(List.of("demo-wallet"), List.copyOf(as.clients().keySet()), pki + ": exactly one client");
             // `none` is the default and what this profile must keep (the demo is public: a fixed subject would hand
             // one synthetic holder's mDL to anyone)
-            assertEquals(AsProperties.SUBJECT_MODE_NONE, as.authorization().subjectMode(), pki + ": subject mode");
-            assertNotEquals(AsProperties.SUBJECT_MODE_FIXED, as.authorization().subjectMode(), pki + ": never fixed");
+            assertEquals(AsProperties.SUBJECT_MODE_NONE, as.authorization().subjectMode(), pki + ": subject mode, never fixed");
             assertNull(as.authorization().fixedSubject(), pki + ": no fixed subject");
 
+            // the client is public (a redirect URI, no secret): RFC 8414 section 2 would read an absent list as
+            // client_secret_basic, which this deployment has nothing to authenticate with
+            assertTrue(as.clientAttestation() == null || as.clientAttestation().attesters() == null
+                    || as.clientAttestation().attesters().isEmpty(), pki + ": no attester configured");
             String document = ComposeProperties.document(ComposeProperties.documentService(binder));
+            assertTrue(document.contains("\"token_endpoint_auth_methods_supported\":[\"none\"]"), pki + ": " + document);
             assertEquals(MDL_DOCUMENT, document, pki + ": the live authorization server document");
         }
     }

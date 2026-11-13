@@ -41,6 +41,9 @@ public class OAuthAuthorizationServerMetadataService {
     /** Certify's identity: the deployment's own base URL (a legacy key, read through the Environment). */
     static final String DOMAIN_URL_PROPERTY = "mosip.certify.domain.url";
 
+    /** RFC 7591 section 2: the token endpoint authenticates a public client with nothing at all. */
+    static final String TOKEN_ENDPOINT_AUTH_METHOD_NONE = "none";
+
     @Autowired
     private ObjectProvider<AsProperties> asProperties;
 
@@ -127,8 +130,15 @@ public class OAuthAuthorizationServerMetadataService {
             metadata.setAuthorizationEndpoint(base + "/oauth/authorize");
             metadata.setPushedAuthorizationRequestEndpoint(base + "/oauth/par");
             metadata.setRequirePushedAuthorizationRequests(Boolean.TRUE);
-            if (as.clientAttestation() != null && as.clientAttestation().attesters() != null && !as.clientAttestation().attesters().isEmpty()) {
+            // RFC 8414 section 2: an omitted token_endpoint_auth_methods_supported means client_secret_basic, and a client
+            // of this flow is a public client - `certify.as.clients.<id>` holds redirect URIs and no secret, so there is
+            // no credential a Basic header could carry (RFC 7591 section 2, RFC 9126 section 2). Say so, or a wallet that
+            // reads the default refuses the code flow it is told to use (F-21 review round 1). With attestation configured
+            // the method is the attested one, published exactly as before.
+            if (clientAttestationConfigured(as)) {
                 metadata.setTokenEndpointAuthMethodsSupported(List.of(ClientAttestationValidator.AUTH_METHOD));
+            } else {
+                metadata.setTokenEndpointAuthMethodsSupported(List.of(TOKEN_ENDPOINT_AUTH_METHOD_NONE));
             }
         }
         // OID4VCI 1.0 section 12.3: a Token Request with a pre-authorized code and no client_id is answered here, so an
@@ -336,6 +346,12 @@ public class OAuthAuthorizationServerMetadataService {
         }
         String trimmed = url.trim();
         return trimmed.endsWith("/") ? trimmed.substring(0, trimmed.length() - 1) : trimmed;
+    }
+
+    /** {@code true} when {@code certify.as.client-attestation.attesters} names at least one attester. */
+    private static boolean clientAttestationConfigured(AsProperties as) {
+        return as.clientAttestation() != null && as.clientAttestation().attesters() != null
+                && !as.clientAttestation().attesters().isEmpty();
     }
 
     /** {@code true} when {@code certify.as.client-attestation.required} refuses unauthenticated token requests. */

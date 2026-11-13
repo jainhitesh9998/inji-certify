@@ -11,6 +11,8 @@
 #         `%2e%2e`, `;`, a trailing slash, an extra segment) are refused for a public request;
 #   local the same keymanager and admin paths still reach the upstream without CF-Ray (the operator on the host), which
 #         is why 8091 must only listen on loopback (docker-compose.public.yaml).
+#   limit a public burst on the rate-limited paths (offer minting, token, PAR, authorize) is answered 429, a local one
+#         is not, and a PAR body above the 8 KiB cap is 413 while an offer's claims JSON still reaches the upstream;
 #   fwd   the OpenID4VCI 1.0 metadata, root-mapped (section 12.2.2) and under the servlet path, reaches the 1.0 handler's
 #         path for GET and HEAD with the request's Accept unchanged (absent, application/jwt, text/html,
 #         application/json, */*): the stub echoes what it received in X-Stub-* headers, which HEAD carries too. The
@@ -299,6 +301,88 @@ for mapping in "/.well-known/openid-credential-issuer/v1/certify/oid4vci $ONE_ZE
         done
     done
 done
+
+# --- the rate-limited paths (F-21 review round 1) ---
+# certify-nginx rate limits the unauthenticated issuance calls a public client can make in a loop - offer minting, the
+# token endpoint, the pushed authorization endpoint and the authorization endpoint - by client address (CF-Connecting-IP,
+# 30 a minute with a burst of 20, then 429). A pushed authorization request is stored until it is redeemed, so it is
+# rate limited too, and its body is capped at 8 KiB (its form fields are a few dozen bytes; offer minting keeps the
+# server default because its claims JSON is legitimately larger).
+#
+# Every request of a burst carries the SAME client address, which is what the limit keys on; the checks above rotate the
+# address, which is why they never trip it.
+python3 - "$WORK" <<'PY_EOF'
+import sys, pathlib
+pathlib.Path(sys.argv[1], "par-body.txt").write_text("client_id=demo-wallet&state=" + "a" * 9000)
+pathlib.Path(sys.argv[1], "par-small.txt").write_text("client_id=demo-wallet&response_type=code")
+pathlib.Path(sys.argv[1], "offer-body.json").write_text('{"credential_configuration_id":"org.iso.18013.5.1.mDL","claims":{"x":"' + "a" * 9000 + '"}}')
+PY_EOF
+
+# burst <who> <method> <path> <count> <client address> -> the number of 429 answers
+burst() {
+    local who="$1" method="$2" path="$3" count="$4" address="$5" n=0 i=0 code body="$WORK/par-small.txt"
+    [ "$method" = GET ] && body=/dev/null
+    while [ "$i" -lt "$count" ]; do
+        local args=(-s -o /dev/null -w '%{http_code}' -X "$method")
+        if [ "$who" = public ]; then
+            args+=(-H 'CF-Ray: 8f00000000000000-BLR' -H "CF-Connecting-IP: $address")
+        fi
+        if [ "$method" = POST ]; then
+            args+=(-H 'Content-Type: application/x-www-form-urlencoded' --data-binary "@$body")
+        fi
+        code="$(curl "${args[@]}" "$BASE$path")" || code="curl-error"
+        [ "$code" = 429 ] && n=$((n + 1))
+        i=$((i + 1))
+    done
+    echo "$n"
+}
+
+# limited <who> <method> <path> <count> <address> <want: some|none>
+limited() {
+    local who="$1" method="$2" path="$3" count="$4" address="$5" want="$6" n
+    n="$(burst "$who" "$method" "$path" "$count" "$address")"
+    total=$((total + 1))
+    local ok=0
+    if [ "$want" = some ] && [ "$n" -gt 0 ]; then ok=1; fi
+    if [ "$want" = none ] && [ "$n" -eq 0 ]; then ok=1; fi
+    if [ "$ok" = 1 ]; then
+        printf 'ok    %-4s %-6s %-4s %-40s %2s requests, 429 x%-2s\n' "$want" "$who" "$method" "$path" "$count" "$n"
+    else
+        printf 'FAIL  %-4s %-6s %-4s %-40s %2s requests, 429 x%-2s\n' "$want" "$who" "$method" "$path" "$count" "$n"
+        failures=$((failures + 1))
+    fi
+}
+
+limited public POST /v1/certify/oauth/par 40 203.0.113.11 some
+limited public GET  "/v1/certify/oauth/authorize?client_id=demo-wallet&request_uri=urn:ietf:params:oauth:request_uri:x" 40 203.0.113.12 some
+limited public POST /v1/certify/oauth/token 40 203.0.113.13 some
+limited public POST /v1/certify/pre-authorized-data 40 203.0.113.14 some
+# the operator and the seed talk to certify from the host or inside the network: not counted, never limited
+limited local  POST /v1/certify/oauth/par 40 - none
+limited local  POST /v1/certify/pre-authorized-data 40 - none
+
+# body-limit <who> <path> <file> <want code>
+body-limit() {
+    local who="$1" path="$2" file="$3" want="$4" code
+    local args=(-s -o "$WORK/body" -w '%{http_code}' -X POST -H 'Content-Type: application/json')
+    if [ "$who" = public ]; then
+        args+=(-H 'CF-Ray: 8f00000000000000-BLR' -H "CF-Connecting-IP: 203.0.113.$(( total % 200 + 20 ))")
+    fi
+    code="$(curl "${args[@]}" --data-binary "@$file" "$BASE$path")" || code="curl-error"
+    total=$((total + 1))
+    if [ "$code" = "$want" ]; then
+        printf 'ok    %-5s %-6s POST %-40s (%s bytes) -> %s\n' "$want" "$who" "$path" "$(wc -c < "$file" | tr -d ' ')" "$code"
+    else
+        printf 'FAIL  %-5s %-6s POST %-40s (%s bytes) -> %s\n' "$want" "$who" "$path" "$(wc -c < "$file" | tr -d ' ')" "$code"
+        failures=$((failures + 1))
+    fi
+}
+
+# a pushed authorization request body above 8 KiB is refused before Certify sees it; an offer's claims JSON is not
+body-limit public /v1/certify/oauth/par "$WORK/par-body.txt" 413
+body-limit public /v1/certify/pre-authorized-data "$WORK/offer-body.json" 200
+body-limit local  /v1/certify/oauth/par "$WORK/par-body.txt" 413
+
 
 echo
 if [ "$failures" -ne 0 ]; then

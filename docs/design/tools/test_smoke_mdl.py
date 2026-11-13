@@ -183,6 +183,67 @@ class StatusEntry(unittest.TestCase):
         s.results.clear()
 
 
+class StatusExpectation(unittest.TestCase):
+    """`--expect-status` (F-21 review round 1): the demo issues no status until M-11, and a restore must not go
+    unnoticed. A present entry is held to {idx: uint, uri: tstr} before anything is fetched."""
+
+    URI = "https://issuer.example/v1/certify/credentials/token-status-list/1"
+
+    def status(self, mso, expect):
+        s.results.clear()
+        smoke = s.Smoke("http://localhost:1", s.MDL_DOCTYPE, "mdl-demo-1", Path("."), expect_status=expect)
+        smoke.status(mso)  # nothing listens on port 1: a run that fetched would fail differently
+        steps = [(step, ok) for step, ok, _ in s.results]
+        s.results.clear()
+        return steps
+
+    def mso(self, entry="default", **override):
+        mso = {"docType": s.MDL_DOCTYPE}
+        if entry == "default":
+            mso["status"] = {"status_list": {"idx": 3, "uri": self.URI}}
+        elif entry is not None:
+            mso["status"] = entry
+        mso.update(override)
+        return mso
+
+    def test_the_demos_default_expectation_passes_without_an_entry(self):
+        self.assertEqual([("MSO carries no status entry (status disabled on this demo until M-11)", True)],
+                         self.status({"docType": s.MDL_DOCTYPE}, "absent"))
+
+    def test_an_entry_fails_the_default_expectation(self):
+        steps = self.status(self.mso(), "absent")
+        self.assertEqual([(False, "absent")], [(ok, "absent") for _, ok in steps][:1], steps)
+        self.assertIn("--expect-status absent", steps[0][0])
+        # the entry is still shape-checked, so the report says what is there
+        self.assertEqual("MSO status.status_list {idx: uint, uri: tstr} (Token Status List)", steps[1][0])
+
+    def test_the_m11_runbook_expectation_fails_without_an_entry(self):
+        steps = self.status({"docType": s.MDL_DOCTYPE}, "present")
+        self.assertEqual([("MSO status entry matches --expect-status present (M-11 restored)", False)], steps)
+
+    def test_the_m11_runbook_expectation_passes_with_a_well_formed_entry(self):
+        steps = self.status(self.mso(), "present")
+        self.assertEqual([("MSO status entry matches --expect-status present (M-11 restored)", True),
+                          ("MSO status.status_list {idx: uint, uri: tstr} (Token Status List)", True)], steps[:2])
+
+    def test_a_malformed_entry_fails_and_is_not_fetched(self):
+        for entry in ({"status_list": {"idx": "3", "uri": self.URI}}, {"status_list": {"idx": 3}},
+                      {"status_list": {"idx": True, "uri": self.URI}}, {"status_list": {"idx": -1, "uri": self.URI}},
+                      {"status_list": {"idx": 3, "uri": ""}}, {"status_list": {"idx": 3, "uri": self.URI, "x": 1}},
+                      {"status_list": "nope"}, {"status_list": {"idx": 3.5, "uri": self.URI}}):
+            problems = s.status_entry_problems({"status": entry})
+            self.assertTrue(problems, entry)
+            steps = self.status(self.mso(entry), "present")
+            self.assertEqual(("MSO status.status_list {idx: uint, uri: tstr} (Token Status List)", False), steps[-1], entry)
+
+    def test_a_status_map_without_a_status_list_is_absent(self):
+        # ISO2 12.3.6: Status = { ? status_list, ? identifier_list, * tstr => RFU }; an IdentifierList-only status (or
+        # one with RFU members only) carries no status_list entry, so it is absent rather than malformed
+        self.assertEqual([], s.status_entry_problems({"status": {}}))
+        self.assertEqual([("MSO carries no status entry (status disabled on this demo until M-11)", True)],
+                         self.status({"status": {}}, "absent"))
+
+
 class TalaoPath(unittest.TestCase):
     """What a wallet that looks for an authorization endpoint even on a pre-authorized offer needs (F-21), and RFC 8414
     section 2 with it."""

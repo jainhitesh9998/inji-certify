@@ -1,8 +1,9 @@
 package io.mosip.certify.as;
 
-import io.mosip.certify.core.constants.Constants;
+import io.mosip.certify.core.dto.CredentialConfigurationSupportedDTO;
+import io.mosip.certify.core.dto.CredentialIssuerMetadataDTO;
+import io.mosip.certify.core.spi.CredentialRegistry;
 import io.mosip.certify.entity.IarSession;
-import io.mosip.certify.repository.CredentialConfigRepository;
 import io.mosip.certify.repository.IarSessionRepository;
 import io.mosip.certify.services.OAuthAuthorizationServerMetadataService;
 import io.mosip.certify.services.VCICacheService;
@@ -38,20 +39,27 @@ public class AuthorizationCodeService {
     static final String RESPONSE_TYPE_CODE = "code";
     static final String AUTHORIZATION_DETAILS_TYPE = "openid_credential";
     static final int CODE_BYTES = 32;
+    /**
+     * The longest {@code state} and {@code issuer_state} a pushed request may carry. Both are opaque to this server and
+     * are echoed back verbatim (RFC 6749 4.1.2, 10.12 recommends a value that binds the request), so a bound is what
+     * keeps an unauthenticated caller from parking 1 MiB strings in the cache (F-21 review round 1; the proxy caps the
+     * whole body at 8 KiB too).
+     */
+    static final int MAX_STATE_LENGTH = 512;
 
     private final AsProperties properties;
     private final VCICacheService cache;
     private final IarSessionRepository sessions;
-    private final CredentialConfigRepository configurations;
+    private final CredentialRegistry registry;
     private final OAuthAuthorizationServerMetadataService metadata;
     private final SecureRandom random = new SecureRandom();
 
     public AuthorizationCodeService(AsProperties properties, VCICacheService cache, IarSessionRepository sessions,
-                                    CredentialConfigRepository configurations, OAuthAuthorizationServerMetadataService metadata) {
+                                    CredentialRegistry registry, OAuthAuthorizationServerMetadataService metadata) {
         this.properties = properties;
         this.cache = cache;
         this.sessions = sessions;
-        this.configurations = configurations;
+        this.registry = registry;
         this.metadata = metadata;
     }
 
@@ -75,6 +83,10 @@ public class AuthorizationCodeService {
         if (redirectUri == null || client.redirectUris() == null || !client.redirectUris().contains(redirectUri)) {
             throw new AsException(400, "invalid_request", "redirect_uri is not registered for this client");
         }
+        // Bounded input: this endpoint is unauthenticated and stores what it accepts (see MAX_STATE_LENGTH and
+        // AuthorizationDetails.MAX_LENGTH/MAX_ENTRIES). Every refusal is the RFC 9126 invalid_request.
+        requireAtMost("state", params.get("state"), MAX_STATE_LENGTH);
+        requireAtMost("issuer_state", params.get("issuer_state"), MAX_STATE_LENGTH);
         String codeChallenge = params.get("code_challenge");
         if (codeChallenge == null || codeChallenge.isBlank()) {
             throw new AsException(400, "invalid_request", "code_challenge is required");
@@ -86,6 +98,11 @@ public class AuthorizationCodeService {
         String authorizationDetails = blankToNull(params.get("authorization_details"));
         if (scope == null && authorizationDetails == null) {
             throw new AsException(400, "invalid_request", "scope or authorization_details is required");
+        }
+        // Validated even when scope is present and decides the effective scope: the value is stored and echoed, and an
+        // entry that is not an openid_credential naming a configuration is malformed whatever else the request carries.
+        if (authorizationDetails != null) {
+            AuthorizationDetails.credentialConfigurationIds(authorizationDetails);
         }
         String effectiveScope = effectiveScope(scope, authorizationDetails);
         String id = token(24);
@@ -152,10 +169,15 @@ public class AuthorizationCodeService {
 
     /** The scope the token carries: the requested scopes (each must be a configuration's scope) or the scope of the configurations named in authorization_details. */
     private String effectiveScope(String scope, String authorizationDetails) {
-        Map<String, String> scopeByConfiguration = configurations.findAll().stream()
-                .filter(c -> c.getStatus() == null || Constants.ACTIVE.equalsIgnoreCase(c.getStatus()))
-                .filter(c -> c.getScope() != null)
-                .collect(Collectors.toMap(c -> c.getCredentialConfigKeyId(), c -> c.getScope(), (a, b) -> a));
+        // The issuer-metadata view is cached (CredentialRegistry, evicted on every configuration write), so a pushed
+        // request costs no database query: the PAR endpoint is unauthenticated and must stay cheap (F-21 review 1).
+        CredentialIssuerMetadataDTO metadataView = registry.issuerMetadata();
+        Map<String, CredentialConfigurationSupportedDTO> supported =
+                metadataView == null || metadataView.getCredentialConfigurationSupportedDTO() == null
+                        ? Map.of() : metadataView.getCredentialConfigurationSupportedDTO();
+        Map<String, String> scopeByConfiguration = supported.entrySet().stream()
+                .filter(e -> e.getValue() != null && e.getValue().getScope() != null)
+                .collect(Collectors.toMap(Map.Entry::getKey, e -> e.getValue().getScope(), (a, b) -> a));
         Set<String> knownScopes = Set.copyOf(scopeByConfiguration.values());
         if (scope != null) {
             List<String> requested = Arrays.stream(scope.trim().split("\\s+")).toList();
@@ -195,5 +217,13 @@ public class AuthorizationCodeService {
 
     private static String blankToNull(String value) {
         return value == null || value.isBlank() ? null : value.trim();
+    }
+
+    /** {@code invalid_request} when {@code value} is longer than {@code max} characters, {@code null} included as fine. */
+    private static void requireAtMost(String parameter, String value, int max) {
+        if (value != null && value.length() > max) {
+            throw new AsException(400, "invalid_request",
+                    parameter + " is longer than " + max + " characters");
+        }
     }
 }

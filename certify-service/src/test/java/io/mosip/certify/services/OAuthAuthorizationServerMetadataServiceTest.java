@@ -689,6 +689,69 @@ public class OAuthAuthorizationServerMetadataServiceTest {
                 new AsProperties.PreAuthorizedGrant(advertiseAnonymousAccess));
     }
 
+    /**
+     * RFC 8414 section 2: an omitted {@code token_endpoint_auth_methods_supported} means {@code client_secret_basic}, and
+     * a client registered under {@code certify.as.clients} is a public client - a redirect URI and no secret (F-21
+     * review round 1). So an own-AS document with clients says {@code ["none"]} (RFC 7591 section 2), the attested method
+     * is published when attesters are configured, and a document with no client says nothing (unchanged).
+     */
+    @Test
+    public void getOAuthAuthorizationServerMetadata_PublicClientsAreAdvertisedAsNone() {
+        ownIdentity("http://localhost:8090");
+        asProperties(as(Map.of("demo-wallet", new AsProperties.Client(List.of("https://wallet.example/cb"))), false, false));
+
+        OAuthAuthorizationServerMetadataDTO result = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+
+        assertEquals(List.of("none"), result.getTokenEndpointAuthMethodsSupported());
+        assertEquals("http://localhost:8090/v1/certify/oauth/authorize", result.getAuthorizationEndpoint());
+    }
+
+    @Test
+    public void getOAuthAuthorizationServerMetadata_AttestersKeepTheAttestedMethod() {
+        ownIdentity("http://localhost:8090");
+        AsProperties withAttesters = new AsProperties(
+                Map.of("demo-wallet", new AsProperties.Client(List.of("https://wallet.example/cb"))),
+                new AsProperties.Authorization("none", null), new AsProperties.Par(Duration.ofSeconds(90)),
+                new AsProperties.ClientAttestation(false, Map.of("attester", new AsProperties.Attester("{}")),
+                        Duration.ofSeconds(60), Duration.ofMinutes(5)),
+                new AsProperties.PreAuthorizedGrant(false));
+        asProperties(withAttesters);
+
+        OAuthAuthorizationServerMetadataDTO result = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+
+        assertEquals(List.of("attest_jwt_client_auth"), result.getTokenEndpointAuthMethodsSupported());
+    }
+
+    @Test
+    public void getOAuthAuthorizationServerMetadata_NoClientsAddsNoAuthMethods() {
+        ownIdentity("http://localhost:8090");
+        asProperties(as(Map.of(), false, false));
+
+        OAuthAuthorizationServerMetadataDTO result = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+
+        assertNull("a pre-authorized-only document names no client authentication",
+                result.getTokenEndpointAuthMethodsSupported());
+        assertNull(result.getAuthorizationEndpoint());
+    }
+
+    @Test
+    public void getOAuthAuthorizationServerMetadata_ExternalAuthorizationServerIsServedAsConfigured() {
+        // not Certify's token endpoint and not even at .../oauth/token (an external AS, e.g. an OIDC provider's
+        // /connect/token): nothing is added, and the code flow of this deployment is not advertised for a server it does
+        // not run. The `/oauth/token` suffix gate below this branch is historical and unchanged: an external AS at that
+        // path still gets the members it always got.
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "tokenEndpoint", "https://idp.example/connect/token");
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "interactiveAuthorizationEndpoint", "");
+        identity("https://issuer.example", "https://issuer.example");
+        dispatcherServletPath("/v1/certify");
+        asProperties(as(Map.of("demo-wallet", new AsProperties.Client(List.of("https://wallet.example/cb"))), false, false));
+
+        OAuthAuthorizationServerMetadataDTO result = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+
+        assertNull(result.getTokenEndpointAuthMethodsSupported());
+        assertNull(result.getAuthorizationEndpoint());
+    }
+
     @Test
     public void getOAuthAuthorizationServerMetadata_WithMultipleValues_ShouldParseCorrectly() {
         // Arrange - set multiple values
