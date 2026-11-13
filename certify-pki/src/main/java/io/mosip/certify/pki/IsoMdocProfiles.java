@@ -315,6 +315,10 @@ public final class IsoMdocProfiles {
             maxLength(commonName, MAX_COMMON_NAME, "DS_SUBJECT_CN_TOO_LONG", "common name (CN)");
             Parsed.Cert parsedIaca = conformingIaca(iaca, iacaKeyPair, "DS_IACA_INVALID");
             Certificates.curve(subjectPublicKey, "DS");
+            if (Certificates.sameKey(parsedIaca.spki(), subjectPublicKey)) {
+                throw new PkiException("DS_KEY_IS_IACA_KEY: the Document Signer public key is the IACA's own key; a"
+                        + " Document Signer needs a key pair of its own, so the IACA key never signs documents");
+            }
             Certificates.checkValidity(validity, DS_MAX_VALIDITY, "DS");
             BigInteger serialNumber = serial != null ? serial : Serials.random();
             Certificates.checkSerial(serialNumber, "DS");
