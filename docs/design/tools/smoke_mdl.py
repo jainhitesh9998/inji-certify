@@ -479,19 +479,26 @@ class Smoke:
         s, _, as_metadata = call("GET", as_url)
         self.as_metadata = as_metadata if isinstance(as_metadata, dict) else {}
         check("authorization server metadata: anonymous pre-authorized grant advertised",
-              s == 200 and self.as_metadata.get("issuer") == servers[0] and self.as_metadata.get("token_endpoint")
+              s == 200 and self.as_metadata.get("issuer") == servers[0]
+              and isinstance(self.as_metadata.get("token_endpoint"), str) and self.as_metadata.get("token_endpoint").strip()
               and PRE_AUTH in self.as_metadata.get("grant_types_supported", [])
               and self.as_metadata.get("pre-authorized_grant_anonymous_access_supported") is True,
               {"url": as_url, "status": s} | {k: self.as_metadata.get(k) for k in ("issuer", "token_endpoint", "pre-authorized_grant_anonymous_access_supported")})
         # RFC 8414 section 2: the document advertises only grants it can complete. grant_types_supported must be present
         # and non-empty (an absent list defaults to authorization_code and implicit), and authorization_code needs
-        # authorization_endpoint - or, for presentation during issuance, a configured interactive_authorization_endpoint.
-        # The demo listed authorization_code with neither and a wallet that follows authorization_servers[0] aborted (G29).
+        # authorization_endpoint - or the interactive authorization endpoint of the OpenID4VCI 1.1 editor's draft, which
+        # is the owner-approved compatibility interpretation (1.0 final has no such endpoint; G29). A blank string is as
+        # absent as a missing member. The demo listed authorization_code with neither and a wallet that follows
+        # authorization_servers[0] aborted (G29).
+        def present(value):
+            return isinstance(value, str) and value.strip() != ""
+
         grants = self.as_metadata.get("grant_types_supported") or []
-        authorization_code_completable = (self.as_metadata.get("authorization_endpoint") is not None
-                                         or self.as_metadata.get("interactive_authorization_endpoint") is not None)
+        authorization_code_completable = (present(self.as_metadata.get("authorization_endpoint"))
+                                         or present(self.as_metadata.get("interactive_authorization_endpoint")))
         check("authorization server metadata: non-empty grant_types_supported, authorization_code completable (RFC 8414 s2)",
-              bool(grants) and ("authorization_code" not in grants or authorization_code_completable),
+              bool(grants) and all(present(g) for g in grants)
+              and ("authorization_code" not in grants or authorization_code_completable),
               {"grant_types_supported": grants,
                "authorization_endpoint": self.as_metadata.get("authorization_endpoint"),
                "interactive_authorization_endpoint": self.as_metadata.get("interactive_authorization_endpoint")})
