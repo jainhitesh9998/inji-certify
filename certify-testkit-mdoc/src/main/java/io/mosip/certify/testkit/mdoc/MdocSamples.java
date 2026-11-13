@@ -318,8 +318,9 @@ public final class MdocSamples {
             }
             DataItem statusList = status.getOrNull("status_list");
             if (statusList == null) {
-                return StatusListReference.malformed("status has no status_list key; ISO/IEC 18013-5 second edition "
-                        + "12.3.6 puts the list reference there");
+                // ISO/IEC 18013-5 second edition 12.3.6: Status = { ? "status_list", ? "identifier_list", * tstr => RFU },
+                // so a status map without status_list (identifier_list only, or RFU keys) is valid and has no list.
+                return StatusListReference.absent();
             }
             if (statusList.getMajorType() != MajorType.MAP) {
                 return StatusListReference.malformed("status_list is " + describe(statusList) + ", not the map "

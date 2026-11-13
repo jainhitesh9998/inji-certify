@@ -562,13 +562,13 @@ days.
 
 | Check | Codes | Clause |
 | --- | --- | --- |
-| `statusList.mso` | `malformed` (the MSO's `status.status_list` is present but not `{uri: tstr, idx: uint}`: missing/typed `uri`, missing/negative/text `idx`, `status_list` not a map) | ISO2 12.3.6 |
+| `statusList.mso` | `malformed` (the MSO's `status.status_list` is present but not `{uri: tstr, idx: uint}`: typed `uri`, negative/text `idx`, `status_list` not a map; a `status` that is not a map. A `status` map without `status_list` — an `identifier_list` only, or RFU keys — is valid and absent) | ISO2 12.3.6 |
 | `statusList.http` | `contentType` (not `application/statuslist+cwt`, parameters ignored) | TSL §8.2 |
 | `statusList.envelope` | `notTagged18` (untagged, a tag other than 17/18/61, or any tag stack other than exactly `[18]` — `18(18(…))` and the self-describe `55799(18(…))` included), `cwtTag61`, `mac0`, `detachedPayload` | TSL §5.2, RFC 9052 §4.2; RFC 8949 §3.4.6; `@owf/cose` 0.6.0 |
 | `statusList.typ` | `missing`, `unprotected`, `notText`, `wrong` | TSL §5.2 |
 | `statusList.x5chain` | `missing`, `unprotectedOnly`, `carriesAnchor` (any self-signed certificate), `serialNumber` (≤ 0 or > 20 octets) | ISO2 12.3.6.3; HAIP §6.1 analogue; RFC 5280 §4.1.2.2 |
 | `statusList.signature` | `invalid:multipaz`, `invalid:authlete` | TSL §5.2 rule 2 |
-| `statusList.chain` | `untrusted` (Multipaz `fromCwt` against `iaca` refuses), `noAnchorSupplied` | ISO2 12.3.6.2 |
+| `statusList.chain` | `untrusted` (Multipaz `fromCwt` against `iaca` refuses, reported when no code `fromCwt` also decides failed — envelope, `typ`, signature, `subMismatch`/`iatMissing`/`iatFuture`/`expMissing`/`expired`, `list:missing`/`bitsNotOne`/`lstNotZlib` — so a `ttlInvalid`, `expAfterSigner`, `iatAfterExp`, `idxOutOfRange` or `statusMismatch` next to a maxValidity refusal cannot hide it), `noAnchorSupplied` | ISO2 12.3.6.2 |
 | `statusList.issuanceChain` | `differs` (the token `x5chain` is not certificate-for-certificate equal to `issuerAuthX5chain`) | Credo `mdocUtil.ts:76-115` |
 | `statusList.claims` | `subMismatch`, `iatMissing`, `iatFuture` (> `at` + 5 s, Multipaz `validateCwt`'s own clock allowance), `iatAfterExp`, `expMissing`, `expired`, `expAfterSigner` (exp > leaf `notAfter`), `ttlInvalid` | TSL §5.2, §8.3 4a/4c; ISO2 12.3.6.3 |
 | `statusList.list` | `missing` (no `status_list` claim, or not a map), `bitsNotOne`, `lstNotZlib` (including raw DEFLATE without the zlib wrapper), `idxOutOfRange`, `statusMismatch:<n>` (read with Multipaz's `StatusList.get`) | ISO2 12.3.6.5; TSL §4.3, §4.1, §8.3 step 6 |
@@ -578,22 +578,39 @@ days.
 
 - A producer writes `<sample>.statuslist.cwt` (the response body as received) and `<sample>.statuslist.ct` (the
   `Content-Type`) beside `<sample>.mdoc`.
-- `MdocSamples` reads three outcomes of the MSO's `status.status_list`: absent, `{uri: tstr, idx: uint}`, or
+- `MdocSamples` reads three outcomes of the MSO's `status.status_list`: absent (including a `status` map without
+  `status_list`, e.g. `identifier_list` only, which 12.3.6 makes valid), `{uri: tstr, idx: uint}`, or
   present-but-malformed with the reason (an unreadable IssuerAuth or MSO answers absent, which is M-01's check).
 - `MdocSampleConformanceTest`: the credential's checks and the status list's join one report, held to the sample's one
-  `.gaps` sidecar exactly both ways like M-01 — a declared `statusList.*` line covers its problem, an undeclared one
-  fails, a declared one no longer reported fails ("gap no longer present"). When the MSO carries a well-formed
+  `.gaps` sidecar exactly both ways like M-01 — an undeclared problem fails, a declared one no longer reported fails
+  ("gap no longer present"). Of the status-list checks only `statusList.mso:malformed` may be declared; every other
+  `statusList.*` line is refused when the sidecar is parsed, because M-11e's samples must pass those (a status list
+  that fails any other check is a defect the sample must not ship). When the MSO carries a well-formed
   `status.status_list`, both sidecars are required and the list is verified with `iaca` = the sample's `.iaca.pem`
   (when present) and `issuerAuthX5chain` = the sample's IssuerAuth `x5chain`; a present-but-malformed reference fails as
   `statusList.mso:malformed` instead of being skipped.
-- No producer writes these sidecars yet (M-11e does; its samples must pass with no `statusList.*` gap).
+- No producer writes these sidecars yet (M-11e does; its samples must pass with no `statusList.*` gap other than a
+  declared `statusList.mso:malformed`).
 
 **Review round 1 (2026-11-13).** Fixed here: `fromCwt` is actually run (the major above); the malformed-MSO skip
 became `statusList.mso:malformed`; the gap set is one per sample across both reports; the whole tag stack is recorded
 and only exactly `[18]` is accepted (`55799` refused, as `@owf/cose` 0.6.0's `Cwt.decodeCoseStructure` refuses
 anything that is not the `Sign1`/`Mac0` tag itself; RFC 8949 §3.4.6 only permits, does not require, tolerance);
 `iatFuture` aligned to Multipaz's 5 s; `iatAfterExp`, `statusList.list:missing` and `statusList.mso:malformed` added;
-`expectedStatus` restricted to 0/1; the bit at `idx` read with Multipaz's `StatusList`. **Open, not in this round:** an
+`expectedStatus` restricted to 0/1; the bit at `idx` read with Multipaz's `StatusList`.
+
+**Review round 2 (2026-11-13, approved with minors).** Fixed here: the `fromCwt` refusal is suppressed only by the
+codes `fromCwt` itself decides, so a maxValidity breach next to a `ttlInvalid`/`expAfterSigner`/`iatAfterExp`/
+`idxOutOfRange`/`statusMismatch` is still `chain:untrusted`; only `statusList.mso:malformed` may be declared as a
+`statusList.*` gap and any other line is refused when the sidecar is parsed; a broken or unrecognised `fromCwt` adapter
+(the mangled Kotlin name, a changed Multipaz) is resolved lazily and reported as the non-declarable `error` code with
+the descriptive message, never as `chain:untrusted`; a `status` map without `status_list` (IdentifierList-only) is
+valid and absent, not malformed; Authlete is handed the wire bytes (it decodes tag 18, `61(18)` and `55799(18(…))`
+itself) and falls back to the unwrapped array only for a tag stack whose envelope check already failed
+(`18(18(…))`). Tests: `aMaxValidityRefusalIsNotHiddenByACodeFromCwtNeverChecks`,
+`oneGapSetCoversBothReportsAndOnlyTheMalformedMsoGapIsDeclarable`,
+`theFromCwtAdapterResolvesAgainstThePinnedMultipazJar`, `aBrokenFromCwtAdapterIsAnErrorNotAnUntrustedChain`,
+`authleteVerifiesTheWireBytesOfAMultipazBuiltToken`, and the IdentifierList-only absent case. **Open (unchanged):** an
 algorithm allow-list (isomdl accepts only ES256/ES384) — owner decision later.
 
 **Acceptance checklist.**

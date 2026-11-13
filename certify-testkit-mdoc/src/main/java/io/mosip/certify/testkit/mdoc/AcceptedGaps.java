@@ -42,6 +42,14 @@ public final class AcceptedGaps {
     /** One accepted problem: a check, one of its problem codes, and why it cannot pass yet. */
     public record Gap(String check, String code, String reason) {
 
+        /**
+         * The one {@code statusList.*} problem a sample may declare: a malformed MSO reference, which a sample can
+         * carry without the list itself being wrong. Every other status-list problem must be fixed in M-11e's samples
+         * (the plan's M-11b section: they pass with no {@code statusList.*} gap), so declaring one is refused here
+         * rather than quietly accepted.
+         */
+        private static final String DECLARABLE_STATUS_LIST_GAP = IndependentStatusListVerifier.CHECK_MSO + ":malformed";
+
         public Gap {
             Map<String, List<String>> registry = registryOf(check);
             if (registry == null) {
@@ -51,6 +59,12 @@ public final class AcceptedGaps {
             if (!knownProblemCode(check, code)) {
                 throw new IllegalArgumentException("unknown problem code " + check + ":" + code + "; " + check
                         + " reports " + registry.get(check));
+            }
+            if (check.startsWith("statusList.") && !keyOf(check, code).equals(DECLARABLE_STATUS_LIST_GAP)) {
+                throw new IllegalArgumentException("the status-list problem " + keyOf(check, code) + " cannot be a "
+                        + ".gaps line: only " + DECLARABLE_STATUS_LIST_GAP + " is declarable, because a status list that "
+                        + "fails any other check is a defect the sample must not ship (M-11e's samples pass with no "
+                        + "statusList.* gap)");
             }
             if (reason == null || reason.isBlank()) {
                 throw new IllegalArgumentException("the gap " + check + ":" + code + " needs a reason");
@@ -106,6 +120,10 @@ public final class AcceptedGaps {
             throw new IllegalArgumentException("the gap " + gap.key() + " is declared twice");
         }
         return new AcceptedGaps(copy);
+    }
+
+    private static String keyOf(String check, String code) {
+        return check + ":" + code;
     }
 
     /** The registry that owns {@code check}, or null when neither verifier reports it. */

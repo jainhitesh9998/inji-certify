@@ -46,6 +46,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -163,6 +164,22 @@ public final class IndependentStatusListVerifier {
 
     private static final Pattern CODE = Pattern.compile("([A-Za-z][A-Za-z0-9]*)(?::([A-Za-z0-9_./-]+))?");
 
+    /**
+     * The codes each check reports that {@code CompressedStatusList.fromCwt} itself refuses on, read from Multipaz
+     * 0.102.0's {@code validateCwt} and {@code fromCwt}/{@code fromCborMap}: the COSE/tag envelope, the protected
+     * {@code typ}, the signature, {@code sub}, {@code exp}/{@code iat} (including Multipaz's own maxValidity) and the
+     * presence/shape of the {@code status_list} claim. A {@code fromCwt} refusal is charged to the chain only when one
+     * of <b>these</b> codes failed; a code {@code fromCwt} never looks at ({@code ttlInvalid}, {@code expAfterSigner},
+     * {@code iatAfterExp}, {@code idxOutOfRange}, {@code statusMismatch}) cannot explain its refusal, so the refusal is
+     * a real gate failure (maxValidity today) and must be reported.
+     */
+    private static final Map<String, Set<String>> FROM_CWT_CODES = Map.of(
+            CHECK_ENVELOPE, Set.of("notTagged18", "cwtTag61", "mac0", "detachedPayload"),
+            CHECK_TYP, Set.of("missing", "unprotected", "notText", "wrong"),
+            CHECK_SIGNATURE, Set.of("invalid:multipaz", "invalid:authlete"),
+            CHECK_CLAIMS, Set.of("subMismatch", "iatMissing", "iatFuture", "expMissing", "expired"),
+            CHECK_LIST, Set.of("missing", "bitsNotOne", "lstNotZlib"));
+
     private static Map<String, List<String>> problemCodes() {
         Map<String, List<String>> codes = new LinkedHashMap<>();
         codes.put(CHECK_MSO, List.of("malformed"));
@@ -181,6 +198,20 @@ public final class IndependentStatusListVerifier {
             throw new IllegalStateException("PROBLEM_CODES must list every check in report order");
         }
         return Collections.unmodifiableMap(codes);
+    }
+
+    /**
+     * True when one of {@code checks} failed on a code {@link #FROM_CWT_CODES} lists, i.e. {@code fromCwt} refuses
+     * this token for a reason the report already names. Any other failure cannot explain a {@code fromCwt} refusal.
+     */
+    static boolean fromCwtRefusalExplained(VerificationReport.Check... checks) {
+        for (VerificationReport.Check check : checks) {
+            Set<String> owned = FROM_CWT_CODES.get(check.name());
+            if (owned != null && check.codes().stream().anyMatch(owned::contains)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** True when {@code code} is one {@code check} reports: a listed code, or a parameterised one with its parameter. */
@@ -245,19 +276,20 @@ public final class IndependentStatusListVerifier {
         // one mutation still fires one code: compute those checks first, then the chain, and keep the report order.
         VerificationReport.Check envelope = run(CHECK_ENVELOPE, token::envelope);
         VerificationReport.Check typ = run(CHECK_TYP, token::typ);
-        VerificationReport.Check signature = run(CHECK_SIGNATURE, token::signature);
+        VerificationReport.Check signature = run(CHECK_SIGNATURE,
+                problems -> token.signature(problems, !envelope.passed()));
         VerificationReport.Check claims = run(CHECK_CLAIMS, problems -> token.claims(problems, uri, at));
         VerificationReport.Check list = run(CHECK_LIST, problems -> token.list(problems, idx, options.expectedStatus()));
-        // fromCwt also requires a status_list claim, so a list failure must not be charged to the chain twice
-        boolean specificsPassed = envelope.passed() && typ.passed() && signature.passed() && claims.passed()
-                && list.passed();
+        // Only a failure fromCwt itself makes can explain its refusal; ttl, exp-vs-notAfter, idx and the status are
+        // outside its rules, so a refusal next to one of those is the gate (maxValidity) and belongs to the chain.
+        boolean fromCwtRefusalExplained = fromCwtRefusalExplained(envelope, typ, signature, claims, list);
         List<VerificationReport.Check> checks = new ArrayList<>();
         checks.add(run(CHECK_HTTP, problems -> http(problems, contentType)));
         checks.add(envelope);
         checks.add(typ);
         checks.add(run(CHECK_X5CHAIN, token::x5chain));
         checks.add(signature);
-        checks.add(run(CHECK_CHAIN, problems -> token.chain(problems, iaca, at, uri, options, specificsPassed)));
+        checks.add(run(CHECK_CHAIN, problems -> token.chain(problems, iaca, at, uri, options, fromCwtRefusalExplained)));
         checks.add(run(CHECK_ISSUANCE_CHAIN, problems -> token.issuanceChain(problems, issuanceChain, options)));
         checks.add(claims);
         checks.add(list);
@@ -496,7 +528,7 @@ public final class IndependentStatusListVerifier {
         }
 
         /** Check 4: the COSE_Sign1 signature, by Multipaz and by Authlete (TSL 5.2 rule 2). */
-        String signature(Problems problems) throws Exception {
+        String signature(Problems problems, boolean envelopeFailed) throws Exception {
             if (notRun(problems)) {
                 return null;
             }
@@ -510,7 +542,7 @@ public final class IndependentStatusListVerifier {
             }
             X509Certificate leaf = chain.get(0);
             signatureWithMultipaz(problems, leaf);
-            signatureWithAuthlete(problems, leaf);
+            signatureWithAuthlete(problems, leaf, envelopeFailed);
             return "verified with Multipaz and Authlete against " + leaf.getSubjectX500Principal();
         }
 
@@ -543,23 +575,34 @@ public final class IndependentStatusListVerifier {
             }
         }
 
-        private void signatureWithAuthlete(Problems problems, X509Certificate leaf) throws Exception {
-            // Authlete's decoder builds a COSESign1 itself for tag 18, so a second tag makes it refuse before the
-            // signature is reached. Hand it the unwrapped array instead: the signed bytes are the protected header
-            // bstr, the payload bstr and the signature bstr, and re-encoding the array preserves all three exactly.
+        private void signatureWithAuthlete(Problems problems, X509Certificate leaf, boolean envelopeFailed)
+                throws Exception {
+            // The wire bytes are what Authlete gets: its decoder reads tag 18, tag 61(18) and 55799(18(...)) itself.
+            // Only a tag stack whose envelope check already failed (18(18(...))) defeats that decoder, and only then
+            // is the unwrapped array handed over instead — the signed protected/payload/signature bstr contents are
+            // the received ones either way.
             CBORItem item;
             try {
-                item = new CBORDecoder(Cbor.INSTANCE.encode(coseArray)).next();
+                item = new CBORDecoder(body).next();
             } catch (Exception e) {
-                problems.add("invalid:authlete", "Authlete cannot decode the COSE_Sign1 array: " + describe(e));
-                return;
+                if (!envelopeFailed) {
+                    problems.add("invalid:authlete", "Authlete cannot decode the body: " + describe(e));
+                    return;
+                }
+                try {
+                    item = new CBORDecoder(Cbor.INSTANCE.encode(coseArray)).next();
+                } catch (Exception fallback) {
+                    problems.add("invalid:authlete", "Authlete cannot decode the COSE_Sign1 array: "
+                            + describe(fallback));
+                    return;
+                }
             }
             while (item instanceof CBORTaggedItem tagged) {
                 item = tagged.getTagContent();
             }
             COSESign1 coseSign1;
             try {
-                coseSign1 = COSESign1.build(item);
+                coseSign1 = item instanceof COSESign1 parsed ? parsed : COSESign1.build(item);
             } catch (Exception e) {
                 problems.add("invalid:authlete", "Authlete cannot read the body as COSE_Sign1: " + describe(e));
                 return;
@@ -581,7 +624,7 @@ public final class IndependentStatusListVerifier {
          * {@code CompressedStatusList.fromCwt} passes to {@code validateCwt} (ISO/IEC 18013-5 second edition 12.3.6.2).
          */
         String chain(Problems problems, X509Certificate iaca, Instant at, String uri, StatusListOptions options,
-                     boolean specificsPassed) {
+                     boolean fromCwtRefusalExplained) {
             if (notRun(problems)) {
                 return null;
             }
@@ -604,6 +647,13 @@ public final class IndependentStatusListVerifier {
             Throwable fromCwtRefusal = null;
             try {
                 MultipazFromCwt.read(body, anchor, uri, at);
+            } catch (MultipazAdapterException e) {
+                // a broken adapter or pinned jar is a harness defect, never the credential's: non-declarable, as ERROR
+                problems.add(ERROR, e.getMessage());
+                return null;
+            } catch (LinkageError e) {
+                problems.add(ERROR, "Multipaz cannot be linked for CompressedStatusList.fromCwt: " + describe(e));
+                return null;
             } catch (Throwable e) {
                 rethrowIfFatal(e);
                 fromCwtRefusal = e;
@@ -629,15 +679,15 @@ public final class IndependentStatusListVerifier {
                         + "x5chain at " + at + ": " + chainRefusal);
                 return null;
             }
-            if (specificsPassed) {
-                problems.add("untrusted", fromCwtReason + ", although the token's typ, signature, sub and exp pass and "
-                        + "its chain validates to " + iaca.getSubjectX500Principal() + ": the remaining rules are "
-                        + "Multipaz's own (maxValidity caps exp at 365 days after the evaluation instant, the wallet "
-                        + "default in CachingRevocationChecker)");
-                return null;
+            if (fromCwtRefusalExplained) {
+                return "the x5chain validates to " + iaca.getSubjectX500Principal() + "; fromCwt refused for a reason one "
+                        + "of the checks it also makes already reports (" + describe(fromCwtRefusal) + ")";
             }
-            return "the x5chain validates to " + iaca.getSubjectX500Principal() + "; fromCwt refused for a reason another "
-                    + "check reports (" + describe(fromCwtRefusal) + ")";
+            problems.add("untrusted", fromCwtReason + ", and no check fromCwt also makes failed, so the refusal is the "
+                    + "gate: Multipaz's maxValidity caps exp at 365 days after the evaluation instant (the wallet "
+                    + "default in CachingRevocationChecker), and the chain itself validates to "
+                    + iaca.getSubjectX500Principal());
+            return null;
         }
 
         /**
@@ -997,40 +1047,61 @@ public final class IndependentStatusListVerifier {
      *
      * <p>Kotlin mangles the method name because {@code maxValidity: Duration} is a value class:
      * {@code fromCwt-myKFqkg}. Java cannot spell that identifier, so the synthetic {@code $default} bridge is resolved
-     * once. The call passes mask {@code 16} (bit 4, the {@code maxValidity} position) so Multipaz's own default is used.
-     * A Multipaz upgrade that changes the signature fails loudly here with the expected descriptor, rather than
-     * silently dropping the gate.
+     * once, lazily, and the call passes mask {@code 16} (bit 4, the {@code maxValidity} position) so Multipaz's own
+     * default is used. Resolution never happens in a static initializer: a failure is kept as the descriptive message
+     * of a {@link MultipazAdapterException}, which the chain check reports as the non-declarable {@code error} code —
+     * never as {@code statusList.chain:untrusted}, which would blame the credential for a harness defect.
      */
     private static final class MultipazFromCwt {
 
         private static final String METHOD = "fromCwt-myKFqkg$default";
-        private static final Method BRIDGE = resolve();
+        private static final String DESCRIPTOR = "Multipaz 0.102.0 CompressedStatusList$Companion." + METHOD
+                + "(byte[] cwt, X509Cert trustedRootCert, Map<WebTokenCheck,String> checks, kotlin.time.Instant atTime,"
+                + " long maxValidity, Continuation, int mask, Object marker)";
 
-        private static Method resolve() {
-            String companion = "org.multipaz.revocation.CompressedStatusList$Companion";
-            try {
-                Class<?> type = Class.forName(companion);
-                Method method = type.getDeclaredMethod(METHOD, type, byte[].class, X509Cert.class, Map.class,
-                        kotlin.time.Instant.class, long.class, Continuation.class, int.class, Object.class);
-                method.setAccessible(true);
-                return method;
-            } catch (ReflectiveOperationException | RuntimeException e) {
-                throw new IllegalStateException("Multipaz CompressedStatusList$Companion." + METHOD + "(byte[], X509Cert, "
-                        + "Map, kotlin.time.Instant, long, Continuation, int, Object) is gone: a Multipaz upgrade changed "
-                        + "fromCwt, and the M-11b gate cannot run without it", e);
+        private static Method bridge;
+        private static String failure;
+        /** Test seam: makes resolution fail as if a Multipaz upgrade had changed fromCwt. */
+        private static String forcedFailure;
+
+        static synchronized Method bridge() {
+            if (forcedFailure != null) {
+                throw new MultipazAdapterException(forcedFailure);
             }
+            if (bridge == null && failure == null) {
+                try {
+                    bridge = resolve();
+                } catch (Throwable e) {
+                    rethrowIfFatal(e);
+                    failure = DESCRIPTOR + " is gone: a Multipaz upgrade changed fromCwt, and the M-11b gate cannot run "
+                            + "without it (" + describe(e) + ")";
+                }
+            }
+            if (failure != null) {
+                throw new MultipazAdapterException(failure);
+            }
+            return bridge;
+        }
+
+        private static Method resolve() throws ReflectiveOperationException {
+            Class<?> type = Class.forName("org.multipaz.revocation.CompressedStatusList$Companion");
+            Method method = type.getDeclaredMethod(METHOD, type, byte[].class, X509Cert.class, Map.class,
+                    kotlin.time.Instant.class, long.class, Continuation.class, int.class, Object.class);
+            method.setAccessible(true);
+            return method;
         }
 
         /** @throws RuntimeException whatever Multipaz refused the token with, as {@code fromCwt} throws it */
         static void read(byte[] body, X509Cert anchor, String uri, Instant at) {
+            Method bridge = bridge();
             Map<WebTokenCheck, String> checks = Map.of(WebTokenCheck.SUB, uri);
-            await(continuation -> invoke(body, anchor, checks, at, continuation));
+            await(continuation -> invoke(bridge, body, anchor, checks, at, continuation));
         }
 
-        private static Object invoke(byte[] body, X509Cert anchor, Map<WebTokenCheck, String> checks, Instant at,
-                                     Continuation<?> continuation) {
+        private static Object invoke(Method bridge, byte[] body, X509Cert anchor, Map<WebTokenCheck, String> checks,
+                                     Instant at, Continuation<?> continuation) {
             try {
-                return BRIDGE.invoke(CompressedStatusList.Companion, CompressedStatusList.Companion, body, anchor, checks,
+                return bridge.invoke(CompressedStatusList.Companion, CompressedStatusList.Companion, body, anchor, checks,
                         kotlinInstant(at), 0L, continuation, 16, null);
             } catch (InvocationTargetException e) {
                 Throwable cause = e.getCause();
@@ -1042,9 +1113,33 @@ public final class IndependentStatusListVerifier {
                 }
                 throw new IllegalStateException("CompressedStatusList.fromCwt refused the token: " + describe(cause), cause);
             } catch (IllegalAccessException e) {
-                throw new IllegalStateException("CompressedStatusList.fromCwt is not callable: " + describe(e), e);
+                throw new MultipazAdapterException(DESCRIPTOR + " is not callable: " + describe(e));
             }
         }
+    }
+
+    /** A harness defect in the {@code fromCwt} adapter: reported as {@code error}, never as a credential problem. */
+    private static final class MultipazAdapterException extends RuntimeException {
+        MultipazAdapterException(String message) {
+            super(message, null, false, false);
+        }
+    }
+
+    /**
+     * The resolved Multipaz {@code fromCwt} bridge, for a test that proves it still matches the pinned jar. Package
+     * private: the testkit is a test module, and the alternative is no test of the one reflective call in the gate.
+     */
+    static Method multipazFromCwtBridge() {
+        return MultipazFromCwt.bridge();
+    }
+
+    /** Test seam for the adapter's failure path; {@code resetMultipazFromCwtAdapterForTest} clears it. */
+    static void failMultipazFromCwtAdapterForTest(String message) {
+        MultipazFromCwt.forcedFailure = message;
+    }
+
+    static void resetMultipazFromCwtAdapterForTest() {
+        MultipazFromCwt.forcedFailure = null;
     }
 
     /** Multipaz's cryptographic entry points are suspend on the JVM without ever suspending; runBlocking keeps that here. */
