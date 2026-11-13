@@ -899,12 +899,14 @@ Branch `wp/m-11d-status-cwt-lists`. Depends on M-11c. About 650 lines.
    - With `token-format: jwt` the service logs one WARN at startup citing ISO/IEC 18013-5 second edition 12.3.6.3.
 3. `allocateCwt(String purpose, SigningContext signing)` returns an `Entry`, under `@Transactional`.
    - `pinned = StatusListSigners.pin(signing)`, then `StatusListSignerPolicy.check(signing, now, DOCUMENT_SIGNER)`.
-   - Candidates are `findByCredentialTypeAndStatusPurposeAndCredentialStatusOrderByCreatedDtimesDesc(TYPE_CWT,
-     purpose, AVAILABLE)` (a new derived query returning a `List`), filtered by the envelope's `signer.x5tS256 ==
-     pinned.x5tS256`.
+   - Candidates are `findCwtCandidates(TYPE_CWT, purpose, AVAILABLE)` — an id-and-envelope projection (review round 1,
+     minor 6: a retired signer's lists stay `AVAILABLE` and are scanned by every allocation, which must not load their
+     entities) — filtered by the envelope's `signer.x5tS256 == pinned.x5tS256`. A row whose envelope cannot be read is
+     skipped with a WARN, never fatal to every mDoc issuance.
    - Cache list id → `x5tS256` in a `ConcurrentHashMap`; the signer of a list never changes.
-   - The first candidate gets `indexProvider.acquireIndex`; when full, mark it `FULL` and create the next one. With no
-     candidate, `createCwt(purpose, signing, pinned)`.
+   - The first candidate gets `indexProvider.acquireIndex`; when full, it is marked `FULL` **with a targeted update of
+     `credential_status` only** (`updateCredentialStatus`), never by saving the entity it read, and the next candidate (or
+     a new list) takes the index. With no candidate, `createCwt(purpose, signing, pinned)`.
 4. `createCwt` stores the 4.4 envelope with a token from `TokenStatusListCwt.encode(uri(id), now, min(now + 2·ttl,
    signerPolicy.validUntil(signing)), ttl, zero bits, signing, signerPolicy, now, DOCUMENT_SIGNER)` — `encode` runs the
    policy itself, so the service cannot forget it. `validUntil` is the earliest `notAfter` of the chain and its IACA
@@ -916,21 +918,38 @@ Branch `wp/m-11d-status-cwt-lists`. Depends on M-11c. About 650 lines.
      later. `encode` throws no `IllegalArgumentException` for this case, so nothing needs a mapping for it.
 5. Serving: `Optional<Served> served(String listId)`, with `record Served(String mediaType, byte[] body)`. For `TYPE`
    rows it returns what `jwt(listId)` returns today; keep `jwt()` for existing callers and tests. For `TYPE_CWT` rows:
+   - The stored token's **signature is verified with the certificate the envelope pins** before it is served, re-signed or
+     updated (review round 1, major 1: `resignCwt` would otherwise re-sign a tampered payload into a valid token).
+     `x5chain` is the leaf whose SHA-256 equals `signer.x5tS256`; a mismatch or a bad COSE_Sign1 signature is an
+     `ERROR` once per document and `503` + `Retry-After` — never a re-sign and never a silent repair. Verification is
+     cached per stored token (`TokenStatusListCwt.verifies`).
+   - An **unparseable or unsupported envelope** (not JSON, `v` other than 1, an unknown `signer.mode`, bytes that are
+     not CBOR) is `UNUSABLE` → `503` + `Retry-After` (review round 1, major 3: it used to escape as a 500 through the
+     global advice).
    - The **same freshness state machine** (`FRESH` / `RENEW` / `UNUSABLE`, `renew-wait`, `renew-backoff`,
      compare-and-set through `replaceDocument` on the stored envelope), using `TokenStatusListCwt.decode` for `sub`
-     and `exp`.
+     and `exp`. A list is `FRESH` when a new signature could not push `exp` later — `exp` already equals
+     `cap(now + 2·ttl, validUntil)` — so the last `ttl` before the signer path's `validUntil` signs nothing (review
+     round 1, major 5).
    - Re-signing goes through `StatusListSigners.resolve(envelope.signer, storedLeaf)`, then `encode` with the same
-     bits and a new `iat`/`exp = min(iat + 2·ttl, signerPolicy.validUntil(signing))` (`encode` runs the policy);
-     `storedLeaf` is the first certificate of the stored token's protected `x5chain`, checked against
-     `signer.x5tS256` (4.4).
+     bits, the stored `signer.mode`, and a new `iat`/`exp = min(iat + 2·ttl, signerPolicy.validUntil(signing))`
+     (`encode` runs the policy); `storedLeaf` is the first certificate of the stored token's protected `x5chain`,
+     checked against `signer.x5tS256` (4.4). The document is re-read with a scalar query (`findDocumentById`), not
+     `findById`, so Spring's open-in-view persistence context cannot hand back the copy this request read (review
+     round 1, m6).
    - `StatusListRetiredException` from `encode` (the leaf's last second) is handled exactly like the one from
      `resolve`.
    - `StatusListRetiredException`: no re-sign attempt. Serve as stored while `exp > now`; afterwards throw
      `TokenStatusListGoneException` (new). **`StatusListRetiredException` extends `IllegalStateException`**, so catch
      it *before* any general `IllegalStateException`/`SigningException` → back-off/503 mapping, or the `410` of D-M11-7
-     becomes a `503` forever.
-6. `update(list, statuses)` (batch job): for `TYPE_CWT` it re-signs with the list's pinned signer. The batch job routes
-   `TYPE_CWT` rows the same way as `TYPE` rows.
+     becomes a `503` forever. The retirement is cached per list, so later requests take no lock, resolve nothing and log
+     once.
+6. `update(list, statuses)` (batch job): one writer per list — the row is re-read under `SELECT … FOR UPDATE`
+   (`findByIdForUpdate`) and the document is re-read from the table, so two updates cannot each sign their caller's
+   snapshot and lose one of the bits, and a re-sign's compare-and-set cannot overwrite a status update committed in
+   between (review round 1, major 2; the JWT path had the same two-writer lost update, now fixed the same way, G39).
+   For `TYPE_CWT` the bits are applied to the verified document and re-signed with the list's pinned signer. The batch
+   job routes `TYPE_CWT` rows the same way as `TYPE` rows.
 7. Controller:
    - `TYPE` rows keep the current code path verbatim (`ResponseEntity<String>`, header `application/statuslist+jwt`).
    - `TYPE_CWT` rows answer `ResponseEntity<byte[]>` with `Content-Type: application/statuslist+cwt`.
@@ -952,6 +971,11 @@ Branch `wp/m-11d-status-cwt-lists`. Depends on M-11c. About 650 lines.
 - [ ] `StatusListPostgresTest.tokenStatusListCwtForMdoc` (Testcontainers) creates, allocates, revokes and re-serves
   on PostgreSQL.
 - [ ] I1-I7 hold, I4 especially: `StatusListPostgresTest.tokenStatusListForSdJwt` unchanged and green.
+- [ ] Review round 1: a tampered stored token is refused (`503`) and a verifier rejects it, renewal never re-signs it;
+  an unparseable or `v:2` envelope is `503` with the production advice in the context; a list in the last `ttl` before
+  `notAfter` signs nothing; two concurrent updates keep both bits (CWT and JWT, PostgreSQL); marking a list `FULL`
+  keeps a concurrently committed revocation (unit schedule and PostgreSQL); a retired list's transactions are closed
+  with a WARN and a revoked-DSC list no longer blocks a JWT list in the same run.
 
 **Negative tests.**
 
@@ -987,6 +1011,23 @@ checklist item inherits that re-run.
   fragile — it has to keep every Kotlin consumer of the default execution off that run — and is not recommended.
 - Whatever form it takes, `certify-service/runtime-classpath.txt` does not move and `check-runtime-classpath.sh`
   stays green.
+
+**Review round 1 (2026-11-13: GPT-6.1 Sol 3 majors, Opus 2 majors + minors; I4 and the 410/503 map confirmed).** Fixed
+here: (1) renewal no longer launders tampered bits — the stored token's signature is checked against the pinned
+certificate before serving, re-signing or updating, and a failure is `503` (fail closed) with the ERROR logged once per
+document; the stricter option was chosen over "serve as stored when no renewal happens" because the provider otherwise
+serves bytes it cannot vouch for, and because renewal is exactly what made the tampering exploitable. (2) the lost
+updates: `update` re-reads the row under `SELECT … FOR UPDATE` and the document from the table (Hibernate may hand back
+the session's cached copy), the `FULL` transition is a targeted `credential_status` update on the CWT path and in
+`DatabaseStatusListIndexProvider` (the JWT path's pre-existing lost update is G39), and PostgreSQL regressions hold both
+schedules. (3) an unreadable or unsupported envelope is `UNUSABLE` → `503`. (4) the batch job closes a retired list's
+transactions with a WARN and skips a permanently refused list for the rest of the run and until the next restart,
+paging past its rows so it can never fill the batch. (5) a list whose `exp` is already capped at `validUntil` is
+`FRESH`, so the last `ttl` before `notAfter` signs and writes nothing. Minors: candidate rows are a projection and an
+unreadable one is skipped; `encode`'s last-second retirement and an intermediate ending first are tested; the
+concurrency test counts signatures; the tampered-token test shows a verifier rejecting it; `signer.mode` is validated
+on read and used at renewal; retirement is cached; `size-bits` is bounded at binding (`TokenStatusListCwt.MAX_BITS`,
+a multiple of 8). Opus m6 (a waiter re-signing under open-in-view) is fixed by the scalar document re-read.
 
 ### M-11e Issuance binding: the DSC that signs the mDL signs its list (certify-spi, certify-issuance, certify-format-mdoc, certify-service)
 

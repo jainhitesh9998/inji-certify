@@ -218,6 +218,7 @@ class StatusListPostgresTest {
     @Autowired org.springframework.core.env.Environment environment;
     @Autowired Flyway flyway;
     @Autowired DataSource dataSource;
+    @Autowired org.springframework.transaction.PlatformTransactionManager transactionManager;
     @MockBean DataProviderPlugin dataProviderPlugin;
     @Value("${mosip.certify.identifier}") String issuerIdentifier;
     @Value("${mosip.certify.domain.url}") String domainUrl;
@@ -493,9 +494,12 @@ class StatusListPostgresTest {
         org.springframework.mock.env.MockEnvironment elsewhere = new org.springframework.mock.env.MockEnvironment()
                 .withProperty("mosip.certify.domain.url", domain)
                 .withProperty("server.servlet.path", environment.getProperty("server.servlet.path", ""));
-        new io.mosip.certify.status.TokenStatusListService(statusListRepository, statusListCredentialService, statusListIndexProvider,
-                keyProviders, tokenStatusListProperties, objectMapper, elsewhere, clock)
-                .update(statusListRepository.findById(listId).orElseThrow(), Map.of());
+        io.mosip.certify.status.TokenStatusListService elsewhereLists =
+                new io.mosip.certify.status.TokenStatusListService(statusListRepository, statusListCredentialService,
+                        statusListIndexProvider, keyProviders, tokenStatusListProperties, objectMapper, elsewhere, clock);
+        // the service instance bypasses Spring's proxy in this helper, so the transaction the row lock needs is opened here
+        new org.springframework.transaction.support.TransactionTemplate(transactionManager).executeWithoutResult(status ->
+                elsewhereLists.update(statusListRepository.findById(listId).orElseThrow(), Map.of()));
     }
 
     private void assertServedFresh(String listId, long revokedIdx, java.time.Duration ttl) throws Exception {
@@ -577,6 +581,126 @@ class StatusListPostgresTest {
         assertTrue(transactionRepository.findByIsProcessedFalseOrderByCreatedDtimesAsc(PageRequest.of(0, 100)).stream()
                 .noneMatch(t -> listId.equals(t.getStatusListCredentialId()) && Long.valueOf(entry.idx()).equals(t.getStatusListIndex())),
                 "the transaction is processed");
+    }
+
+    /**
+     * Review round 1, major 2: two status updates on one CWT list, committed concurrently, must both keep their bit. Before
+     * the fix each signed its caller's snapshot and saved the whole row, so the later commit reverted the earlier bit
+     * (reproduced on PostgreSQL 15: bit0=false, bit1=true).
+     */
+    @Test
+    void concurrentCwtUpdatesKeepBothBits() throws Exception {
+        io.mosip.certify.spi.SigningContext signing = keyProviders.signingContext(io.mosip.certify.spi.SigningConfig.of(
+                io.mosip.certify.signing.KeyRef.parse("x509-file:sdjwt-es256"), io.mosip.certify.signing.SignatureAlgorithm.ES256));
+        io.mosip.certify.status.TokenStatusListService.Entry first = tokenStatusLists.allocateCwt("revocation", signing);
+        io.mosip.certify.status.TokenStatusListService.Entry second = tokenStatusLists.allocateCwt("revocation", signing);
+        String listId = first.uri().substring(first.uri().lastIndexOf('/') + 1);
+        assertEquals(listId, second.uri().substring(second.uri().lastIndexOf('/') + 1));
+
+        CredentialStatusTransaction a = pending("cwt-race-a-" + first.idx(), listId, first.idx());
+        CredentialStatusTransaction b = pending("cwt-race-b-" + second.idx(), listId, second.idx());
+        transactionRepository.saveAll(List.of(a, b));
+        concurrently(2, List.of(() -> batchJob.updateStatusList(listId, List.of(a)),
+                () -> batchJob.updateStatusList(listId, List.of(b))));
+
+        io.mosip.certify.status.TokenStatusListCwt.Decoded decoded = io.mosip.certify.status.TokenStatusListCwt.decode(
+                mockMvc.perform(get("/credentials/token-status-list/" + listId)).andReturn()
+                        .getResponse().getContentAsByteArray());
+        assertTrue(io.mosip.certify.status.TokenStatusListService.get(decoded.lst(), first.idx()), "the first bit survived");
+        assertTrue(io.mosip.certify.status.TokenStatusListService.get(decoded.lst(), second.idx()), "the second bit survived");
+    }
+
+    /** The same lost update existed on the JWT path (major 2, "check whether the JWT update path has it too"). */
+    @Test
+    void concurrentJwtUpdatesKeepBothBits() throws Exception {
+        io.mosip.certify.status.TokenStatusListService.Entry first = tokenStatusLists.allocate("revocation");
+        io.mosip.certify.status.TokenStatusListService.Entry second = tokenStatusLists.allocate("revocation");
+        String listId = first.uri().substring(first.uri().lastIndexOf('/') + 1);
+        assertEquals(listId, second.uri().substring(second.uri().lastIndexOf('/') + 1));
+
+        CredentialStatusTransaction a = pending("jwt-race-a-" + first.idx(), listId, first.idx());
+        CredentialStatusTransaction b = pending("jwt-race-b-" + second.idx(), listId, second.idx());
+        transactionRepository.saveAll(List.of(a, b));
+        concurrently(2, List.of(() -> batchJob.updateStatusList(listId, List.of(a)),
+                () -> batchJob.updateStatusList(listId, List.of(b))));
+
+        SignedJWT list = SignedJWT.parse(mockMvc.perform(get("/credentials/token-status-list/" + listId)).andReturn()
+                .getResponse().getContentAsString());
+        byte[] bits = io.mosip.certify.status.TokenStatusListService.decode(
+                list.getJWTClaimsSet().getJSONObjectClaim("status_list").get("lst").toString());
+        assertTrue(io.mosip.certify.status.TokenStatusListService.get(bits, first.idx()), "the first bit survived");
+        assertTrue(io.mosip.certify.status.TokenStatusListService.get(bits, second.idx()), "the second bit survived");
+    }
+
+    /**
+     * Review round 1, major 2(c): marking a list {@code FULL} must not write its document. The index pool is exhausted
+     * (so the next allocation marks the list FULL) and a revocation is committed first; the document must still hold it
+     * afterwards, on PostgreSQL.
+     */
+    @Test
+    void allocationMarkingFullKeepsTheCommittedRevocation() throws Exception {
+        io.mosip.certify.spi.SigningContext signing = keyProviders.signingContext(io.mosip.certify.spi.SigningConfig.of(
+                io.mosip.certify.signing.KeyRef.parse("x509-file:sdjwt-es256"), io.mosip.certify.signing.SignatureAlgorithm.ES256));
+        io.mosip.certify.status.TokenStatusListService.Entry entry = tokenStatusLists.allocateCwt("revocation", signing);
+        String listId = entry.uri().substring(entry.uri().lastIndexOf('/') + 1);
+        CredentialStatusTransaction revocation = pending("cwt-full-" + entry.idx(), listId, entry.idx());
+        transactionRepository.save(revocation);
+        batchJob.updateStatusList(listId, List.of(revocation));
+        String revoked = statusListRepository.findById(listId).orElseThrow().getVcDocument();
+
+        // exhaust the pool without claiming: the next allocation finds no free index and marks the list FULL
+        try (Connection c = dataSource.getConnection();
+             PreparedStatement ps = c.prepareStatement("DELETE FROM " + SCHEMA
+                     + ".status_list_available_indices WHERE status_list_credential_id = ? AND is_assigned = false")) {
+            ps.setString(1, listId);
+            ps.executeUpdate();
+        }
+        io.mosip.certify.status.TokenStatusListService.Entry next = tokenStatusLists.allocateCwt("revocation", signing);
+        assertFalse(listId.equals(next.uri().substring(next.uri().lastIndexOf('/') + 1)),
+                "the full list takes no more indices; a new one was created");
+
+        io.mosip.certify.entity.StatusListCredential full = statusListRepository.findById(listId).orElseThrow();
+        assertEquals(io.mosip.certify.entity.StatusListCredential.CredentialStatus.FULL, full.getCredentialStatus());
+        assertEquals(revoked, full.getVcDocument(), "marking the list FULL wrote no document and keeps the revocation");
+    }
+
+    private static CredentialStatusTransaction pending(String credentialId, String listId, long idx) {
+        CredentialStatusTransaction txn = new CredentialStatusTransaction();
+        txn.setCredentialId(credentialId);
+        txn.setStatusPurpose("revocation");
+        txn.setStatusValue(true);
+        txn.setStatusListCredentialId(listId);
+        txn.setStatusListIndex(idx);
+        txn.setCreatedDtimes(java.time.LocalDateTime.now());
+        txn.setIsProcessed(false);
+        return txn;
+    }
+
+    /** Runs the given tasks at once and rethrows the first failure, so a lost update or a deadlock fails the test. */
+    private static void concurrently(int threads, List<ThrowingRunnable> tasks) throws Exception {
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(threads);
+        try {
+            java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+            List<java.util.concurrent.Future<?>> futures = new java.util.ArrayList<>();
+            for (ThrowingRunnable task : tasks) {
+                futures.add(pool.submit(() -> {
+                    start.await();
+                    task.run();
+                    return null;
+                }));
+            }
+            start.countDown();
+            for (java.util.concurrent.Future<?> future : futures) {
+                future.get(60, java.util.concurrent.TimeUnit.SECONDS);
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @FunctionalInterface
+    private interface ThrowingRunnable {
+        void run() throws Exception;
     }
 
     private JsonNode issueOid4vci() throws Exception {

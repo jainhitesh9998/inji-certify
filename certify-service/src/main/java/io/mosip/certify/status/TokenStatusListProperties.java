@@ -33,6 +33,12 @@ public record TokenStatusListProperties(String keyRef, @DefaultValue("ES256") St
         renewWait = renewWait == null || renewWait.isNegative() ? Duration.ofSeconds(5) : renewWait;
         renewBackoff = renewBackoff == null || renewBackoff.isNegative() ? Duration.ofSeconds(30) : renewBackoff;
         mdoc = mdoc == null ? new Mdoc(null, null, null) : mdoc;
+        if (sizeBits < 8 || sizeBits % 8 != 0 || sizeBits > TokenStatusListCwt.MAX_BITS) {
+            // a list whose bit array is not a whole number of bytes, or larger than the codec's own ceiling, cannot be
+            // stored and read back consistently (review round 1, nit 8)
+            throw new IllegalArgumentException("certify.status.token-status-list.size-bits must be a positive multiple of"
+                    + " 8 and at most " + TokenStatusListCwt.MAX_BITS + ", got " + sizeBits);
+        }
     }
 
     /**

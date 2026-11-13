@@ -107,6 +107,17 @@ class TokenStatusListCwtServiceTest {
     static final String SERVLET_PATH = "/v1/certify";
     static final KeyRef ALIAS = KeyRef.parse("x509-file:mdl-dsc");
 
+    /** A Document Signer that ends at a chosen instant (the last-ttl and last-second cases). */
+    static final java.security.KeyPair SOON_KEYS = StatusListTestKeys.p256();
+    static final java.security.KeyPair LAST_SECOND_KEYS = StatusListTestKeys.p256();
+    static final java.security.KeyPair INTERMEDIATE_DSC_KEYS = StatusListTestKeys.p256();
+
+    static X509Certificate signerUntil(java.security.KeyPair keys, Instant notAfter, String commonName) {
+        return StatusListTestKeys.signer(keys, commonName, IACA, StatusListTestKeys.IACA_KEYS,
+                List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true,
+                Instant.now().minus(100, java.time.temporal.ChronoUnit.DAYS), notAfter);
+    }
+
     @Test
     void allocateCwtCreatesAPinnedListWhoseTokenIsTheCwtForm() {
         Fixture fixture = new Fixture();
@@ -262,19 +273,48 @@ class TokenStatusListCwtServiceTest {
     }
 
     @Test
-    void aTamperedStoredTokenIsServedAsStored() {
+    void aTamperedStoredTokenIsRefusedAndAVerifierRejectsIt() {
         Fixture fixture = new Fixture();
         TokenStatusListService lists = fixture.lists(T0);
         TokenStatusListService.Entry entry = lists.allocateCwt("revocation", fixture.dsc());
         String listId = fixture.listId(entry);
-        // one bit of lst flipped in the payload without re-signing: the service serves its own row, no signature check,
-        // no repair; the point is that it never trusts the row for the signer, which renewal re-reads and checks
-        fixture.storeToken(listId, TokenStatusListCwtBase.tamperLst(
-                TokenStatusListCwtBase.token(fixture.rows.get(listId).getVcDocument()), 9));
+        byte[] genuine = TokenStatusListCwtBase.token(fixture.rows.get(listId).getVcDocument());
+        assertTrue(TokenStatusListCwt.verifies(genuine, DSC), "the stored token starts out verifiable");
+        // one bit of lst flipped in the payload without re-signing: the signature no longer covers the bits, so the
+        // stored row is refused (503, fail closed) rather than served or, worse, re-signed (review round 1, major 1)
+        byte[] tampered = TokenStatusListCwtBase.tamperLst(genuine, 9, true);
+        assertFalse(TokenStatusListCwt.verifies(tampered, DSC), "an independent verifier rejects the tampered token");
+        assertTrue(TokenStatusListService.get(TokenStatusListCwt.decode(tampered).lst(), 9), "its payload says revoked");
 
-        TokenStatusListService.Served served = lists.served(listId).orElseThrow();
-        TokenStatusListCwt.Decoded servedToken = TokenStatusListCwt.decode(served.body());
-        assertTrue(TokenStatusListService.get(servedToken.lst(), 9), "the stored bits are served as they are");
+        int signedBefore = fixture.signed.get();
+        fixture.storeToken(listId, tampered);
+        TokenStatusListUnavailableException refused = assertThrows(TokenStatusListUnavailableException.class,
+                () -> lists.served(listId));
+        assertEquals(BACKOFF.getSeconds(), refused.retryAfterSeconds());
+        assertEquals(0, fixture.replaced.get(), "nothing is written: a tampered token is never repaired by signing");
+        assertEquals(signedBefore, fixture.signed.get(), "and nothing is signed");
+    }
+
+    @Test
+    void aTamperedTokenIsNotLaunderedIntoAValidOneByRenewal() {
+        Fixture fixture = new Fixture();
+        MutableClock clock = new MutableClock(T0);
+        TokenStatusListService lists = fixture.lists(clock);
+        TokenStatusListService.Entry entry = lists.allocateCwt("revocation", fixture.dsc());
+        String listId = fixture.listId(entry);
+        // the reproduction of review round 1, major 1: revoke, clear the stored bit in the DB without signing, then
+        // advance into renewal. Without the signature check the re-sign makes signature=true and revoked=false.
+        byte[] bits = TokenStatusListCwt.decode(TokenStatusListCwtBase.token(
+                fixture.rows.get(listId).getVcDocument())).lst();
+        TokenStatusListService.set(bits, entry.idx(), true);
+        fixture.storeBits(listId, bits, T0);
+        byte[] revoked = TokenStatusListCwtBase.token(fixture.rows.get(listId).getVcDocument());
+        clock.advance(TTL.plusSeconds(60));
+
+        int signedBefore = fixture.signed.get();
+        fixture.storeToken(listId, TokenStatusListCwtBase.tamperLst(revoked, entry.idx(), false)); // clears the revoked bit
+        assertThrows(TokenStatusListUnavailableException.class, () -> lists.served(listId));
+        assertEquals(signedBefore, fixture.signed.get(), "renewal never signs a payload the pinned signer did not sign");
         assertEquals(0, fixture.replaced.get());
     }
 
@@ -297,8 +337,8 @@ class TokenStatusListCwtServiceTest {
         TokenStatusListUnavailableException refused = assertThrows(TokenStatusListUnavailableException.class,
                 () -> lists.served(listId));
         assertEquals(BACKOFF.getSeconds(), refused.retryAfterSeconds());
-        assertTrue(String.valueOf(refused.getCause().getMessage()).startsWith(StatusListSigners.GONE),
-                String.valueOf(refused.getCause()));
+        assertTrue(refused.getMessage().contains("does not verify with its pinned signer"), refused.getMessage());
+        assertEquals(0, fixture.replaced.get());
     }
 
     @Test
@@ -323,7 +363,7 @@ class TokenStatusListCwtServiceTest {
 
         clock.advance(Duration.ofMinutes(31)); // past its exp
         TokenStatusListGoneException gone = assertThrows(TokenStatusListGoneException.class, () -> lists.served(listId));
-        assertTrue(gone.getCause() instanceof StatusListRetiredException, "the 410 is the retirement, not the 503 back-off");
+        assertTrue(gone.getMessage().contains("retired"), "the 410 is the retirement, not the 503 back-off: " + gone.getMessage());
         assertEquals(0, fixture.signed.get());
         assertEquals(0, fixture.replaced.get());
     }
@@ -400,13 +440,17 @@ class TokenStatusListCwtServiceTest {
                 fixture.rows.get(listId).getVcDocument())).lst(), clock.instant());
         clock.advance(TTL.plusSeconds(60));
 
+        int signedBefore = fixture.signed.get();
         List<String> bodies = concurrently(8, () -> Base64.getEncoder().encodeToString(
                 lists.served(listId).orElseThrow().body()));
         assertEquals(8, bodies.size());
         assertEquals(1, fixture.replaced.get(), "one re-sign per list at a time; the rest get that token or the stored one");
-        assertTrue(bodies.stream().allMatch(body -> body.equals(bodies.get(0)))
-                        || bodies.stream().distinct().count() <= 2,
-                "every request served a CWT of this list");
+        assertEquals(1, fixture.signed.get() - signedBefore, "exactly one signature for eight concurrent requests");
+        for (String body : bodies) {
+            TokenStatusListCwt.Decoded decoded = TokenStatusListCwt.decode(Base64.getDecoder().decode(body));
+            assertEquals(entry.uri(), decoded.sub());
+            assertEquals(DSC, decoded.x5chain().get(0));
+        }
     }
 
     @Test
@@ -416,6 +460,181 @@ class TokenStatusListCwtServiceTest {
         fixture.rows.put("bitstring", fixture.row("bitstring", "BitstringStatusListCredential", "{}"));
         assertTrue(lists.served("bitstring").isEmpty(), "the token endpoint only serves token status lists");
         assertTrue(lists.served("no-such-list").isEmpty());
+    }
+
+    /**
+     * Review round 1, major 2(c): the schedule that lost a revocation — allocation reads the candidate rows, a revocation
+     * commits, then allocation marks the list {@code FULL}. Writing the whole entity would restore the document it read;
+     * the status is written on its own, so the committed revocation stays.
+     */
+    @Test
+    void markingAFullListFullKeepsAConcurrentlyCommittedRevocation() {
+        Fixture fixture = new Fixture(8);
+        MutableClock clock = new MutableClock(T0);
+        TokenStatusListService lists = fixture.lists(clock);
+        TokenStatusListService.Entry first = lists.allocateCwt("revocation", fixture.dsc());
+        for (int index = 1; index < 8; index++) {
+            lists.allocateCwt("revocation", fixture.dsc()); // fill the pool: the next allocation marks it FULL
+        }
+        String listId = fixture.listId(first);
+        byte[] bits = TokenStatusListCwt.decode(tokenOf(fixture, listId)).lst().clone();
+        TokenStatusListService.set(bits, 0, true);
+        AtomicReference<String> committed = new AtomicReference<>();
+        fixture.interleave = () -> {
+            // the revocation commits between the candidate read and the marking: a re-signed token with the bit set
+            fixture.storeBits(listId, bits, T0);
+            committed.set(fixture.rows.get(listId).getVcDocument());
+            fixture.rows.get(listId).setCredentialStatus(StatusListCredential.CredentialStatus.AVAILABLE);
+        };
+
+        TokenStatusListService.Entry overflow = lists.allocateCwt("revocation", fixture.dsc());
+
+        assertNotEquals(listId, fixture.listId(overflow), "the full list takes no more indices");
+        assertEquals(StatusListCredential.CredentialStatus.FULL,
+                fixture.rows.get(listId).getCredentialStatus(), "the list is marked FULL");
+        assertEquals(committed.get(), fixture.rows.get(listId).getVcDocument(),
+                "marking it FULL wrote no document, so the committed revocation is kept");
+        assertTrue(TokenStatusListService.get(
+                TokenStatusListCwt.decode(tokenOf(fixture, listId)).lst(), 0), "the revoked bit is still set");
+    }
+
+    /**
+     * Review round 1, major 5: once {@code exp} sits at the signer path's {@code validUntil}, a new signature carries the
+     * same {@code exp}; renewing on every request would sign and write without changing a byte. In the last {@code ttl}
+     * before {@code notAfter} the list is served as stored.
+     */
+    @Test
+    void theLastTtlBeforeTheSignerNotAfterSignsNothing() {
+        Fixture fixture = new Fixture();
+        MutableClock clock = new MutableClock(T0);
+        X509Certificate soon = signerUntil(SOON_KEYS, T0.plus(TTL), "Status List Test Last Hour DSC");
+        fixture.provider.add("mdl-dsc@2030-01", SOON_KEYS.getPrivate(), CertificateChain.of(soon, IACA),
+                SignatureAlgorithm.ES256, "mdoc-dsc");
+        TokenStatusListService lists = fixture.lists(clock);
+        TokenStatusListService.Entry entry = lists.allocateCwt("revocation", fixture.signing("x509-file:mdl-dsc@2030-01"));
+        assertEquals(soon.getNotAfter().toInstant(), TokenStatusListCwt.decode(
+                TokenStatusListCwtBase.token(fixture.rows.get(fixture.listId(entry)).getVcDocument())).exp(),
+                "exp is capped at the signer's notAfter");
+
+        clock.advance(TTL.minusSeconds(60)); // less than ttl to go: the old rule renewed on every request
+        int signedBefore = fixture.signed.get();
+        for (int request = 0; request < 5; request++) {
+            assertEquals(TokenStatusListService.MEDIA_TYPE_CWT, lists.served(fixture.listId(entry)).orElseThrow().mediaType());
+        }
+        assertEquals(signedBefore, fixture.signed.get(), "a capped list is signed no more than once (here: never)");
+        assertEquals(0, fixture.replaced.get(), "and nothing is written");
+        assertEquals(TokenStatusListService.Freshness.FRESH, lists.freshnessCwt(fixture.listId(entry),
+                lists.envelope(fixture.rows.get(fixture.listId(entry)).getVcDocument())));
+    }
+
+    /**
+     * Review round 1, minor 7: {@code encode} answers the last second of the leaf's validity as retirement, and that has
+     * to be the 410, not the 503 — the catch order in {@code served} is what decides it.
+     */
+    @Test
+    void aListInTheSignersLastSecondIsRetiredByEncodeNotByResolve() {
+        Fixture fixture = new Fixture();
+        MutableClock clock = new MutableClock(T0);
+        X509Certificate lastSecond = signerUntil(LAST_SECOND_KEYS, T0.plus(TTL), "Status List Test Last Second DSC");
+        fixture.provider.add("mdl-dsc@2030-02", LAST_SECOND_KEYS.getPrivate(), CertificateChain.of(lastSecond, IACA),
+                SignatureAlgorithm.ES256, "mdoc-dsc");
+        TokenStatusListService lists = fixture.lists(clock);
+        TokenStatusListService.Entry entry = lists.allocateCwt("revocation",
+                fixture.signing("x509-file:mdl-dsc@2030-02"));
+        String listId = fixture.listId(entry);
+
+        clock.advance(TTL); // exactly notAfter: resolve still accepts the signer, encode cannot give it a second
+        TokenStatusListGoneException gone = assertThrows(TokenStatusListGoneException.class, () -> lists.served(listId));
+        assertTrue(gone.getMessage().contains("retired"), gone.getMessage());
+        assertEquals(0, fixture.replaced.get());
+    }
+
+    /**
+     * Review round 1, minor 7: an intermediate that ends before the leaf gives {@code STATUS_SIGNER_EXPIRED} at renewal —
+     * the back-off and 503, not retirement, because the leaf still has years to run and an operator can issue a new
+     * intermediate path.
+     */
+    @Test
+    void anIntermediateEndingFirstIsRefusedExpiredNotRetired() {
+        Fixture fixture = new Fixture(1024, Duration.ofDays(20), RENEW_WAIT, BACKOFF);
+        MutableClock clock = new MutableClock(T0);
+        Instant intermediateEnd = StatusListTestKeys.SHORT_INTERMEDIATE.getNotAfter().toInstant();
+        X509Certificate leaf = StatusListTestKeys.signer(INTERMEDIATE_DSC_KEYS, "Status List Test Behind A Short Intermediate",
+                StatusListTestKeys.SHORT_INTERMEDIATE, StatusListTestKeys.SHORT_INTERMEDIATE_KEYS,
+                List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true,
+                Instant.now().minus(100, java.time.temporal.ChronoUnit.DAYS), Instant.now().plus(200, java.time.temporal.ChronoUnit.DAYS));
+        fixture.provider.add("mdl-dsc@2030-03", INTERMEDIATE_DSC_KEYS.getPrivate(),
+                CertificateChain.of(leaf, StatusListTestKeys.SHORT_INTERMEDIATE), SignatureAlgorithm.ES256, "mdoc-dsc");
+        TokenStatusListService lists = fixture.lists(clock);
+        TokenStatusListService.Entry entry = lists.allocateCwt("revocation",
+                fixture.signing("x509-file:mdl-dsc@2030-03"));
+        assertEquals(intermediateEnd, TokenStatusListCwt.decode(
+                TokenStatusListCwtBase.token(fixture.rows.get(fixture.listId(entry)).getVcDocument())).exp(),
+                "exp is capped at the earliest notAfter of the path");
+
+        clock.advance(Duration.between(T0, intermediateEnd).plusSeconds(1));
+        TokenStatusListUnavailableException refused = assertThrows(TokenStatusListUnavailableException.class,
+                () -> lists.served(fixture.listId(entry)));
+        assertEquals(BACKOFF.getSeconds(), refused.retryAfterSeconds());
+        assertTrue(String.valueOf(refused.getCause().getMessage()).startsWith(StatusListSignerPolicy.EXPIRED),
+                String.valueOf(refused.getCause()));
+    }
+
+    /** Review round 1, major 3: a document this build cannot read is unusable (503), never the global advice's 500. */
+    @Test
+    void anUnreadableDocumentIsUnavailableNotAnInternalError() {
+        Fixture fixture = new Fixture();
+        MutableClock clock = new MutableClock(T0);
+        TokenStatusListService lists = fixture.lists(clock);
+        TokenStatusListService.Entry entry = lists.allocateCwt("revocation", fixture.dsc());
+        String listId = fixture.listId(entry);
+        String good = fixture.rows.get(listId).getVcDocument();
+
+        for (String document : List.of("not json at all", "{\"v\":2,\"signer\":{\"mode\":\"document-signer\","
+                + "\"keyRef\":\"x509-file:mdl-dsc\",\"x5tS256\":\"abc\"},\"token\":\"AAAA\"}", "{}")) {
+            fixture.rows.get(listId).setVcDocument(document);
+            TokenStatusListUnavailableException refused = assertThrows(TokenStatusListUnavailableException.class,
+                    () -> lists.served(listId), document);
+            assertEquals(BACKOFF.getSeconds(), refused.retryAfterSeconds());
+        }
+        // and an envelope naming a signer.mode this build does not know is refused on read (nit 8)
+        fixture.rows.get(listId).setVcDocument(good.replace("\"document-signer\"", "\"status-signer\""));
+        TokenStatusListUnavailableException unknownMode = assertThrows(TokenStatusListUnavailableException.class,
+                () -> lists.served(listId));
+        assertTrue(unknownMode.getMessage().contains("cannot read"), unknownMode.getMessage());
+    }
+
+    /** Review round 1, nit 8: the dedicated mode is read from the envelope, never hard-coded at renewal. */
+    @Test
+    void aDedicatedListIsResignedUnderItsOwnMode() {
+        Fixture fixture = new Fixture();
+        MutableClock clock = new MutableClock(T0);
+        TokenStatusListService lists = fixture.lists(clock);
+        TokenStatusListService.Entry entry = lists.allocateCwt("revocation", fixture.dsc());
+        String listId = fixture.listId(entry);
+        // rewrite the envelope's mode to dedicated: renewal must hold the signer to the .45 EKU, which this Document
+        // Signer does not carry, so the refusal proves the stored mode decided
+        String document = fixture.rows.get(listId).getVcDocument();
+        fixture.rows.get(listId).setVcDocument(document.replace("\"document-signer\"", "\"dedicated\""));
+        fixture.registry.enforced.set(true); // the signer rules (purpose included) only run under a configured IACA
+        clock.advance(TTL.plusSeconds(60));
+        byte[] stored = tokenOf(fixture, listId);
+
+        // the renewal is refused, so the still-valid token is served as stored and nothing is signed or written; the
+        // refusal names the *dedicated* purpose, which only the stored mode can ask for
+        TokenStatusListService.Served served = lists.served(listId).orElseThrow();
+        assertArrayEquals(stored, served.body());
+        assertEquals(0, fixture.replaced.get());
+
+        clock.advance(TTL.plus(BACKOFF)); // past exp and past the back-off
+        TokenStatusListUnavailableException refused = assertThrows(TokenStatusListUnavailableException.class,
+                () -> lists.served(listId));
+        assertTrue(String.valueOf(refused.getCause().getMessage()).startsWith(StatusListSignerPolicy.PURPOSE),
+                String.valueOf(refused.getCause()));
+    }
+
+    private static byte[] tokenOf(Fixture fixture, String listId) {
+        return TokenStatusListCwtBase.token(fixture.rows.get(listId).getVcDocument());
     }
 
     @Test
@@ -428,6 +647,13 @@ class TokenStatusListCwtServiceTest {
                 new TokenStatusListProperties.Mdoc("jwt", null, null).tokenFormat(), "the escape hatch is accepted");
 
         assertThrows(IllegalArgumentException.class, () -> new TokenStatusListProperties.Mdoc("vc+sd-jwt", null, null));
+        // nit 8: a list the codec cannot read back is refused at binding, never at the first request
+        assertThrows(IllegalArgumentException.class,
+                () -> new TokenStatusListProperties(null, "ES256", "leaf", 0, TTL, RENEW_WAIT, BACKOFF, null));
+        assertThrows(IllegalArgumentException.class,
+                () -> new TokenStatusListProperties(null, "ES256", "leaf", 12, TTL, RENEW_WAIT, BACKOFF, null));
+        assertThrows(IllegalArgumentException.class, () -> new TokenStatusListProperties(null, "ES256", "leaf",
+                TokenStatusListCwt.MAX_BITS + 8, TTL, RENEW_WAIT, BACKOFF, null));
         assertThrows(IllegalArgumentException.class, () -> new TokenStatusListProperties.Mdoc("cwt", "status-signer", null));
         IllegalArgumentException dedicated = assertThrows(IllegalArgumentException.class,
                 () -> new TokenStatusListProperties.Mdoc("cwt", "dedicated", null));
@@ -491,6 +717,8 @@ class TokenStatusListCwtServiceTest {
         final StatusListCredentialService bitstringLists = mock(StatusListCredentialService.class);
         final ObjectMapper objectMapper = new ObjectMapper();
         final MutableRegistry registry = new MutableRegistry();
+        /** Run once inside the next candidate read, after the rows were projected: a concurrent commit (tests). */
+        Runnable interleave = () -> { };
         TokenStatusListProperties properties;
         MutableClock clock;
         /** Whether the services this fixture builds use {@code mdoc.token-format=jwt} (D-M11-3's escape hatch). */
@@ -527,6 +755,32 @@ class TokenStatusListCwtServiceTest {
                 row.setVcDocument(inv.getArgument(2));
                 documents.put(id, row.getVcDocument());
                 replaced.incrementAndGet();
+                return 1;
+            });
+            when(repository.findCwtCandidates(anyString(), anyString(), any())).thenAnswer(inv -> {
+                List<StatusListCredentialRepository.CwtCandidate> projected = rows.values().stream()
+                        .filter(row -> inv.getArgument(0).equals(row.getCredentialType()))
+                        .filter(row -> inv.getArgument(1).equals(row.getStatusPurpose()))
+                        .filter(row -> inv.getArgument(2).equals(row.getCredentialStatus()))
+                        .sorted(Comparator.comparing(StatusListCredential::getCreatedDtimes)
+                                .thenComparing(row -> sequence.getOrDefault(row.getId(), 0)).reversed())
+                        .map(row -> (StatusListCredentialRepository.CwtCandidate) new Candidate(row.getId(), row.getVcDocument()))
+                        .toList();
+                Runnable concurrent = interleave;
+                interleave = () -> { };
+                concurrent.run(); // a revocation commits now, after the rows (and their documents) were read
+                return projected;
+            });
+            when(repository.findByIdForUpdate(anyString())).thenAnswer(inv ->
+                    Optional.ofNullable(rows.get(inv.<String>getArgument(0))).map(Fixture::copy));
+            when(repository.findDocumentById(anyString())).thenAnswer(inv ->
+                    Optional.ofNullable(rows.get(inv.<String>getArgument(0))).map(StatusListCredential::getVcDocument));
+            when(repository.updateCredentialStatus(anyString(), any())).thenAnswer(inv -> {
+                StatusListCredential row = rows.get(inv.<String>getArgument(0));
+                if (row == null) {
+                    return 0;
+                }
+                row.setCredentialStatus(inv.getArgument(1));
                 return 1;
             });
             when(repository.findFirstByCredentialTypeAndStatusPurposeAndCredentialStatusOrderByCreatedDtimesDesc(
@@ -580,6 +834,19 @@ class TokenStatusListCwtServiceTest {
             row.setCredentialStatus(StatusListCredential.CredentialStatus.AVAILABLE);
             row.setCreatedDtimes(LocalDateTime.now());
             return row;
+        }
+
+        /** The projection row allocation reads. */
+        record Candidate(String id, String vcDocument) implements StatusListCredentialRepository.CwtCandidate {
+            @Override
+            public String getId() {
+                return id;
+            }
+
+            @Override
+            public String getVcDocument() {
+                return vcDocument;
+            }
         }
 
         TokenStatusListService lists(Instant now) {
@@ -726,14 +993,14 @@ class TokenStatusListCwtServiceTest {
             return CwtEnvelope.signOrdered(claims, CoseHeaderPolicy.statusListCwt(), key, StatusListTestKeys.SIGNER);
         }
 
-        /** One bit of {@code lst} flipped inside the payload, with the signature left untouched (a tampered row). */
-        static byte[] tamperLst(byte[] token, long idx) {
+        /** One bit of {@code lst} written inside the payload, with the signature left untouched (a tampered row). */
+        static byte[] tamperLst(byte[] token, long idx, boolean value) {
             CBORObject sign1 = CBORObject.DecodeFromBytes(token).UntagOne();
             CBORObject claims = CBORObject.DecodeFromBytes(sign1.get(2).GetByteString());
             CBORObject statusList = claims.get(CBORObject.FromObject(TokenStatusListCwt.CLAIM_STATUS_LIST));
             byte[] bits = TokenStatusListCwt.inflate(statusList.get(CBORObject.FromObject("lst")).GetByteString(),
                     TokenStatusListCwt.MAX_BITS / 8);
-            TokenStatusListService.set(bits, idx, true);
+            TokenStatusListService.set(bits, idx, value);
             statusList.set(CBORObject.FromObject("lst"), CBORObject.FromObject(TokenStatusListService.zlib(bits)));
             CBORObject rebuilt = CBORObject.NewArray()
                     .Add(sign1.get(0))

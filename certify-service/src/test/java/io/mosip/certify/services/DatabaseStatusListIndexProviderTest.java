@@ -24,6 +24,7 @@ import java.util.Collections;
 import java.util.Optional;
 
 import static org.junit.Assert.*;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.*;
 
@@ -105,6 +106,7 @@ public class DatabaseStatusListIndexProviderTest {
     @Test
     public void should_markListFullAndReturnEmpty_when_capacityIsReached() {
         StatusListCredential list = statusList(1L);
+        StatusListCredential.CredentialStatus before = list.getCredentialStatus();
         when(statusListCredentialRepository.findById("list-1")).thenReturn(Optional.of(list));
         // physical capacity = 1*1024*8 = 8192; threshold 50% = 4096
         when(statusListAvailableIndicesRepository.countByStatusListCredentialIdAndIsAssignedTrue("list-1"))
@@ -113,9 +115,12 @@ public class DatabaseStatusListIndexProviderTest {
         Optional<Long> result = provider.acquireIndex("list-1", Collections.emptyMap());
 
         assertTrue(result.isEmpty());
-        ArgumentCaptor<StatusListCredential> captor = ArgumentCaptor.forClass(StatusListCredential.class);
-        verify(statusListCredentialRepository).save(captor.capture());
-        assertEquals(StatusListCredential.CredentialStatus.FULL, captor.getValue().getCredentialStatus());
+        // M-11d review round 1, major 2: credential_status only, so the document read above is never written back
+        // (saving the entity reverted a revocation committed in between; see G39)
+        verify(statusListCredentialRepository).updateCredentialStatus("list-1",
+                StatusListCredential.CredentialStatus.FULL);
+        verify(statusListCredentialRepository, never()).save(any(StatusListCredential.class));
+        assertEquals("the caller's entity is not changed or written", before, list.getCredentialStatus());
     }
 
     @Test

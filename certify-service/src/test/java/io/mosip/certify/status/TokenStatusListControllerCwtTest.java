@@ -23,6 +23,7 @@ import static io.mosip.certify.status.StatusListTestKeys.EXPIRED;
 import static io.mosip.certify.status.StatusListTestKeys.EXPIRED_KEYS;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -181,6 +182,34 @@ class TokenStatusListControllerCwtTest {
         assertEquals(Long.toString(TokenStatusListCwtServiceTest.BACKOFF.getSeconds()),
                 refused.getResponse().getHeader(HttpHeaders.RETRY_AFTER),
                 "a revoked signer is the back-off and 503, never an unsigned or old-exp body");
+    }
+
+    /**
+     * Review round 1, major 3: a corrupt or unsupported envelope reaches the production {@link
+     * io.mosip.certify.advice.ExceptionHandlerAdvice} if it is thrown, which answers the MOSIP envelope with 200; with
+     * the advice in the context the endpoint must still answer 503 and {@code Retry-After} itself.
+     */
+    @Test
+    void anUnreadableRowIs503EvenWithTheGlobalAdviceInTheContext() throws Exception {
+        TokenStatusListCwtServiceTest.Fixture fixture = new TokenStatusListCwtServiceTest.Fixture();
+        TokenStatusListService lists = fixture.lists(TokenStatusListCwtServiceTest.T0);
+        TokenStatusListService.Entry entry = lists.allocateCwt("revocation", fixture.dsc());
+        String listId = fixture.listId(entry);
+        MockMvc mvc = MockMvcBuilders.standaloneSetup(new TokenStatusListController(lists))
+                .setControllerAdvice(new io.mosip.certify.advice.ExceptionHandlerAdvice()).build();
+
+        for (String document : List.of("not json at all",
+                "{\"v\":2,\"signer\":{\"mode\":\"document-signer\",\"keyRef\":\"x509-file:mdl-dsc\","
+                        + "\"x5tS256\":\"abc\"},\"token\":\"AAAA\"}")) {
+            fixture.rows.get(listId).setVcDocument(document);
+            MvcResult result = mvc.perform(get("/credentials/token-status-list/" + listId)).andReturn();
+            assertEquals(503, result.getResponse().getStatus(), document);
+            assertEquals(Long.toString(TokenStatusListCwtServiceTest.BACKOFF.getSeconds()),
+                    result.getResponse().getHeader(HttpHeaders.RETRY_AFTER), document);
+            assertEquals(0, result.getResponse().getContentAsByteArray().length, document);
+            assertNotEquals("application/json", result.getResponse().getContentType(),
+                    "the global advice's 200 envelope is what this test exists to prevent");
+        }
     }
 
     @Test
