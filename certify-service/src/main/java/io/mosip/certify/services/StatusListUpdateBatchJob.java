@@ -51,13 +51,13 @@ public class StatusListUpdateBatchJob {
     private int batchSize;
 
     /**
-     * The clock {@code validFrom} is written from: {@code Clock.systemUTC()} unless a deployment, or a test, injects
-     * another through {@link #setClock(Clock)}.
+     * The clock {@code validFrom} is written from: {@code Clock.systemUTC()} always in production;
+     * only a test sets another through {@link #setClock(Clock)} (not a Spring injection point, so a {@code Clock} bean a
+     * deployment or plugin defines can neither replace the writer clock nor make startup ambiguous).
      */
     private Clock clock = Clock.systemUTC();
 
-    /** Optional injection point for the writer clock; the default is the system clock. */
-    @Autowired(required = false)
+    /** For tests: the writer clock (production keeps {@code Clock.systemUTC()}). */
     public void setClock(Clock clock) {
         this.clock = clock;
     }
