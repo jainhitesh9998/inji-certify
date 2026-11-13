@@ -66,11 +66,14 @@ public final class MdocDscPolicy {
     public static final String CRL_STALE = "CRL_STALE";
     /** The dry run could not resolve the configured signing key, so no policy rule could be judged (fail closed). */
     public static final String KEY_UNRESOLVED = "KEY_UNRESOLVED";
+    /** IACAs are configured but the policy over them cannot be obtained, so no rule could be judged (fail closed). */
+    public static final String TRUST_ANCHORS_UNAVAILABLE = "TRUST_ANCHORS_UNAVAILABLE";
 
     /** The rules this class names itself; the Annex B profile rules come from {@link AnnexBValidator#RULES}. */
     public static final Set<String> RULES = Set.of(X5CHAIN_MISSING, DSC_SELF_SIGNED, X5CHAIN_NONE,
             X5CHAIN_DROPS_INTERMEDIATES, X5CHAIN_CARRIES_ANCHOR, DSC_NOT_YET_VALID, DSC_EXPIRED, CHAIN_LINK_INVALID,
-            DSC_NO_TRUSTED_IACA, IACA_NOT_YET_VALID, IACA_EXPIRED, DSC_REVOKED, CRL_STALE, KEY_UNRESOLVED);
+            DSC_NO_TRUSTED_IACA, IACA_NOT_YET_VALID, IACA_EXPIRED, DSC_REVOKED, CRL_STALE, KEY_UNRESOLVED,
+            TRUST_ANCHORS_UNAVAILABLE);
 
     /** Profile results per (DSC, IACA) pair: neither validator depends on the instant, so a pair is judged once. */
     private static final int PROFILE_CACHE_SIZE = 64;
@@ -85,6 +88,15 @@ public final class MdocDscPolicy {
     /** The policy without trust anchors: only the rules that apply whatever is configured. */
     public static MdocDscPolicy notEnforced() {
         return new MdocDscPolicy(TrustAnchorRegistry.EMPTY);
+    }
+
+    /**
+     * The refusal for a caller that knows {@code mdoc-iaca} anchors are configured but cannot obtain the policy over them
+     * (several registries, none primary): signing fails closed rather than skipping the trust-anchor rules.
+     */
+    public static FormatException unavailable(String reason) {
+        return refuse(TRUST_ANCHORS_UNAVAILABLE, "mdoc-iaca trust anchors are configured but the DSC policy over them"
+                + " cannot be applied: " + reason + "; mDocs are not signed until it can (D16)");
     }
 
     /** Whether the trust-anchor rules apply: the registry holds at least one {@code mdoc-iaca} anchor. */

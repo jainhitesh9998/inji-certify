@@ -69,8 +69,10 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 /**
  * M-06 and M-08 in the running service: the x509-file provider in dev mode with an Annex B IACA and a Document Signer,
  * two operator IACAs from files (one with a CRL), the DSC policy enforced on every surface, and the publication on.
- * The anchors are {@code operator-iaca} (configured id, CRL file), the second file's subject key identifier (no CRL)
- * and {@code demo-iaca} (the x509-file IACA, named by its own CRL distribution point, with a dev-mode CRL).
+ * The anchors are {@code operator-iaca} (configured id, CRL file), the second file's subject key identifier (no CRL),
+ * {@code stale-iaca} (a CRL more than the grace past its nextUpdate at startup, with a Document Signer imported through
+ * {@code pem-keys}; the service still starts) and {@code demo-iaca} (the x509-file IACA, named by its own CRL
+ * distribution point, with a dev-mode CRL).
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -93,6 +95,12 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
         "certify.pki.trust-anchors.mdoc-iaca[0].certificate=" + IacaTrustAnchorsTest.DIRECTORY + "/operator-iaca.pem",
         "certify.pki.trust-anchors.mdoc-iaca[0].crl=" + IacaTrustAnchorsTest.DIRECTORY + "/operator-iaca.crl",
         "certify.pki.trust-anchors.mdoc-iaca[1].certificate=" + IacaTrustAnchorsTest.DIRECTORY + "/second-iaca.der",
+        "certify.pki.trust-anchors.mdoc-iaca[2].id=stale-iaca",
+        "certify.pki.trust-anchors.mdoc-iaca[2].certificate=" + IacaTrustAnchorsTest.DIRECTORY + "/stale-iaca.pem",
+        "certify.pki.trust-anchors.mdoc-iaca[2].crl=" + IacaTrustAnchorsTest.DIRECTORY + "/stale-iaca.crl",
+        "certify.keyprovider.x509-file.pem-keys[0].alias=stale-dsc",
+        "certify.keyprovider.x509-file.pem-keys[0].key=" + IacaTrustAnchorsTest.DIRECTORY + "/stale-dsc.key",
+        "certify.keyprovider.x509-file.pem-keys[0].chain=" + IacaTrustAnchorsTest.DIRECTORY + "/stale-dsc-chain.pem",
         "mosip.certify.issuer.ledger-enabled=false",
         "spring.jpa.database-platform=org.hibernate.dialect.H2Dialect",
         "spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.H2Dialect",
@@ -111,6 +119,7 @@ class IacaTrustAnchorsTest {
     static final String DOCTYPE = "org.iso.18013.5.1.mDL.trust-anchors";
     static final String X509_CONFIG = "TrustAnchorsMdlX509File";
     static final String KEYMANAGER_CONFIG = "TrustAnchorsMdlKeymanager";
+    static final String STALE_CONFIG = "TrustAnchorsMdlStaleCrl";
 
     static final X509Certificate OPERATOR_IACA;
     static final X509Certificate SECOND_IACA;
@@ -138,6 +147,21 @@ class IacaTrustAnchorsTest {
             SECOND_IACA = IsoMdocProfiles.iaca(p256()).country("IN").commonName("Lorem Ipsum Second IACA")
                     .issuerAltUri("https://second.example.test").crlDistributionPoint("https://second.example.test/crl/second.crl").build();
             Files.write(directory.resolve("second-iaca.der"), SECOND_IACA.getEncoded());
+            // an IACA whose CRL is two days past its nextUpdate (more than the PT24H grace) when the service starts
+            Instant since = Instant.now().minus(30, ChronoUnit.DAYS);
+            KeyPair staleKeys = p256();
+            X509Certificate staleIaca = IsoMdocProfiles.iaca(staleKeys).country("IN").commonName("Lorem Ipsum Stale CRL IACA")
+                    .issuerAltUri("https://certify.example.test").notBefore(since)
+                    .crlDistributionPoint(PUBLIC_BASE + "/mdoc/iaca/stale-iaca.crl").build();
+            Files.writeString(directory.resolve("stale-iaca.pem"), Pem.writeCertificate(staleIaca));
+            Files.writeString(directory.resolve("stale-iaca.crl"), Pem.writeCrl(CrlBuilder.forIaca(staleIaca, staleKeys)
+                    .crlNumber(BigInteger.valueOf(3)).thisUpdate(Instant.now().minus(10, ChronoUnit.DAYS))
+                    .nextUpdate(Instant.now().minus(2, ChronoUnit.DAYS)).build()));
+            KeyPair staleDscKeys = p256();
+            X509Certificate staleDsc = IsoMdocProfiles.ds(staleDscKeys, staleIaca, staleKeys).commonName("Lorem Ipsum Stale CRL DSC")
+                    .notBefore(since).build();
+            Files.writeString(directory.resolve("stale-dsc.key"), Pem.writePrivateKey(staleDscKeys.getPrivate()));
+            Files.writeString(directory.resolve("stale-dsc-chain.pem"), Pem.writeCertificates(List.of(staleDsc, staleIaca)));
         } catch (Exception e) {
             throw new ExceptionInInitializerError(e);
         }
@@ -177,7 +201,7 @@ class IacaTrustAnchorsTest {
         assertTrue(result.getResponse().getContentType().startsWith(MediaType.APPLICATION_JSON_VALUE));
         assertEquals("max-age=300, public", result.getResponse().getHeader("Cache-Control"));
         JsonNode list = objectMapper.readTree(result.getResponse().getContentAsString());
-        assertEquals(List.of("operator-iaca", secondId(), "demo-iaca"), ids(list));
+        assertEquals(List.of("operator-iaca", secondId(), "stale-iaca", "demo-iaca"), ids(list));
         JsonNode operator = list.get(0);
         assertEquals("IN", operator.get("country").asText());
         assertEquals(OPERATOR_IACA.getSubjectX500Principal().getName(), operator.get("subject").asText());
@@ -189,7 +213,7 @@ class IacaTrustAnchorsTest {
         assertEquals("iaca/operator-iaca.der", operator.get("der").asText());
         assertEquals("iaca/operator-iaca.crl", operator.get("crl").asText());
         assertTrue(list.get(1).get("crl").isNull(), "no CRL configured for the second IACA");
-        assertEquals("iaca/demo-iaca.crl", list.get(2).get("crl").asText(), "dev mode issues the x509-file IACA's CRL");
+        assertEquals("iaca/demo-iaca.crl", list.get(3).get("crl").asText(), "dev mode issues the x509-file IACA's CRL");
     }
 
     @Test
@@ -283,6 +307,33 @@ class IacaTrustAnchorsTest {
         assertTrue(!issued.getResponse().getContentAsString().contains("\"credentials\""), issued.getResponse().getContentAsString());
     }
 
+    /**
+     * Round 2, items 2 and 4: an IACA whose CRL is past the grace at startup does not stop the service (this context
+     * started with one); the v2 dry run and the preview of an mDoc configuration under that IACA answer 400 with
+     * CRL_STALE, and issuance fails closed, while the other IACAs keep signing.
+     */
+    @Test
+    void aStaleCrlAtStartupStartsTheServiceAndRefusesTheDryRunAndPreviewUnderItsIaca() throws Exception {
+        Map<String, Object> body = body(STALE_CONFIG, Map.of("provider", "x509-file", "alias", "stale-dsc", "alg", "ES256",
+                "x5c", "without-anchor"));
+        body.put("sampleClaims", Map.of("fullName", "Demo Holder", "dateOfBirth", "1990-01-01"));
+        MvcResult dryRun = mockMvc.perform(post("/v2/credential-configurations").contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(body))).andReturn();
+        String refusal = dryRun.getResponse().getContentAsString();
+        assertEquals(400, dryRun.getResponse().getStatus(), refusal);
+        assertTrue(refusal.contains("certificate_chain_invalid: CRL_STALE"), refusal);
+
+        body.remove("sampleClaims");
+        create(STALE_CONFIG, body);
+        MvcResult preview = mockMvc.perform(post("/v2/credential-configurations/" + STALE_CONFIG + "/preview")
+                .contentType(MediaType.APPLICATION_JSON).content("{\"claims\": {\"fullName\": \"Demo Holder\", \"dateOfBirth\": \"1990-01-01\"}}")).andReturn();
+        assertEquals(400, preview.getResponse().getStatus(), preview.getResponse().getContentAsString());
+        assertTrue(preview.getResponse().getContentAsString().contains("CRL_STALE"), preview.getResponse().getContentAsString());
+        MvcResult issued = issue(STALE_CONFIG);
+        assertTrue(issued.getResponse().getStatus() >= 400, "no credential: " + issued.getResponse().getContentAsString());
+        assertTrue(!issued.getResponse().getContentAsString().contains("\"credentials\""), issued.getResponse().getContentAsString());
+    }
+
     // ---- helpers ----------------------------------------------------------------------------------------------------
 
     private void ensureConfiguration(String id, Map<String, Object> signing) throws Exception {
@@ -308,9 +359,10 @@ class IacaTrustAnchorsTest {
         body.put("id", id);
         body.put("scope", "sample_vc_ldp"); // the local TestBearer token carries this scope
         body.put("format", "mso_mdoc");
-        body.put("formatConfig", Map.of("doctype", id.equals(X509_CONFIG) ? DOCTYPE : DOCTYPE + ".keymanager"));
+        String doctype = id.equals(X509_CONFIG) ? DOCTYPE : id.equals(STALE_CONFIG) ? DOCTYPE + ".stale" : DOCTYPE + ".keymanager";
+        body.put("formatConfig", Map.of("doctype", doctype));
         body.put("signing", new LinkedHashMap<>(signing));
-        body.put("template", Map.of("content", id.equals(X509_CONFIG) ? template : template.replace(DOCTYPE, DOCTYPE + ".keymanager")));
+        body.put("template", Map.of("content", id.equals(X509_CONFIG) ? template : template.replace(DOCTYPE, doctype)));
         body.put("display", Map.of("display", List.of(Map.of("name", id, "locale", "en")), "order", List.of("family_name")));
         return body;
     }

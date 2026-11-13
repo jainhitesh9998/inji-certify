@@ -18,7 +18,7 @@ import org.springframework.context.annotation.Import;
  *
  * <p>The file data source is excluded so a migration job never reads, validates or holds the demo JSON and its
  * binaries: a broken demo file must not block a migration. The trust-anchor registry (M-06) is excluded for the same
- * reason: it reads and validates IACA certificates and CRLs, refuses to start on a stale CRL, and in dev mode issues
+ * reason: it reads and validates IACA certificates and CRLs, refuses to start on an invalid one, and in dev mode issues
  * a CRL and writes its number next to the keystore, none of which a migration needs. The exclusion is listed in
  * {@code spring.autoconfigure.exclude} rather than on {@code @EnableAutoConfiguration(exclude = ...)}: this class is a
  * {@link SpringBootConfiguration} inside the application's scan base, and an annotation exclusion there applies to every

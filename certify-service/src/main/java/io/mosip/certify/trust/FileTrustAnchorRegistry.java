@@ -63,15 +63,19 @@ import java.util.regex.Pattern;
  * for an IACA whose private key the x509-file provider holds in dev mode, an empty CRL is issued at startup and
  * re-issued once half its validity has passed, numbered after the last number recorded in a {@link CrlNumberStore}.
  * Every tick, unchanged files included, logs a CRL past its nextUpdate: WARN within {@code certify.pki.stale-crl-grace}
- * (signing continues), ERROR past it (the DSC policy refuses {@code CRL_STALE}); at startup a CRL past the grace
- * refuses to start (decision log 2026-11-13). The gauge {@value #METRIC}{@code {anchor}} counts down to each CRL's
+ * (signing continues), ERROR past it (the DSC policy refuses {@code CRL_STALE}); at startup too, where a CRL past the
+ * grace is logged at ERROR and the service starts, since only mDoc signing under that IACA is affected and the policy
+ * already fails closed for it (decision log 2026-11-13). The gauge {@value #METRIC}{@code {anchor}} counts down to each CRL's
  * nextUpdate, negative once it has passed.
  */
 @Slf4j
 public class FileTrustAnchorRegistry implements TrustAnchorRegistry, AutoCloseable {
 
-    /** Seconds until the anchor's current CRL reaches its nextUpdate; negative once it has. Tagged {@code anchor}. */
-    public static final String METRIC = "certify.pki.crl.seconds_to_next_update";
+    /**
+     * Seconds until the anchor's current CRL reaches its nextUpdate; negative once it has. Tagged {@code anchor}, base
+     * unit seconds, so Prometheus exports it as {@code certify_pki_crl_next_update_seconds{anchor}}.
+     */
+    public static final String METRIC = "certify.pki.crl.next_update";
 
     /** Issues an empty CRL for an IACA whose key the caller holds; empty when it holds none (production). */
     @FunctionalInterface
@@ -155,16 +159,11 @@ public class FileTrustAnchorRegistry implements TrustAnchorRegistry, AutoCloseab
                 issueDevCrl(anchor, BigInteger.ZERO, true).ifPresent(state -> current(anchor.id(), state));
             }
         }
+        // a stale CRL does not refuse startup: the service issues other formats, and mDoc signing under that IACA fails
+        // closed (CRL_STALE) on its own; the ERROR below and the gauge tell the operator (decision log 2026-11-13)
         Instant now = clock.instant();
         for (Anchor anchor : anchors) {
-            CrlState state = crls.get(anchor.id());
-            if (state != null && pastGrace(state.crl(), now)) {
-                throw new IllegalStateException("The CRL " + (crlFiles.containsKey(anchor.id()) ? crlFiles.get(anchor.id()) + " " : "")
-                        + "of the IACA " + anchor.id() + " passed its nextUpdate " + nextUpdate(state.crl()) + " more than "
-                        + staleCrlGrace + " ago (certify.pki.stale-crl-grace): every mDL signed under it would be"
-                        + " rejected by verifiers (RFC 5280 6.3.3); publish a new CRL before starting");
-            }
-            logFreshness(anchor, state, now);
+            logFreshness(anchor, crls.get(anchor.id()), now);
         }
         if (!anchors.isEmpty()) {
             log.info("mdoc-iaca trust anchors: {}", anchors.stream().map(anchor -> anchor.id() + " ("
@@ -300,7 +299,8 @@ public class FileTrustAnchorRegistry implements TrustAnchorRegistry, AutoCloseab
 
     /**
      * A changed CRL file that validated replaces the current CRL only when it moves forward (RFC 5280 5.2.3): a larger
-     * cRLNumber and a thisUpdate no earlier. The same CRL written again changes nothing. Anything else (a lower number,
+     * cRLNumber, and a thisUpdate no more than {@link AnnexBValidator#CLOCK_SKEW} earlier than the current one's (the
+     * number orders CRLs; the skew absorbs a signer whose clock ran fast). The same CRL written again changes nothing. Anything else (a lower number,
      * the same number with other content, an earlier thisUpdate) is a rollback that could un-revoke a Document Signer:
      * it is logged at ERROR on every tick until the file is fixed, and the current CRL stays.
      */
@@ -319,14 +319,17 @@ public class FileTrustAnchorRegistry implements TrustAnchorRegistry, AutoCloseab
         }
         Instant wasThisUpdate = current.crl().getThisUpdate().toInstant();
         Instant isThisUpdate = candidate.crl().getThisUpdate().toInstant();
+        // RFC 5280 5.2.3 orders CRLs by number; thisUpdate only guards against an old list renumbered, within the clock
+        // skew AnnexBValidator allows, so a CRL signed on a slightly slow clock after one signed on a fast clock is taken
         String problem = order < 0 ? "its cRLNumber " + is + " is lower than the current " + was
                 : order == 0 ? "its cRLNumber " + is + " is the current one's, but its content differs"
-                : isThisUpdate.isBefore(wasThisUpdate) ? "its thisUpdate " + isThisUpdate + " is earlier than the current " + wasThisUpdate
+                : isThisUpdate.isBefore(wasThisUpdate.minus(AnnexBValidator.CLOCK_SKEW)) ? "its thisUpdate " + isThisUpdate
+                        + " is more than " + AnnexBValidator.CLOCK_SKEW + " earlier than the current " + wasThisUpdate
                 : null;
         if (problem != null) {
             log.error("Refused the CRL {} of the IACA {}: {}. A replacement must carry a larger cRLNumber (RFC 5280"
-                    + " 5.2.3) and a thisUpdate no earlier than the current CRL's, since an older list could un-revoke a"
-                    + " Document Signer; the current CRL (cRLNumber {}, thisUpdate {}) stays in use", file, anchor.id(),
+                    + " 5.2.3) and a thisUpdate no earlier than the current CRL's less the clock skew, since an older list"
+                    + " could un-revoke a Document Signer; the current CRL (cRLNumber {}, thisUpdate {}) stays in use", file, anchor.id(),
                     problem, was, wasThisUpdate);
             return;
         }
@@ -392,7 +395,10 @@ public class FileTrustAnchorRegistry implements TrustAnchorRegistry, AutoCloseab
         } catch (IOException | RuntimeException e) {
             if (startup) {
                 throw new IllegalStateException("Cannot record the cRLNumber " + number + " of the dev-mode CRL of the IACA "
-                        + anchor.id() + ": " + e.getMessage(), e);
+                        + anchor.id() + crlNumbers.location().map(file -> " in " + file + " (" + e.getMessage() + "); in"
+                        + " x509-file dev mode the keystore's directory " + file.getParent() + " must be writable, since the"
+                        + " last cRLNumber of each dev IACA is kept there (<keystore>.crl-numbers) so numbers keep increasing"
+                        + " across restarts").orElse(": " + e.getMessage()), e);
             }
             log.error("Cannot record the cRLNumber {} of the dev-mode CRL of the IACA {} ({}); the current CRL stays in use",
                     number, anchor.id(), e.getMessage());
