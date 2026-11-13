@@ -23,6 +23,7 @@ import java.util.Base64;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -376,12 +377,63 @@ class CoseStatusListHeaderTest {
         assertTrue(refused.getMessage().startsWith("STATUS_SIGNER_SELF_SIGNED: "), refused.getMessage());
         assertTrue(refused.getMessage().contains("CN=M-11a Test IACA"), refused.getMessage());
 
-        // and a full chain is refused for the same reason: it would carry the self-signed anchor
+    }
+
+    @Test
+    void aStatusListTokenRefusesAChainThatCarriesItsAnchor() {
+        // FULL emits [leaf, intermediate, IACA]: the self-signed certificate is further up, not the leaf, so this is the
+        // CARRIES_ANCHOR rule of the plan's section 4.7, not SELF_SIGNED
         CoseHeaderPolicy full = new CoseHeaderPolicy(JwsHeaderPolicy.ChainInclusion.FULL, null, true, false,
                 STATUS_LIST_MEDIA_TYPE, true);
-        SigningException carriesAnchor = assertThrows(SigningException.class,
+        SigningException refused = assertThrows(SigningException.class,
                 () -> CoseEnvelope.sign1(PAYLOAD, full, THREE_CERTS, SIGNER));
-        assertTrue(carriesAnchor.getMessage().startsWith("STATUS_SIGNER_SELF_SIGNED: "), carriesAnchor.getMessage());
+        assertTrue(refused.getMessage().startsWith("STATUS_SIGNER_CARRIES_ANCHOR: "), refused.getMessage());
+        assertTrue(refused.getMessage().contains("CN=M-11a Test IACA"), refused.getMessage());
+    }
+
+    @Test
+    void aLeafPolicyInspectsAndEmitsOnlyTheEndEntity() throws Exception {
+        // x5chain leaf under [leaf, IACA] emits the DSC alone; the IACA the provider also holds is never inspected, so
+        // the token is not refused for a certificate it does not carry
+        CoseHeaderPolicy leaf = new CoseHeaderPolicy(JwsHeaderPolicy.ChainInclusion.LEAF, null, true, false,
+                STATUS_LIST_MEDIA_TYPE, true);
+        CBORObject sign1 = untag(CoseEnvelope.sign1(PAYLOAD, leaf, ONE_CERT, SIGNER), CoseEnvelope.TAG_COSE_SIGN1);
+        CBORObject x5chain = CBORObject.DecodeFromBytes(sign1.get(0).GetByteString())
+                .get(CBORObject.FromObject(CoseEnvelope.LABEL_X5CHAIN));
+        assertEquals(CBORType.ByteString, x5chain.getType());
+        assertArrayEquals(LEAF.getEncoded(), x5chain.GetByteString());
+        assertEquals("a0", hex(sign1.get(1).EncodeToBytes()));
+    }
+
+    @Test
+    void theRefusalsRunBeforeAProviderThatBuildsTheEnvelopeItself() {
+        // a provider overriding Signer.signCose builds the whole COSE_Sign1 and would otherwise skip the chain rules
+        Signer nativeSigner = new Signer() {
+            @Override
+            public byte[] signRaw(byte[] data, SigningKey key, SignatureAlgorithm algorithm) {
+                throw new AssertionError("signRaw must not be reached: the provider builds the envelope");
+            }
+
+            @Override
+            public Optional<byte[]> signCose(Signer.CoseInput input, SigningKey key) {
+                return Optional.of(new byte[]{(byte) 0xd2, (byte) 0x80});
+            }
+        };
+        SigningException noChain = assertThrows(SigningException.class,
+                () -> CoseEnvelope.sign1(PAYLOAD, CoseHeaderPolicy.statusListCwt(), NO_CHAIN, nativeSigner));
+        assertTrue(noChain.getMessage().startsWith("STATUS_SIGNER_NO_CHAIN: "), noChain.getMessage());
+        SigningException selfSigned = assertThrows(SigningException.class,
+                () -> CoseEnvelope.sign1(PAYLOAD, CoseHeaderPolicy.statusListCwt(), SELF_SIGNED, nativeSigner));
+        assertTrue(selfSigned.getMessage().startsWith("STATUS_SIGNER_SELF_SIGNED: "), selfSigned.getMessage());
+
+        // a usable chain reaches the provider untouched
+        assertArrayEquals(new byte[]{(byte) 0xd2, (byte) 0x80},
+                CoseEnvelope.sign1(PAYLOAD, CoseHeaderPolicy.statusListCwt(), ONE_CERT, nativeSigner));
+        // and the legacy paths never consult the protected form, so their handling of a provider is unchanged (I2)
+        assertArrayEquals(new byte[]{(byte) 0xd2, (byte) 0x80},
+                CoseEnvelope.sign1(PAYLOAD, CoseHeaderPolicy.mdocIssuerAuth(), SELF_SIGNED, nativeSigner));
+        assertArrayEquals(new byte[]{(byte) 0xd2, (byte) 0x80},
+                CoseEnvelope.sign1(PAYLOAD, CoseHeaderPolicy.mdocIssuerAuth(), NO_CHAIN, nativeSigner));
     }
 
     @Test
