@@ -144,6 +144,8 @@ An issuer can name the ISO/IEC 18013-5 IACAs its mDoc Document Signers chain to 
 
 - BouncyCastle 1.69 plugins. A deployment that loads the published plugin jars (`mock-certify-plugin`, `mosip-identity-certify-plugin` from `injistackdev/inji-certify-with-plugins`) on `loader.path` gets their unshaded BouncyCastle 1.69 ahead of the service's 1.78.1, and the PKI code failed startup with `NoSuchMethodError: SubjectPublicKeyInfo.getPublicKeyData()`. The service now runs on any BouncyCastle from 1.69 to 1.78.1 at runtime; nothing to configure. CI runs the PKI and mDoc module tests on 1.69 (Maven profile `bc169`) and checks every BouncyCastle reference of the service against 1.69 (`docs/design/tools/check-bc169-linkage.sh`).
 
+- `/oid4vci` issuer metadata. The document under `/oid4vci/.well-known/openid-credential-issuer` no longer carries members whose value is null (`logo`, `background_image`, `background_color`, `text_color`, a claim's `display`): OpenID4VCI 1.0 section 12.2.4 defines them as optional, so they are absent unless configured. `credential_metadata.claims` now follows the configuration's `display.order` (claims it does not list come after, ordered by path) instead of map order. The compatibility documents (`/.well-known/openid-credential-issuer`, `/issuance/...`) are unchanged.
+
 ## Removal of  Artifactory dependency
 
 ```text

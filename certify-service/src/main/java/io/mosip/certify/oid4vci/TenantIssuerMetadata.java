@@ -62,6 +62,26 @@ public class TenantIssuerMetadata {
         return document;
     }
 
+    /**
+     * Per configuration id of the tenant, the claim names in display order ({@code display.order}), which the
+     * {@code /oid4vci} document follows for {@code credential_metadata.claims} (OpenID4VCI 1.0 section 12.2.4). A
+     * registry that cannot be read leaves the claims ordered by path rather than failing the metadata document.
+     */
+    public Map<String, List<String>> claimOrders(String tenantId) {
+        Map<String, List<String>> orders = new java.util.HashMap<>();
+        try {
+            for (CredentialConfiguration configuration : configurations.all(tenantId)) {
+                if (configuration.display() != null && configuration.display().order() != null) {
+                    orders.put(configuration.id(), configuration.display().order());
+                }
+            }
+        } catch (RuntimeException e) {
+            org.slf4j.LoggerFactory.getLogger(TenantIssuerMetadata.class)
+                    .warn("Claim display order unavailable for tenant {}; claims are ordered by path", tenantId, e);
+        }
+        return orders;
+    }
+
     @SuppressWarnings("unchecked")
     Map<String, Object> entry(CredentialConfiguration configuration) {
         Map<String, Object> raw = configuration.formatConfig() == null ? Map.of() : configuration.formatConfig().raw();
