@@ -1,0 +1,46 @@
+# The ISO/IEC 18013-5 mDL issuer (docs/design/20-mdl-issuer.md, M-10) on the rebuilt service, next to the farmer use
+# case: profile "mdl" plus a PKI profile, the demo holders, and a one-shot service that writes the mDL credential
+# configuration through the v2 API. On top of the base file and the rebuild overlay:
+#
+#   docker compose -f docker-compose.yaml -f docker-compose.rebuild.yaml -f docker-compose.mdl.yaml \
+#       up -d database certify certify-nginx mdl-seed
+#
+# Environment (all optional):
+#   CERTIFY_PUBLIC_URL   the URL wallets reach certify-nginx at: identifiers, offers, metadata, the IACA's
+#                        issuerAltName and CRL distribution point (default http://localhost:8091; the public demo uses
+#                        https://credentials.loremipsum.co.in)
+#   MDL_PKI_PROFILE      mdl-dev (default: dev-mode IACA and DSC kept in ./data/MDL_PKI) or mdl-operator
+#   MDL_PKI_DIR          mdl-operator only: host directory with mdl-dsc.key.pem, dsc-chain.pem, iaca.pem, iaca.crl
+#   MDL_SEED_UPDATE      true: the seed replaces an existing mDL configuration (PUT) instead of leaving it
+# See config/mdl/README.md.
+services:
+  certify:
+    environment:
+      - active_profile_env=default, csvdp-farmer, rebuild, mdl, ${MDL_PKI_PROFILE:-mdl-dev}
+      - mosip_certify_domain_url=${CERTIFY_PUBLIC_URL:-http://localhost:8091}
+    volumes:
+      - ./config/certify-mdl.properties:/home/mosip/config/certify-mdl.properties:ro
+      - ./config/certify-mdl-dev.properties:/home/mosip/config/certify-mdl-dev.properties:ro
+      - ./config/certify-mdl-operator.properties:/home/mosip/config/certify-mdl-operator.properties:ro
+      # holders.json and the portraits it names (the file data source "mdldemo"); read-only, see config/mdl/README.md
+      - ./config/mdl:/home/mosip/config/mdl:ro
+      # mdl-dev: the generated IACA and Document Signer, kept across restarts
+      - ./data/MDL_PKI:/home/mosip/mdl-pki
+      # mdl-operator: the DSC key, [DSC, IACA] chain, IACA and CRL produced offline with certify-cli
+      - ${MDL_PKI_DIR:-./data/MDL_PKI_OPERATOR}:/pki:ro
+
+  mdl-seed:
+    image: curlimages/curl:8.11.1
+    entrypoint: ["sh", "/mdl/seed.sh"]
+    environment:
+      - CERTIFY_URL=http://certify:8090/v1/certify
+      - MDL_SEED_UPDATE=${MDL_SEED_UPDATE:-false}
+    volumes:
+      - ./config/mdl/seed.sh:/mdl/seed.sh:ro
+      - ./config/mdl/mdl-configuration.json:/mdl/mdl-configuration.json:ro
+      - ./config/mdl/mdl.vm:/mdl/mdl.vm:ro
+    networks:
+      - network
+    depends_on:
+      - certify
+    restart: "no"

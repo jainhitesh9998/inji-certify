@@ -1,0 +1,41 @@
+## The mDL template of the mdl profile (docs/design/20-mdl-issuer.md, M-10): renders the mDoc formatter's template
+## JSON for one holders.json record (data source "mdldemo", keyed by the access token's sub). The formatter types each
+## element by ISO/IEC 18013-5 Table 5 (full-date, bstr, uint, bool, driving_privileges), draws the digestIDs, checks
+## the mandatory elements and that docType equals the configuration's doctype, and decides validityInfo at signing.
+## Values are inserted as they are in holders.json: they must not contain a double quote or a backslash.
+## Optional elements are written only when the record has them ("$!x" is empty for a missing field, and keeps a false
+## or 0 value, which #if($x) would drop).
+{
+    "docType": "org.iso.18013.5.1.mDL",
+    "nameSpaces": {
+        "org.iso.18013.5.1": [
+            {"elementIdentifier": "family_name", "elementValue": "$family_name"},
+            {"elementIdentifier": "given_name", "elementValue": "$given_name"},
+            {"elementIdentifier": "birth_date", "elementValue": "$birth_date"},
+            {"elementIdentifier": "issue_date", "elementValue": "$issue_date"},
+            {"elementIdentifier": "expiry_date", "elementValue": "$expiry_date"},
+            {"elementIdentifier": "issuing_country", "elementValue": "$issuing_country"},
+            {"elementIdentifier": "issuing_authority", "elementValue": "$issuing_authority"},
+            {"elementIdentifier": "document_number", "elementValue": "$document_number"},
+            {"elementIdentifier": "portrait", "elementValue": "$portrait"},
+            {"elementIdentifier": "driving_privileges", "elementValue": [
+#foreach($privilege in $driving_privileges)
+                {"vehicle_category_code": "$privilege.vehicle_category_code"#if("$!privilege.issue_date" != ""), "issue_date": "$privilege.issue_date"#{end}#if("$!privilege.expiry_date" != ""), "expiry_date": "$privilege.expiry_date"#{end}#if($privilege.codes), "codes": [#foreach($code in $privilege.codes){"code": "$code.code"#if("$!code.sign" != ""), "sign": "$code.sign"#{end}#if("$!code.value" != ""), "value": "$code.value"#{end}}#if($foreach.hasNext), #{end}#{end}]#{end}}#if($foreach.hasNext),#{end}
+#end
+            ]},
+#if("$!sex" != "")
+            {"elementIdentifier": "sex", "elementValue": $sex},
+#end
+#if("$!age_over_18" != "")
+            {"elementIdentifier": "age_over_18", "elementValue": $age_over_18},
+#end
+#if("$!nationality" != "")
+            {"elementIdentifier": "nationality", "elementValue": "$nationality"},
+#end
+#if("$!resident_city" != "")
+            {"elementIdentifier": "resident_city", "elementValue": "$resident_city"},
+#end
+            {"elementIdentifier": "un_distinguishing_sign", "elementValue": "$un_distinguishing_sign"}
+        ]
+    }
+}
