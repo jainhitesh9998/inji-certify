@@ -516,6 +516,9 @@ Branch `wp/m-11a-cose-status-headers`. Depends on nothing. About 250 lines.
   `withoutAnchor()` keeps a lone self-signed certificate, and `mdocIssuerAuth()` keeps forwarding it — a test proves
   that is unchanged (I2) — so the status-list header path refuses it instead of emitting a token that carries its own
   trust anchor; `[DSC, IACA]` emits the DSC alone and `[DSC, intermediate, IACA]` emits `[DSC, intermediate]`.
+- A `FULL` chain over `[DSC, intermediate, IACA]` is refused with `STATUS_SIGNER_CARRIES_ANCHOR` (a self-signed
+  certificate above the leaf); a `LEAF` policy inspects and emits only the end entity, so `[DSC, IACA]` signs with the DSC;
+  the refusals run before a provider's native `signCose` is asked, so a provider that builds the envelope cannot skip them.
 - `signOrdered` refuses claim keys that break RFC 8949 §4.2.1's bytewise lexicographic order of the encoded keys,
   refuses an untagged status-list policy, and its output never starts with `d8 3d` (tag 61).
 
@@ -629,8 +632,9 @@ Branch `wp/m-11c-status-cwt-codec`. Depends on M-11a. About 450 lines.
    `TrustAnchorRegistry` bean (`TrustAnchorRegistry.EMPTY` when absent) and `AnnexBValidator.CLOCK_SKEW`.
    - `Mode` is `DOCUMENT_SIGNER` or `DEDICATED`.
    - Each rule is a distinct message prefix.
-   - `StatusListSignerPolicy` must still run before every `signOrdered`: the envelope refuses only an empty chain and a
-     self-signed one (`M-11a`), and checks no EKU, validity, revocation or IACA.
+   - `StatusListSignerPolicy` must still run before every `signOrdered`: the envelope refuses only an empty chain, a
+     self-signed leaf, or an emitted chain that carries a self-signed certificate (`M-11a`), and checks no EKU,
+     validity, revocation or IACA.
    - A `SigningException` from `M-11a`'s envelope whose message starts with `STATUS_SIGNER_` is mapped like the
      policy's `IllegalStateException`: renewal back-off and `503`, and at issuance `status_list_unavailable`.
 

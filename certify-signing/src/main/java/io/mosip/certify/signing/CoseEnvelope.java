@@ -23,7 +23,7 @@ public final class CoseEnvelope {
 
     public static byte[] sign1(byte[] payload, byte[] externalAad, CoseHeaderPolicy policy, SigningKey key, Signer signer) {
         // the refusals of the protected Status List Token form are decided before the provider is asked, so a provider
-        // that builds the envelope itself (Signer.signCose) cannot skip them; nothing is encoded here, so every other
+        // that builds the envelope itself (Signer.signCose) cannot skip them; no CBOR is built here, so every other
         // policy is byte-identical to 4f1ebcf1 (I2)
         List<byte[]> protectedChain = protectedChain(policy, key);
         return signer.signCose(new Signer.CoseInput(payload, externalAad, policy), key)
