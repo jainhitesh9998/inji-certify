@@ -33,6 +33,17 @@ jobs:
           java-version: '21'
           cache: maven
 
+      # Pin Maven 3.9 (CLAUDE.md): the runner image's newer Maven rejects POM issues that 3.9 only warns about.
+      - name: Maven 3.9.9
+        run: |
+          base=https://archive.apache.org/dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz
+          curl -fsSL "$base" -o /tmp/maven.tgz
+          echo "$(curl -fsSL "$base.sha512" | cut -d' ' -f1)  /tmp/maven.tgz" | sha512sum -c -
+          sudo tar -xzf /tmp/maven.tgz -C /opt
+          echo "/opt/apache-maven-3.9.9/bin" >> "$GITHUB_PATH"
+      - name: Maven version
+        run: mvn -v
+
       - name: Docker is available for Testcontainers
         run: docker version
 
