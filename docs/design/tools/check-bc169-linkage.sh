@@ -22,16 +22,41 @@ set -euo pipefail
 TOOLS="docs/design/tools"
 JARS_DIR="target/bc169"
 MVN_ARGS=(-B -ntp -q -Dgpg.skip=true -Dmaven.gitcommitid.skip=true)
-if [ -f .mvn/settings-local.xml ]; then
+# .mvn/settings-local.xml is a LOCAL-ONLY convenience (CLAUDE.md): it routes jitpack.io and sovrin to Central so a
+# developer's Maven never asks JitPack to build a missing coordinate. It must not reach CI, whose "Build and verify"
+# step resolves with the default repositories: `com.github.multiformats:java-multibase` exists only on JitPack, and a
+# runner has no local copy to fall back on, so the local settings fail this guard where that build succeeded.
+if [ -z "${CI:-}" ] && [ -f .mvn/settings-local.xml ]; then
     MVN_ARGS+=(-s .mvn/settings-local.xml -Dmaven.legacyLocalRepo=true)
 fi
+
+# Maven's output is kept in a log, never discarded: `> /dev/null` under `set -e` turns a resolution failure into a bare
+# "exit code 1" with no output at all (the runtime-classpath guard failed exactly that way in run 43375424465). The log
+# goes outside the repository, and on failure its tail is printed before the script exits with Maven's own status. `-q`
+# keeps a successful run silent as before.
+MVN_LOG="${RUNNER_TEMP:-/tmp}/check-bc169-linkage-mvn.log"
+run_mvn() {  # run_mvn <mvn args...>; exits with Maven's status, printing the log's tail when it fails
+    local status
+    set +e
+    mvn "${MVN_ARGS[@]}" "$@" > "${MVN_LOG}" 2>&1
+    status=$?
+    set -e
+    if [ "${status}" -ne 0 ]; then
+        echo "--- last 80 lines of ${MVN_LOG} ---" >&2
+        tail -n 80 "${MVN_LOG}" >&2
+        echo "-------------------------------------" >&2
+        echo "FAIL: mvn $* exited ${status} (full log: ${MVN_LOG})" >&2
+        exit "${status}"
+    fi
+}
+
 mkdir -p "${JARS_DIR}"
 classpath=""
 for artifact in bcprov bcpkix bcutil; do
     jar="${JARS_DIR}/${artifact}-jdk15on-1.69.jar"
     if [ ! -f "${jar}" ]; then
-        mvn "${MVN_ARGS[@]}" -N dependency:copy -Dartifact="org.bouncycastle:${artifact}-jdk15on:1.69" \
-            -DoutputDirectory="${JARS_DIR}" > /dev/null
+        run_mvn -N dependency:copy -Dartifact="org.bouncycastle:${artifact}-jdk15on:1.69" \
+            -DoutputDirectory="${JARS_DIR}"
     fi
     classpath="${classpath:+${classpath}:}${jar}"
 done
@@ -40,8 +65,8 @@ done
 # compile in the same session makes Maven resolve the Certify modules to their target/classes, not to ~/.m2 jars.
 listing="certify-service/${JARS_DIR}/runtime-classpath.txt"
 rm -f "${listing}"
-mvn "${MVN_ARGS[@]}" -pl certify-service -am compile dependency:list -DincludeScope=runtime \
-    -DoutputAbsoluteArtifactFilename=true -DoutputFile="${JARS_DIR}/runtime-classpath.txt" > /dev/null
+run_mvn -pl certify-service -am compile dependency:list -DincludeScope=runtime \
+    -DoutputAbsoluteArtifactFilename=true -DoutputFile="${JARS_DIR}/runtime-classpath.txt"
 if [ ! -s "${listing}" ]; then
     echo "FAIL: ${listing} was not written; cannot list certify-service's runtime classpath" >&2
     exit 2
