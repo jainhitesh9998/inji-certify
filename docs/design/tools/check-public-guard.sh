@@ -143,6 +143,8 @@ pass public POST /v1/certify/pre-authorized-data
 204  public OPTIONS /v1/certify/oid4vci/credential
 204  public OPTIONS /v1/certify/pre-authorized-data
 # --- the root-level locations, as before ---
+302  public GET  /
+302  public HEAD /
 pass public GET  /.well-known/openid-credential-issuer
 pass public GET  /.well-known/openid-credential-issuer/v1/certify/oid4vci
 pass public GET  /.well-known/openid-credential-issuer/v1/certify/t/acme/oid4vci
