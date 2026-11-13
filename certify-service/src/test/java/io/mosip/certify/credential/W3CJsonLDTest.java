@@ -352,7 +352,7 @@ public class W3CJsonLDTest {
      * The compatibility reader's rule, asserted rather than restated: the value's UTC wall clock (the same for every
      * zone designator) read in the JVM's default zone, at the seconds precision the proof's {@code created} is written
      * with. Applying the {@code Z}/offset instead would move {@code proof.created} on every deployment not on UTC, which
-     * is a wire change in the compatibility path (see {@code LegacyW3cDateTimes} and gap G33).
+     * is a wire change in the compatibility path (see {@code LegacyW3cDateTimes} and gap G38).
      */
     private static Date proofSecondOf(String value) {
         return Date.from(LocalDateTime.ofInstant(Instant.parse(value), ZoneOffset.UTC)

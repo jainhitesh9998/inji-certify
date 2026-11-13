@@ -52,7 +52,7 @@ import java.util.Date;
  * did ({@code LocalDateTime.parse(value, UTC_DATETIME_PATTERN).atZone(ZoneId.systemDefault())}) — so {@code
  * proof.created} stays byte-identical to what every earlier release wrote for a {@code Z} value.
  *
- * <p><strong>Open owner question (G33):</strong> that last rule means a UTC {@code validFrom} becomes {@code created =
+ * <p><strong>Open owner question (G38):</strong> that last rule means a UTC {@code validFrom} becomes {@code created =
  * validFrom - the JVM's offset} (Asia/Kolkata: 5h30 earlier; America/Los_Angeles: 8h later, i.e. in the future at
  * signing time). Data Integrity defines {@code created} as the proof's creation time, and {@code
  * LdpVcFormatter.createdFrom} — the new formatter module — applies the designator correctly. Applying it here as well
@@ -100,7 +100,7 @@ public final class LegacyW3cDateTimes {
 
     /**
      * The proof's {@code created} for a credential: its {@code issuanceDate}/{@code validFrom} normalised to UTC and
-     * then read as a wall clock in the JVM's default zone, as the compatibility path has always read it (G33).
+     * then read as a wall clock in the JVM's default zone, as the compatibility path has always read it (G38).
      * {@link Date} holds milliseconds, so a finer fraction is truncated, exactly as it was before.
      *
      * @throws DateTimeParseException if the value is not an RFC 3339 / XML Schema dateTime, has no zone designator, or
