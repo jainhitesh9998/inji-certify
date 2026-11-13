@@ -150,6 +150,8 @@ An issuer can name the ISO/IEC 18013-5 IACAs its mDoc Document Signers chain to 
 
 - Generated keystores are owner-only. The `x509-file` provider's dev-mode PKCS#12 (and any keystore `JcaKeyProvider.saveAsPkcs12` writes) is created `rw-------` through a temporary file in the same directory and an atomic move, so it is never readable by other users, whatever the umask, not even while it is written; a keystore an earlier release left `rw-r--r--` becomes `rw-------` the next time dev mode adds a key to it (otherwise run `chmod 600` on it). On a file system without POSIX permissions a warning asks the operator to restrict the file. Keymanager's own PKCS#12 (`mosip.kernel.keymanager.hsm.config-path`) is created by kernel-keymanager and is unchanged.
 
+- mDL text elements. An `org.iso.18013.5.1.mDL` whose mandatory Table 5 text element (`family_name`, `given_name`, `issuing_authority`, `document_number`, ...) is empty, or is a Velocity reference the template left unrendered because the data source had no value (`$name`, `${name}`, `$!name`, `$!{name}`), is refused before signing with `mdoc_data_model_invalid` naming the element (the v2 dry run and preview report it the same way), instead of being signed with `${family_name}` as the holder's name. Text that merely contains a `$` is issued as before. The legacy `POST /issuance/credential` path with compat-core off is unchanged.
+
 ## Removal of  Artifactory dependency
 
 ```text

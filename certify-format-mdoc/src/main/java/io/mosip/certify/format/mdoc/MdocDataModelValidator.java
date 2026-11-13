@@ -97,6 +97,7 @@ final class MdocDataModelValidator {
                     + " (ISO/IEC 18013-5 7.2.1 Table 5)");
         }
         typeCheck(mdl);
+        mandatoryTextIsFilledIn(mdl);
         requireByteString(mdl, "portrait");
         portraitIsAJpeg((byte[]) mdl.get("portrait"));
         unDistinguishingSign(mdl.get("un_distinguishing_sign"));
@@ -128,6 +129,34 @@ final class MdocDataModelValidator {
         }
         if (mdl.get("sex") instanceof Number sex && !SEX_CODES.contains(sex.longValue())) {
             throw invalid("sex is " + sex + "; ISO/IEC 5218 allows only 0 (not known), 1 (male), 2 (female) or 9 (not applicable)");
+        }
+    }
+
+    /**
+     * A Velocity reference the template left as text because the data source supplied no value: {@code $name},
+     * {@code ${name}}, {@code $!name}, {@code $!{name}}, with dotted properties ({@code $holder.name}).
+     */
+    private static final java.util.regex.Pattern UNRENDERED_REFERENCE = java.util.regex.Pattern.compile(
+            "\\$!?(\\{[A-Za-z][A-Za-z0-9_-]*(\\.[A-Za-z][A-Za-z0-9_-]*)*}|[A-Za-z][A-Za-z0-9_-]*(\\.[A-Za-z][A-Za-z0-9_-]*)*)");
+
+    /**
+     * A mandatory text element of Table 5 (family_name, given_name, issuing_authority, document_number, ...) carries a
+     * value: neither empty nor the unrendered template reference Velocity prints for a value the data source lacked.
+     * Either would be signed as the holder's data and shown by every wallet and reader (7.2.1).
+     */
+    private static void mandatoryTextIsFilledIn(Map<String, Object> mdl) {
+        for (String element : MdocElementTypes.MDL_MANDATORY.stream().sorted().toList()) {
+            if (MdocElementTypes.builtInType(NAMESPACE, element).orElse(null) != MdocElementTypes.Type.TSTR
+                    || !(mdl.get(element) instanceof String text)) {
+                continue;
+            }
+            if (text.isBlank()) {
+                throw invalid(element + " is empty; a mandatory element of ISO/IEC 18013-5 7.2.1 Table 5 must carry a value");
+            }
+            if (UNRENDERED_REFERENCE.matcher(text.trim()).matches()) {
+                throw invalid(element + " is the unrendered template reference " + text.trim() + ": the data source supplied no"
+                        + " value for it, and a mandatory element of ISO/IEC 18013-5 7.2.1 Table 5 must carry the holder's value");
+            }
         }
     }
 
