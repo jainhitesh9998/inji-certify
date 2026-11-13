@@ -6,9 +6,7 @@ import org.bouncycastle.asn1.ASN1Integer;
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.ASN1OctetString;
 import org.bouncycastle.asn1.ASN1Primitive;
-import org.bouncycastle.asn1.ASN1PrintableString;
 import org.bouncycastle.asn1.ASN1String;
-import org.bouncycastle.asn1.ASN1UTF8String;
 import org.bouncycastle.asn1.x500.AttributeTypeAndValue;
 import org.bouncycastle.asn1.x500.RDN;
 import org.bouncycastle.asn1.x500.X500Name;
@@ -514,7 +512,7 @@ public final class AnnexBValidator {
 
     /** The RFC 5280 key usage bits, index 0 digitalSignature through 8 decipherOnly, as {@link X509Certificate#getKeyUsage}. */
     private static boolean[] keyUsageBits(ASN1Primitive primitive) {
-        ASN1BitString bits = ASN1BitString.getInstance(primitive);
+        ASN1BitString bits = BcCompat.bitString(primitive);
         byte[] bytes = bits.getBytes();
         boolean[] usage = new boolean[Math.max(0, bytes.length * 8 - bits.getPadBits())];
         for (int i = 0; i < usage.length; i++) {
@@ -610,10 +608,10 @@ public final class AnnexBValidator {
             for (AttributeTypeAndValue attribute : rdn.getTypesAndValues()) {
                 ASN1Encodable value = attribute.getValue();
                 String label = DIRECTORY_STRINGS.get(attribute.getType());
-                if (label != null && !(value instanceof ASN1PrintableString) && !(value instanceof ASN1UTF8String)) {
+                if (label != null && !BcCompat.isPrintableString(value) && !BcCompat.isUtf8String(value)) {
                     report.fail("SUBJECT_ENCODING_INVALID", "the " + label + " is a " + value.getClass().getSimpleName()
                             + "; RFC 5280 section 4.1.2.4 requires a PrintableString or a UTF8String");
-                } else if (BCStyle.SERIALNUMBER.equals(attribute.getType()) && !(value instanceof ASN1PrintableString)) {
+                } else if (BCStyle.SERIALNUMBER.equals(attribute.getType()) && !BcCompat.isPrintableString(value)) {
                     report.fail("SUBJECT_ENCODING_INVALID", "the serialNumber attribute is a "
                             + value.getClass().getSimpleName() + "; X.520 defines it as a PrintableString");
                 } else if (value instanceof ASN1String && Certificates.string(value) == null) {
@@ -627,7 +625,7 @@ public final class AnnexBValidator {
 
     private static void country(Report report, AttributeTypeAndValue country) {
         ASN1Encodable value = country.getValue();
-        if (!(value instanceof ASN1PrintableString)) {
+        if (!BcCompat.isPrintableString(value)) {
             report.fail("SUBJECT_COUNTRY_NOT_PRINTABLE", "the country is a " + value.getClass().getSimpleName()
                     + "; X.520 countryName is a PrintableString");
         }

@@ -17,7 +17,6 @@ import io.mosip.certify.signing.SigningException;
 import org.bouncycastle.asn1.ASN1Encodable;
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.ASN1String;
-import org.bouncycastle.asn1.DERIA5String;
 import org.bouncycastle.asn1.x500.RDN;
 import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.asn1.x500.style.BCStyle;
@@ -383,7 +382,7 @@ final class MdocKeys {
                 }
                 for (GeneralName general : GeneralNames.getInstance(name.getName()).getNames()) {
                     if (general.getTagNo() == GeneralName.uniformResourceIdentifier) {
-                        return DERIA5String.getInstance(general.getName()).getString();
+                        return io.mosip.certify.pki.BcCompat.ia5String(general.getName());
                     }
                 }
             }

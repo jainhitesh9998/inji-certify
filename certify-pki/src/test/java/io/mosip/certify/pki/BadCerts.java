@@ -123,7 +123,7 @@ final class BadCerts {
     static SubjectPublicKeyInfo compressed(KeyPair bcKeyPair) {
         ECPublicKey key = (ECPublicKey) bcKeyPair.getPublic();
         SubjectPublicKeyInfo original = spki(bcKeyPair.getPublic());
-        return new SubjectPublicKeyInfo(original.getAlgorithm(), new DERBitString(key.getQ().getEncoded(true)));
+        return new SubjectPublicKeyInfo(original.getAlgorithm(), key.getQ().getEncoded(true));
     }
 
     /** The same key with explicit curve parameters instead of a named-curve OID, which the key profile does not allow. */
@@ -131,7 +131,7 @@ final class BadCerts {
         X9ECParameters curve = ECNamedCurveTable.getByName("secp256r1");
         return new SubjectPublicKeyInfo(
                 new AlgorithmIdentifier(spki(key).getAlgorithm().getAlgorithm(), curve.toASN1Primitive()),
-                new DERBitString(spki(key).getPublicKeyData().getBytes()));
+                BcCompat.subjectPublicKey(spki(key)).getBytes());
     }
 
     /**
@@ -146,7 +146,7 @@ final class BadCerts {
         System.arraycopy(xs, 0, point, 1, 32);
         System.arraycopy(ys, 0, point, 33, 32);
         return new SubjectPublicKeyInfo(new AlgorithmIdentifier(
-                org.bouncycastle.asn1.x9.X9ObjectIdentifiers.id_ecPublicKey, Certificates.P256), new DERBitString(point));
+                org.bouncycastle.asn1.x9.X9ObjectIdentifiers.id_ecPublicKey, Certificates.P256), point);
     }
 
     /** {@code 04 || 64 zero octets}: the point (0, 0), which is not on P-256 (and which some libraries read as infinity). */

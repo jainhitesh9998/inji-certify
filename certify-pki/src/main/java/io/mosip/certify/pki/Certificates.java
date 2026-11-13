@@ -246,7 +246,7 @@ final class Certificates {
     /** The RFC 5280 section 4.2.1.2 method 1 key identifier: SHA-1 over the subjectPublicKey BIT STRING contents. */
     static byte[] keyIdentifier(SubjectPublicKeyInfo spki) {
         try {
-            return MessageDigest.getInstance("SHA-1").digest(spki.getPublicKeyData().getBytes());
+            return MessageDigest.getInstance("SHA-1").digest(BcCompat.subjectPublicKey(spki).getBytes());
         } catch (NoSuchAlgorithmException e) {
             throw new PkiException("Cannot compute a key identifier", e);
         }
@@ -475,10 +475,10 @@ final class Certificates {
         if (!CURVES.containsKey(curve)) {
             return "the curve " + curve.getId() + " is not P-256, P-384 or P-521";
         }
-        if (spki.getPublicKeyData().getPadBits() != 0) {
+        if (BcCompat.subjectPublicKey(spki).getPadBits() != 0) {
             return "the subjectPublicKey BIT STRING is not a whole number of octets";
         }
-        byte[] point = spki.getPublicKeyData().getBytes();
+        byte[] point = BcCompat.subjectPublicKey(spki).getBytes();
         int fieldOctets = (curveBits(curve) + 7) / 8;
         if (point.length == 0 || point[0] != 0x04) {
             return "the public key is not an uncompressed point (first octet " + (point.length == 0 ? "none" : point[0]) + ")";
