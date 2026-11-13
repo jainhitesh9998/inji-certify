@@ -351,6 +351,34 @@ class PkiCommandTest {
         assertEquals(fingerprint, PkiFiles.sha256(iaca), "the printed fingerprint is the certificate's");
     }
 
+    @Test
+    void iacaCreateRefusesACrlUriWhoseAnchorIdTheServiceWouldRefuse() {
+        // the service's PkiProperties.ID is [a-z0-9][a-z0-9._-]{0,63}: with any other <id> it refuses to start on this IACA
+        for (String id : List.of("Lorem", "-lorem", "lorem%20ipsum", "a".repeat(65), "lörem")) {
+            reset();
+            assertEquals(1, run("pki", "iaca", "create", "-k", p("iaca.p12"), "-p", PASSWORD,
+                    "--country", "IN", "--cn", "Lorem Ipsum Demo IACA", "--issuer-alt-uri", "https://a.test",
+                    "--crl-uri", "https://a.test/v1/certify/mdoc/iaca/" + id + ".crl"), id);
+            assertTrue(stderr().contains("is not a valid anchor id"), stderr());
+            assertFalse(Files.exists(path("iaca.p12")), "nothing is written for " + id);
+        }
+    }
+
+    @Test
+    void iacaCreateWarnsOnlyWhenTheCrlUriIsNotACertifyPublication() {
+        assertEquals(0, run("pki", "iaca", "create", "-k", p("iaca.p12"), "-p", PASSWORD,
+                "--country", "IN", "--cn", "Lorem Ipsum Demo IACA", "--issuer-alt-uri", "https://a.test",
+                "--crl-uri", "https://a.test/v1/certify/mdoc/iaca/lorem-ipsum_demo.1.crl"), stderr());
+        assertFalse(stderr().contains("warning"), stderr());
+        reset();
+
+        assertEquals(0, run("pki", "iaca", "create", "-k", p("other.p12"), "-p", PASSWORD,
+                "--country", "IN", "--cn", "Lorem Ipsum Demo IACA", "--issuer-alt-uri", "https://a.test",
+                "--crl-uri", "https://a.test/pki/iaca.crl"), stderr());
+        assertTrue(stderr().contains("warning: --crl-uri https://a.test/pki/iaca.crl is not"), stderr());
+        assertTrue(stderr().contains("Certify will not publish"), stderr());
+    }
+
     // ------------------------------------------------------------------ dsc issue
 
     @Test

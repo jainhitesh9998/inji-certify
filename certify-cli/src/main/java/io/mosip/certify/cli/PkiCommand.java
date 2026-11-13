@@ -15,6 +15,7 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.StringReader;
 import java.math.BigInteger;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.FileSystemException;
@@ -332,6 +333,7 @@ class PkiCommand {
                     throw new UsageException("--validity-years is " + validityYears
                             + "; Annex B allows 1 to 20 calendar years");
                 }
+                checkCrlUri(crlUri);
                 PkiFiles.curve(algorithm);
                 PkiFiles.requireLowerCaseAlias(alias, "--alias");
                 Path store = keystore == null ? null : SecureFiles.canonical(keystore);
@@ -380,6 +382,33 @@ class PkiCommand {
                 }
             }
 
+            /**
+             * Refuses a {@code --crl-uri} whose path is {@code …/mdoc/iaca/<id>.crl} with an {@code <id>} Certify's
+             * trust-anchor registry would refuse (it would not start with this IACA, and would never serve that URL), and
+             * warns when the URI is not under {@code /mdoc/iaca/} at all: then Certify does not publish the CRL and the
+             * operator must serve it at that URI.
+             */
+            static void checkCrlUri(String crlUri) {
+                String path;
+                try {
+                    path = URI.create(crlUri).getPath();
+                } catch (IllegalArgumentException e) {
+                    return; // the certificate builder refuses a URI that is not absolute http(s)
+                }
+                Matcher published = PUBLISHED_CRL.matcher(path == null ? "" : path);
+                if (published.matches()) {
+                    if (!ANCHOR_ID.matcher(published.group(1)).matches()) {
+                        throw new UsageException("--crl-uri " + crlUri + ": '" + published.group(1) + "' is not a valid"
+                                + " anchor id (" + ANCHOR_ID.pattern() + ": lower-case letters, digits, '.', '_' and '-',"
+                                + " starting with a letter or digit, at most 64 characters), so Certify would refuse"
+                                + " this IACA and never serve /mdoc/iaca/" + published.group(1) + ".crl");
+                    }
+                } else {
+                    System.err.println("warning: --crl-uri " + crlUri + " is not https://<host>/v1/certify/mdoc/iaca/<id>.crl:"
+                            + " Certify will not publish this IACA's CRL there; serve it at that URI yourself");
+                }
+            }
+
             /** The IACA certificate, or {@code null} after printing its violations. */
             private X509Certificate build(KeyPair keyPair) {
                 Instant start = Instant.now().truncatedTo(ChronoUnit.SECONDS);
@@ -405,6 +434,11 @@ class PkiCommand {
             }
         }
     }
+
+    /** A CRL distribution point Certify publishes: {@code …/mdoc/iaca/<id>.crl} (FileTrustAnchorRegistry). */
+    static final Pattern PUBLISHED_CRL = Pattern.compile(".*/mdoc/iaca/([^/]+)\\.crl$");
+    /** The service's anchor id rule ({@code PkiProperties.ID}); the CLI does not depend on certify-service. */
+    static final Pattern ANCHOR_ID = Pattern.compile("[a-z0-9][a-z0-9._-]{0,63}");
 
     // ------------------------------------------------------------------ pki dsc
 

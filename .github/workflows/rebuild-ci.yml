@@ -23,6 +23,9 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          # full history: IssuanceGoldenTest compares the mso_mdoc golden with its pinned baseline commit (ce1211ef)
+          fetch-depth: 0
 
       - uses: actions/setup-java@v4
         with:
