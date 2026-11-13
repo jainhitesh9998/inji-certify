@@ -631,10 +631,10 @@ class PkiCommandTest {
                     certificate("CN=" + alias, key, "CN=" + alias, key, from, to)});
         }
         assertEquals("mdl-dsc@2026-11.10", PkiCommand.Rotation.current(store, "mdl-dsc", Instant.now()).orElseThrow());
-        assertTrue(PkiCommand.Rotation.compareLabels("2026-11.10", "2026-11.9") > 0);
-        assertTrue(PkiCommand.Rotation.compareLabels("2026-11", "2026-11.2") < 0);
-        assertTrue(PkiCommand.Rotation.compareLabels("2026-12", "2026-11.10") > 0);
-        assertTrue(PkiCommand.Rotation.compareLabels("2026-11.02", "2026-11.2") != 0, "a total order");
+        assertTrue(io.mosip.certify.keyprovider.jca.VersionLabels.compare("2026-11.10", "2026-11.9") > 0);
+        assertTrue(io.mosip.certify.keyprovider.jca.VersionLabels.compare("2026-11", "2026-11.2") < 0);
+        assertTrue(io.mosip.certify.keyprovider.jca.VersionLabels.compare("2026-12", "2026-11.10") > 0);
+        assertTrue(io.mosip.certify.keyprovider.jca.VersionLabels.compare("2026-11.02", "2026-11.2") != 0, "a total order");
     }
 
     @Test
@@ -974,12 +974,19 @@ class PkiCommandTest {
         assertTrue(Files.isSymbolicLink(path("state-link.json")), "the link stays a link");
         String keyId = CrlState.keyId(Pem.readCertificate(readString("iaca.pem")));
         assertEquals(BigInteger.TWO, CrlState.read(path("vault/state.json")).inventory(keyId).lastCrlNumber());
+        assertTrue(stderr().contains("recorded " + real("vault").resolve("state.json") + " as the CRL state of this"
+                + " IACA in " + statePath()), stderr());
         reset();
-        // without --state, the copy beside the IACA is gone: the vault file must be named, never silently forked
-        assertEquals(2, crl("crl-3.pem"), "no inventory beside the IACA and no --state");
+        // the slot beside the IACA now points at the vault file: a run without --state finds it, never forks
+        assertEquals(0, crl("crl-3.pem"), stderr());
+        assertTrue(stdout().contains("crlNumber=3\n")
+                && stdout().contains("state=" + real("vault").resolve("state.json") + "\n"), stdout());
         reset();
-        assertEquals(0, crl("crl-3.pem", "--state", p("vault/state.json")), stderr());
-        assertTrue(stdout().contains("crlNumber=3\n"), stdout());
+        assertEquals(0, crl("crl-4.pem", "--state", p("vault/state.json")), stderr());
+        assertTrue(stdout().contains("crlNumber=4\n"), stdout());
+        reset();
+        assertEquals(0, crl("crl-5.pem", "--state", p("state-link.json")), "the link names the same file: " + stderr());
+        assertTrue(stdout().contains("crlNumber=5\n"), stdout());
     }
 
     @Test
@@ -989,29 +996,210 @@ class PkiCommandTest {
         reset();
         assertEquals(1, crl("crl-x.pem", "--state", p("fresh.json"), "--initial"),
                 "a second inventory for the same IACA would restart its numbers");
-        assertTrue(stderr().contains("does not record this IACA, but [" + statePath() + "]"), stderr());
+        assertTrue(stderr().contains("--state " + real("fresh.json") + " is not the CRL state of this IACA: "
+                + statePath() + " is") && stderr().contains("--base-crl"), stderr());
         assertFalse(Files.exists(path("fresh.json")));
         reset();
-        // two files recording one IACA: refused, both named by their absolute real path
-        Files.copy(statePath(), path("copy.crlstate.json"));
+        // no slot and two files recording one IACA: refused, both named by their absolute real path
+        Files.move(statePath(), path("a.crlstate.json"));
+        Files.copy(path("a.crlstate.json"), path("b.crlstate.json"));
         assertEquals(1, crl("crl-2.pem"));
-        assertTrue(stderr().contains("more than one file [" + real("copy.crlstate.json") + ", " + statePath() + "]"),
-                stderr());
+        assertTrue(stderr().contains("more than one file [" + real("a.crlstate.json") + ", " + real("b.crlstate.json")
+                + "]"), stderr());
         reset();
-        assertEquals(0, crl("crl-2.pem", "--state", p("copy.crlstate.json")), "--state says which: " + stderr());
+        // --state says which (at or ahead of the other); the slot then points at it
+        assertEquals(0, crl("crl-2.pem", "--state", p("a.crlstate.json")), stderr());
+        assertTrue(stderr().contains("warning: " + real("b.crlstate.json") + " also records this IACA"), stderr());
+        assertTrue(CrlState.readEntry(statePath()) instanceof CrlState.Pointer pointer
+                && pointer.stateAt().equals(real("a.crlstate.json")), "a pointer in the slot");
         reset();
-        Files.copy(path("copy.crlstate.json"), path("custom.json"));
-        assertEquals(0, crl("crl-3.pem", "--state", p("custom.json")), "any name that records the IACA: " + stderr());
-        assertTrue(stdout().contains("crlNumber=3\n"), stdout());
+        assertEquals(0, crl("crl-3.pem"), stderr());
+        assertTrue(stdout().contains("crlNumber=3\n") && stdout().contains("state=" + real("a.crlstate.json")),
+                stdout());
+        reset();
+        // a stale copy cannot be chosen: it disagrees with the pointer
+        assertEquals(1, crl("crl-x.pem", "--state", p("b.crlstate.json")));
+        assertTrue(stderr().contains("is not the CRL state of this IACA: " + real("a.crlstate.json")), stderr());
+        reset();
+        // without a slot, a --state that records nothing while another file does would start a second inventory
+        Files.delete(statePath());
+        Files.delete(path("b.crlstate.json"));
+        assertEquals(1, crl("crl-x.pem", "--state", p("fresh.json"), "--initial"));
+        assertTrue(stderr().contains("does not record this IACA, but [" + real("a.crlstate.json") + "]"), stderr());
+        assertFalse(Files.exists(path("fresh.json")) || Files.exists(statePath()), "no state and no pointer written");
         reset();
         assertEquals(1, crl("x.crlstate.json"), "--out must not look like a state file");
+    }
+
+    /** Reviewer finding: two runs naming different --state files both issued CRL 1. */
+    @Test
+    void alternateStateNamesNeverForkTheInventory() throws Exception {
+        iaca();
+        assertEquals(0, crl("crl-1.pem", "--initial", "--state", p("state-a.json"), "--revoke", "0xabc"), stderr());
+        assertTrue(CrlState.readEntry(statePath()) instanceof CrlState.Pointer pointer
+                && pointer.stateAt().equals(real("state-a.json")), "the slot points at state-a.json");
+        reset();
+        assertEquals(1, crl("crl-b.pem", "--initial", "--state", p("state-b.json")), "a second CRL 1");
+        assertTrue(stderr().contains("--state " + real("state-b.json") + " is not the CRL state of this IACA: "
+                + real("state-a.json") + " is (the pointer " + statePath() + ")"), stderr());
+        assertTrue(stderr().contains("--base-crl"), stderr());
+        assertFalse(Files.exists(path("state-b.json")) || Files.exists(path("crl-b.pem")));
+        reset();
+        assertEquals(1, crl("crl-b.pem", "--state", p("state-b.json")));
+        reset();
+        // a copy of the IACA in the same directory, without --state, follows the pointer
+        Files.copy(path("iaca.p12"), path("b.p12"));
+        assertEquals(0, run("pki", "crl", "issue", "--iaca", p("b.p12"), "-p", PASSWORD, "--out", p("crl-2.pem")),
+                stderr());
+        assertTrue(stdout().contains("crlNumber=2\n") && stdout().contains("revoked=1\n")
+                && stdout().contains("state=" + real("state-a.json") + "\n"), stdout());
+        reset();
+        assertEquals(2, crl("crl-x.pem", "--initial"));
+        assertTrue(stderr().contains("--initial is for an IACA without a revocation inventory"), stderr());
+        // the pointer itself is no state
+        reset();
+        assertEquals(1, crl("crl-x.pem", "--state", statePath().toString()));
+        assertTrue(stderr().contains("is a CRL state pointer to " + real("state-a.json")), stderr());
+    }
+
+    /** Reviewer finding: a --state in another directory was invisible to later runs, and --initial restarted at 1. */
+    @Test
+    void anExternalStateIsFoundWithoutStateAndAMissingOneStopsTheRun() throws Exception {
+        iaca();
+        Files.createDirectories(path("elsewhere"));
+        assertEquals(0, crl("crl-1.pem", "--initial", "--state", p("elsewhere/s.json"), "--revoke", "0x1234"),
+                stderr());
+        reset();
+        assertEquals(2, crl("crl-x.pem", "--initial"), "CRL 1 again");
+        assertTrue(stderr().contains("--initial is for an IACA without a revocation inventory, but "
+                + real("elsewhere/s.json") + " records CRL number 1"), stderr());
+        reset();
+        assertEquals(0, crl("crl-2.pem"), stderr());
+        assertTrue(stdout().contains("crlNumber=2\n") && stdout().contains("revoked=1\n")
+                && stdout().contains("state=" + real("elsewhere/s.json") + "\n"), stdout());
+        reset();
+        // the medium is not mounted (the file is gone): the run stops, it never starts again at CRL 1
+        Files.move(path("elsewhere/s.json"), path("elsewhere/moved.json"));
+        for (String[] extra : List.of(new String[0], new String[] {"--initial"},
+                new String[] {"--state", p("elsewhere/moved.json")})) {
+            reset();
+            assertEquals(2, crl("crl-x.pem", extra), String.join(" ", extra));
+            assertTrue(stderr().contains("names " + real("elsewhere").resolve("s.json") + ", which does not exist"),
+                    stderr());
+        }
+        assertFalse(Files.exists(path("crl-x.pem")) || Files.exists(path("elsewhere/s.json")));
+        reset();
+        // a missing --state directory is refused, not created
+        assertEquals(1, crl("crl-x.pem", "--state", p("unmounted/s.json")));
+        assertTrue(stderr().contains("does not exist") && !Files.exists(path("unmounted")), stderr());
+        reset();
+        // the remedy the message names: move the pointer aside and name the file
+        Files.move(statePath(), path("pointer.bak"));
+        assertEquals(0, crl("crl-3.pem", "--state", p("elsewhere/moved.json")), stderr());
+        assertTrue(stdout().contains("crlNumber=3\n") && stdout().contains("revoked=1\n"), stdout());
+    }
+
+    /** Several holders: the inventory in use must be at or ahead of every other file that records the IACA. */
+    @Test
+    void anInventoryBehindAnotherHolderIsRefused() throws Exception {
+        iaca();
+        assertEquals(0, crl("crl-1.pem", "--initial"), stderr());
+        byte[] atOne = Files.readAllBytes(statePath());
+        reset();
+        assertEquals(0, crl("crl-2.pem", "--revoke", "0xbeef"), stderr());
+        // the canonical state goes back to CRL 1 while a copy at CRL 2 (the round-2 name) remains
+        Files.copy(statePath(), path("iaca.p12" + CrlState.SUFFIX));
+        Files.write(statePath(), atOne);
+        reset();
+        assertEquals(2, crl("crl-x.pem"), "behind the copy");
+        assertTrue(stderr().contains("the CRL state " + statePath() + " (CRL number 1) is behind "
+                + real("iaca.p12" + CrlState.SUFFIX) + " (CRL number 2)") && stderr().contains("--base-crl"), stderr());
+        reset();
+        assertEquals(2, crl("crl-x.pem", "--state", statePath().toString()), "named explicitly: still behind");
+        reset();
+        assertEquals(1, crl("crl-x.pem", "--state", p("iaca.p12" + CrlState.SUFFIX)),
+                "the copy is not the IACA's state");
+        reset();
+        // same number, but the copy lists a serial the canonical state lacks
+        String two = Files.readString(path("iaca.p12" + CrlState.SUFFIX));
+        Files.writeString(statePath(), two.replaceAll("\\{\\s*\"serial\" : \"beef\"[^}]*\\}", ""));
+        assertEquals(2, crl("crl-x.pem"));
+        assertTrue(stderr().contains("does not list 0xbeef"), stderr());
+        assertFalse(Files.exists(path("crl-x.pem")));
+        reset();
+        // the remedy: catch up from the last published CRL
+        assertEquals(0, crl("crl-3.pem", "--base-crl", p("crl-2.pem")), stderr());
+        assertTrue(stdout().contains("crlNumber=3\n") && stdout().contains("revoked=1\n"), stdout());
+        assertTrue(stderr().contains("warning: " + real("iaca.p12" + CrlState.SUFFIX) + " also records this IACA"),
+                stderr());
+    }
+
+    /** D3: an IACA on read-only offline media keeps its lock and state where --state says. */
+    @Test
+    void aReadOnlyIacaDirectoryNeedsAWritableState() throws Exception {
+        assumeTrue(SecureFiles.posix(dir), "POSIX permissions");
+        assumeTrue(!"root".equals(System.getProperty("user.name")), "root writes into a read-only directory");
+        Files.createDirectories(path("media"));
+        Files.createDirectories(path("rw"));
+        Files.createDirectories(path("ro-state"));
+        iaca("media/iaca.p12", "iaca.pem", "Lorem Ipsum Demo IACA");
+        List<String> before;
+        try (var files = Files.list(path("media"))) {
+            before = files.map(f -> f.getFileName().toString()).sorted().toList();
+        }
+        Files.setPosixFilePermissions(path("media"), PosixFilePermissions.fromString("r-xr-xr-x"));
+        Files.setPosixFilePermissions(path("ro-state"), PosixFilePermissions.fromString("r-xr-xr-x"));
+        try {
+            String keyId = CrlState.keyId(Pem.readCertificate(readString("iaca.pem")));
+            assertEquals(1, run("pki", "crl", "issue", "--iaca", p("media/iaca.p12"), "-p", PASSWORD, "--initial",
+                    "--out", p("rw/crl-1.pem")));
+            assertTrue(stderr().contains("the IACA directory " + real("media") + " is read-only; pass --state <file>"
+                    + " in a writable directory and use the same --state on every run"), stderr());
+            reset();
+            assertEquals(0, run("pki", "crl", "issue", "--iaca", p("media/iaca.p12"), "-p", PASSWORD, "--initial",
+                    "--revoke", "0x1234", "--state", p("rw/s.json"), "--out", p("rw/crl-1.pem")), stderr());
+            assertTrue(stdout().contains("crlNumber=1\n") && stdout().contains("state=" + real("rw/s.json")), stdout());
+            try (var files = Files.list(path("rw"))) {
+                List<String> names = files.map(f -> f.getFileName().toString()).toList();
+                assertTrue(names.contains("." + keyId + ".crl.lock") && names.contains("s.json.lock")
+                        && names.contains(CrlState.canonicalName(keyId)), "lock and pointer beside the state: "
+                        + names);
+            }
+            reset();
+            assertEquals(0, run("pki", "crl", "issue", "--iaca", p("media/iaca.p12"), "-p", PASSWORD,
+                    "--state", p("rw/s.json"), "--out", p("rw/crl-2.pem")), stderr());
+            assertTrue(stdout().contains("crlNumber=2\n") && stdout().contains("revoked=1\n"), stdout());
+            reset();
+            assertEquals(1, run("pki", "crl", "issue", "--iaca", p("media/iaca.p12"), "-p", PASSWORD, "--initial",
+                    "--state", p("rw/t.json"), "--out", p("rw/crl-x.pem")), "another name in the same directory");
+            assertTrue(stderr().contains("is not the CRL state of this IACA: " + real("rw/s.json")), stderr());
+            reset();
+            assertEquals(1, run("pki", "crl", "issue", "--iaca", p("media/iaca.p12"), "-p", PASSWORD,
+                    "--out", p("rw/crl-x.pem")), "every run names the state");
+            reset();
+            // a --state directory that is not writable: the lock failure names the directory and the cause
+            assertEquals(2, run("pki", "crl", "issue", "--iaca", p("media/iaca.p12"), "-p", PASSWORD, "--initial",
+                    "--state", p("ro-state/s.json"), "--out", p("rw/crl-x.pem")));
+            assertTrue(stderr().contains("cannot take the lock ." + keyId + ".crl.lock in the directory "
+                    + real("ro-state") + ": permission denied"), stderr());
+            assertFalse(Files.exists(path("rw/crl-x.pem")));
+            try (var files = Files.list(path("media"))) {
+                assertEquals(before, files.map(f -> f.getFileName().toString()).sorted().toList(),
+                        "nothing written beside the IACA");
+            }
+            assertNotNull(readCrl("rw/crl-2.pem").getRevokedCertificate(new BigInteger("1234", 16)));
+        } finally {
+            Files.setPosixFilePermissions(path("media"), PosixFilePermissions.fromString("rwx------"));
+            Files.setPosixFilePermissions(path("ro-state"), PosixFilePermissions.fromString("rwx------"));
+        }
     }
 
     @Test
     void theRound2StateFileNameIsReadAndRenamedUnderTheLock() throws Exception {
         iaca();
-        assertEquals(0, crl("crl-1.pem", "--initial", "--state", p("iaca.p12.crlstate.json")), stderr());
-        assertTrue(Files.exists(path("iaca.p12.crlstate.json")));
+        assertEquals(0, crl("crl-1.pem", "--initial"), stderr());
+        // a round-2 CLI kept the inventory under <iaca-store>.crlstate.json
+        Files.move(statePath(), path("iaca.p12.crlstate.json"));
         reset();
         assertEquals(0, crl("crl-2.pem"), stderr());
         assertTrue(stderr().contains("renamed the CRL state " + real("iaca.p12.crlstate.json") + " to "
@@ -1255,8 +1443,17 @@ class PkiCommandTest {
     @Test
     void keysImportAddsAnOpenSslKeyAndChainAndRefusesADuplicateAlias() throws Exception {
         requireOpenSsl();
+        // req -x509 makes a CA certificate by default; a signing key needs an end-entity one
         openssl("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
-                "-keyout", p("key.pem"), "-out", p("cert.pem"), "-days", "365", "-subj", "/C=IN/CN=Imported DSC");
+                "-keyout", p("ca-key.pem"), "-out", p("ca-cert.pem"), "-days", "365", "-subj", "/C=IN/CN=Imported CA");
+        assertEquals(2, run("keys", "import", "-k", p("imported.p12"), "-p", PASSWORD,
+                "--alias", "imported-ca", "--key", p("ca-key.pem"), "--chain", p("ca-cert.pem")));
+        assertTrue(stderr().contains("KEY_IS_CA") && stderr().contains("basicConstraints CA:true"), stderr());
+        assertFalse(Files.exists(path("imported.p12")));
+        reset();
+        openssl("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+                "-keyout", p("key.pem"), "-out", p("cert.pem"), "-days", "365", "-subj", "/C=IN/CN=Imported DSC",
+                "-addext", "basicConstraints=critical,CA:FALSE", "-addext", "keyUsage=critical,digitalSignature");
         openssl("pkcs8", "-topk8", "-v2", "aes-256-cbc", "-v2prf", "hmacWithSHA256", "-iter", "200000",
                 "-in", p("key.pem"), "-passout", "pass:" + PASSWORD, "-out", p("key-enc.pem"));
 
@@ -1279,7 +1476,8 @@ class PkiCommandTest {
 
         // a key from another pair does not match the certificate
         openssl("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
-                "-keyout", p("other-key.pem"), "-out", p("other-cert.pem"), "-days", "365", "-subj", "/CN=Other");
+                "-keyout", p("other-key.pem"), "-out", p("other-cert.pem"), "-days", "365", "-subj", "/CN=Other",
+                "-addext", "basicConstraints=critical,CA:FALSE");
         assertEquals(2, run("keys", "import", "-k", p("mismatch.p12"), "-p", PASSWORD,
                 "--alias", "mismatch", "--key", p("other-key.pem"), "--chain", p("cert.pem")));
         assertTrue(stderr().contains("does not belong"), stderr());
@@ -1329,6 +1527,11 @@ class PkiCommandTest {
         assertTrue(stdout().contains("chain=2\n"), stdout());
         assertEquals(2, PkiFiles.chain(PkiFiles.read(path("imported.p12"), PASSWORD.toCharArray()),
                 "mdl-dsc@2026-11").size());
+        reset();
+        // PKCS#12 stores no purpose; the listing derives mdoc-dsc from the mDL extended key usage of the DSC
+        assertEquals(0, run("keys", "list", "-k", p("imported.p12"), "-p", PASSWORD), stderr());
+        assertTrue(stdout().lines().anyMatch(line -> line.startsWith("mdl-dsc@2026-11\t")
+                && line.contains("\tmdoc-dsc\t")), stdout());
         reset();
         assertEquals(0, run("keys", "import", "-k", p("imported.p12"), "-p", PASSWORD, "--alias", "full",
                 "--key", p("dsc-key.pem"), "--chain", p("dsc-chain.pem"), "--profile", "mdoc-dsc"), stderr());
@@ -1492,6 +1695,198 @@ class PkiCommandTest {
                 "--key", p("iaca-key.pem"), "--chain", p("iaca.pem")), "the IACA itself, as a chain of one");
         assertTrue(stderr().contains("KEY_IS_IACA") && stderr().contains("--iaca"), stderr());
         assertFalse(Files.exists(path("online.p12")), "nothing was written");
+    }
+
+    /** Reviewer finding: Root -> Middle (critical 1.2.3.4) -> Leaf imported with --anchor mid.pem. */
+    @Test
+    void anAnchorIsJudgedItselfIncludingItsCriticalExtensions() throws Exception {
+        Instant now = Instant.now();
+        Instant from = now.minus(1, ChronoUnit.HOURS);
+        Instant to = now.plus(30, ChronoUnit.DAYS);
+        KeyPair rootKey = ecKey();
+        KeyPair middleKey = ecKey();
+        KeyPair leafKey = ecKey();
+        Files.writeString(path("leaf-key.pem"), Pem.writePrivateKey(leafKey.getPrivate()));
+        X509Certificate root = certificate("CN=Root", rootKey, "CN=Root", rootKey, from, to,
+                basicConstraints(true, -1), keyUsage(KeyUsage.keyCertSign | KeyUsage.cRLSign));
+        X509Certificate middle = certificate("CN=Middle", middleKey, "CN=Root", rootKey, from, to,
+                basicConstraints(true, -1), keyUsage(KeyUsage.keyCertSign | KeyUsage.cRLSign),
+                Extension.create(new ASN1ObjectIdentifier("1.2.3.4"), true, DERNull.INSTANCE));
+        X509Certificate leaf = certificate("CN=Leaf", leafKey, "CN=Middle", middleKey, from, to,
+                basicConstraints(false, -1), keyUsage(KeyUsage.digitalSignature));
+        Files.writeString(path("root.pem"), Pem.writeCertificate(root));
+        Files.writeString(path("mid.pem"), Pem.writeCertificate(middle));
+        Files.writeString(path("leaf.pem"), Pem.writeCertificate(leaf));
+        Files.writeString(path("leaf-mid.pem"), Pem.writeCertificates(List.of(leaf, middle)));
+        for (String[] shape : List.of(new String[] {"leaf.pem", "mid.pem"}, new String[] {"leaf-mid.pem", "mid.pem"},
+                new String[] {"leaf-mid.pem", "root.pem"})) {
+            reset();
+            assertEquals(2, run("keys", "import", "-k", p("imported.p12"), "-p", PASSWORD, "--alias", "leaf",
+                    "--key", p("leaf-key.pem"), "--chain", p(shape[0]), "--anchor", p(shape[1])),
+                    String.join(" ", shape));
+            assertTrue(stderr().contains("1.2.3.4") || stderr().contains("critical"), stderr());
+        }
+        assertFalse(Files.exists(path("imported.p12")), "nothing imported");
+        if (openSslAvailable()) {
+            OpenSsl result = opensslResult("verify", "-x509_strict", "-CAfile", p("root.pem"), "-untrusted",
+                    p("mid.pem"), p("leaf.pem"));
+            assertTrue(result.code() != 0 && result.output().contains("error 34"), "OpenSSL agrees: "
+                    + result.output());
+        }
+        // the anchor's other duties: a CA, with keyCertSign, valid now
+        X509Certificate expired = certificate("CN=Middle", middleKey, "CN=Root", rootKey,
+                now.minus(30, ChronoUnit.DAYS), now.minus(1, ChronoUnit.DAYS), basicConstraints(true, -1),
+                keyUsage(KeyUsage.keyCertSign));
+        X509Certificate noCertSign = certificate("CN=Middle", middleKey, "CN=Root", rootKey, from, to,
+                basicConstraints(true, -1), keyUsage(KeyUsage.digitalSignature));
+        for (Map.Entry<X509Certificate, String> anchor : Map.of(expired, "is not valid at", noCertSign,
+                "keyCertSign").entrySet()) {
+            Files.writeString(path("anchor.pem"), Pem.writeCertificate(anchor.getKey()));
+            reset();
+            assertEquals(2, run("keys", "import", "-k", p("imported.p12"), "-p", PASSWORD, "--alias", "leaf",
+                    "--key", p("leaf-key.pem"), "--chain", p("leaf.pem"), "--anchor", p("anchor.pem")));
+            assertTrue(stderr().contains(anchor.getValue()), stderr());
+        }
+        // without the unknown extension, the same shape imports
+        X509Certificate plainMiddle = certificate("CN=Middle", middleKey, "CN=Root", rootKey, from, to,
+                basicConstraints(true, -1), keyUsage(KeyUsage.keyCertSign | KeyUsage.cRLSign));
+        Files.writeString(path("mid.pem"), Pem.writeCertificate(plainMiddle));
+        reset();
+        assertEquals(0, run("keys", "import", "-k", p("imported.p12"), "-p", PASSWORD, "--alias", "leaf",
+                "--key", p("leaf-key.pem"), "--chain", p("leaf.pem"), "--anchor", p("mid.pem")), stderr());
+    }
+
+    /** D3: a CA key never enters an issuer keystore, Annex B IACA or not. */
+    @Test
+    void aCaKeyIsNeverImported() throws Exception {
+        Instant from = Instant.now().minus(1, ChronoUnit.HOURS);
+        Instant to = Instant.now().plus(30, ChronoUnit.DAYS);
+        KeyPair key = ecKey();
+        Files.writeString(path("key.pem"), Pem.writePrivateKey(key.getPrivate()));
+        Map<String, Extension[]> shapes = new java.util.LinkedHashMap<>();
+        shapes.put("basicConstraints CA:true", new Extension[] {basicConstraints(true, -1)});
+        shapes.put("keyUsage keyCertSign", new Extension[] {basicConstraints(false, -1),
+                keyUsage(KeyUsage.digitalSignature | KeyUsage.keyCertSign)});
+        shapes.put("keyUsage cRLSign", new Extension[] {keyUsage(KeyUsage.digitalSignature | KeyUsage.cRLSign)});
+        for (Map.Entry<String, Extension[]> shape : shapes.entrySet()) {
+            Files.writeString(path("ca.pem"), Pem.writeCertificate(certificate("CN=Some CA", key, "CN=Some CA", key,
+                    from, to, shape.getValue())));
+            reset();
+            assertEquals(2, run("keys", "import", "-k", p("imported.p12"), "-p", PASSWORD, "--alias", "ca",
+                    "--key", p("key.pem"), "--chain", p("ca.pem")), shape.getKey());
+            assertTrue(stderr().contains("KEY_IS_CA") && stderr().contains(shape.getKey()), stderr());
+        }
+        assertFalse(Files.exists(path("imported.p12")));
+        Files.writeString(path("ee.pem"), Pem.writeCertificate(certificate("CN=Signer", key, "CN=Signer", key,
+                from, to, basicConstraints(false, -1), keyUsage(KeyUsage.digitalSignature))));
+        reset();
+        assertEquals(0, run("keys", "import", "-k", p("imported.p12"), "-p", PASSWORD, "--alias", "ee",
+                "--key", p("key.pem"), "--chain", p("ee.pem")), stderr());
+    }
+
+    /** Reviewer finding: --overwrite replaced another IACA's keystore or a CRL state with only a warning. */
+    @Test
+    void overwriteReplacesOnlyAPreviousOutputOfTheSameKind() throws Exception {
+        iaca();
+        iaca("other.p12", "other.pem", "Other Demo IACA");
+        dsc("mdl-dsc@2026-10");
+        assertEquals(0, crl("iaca.crl", "--initial"), stderr());
+        reset();
+        assertEquals(0, run("pki", "crl", "issue", "--iaca", p("other.p12"), "-p", PASSWORD, "--initial",
+                "--state", p("other-state.json"), "--out", p("other.crl")), stderr());
+        assertEquals(0, run("pki", "iaca", "create", "--pem-out", p("pem-iaca.pem"), "-p", PASSWORD, "--country",
+                "IN", "--cn", "PEM IACA", "--issuer-alt-uri", "https://a.test", "--crl-uri", "https://a.test/i.crl"),
+                stderr());
+        assertEquals(0, run("keys", "generate", "-k", p("keys.p12"), "-p", PASSWORD, "--alias", "plain", "--alg",
+                "ES256"), stderr());
+        Map<String, byte[]> victims = new HashMap<>();
+        for (String name : List.of("other.p12", "other-state.json", "pem-iaca.pem", "keys.p12", "iaca.crl",
+                "dsc-chain.pem")) {
+            victims.put(name, sha256(path(name)));
+        }
+
+        // crl issue: another IACA's keystore, a CRL state, a key PEM or a chain is no CRL
+        for (String victim : List.of("other.p12", "other-state.json", "pem-iaca.pem", "dsc-chain.pem")) {
+            reset();
+            assertEquals(2, crl(victim, "--overwrite"), victim);
+            assertTrue(stderr().contains("--out " + p(victim) + " exists and is not a CRL"), stderr());
+        }
+        // dsc issue and rotate: a keystore, a CRL or an IACA PEM (key and certificate) is no chain
+        for (String victim : List.of("other.p12", "iaca.crl", "pem-iaca.pem", "other-state.json")) {
+            reset();
+            assertEquals(2, run("pki", "dsc", "issue", "--iaca", p("iaca.p12"), "-p", PASSWORD, "--generate",
+                    "-k", p("issuer.p12"), "-P", ISSUER_PASSWORD, "--alias", "mdl-dsc@2026-11",
+                    "--out", p(victim), "--overwrite"), victim);
+            assertTrue(stderr().contains("exists and is not PEM certificate(s)"), stderr());
+            reset();
+            assertEquals(2, run("pki", "dsc", "rotate", "--iaca", p("iaca.p12"), "-p", PASSWORD,
+                    "-k", p("issuer.p12"), "-P", ISSUER_PASSWORD, "--out", p(victim), "--overwrite"), victim);
+        }
+        reset();
+        assertEquals(0, run("keys", "list", "-k", p("issuer.p12"), "-p", ISSUER_PASSWORD));
+        assertEquals(1, stdout().lines().count(), "no key was added: " + stdout());
+        // keys csr: a keystore or a chain is no request; a request is replaced
+        for (String victim : List.of("other.p12", "dsc-chain.pem")) {
+            reset();
+            assertEquals(2, run("keys", "csr", "-k", p("keys.p12"), "-p", PASSWORD, "--alias", "plain",
+                    "--out", p(victim), "--overwrite"), victim);
+            assertTrue(stderr().contains("exists and is not a PKCS#10 request"), stderr());
+        }
+        for (Map.Entry<String, byte[]> victim : victims.entrySet()) {
+            assertArrayEquals(victim.getValue(), sha256(path(victim.getKey())), victim.getKey() + " untouched");
+        }
+        reset();
+        assertEquals(0, run("keys", "csr", "-k", p("keys.p12"), "-p", PASSWORD, "--alias", "plain",
+                "--out", p("req.pem")), stderr());
+        assertEquals(0, run("keys", "csr", "-k", p("keys.p12"), "-p", PASSWORD, "--alias", "plain",
+                "--out", p("req.pem"), "--overwrite"), stderr());
+        // no CRL number was spent on the refusals; a CRL still replaces a CRL
+        reset();
+        assertEquals(0, crl("iaca.crl", "--overwrite"), stderr());
+        assertTrue(stdout().contains("crlNumber=2\n"), stdout());
+    }
+
+    /** Reviewer finding: a hard-linked --out consumed a CRL number on every refused run. */
+    @Test
+    void hardLinkedOutputsAndKeystoresAreRefusedBeforeANumberOrAKeyIsSpent() throws Exception {
+        assumeTrue(SecureFiles.posix(dir), "links");
+        iaca();
+        dsc("mdl-dsc@2026-10");
+        assertEquals(0, crl("iaca.crl", "--initial"), stderr());
+        Files.createLink(path("published.crl"), path("iaca.crl"));
+        for (int i = 0; i < 2; i++) {
+            reset();
+            assertEquals(1, crl("iaca.crl", "--overwrite"));
+            assertTrue(stderr().contains("has 2 hard links") && stderr().contains("cp -p '" + real("iaca.crl")
+                    + "' '" + real("iaca.crl") + ".new' && mv"), stderr());
+        }
+        String keyId = CrlState.keyId(Pem.readCertificate(readString("iaca.pem")));
+        assertEquals(BigInteger.ONE, CrlState.read(statePath()).inventory(keyId).lastCrlNumber(), "no number spent");
+        Files.delete(path("published.crl"));
+        reset();
+        assertEquals(0, crl("iaca.crl", "--overwrite"), stderr());
+        assertTrue(stdout().contains("crlNumber=2\n"), stdout());
+
+        Files.createLink(path("issuer-copy.p12"), path("issuer.p12"));
+        byte[] issuer = sha256(path("issuer.p12"));
+        reset();
+        assertEquals(1, run("pki", "dsc", "rotate", "--iaca", p("iaca.p12"), "-p", PASSWORD, "-k", p("issuer.p12"),
+                "-P", ISSUER_PASSWORD, "--out", p("new-chain.pem")));
+        assertTrue(stderr().contains("has 2 hard links"), stderr());
+        reset();
+        assertEquals(1, run("keys", "generate", "-k", p("issuer.p12"), "-p", ISSUER_PASSWORD, "--alias", "x",
+                "--alg", "ES256"));
+        assertArrayEquals(issuer, sha256(path("issuer.p12")));
+        assertFalse(Files.exists(path("new-chain.pem")));
+        Files.createLink(path("chain-copy.pem"), path("dsc-chain.pem"));
+        Files.delete(path("issuer-copy.p12"));
+        reset();
+        assertEquals(1, run("pki", "dsc", "issue", "--iaca", p("iaca.p12"), "-p", PASSWORD, "--generate",
+                "-k", p("issuer.p12"), "-P", ISSUER_PASSWORD, "--alias", "mdl-dsc@2026-11",
+                "--out", p("dsc-chain.pem"), "--overwrite"));
+        reset();
+        assertEquals(0, run("keys", "list", "-k", p("issuer.p12"), "-p", ISSUER_PASSWORD));
+        assertFalse(stdout().contains("mdl-dsc@2026-11"), "refused before the keystore was touched: " + stdout());
     }
 
     // ------------------------------------------------------------------ pem IACA

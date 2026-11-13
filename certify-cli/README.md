@@ -28,7 +28,7 @@ Existing commands (`keys generate|list|jwks`, `sign jws|cose`) keep their option
 | `pki crl issue` | IACA-signed X.509 v2 CRL listing every serial ever revoked, under the next CRL number |
 | `pki check` | judge a chain (and optionally a CRL) against `iaca` or `mdoc-dsc`, at now or `--at` |
 | `keys csr` | PKCS#10 request for an existing keystore key |
-| `keys import` | import a PEM private key and a certificate chain that is a valid RFC 5280 path into the PKCS#12 keystore (never an IACA key) |
+| `keys import` | import a PEM private key and a certificate chain that is a valid RFC 5280 path into the PKCS#12 keystore (never an IACA or other CA key) |
 
 ## Passwords
 
@@ -64,16 +64,23 @@ A password is never printed or logged, and the CLI overwrites its `char[]` copie
   `rw-r--r--` minus the umask. On a filesystem without POSIX permissions the CLI warns and the operator restricts
   access.
 - **Locks.** Adding to a keystore and issuing a CRL are read-modify-write: they run under an exclusive lock on
-  `<file>.lock` next to the file (across processes and threads). Lock files stay in place; they hold no data.
+  `<file>.lock` next to the file (across processes and threads). Lock files stay in place; they hold no data. A lock
+  that cannot be created is reported with its directory and the cause (`cannot take the lock … in the directory …:
+  permission denied …`).
 - **No overwrites.** A new keystore or `--pem-out` file is created with `CREATE_NEW` and never replaces an existing one;
   an existing alias is refused; an existing `--out` (chain, CSR, CRL) is refused unless `--overwrite` (`--force` is
   accepted as its alias on `pki dsc` and `keys csr`; on `pki crl issue`, `--force` means something else, see below).
+  Even with `--overwrite`, an existing `--out` is replaced only when it already holds what the command writes: a CRL
+  (PEM or DER) for `pki crl issue`, PEM certificates only for `pki dsc issue|rotate`, a PKCS#10 request for `keys csr`.
+  Anything else — a keystore, a CRL state, a PEM file with a private key — is refused (exit `2`) and left as it was.
 - **Links.** Every file the CLI locks or writes is first resolved to its real path (symbolic links followed; for a new
   file, the real directory plus its name), and that one path is locked, read, written through a temporary file in the
   real directory and replaced atomically. `-k issuer-link.p12` or `--state state-link.json` therefore updates the file
   the link points at and the link stays a link; the deployment and the CLI never end up with two diverging copies. A
   symbolic link to a file that does not exist is refused, and so is replacing a file with more than one hard link (the
-  rename would give one name the new content and leave the others on the old one); both exit `1`.
+  rename would give one name the new content and leave the others on the old one); both exit `1`. The hard-link check
+  runs before anything is spent — before a key is generated into `-k`, before a CRL number is reserved for `--out` —
+  and the message gives the non-destructive fix, `cp -p f f.new && mv f.new f` (the other names keep the old file).
 - **No aliasing.** Before anything is written, input and output paths are resolved as above and two names for one file
   are refused: `--out x.p12` with `-k x.p12`, `--out` through a symbolic link or `sub/../`, `-k` equal to `--iaca`.
 - **Aliases are lower case.** The JDK PKCS#12 keystore stores every alias in lower case, so `Mdl-DSC@2026-11` would be
@@ -92,8 +99,8 @@ IACA PEM, or a chain when `--out` is omitted — on stdout. Diagnostics, fingerp
 | Exit code | Meaning |
 | --- | --- |
 | `0` | the object was written, or `pki check` found nothing |
-| `1` | usage: a picocli parameter error (unknown or missing option, bad value) on any command, conflicting or missing options (`--csr` without `--cn`, `-k` with `--pem-out`, `--iaca` with `pki check --profile iaca`), a value that does not parse (`--crl-number`, `--revoke`, `--at`), an upper-case alias, two paths naming one file, a dangling symbolic link or a hard-linked file to replace, two CRL state files for one IACA or a `--state` that would start a second one, a missing password; for `pki check`, an input it cannot read; an unexpected failure of `keys list|jwks` or `sign` |
-| `2` | a refusal of a well-formed request — Annex B violations, an existing alias or output file, a CRL number that does not increase, no revocation inventory, a corrupt CRL state, an inventory behind the CRL in `--out`, a wrong password (`pki`, `keys generate|csr|import`), a key or chain that does not match or is not a valid certification path, an IACA key offered to `keys import` — or `pki check` findings |
+| `1` | usage: a picocli parameter error (unknown or missing option, bad value) on any command, conflicting or missing options (`--csr` without `--cn`, `-k` with `--pem-out`, `--iaca` with `pki check --profile iaca`), a value that does not parse (`--crl-number`, `--revoke`, `--at`), an upper-case alias, two paths naming one file, a dangling symbolic link or a hard-linked file to replace, a `--state` that is not the IACA's recorded state (or would start a second inventory, or is a pointer), several state files for one IACA with none recorded, a read-only IACA directory without `--state`, a `--state` directory that does not exist, a missing password; for `pki check`, an input it cannot read; an unexpected failure of `keys list|jwks` or `sign` |
+| `2` | a refusal of a well-formed request — Annex B violations, an existing alias or output file, an existing `--out` that is not what the command writes, a CRL number that does not increase, no revocation inventory, a corrupt CRL state or a pointer to a missing one, an inventory behind the CRL in `--out` or behind another state file of the IACA, a lock that cannot be created, a wrong password (`pki`, `keys generate|csr|import`), a key or chain that does not match or is not a valid certification path, an IACA or other CA key offered to `keys import` — or `pki check` findings |
 
 `pki check` prints one line per finding, `<RULE_ID>\t<message>`, and `ok <profile> [crl] at <instant>` when there is
 none. The identifiers are those `certify-pki` publishes in `AnnexBValidator.RULES`, plus the checks of the command
@@ -119,15 +126,36 @@ key identifier in hex, in the real directory of the IACA keystore (the command p
 
 - **One inventory per IACA.** The file is named by the IACA's key, not by the keystore file, so `iaca.p12`, a copy
   `b.p12` and the `--pem-out` PEM of the same IACA in one directory find, create and update the same file. A symbolic
-  link to the IACA is resolved first: `linked/iaca.p12` finds the inventory beside the real `iaca.p12`. Discovery reads
-  every `*.crlstate.json` in that directory (and in the `--state` directory) and takes the one that records this IACA.
-  `--state <file>` names a file explicitly; it is refused when it does not record the IACA while another file does, so
-  it can never start a second inventory. Two files recording one IACA are refused, listed by absolute path, until
-  `--state` says which one is current. A file under the earlier name `<iaca-store>.crlstate.json` is still read, and
-  renamed to `iaca-<ski>.crlstate.json` the first time the command uses it.
-- **Locks.** Every run first takes `.<ski>.crl.lock` in that directory (and in the `--state` directory), then looks for
-  the inventory, then holds `<state>.lock` while it writes it — across processes and threads. Two concurrent first CRLs
-  from two copies of one IACA give one CRL 1 and one refusal, never two inventories at CRL 1.
+  link to the IACA is resolved first: `linked/iaca.p12` finds the inventory beside the real `iaca.p12`.
+- **One authoritative slot.** `iaca-<ski>.crlstate.json` in the IACA's directory is where every run looks first. It
+  holds the inventory itself, or — when `--state <file>` keeps the inventory elsewhere (another name, another
+  directory, a symbolic link resolved to its target) — a **pointer** to it, written there on the first run that uses
+  that `--state`: `{"format": "certify-cli/crl-state-pointer/1", "iaca": "<ski>", "stateAt": "<real path>"}`. A later
+  run without `--state` follows the pointer, so `--initial` can never start again at CRL 1 beside the IACA, and a run
+  with a **different** `--state` is refused (exit `1`, naming both files; to rebuild the inventory somewhere else on
+  purpose, move the slot aside and pass the new `--state` with `--base-crl <the last published CRL>`). A pointer whose
+  file is missing (a medium that is not mounted, a deleted file) stops every run (exit `2`): restore the file, or move
+  the pointer aside and rebuild with `--state <file> --base-crl <the last published CRL>`.
+- **Other holders.** Discovery also reads every `*.crlstate.json` in the IACA's directory and the `--state` directory.
+  A file there that records the same IACA (a copy, the round-2 name next to the canonical one) is a holder: the
+  inventory in use must be at or ahead of every holder — a lower `lastCrlNumber`, or a serial a holder lists and it
+  lacks, is refused (exit `2`; `--base-crl <the last published CRL>` catches it up), and a run that passes warns that
+  the holder is now behind. With no slot and several holders, the command refuses until `--state` names one (which
+  then gets the pointer). A file under the earlier name `<iaca-store>.crlstate.json` is still read, and renamed to
+  `iaca-<ski>.crlstate.json` the first time the command uses it.
+- **Locks.** Every run first takes `.<ski>.crl.lock` in the slot's directory (and in the `--state` directory), then
+  looks for the inventory, then holds `<state>.lock` while it writes it — across processes and threads. Two concurrent
+  first CRLs from two copies of one IACA give one CRL 1 and one refusal, never two inventories at CRL 1. The pointer
+  is written under that lock, after every check has passed and before the inventory: a crash in between leaves a
+  pointer to a missing file, which stops the next run instead of hiding the inventory.
+- **A read-only IACA directory** (D3: the IACA on offline, write-protected media). The CLI cannot lock or write beside
+  the IACA, so it refuses without `--state` (exit `1`: "the IACA directory … is read-only; pass --state <file> in a
+  writable directory and use the same --state on every run"). With `--state`, the lock, the inventory and the slot (a
+  pointer when the file has another name) live in the `--state` directory. **Where the state lives is then the
+  operator's responsibility**: the CLI can only protect runs that name a file in that same directory, and cannot see
+  an inventory kept in another writable directory. Keep one `--state` path on every run, back it up with the IACA
+  media, and always pass the last published CRL (`--out <it> --overwrite`, or `--base-crl`) so a stale or second
+  inventory is caught by the CRL check below.
 - Each CRL lists the whole inventory plus the new `--revoke` serials (a serial revoked again keeps its first date). The
   number defaults to the last + 1; `--crl-number` must be greater than the last recorded one.
 - The number and the new revocations are recorded **before** the CRL file is written. A failure in between leaves a gap
@@ -145,13 +173,15 @@ key identifier in hex, in the real directory of the IACA keystore (the command p
   (`--base-crl` may name the `--out` file itself). It never merges implicitly. `--initial` is refused the same way when
   `--out` holds a CRL of the IACA.
 - **Pass the last published CRL every time**, as `--out <it> --overwrite` (as the recipes do) or as `--base-crl`. That
-  is the only way the CLI can see that an inventory is stale: a backup restored without the latest state, or an IACA
-  copied to another directory (which starts its own inventory there), is otherwise indistinguishable from an up-to-date
-  one, and the next CRL would reuse a number and drop the revocations made since.
+  is the only way the CLI can see that an inventory is stale when no other holder is in sight: a backup restored
+  without the latest state, an IACA copied to another directory (which starts its own inventory there), or a read-only
+  IACA run with a `--state` in another directory is otherwise indistinguishable from an up-to-date one, and the next
+  CRL would reuse a number and drop the revocations made since.
 - An empty or unreadable state file, or one that records an IACA without its `lastCrlNumber`, is a hard error (exit
   `2`), never an empty inventory. Because discovery reads every `*.crlstate.json` in the directory, a corrupt state file
   of **another** IACA there blocks this one too; that fails safe (nothing is issued until the file is restored or moved
-  aside). Back the file up with the IACA keystore; it holds no secret but it is the only record of what was revoked.
+  aside). Back the file (and its pointer, if any) up with the IACA keystore; it holds no secret but it is the only
+  record of what was revoked.
 
 ## Recipe 1 — offline IACA and Document Signer for the `x509-file` provider
 
@@ -380,7 +410,7 @@ certify pki crl issue --iaca operator-iaca.pem --initial --out iaca.crl
 # 4. Independent verification.
 openssl verify -x509_strict -crl_check -CAfile operator-iaca-cert.pem -CRLfile iaca.crl operator-dsc.pem
 # operator-dsc.pem: OK
-certify keys list -k issuer.p12      # mdl-dsc@2026-11  ES256  …
+certify keys list -k issuer.p12      # mdl-dsc@2026-11  ES256  mdoc-dsc  validUntil=…
 ```
 
 `issuer.p12`, `operator-iaca-cert.pem` and `iaca.crl` travel into the deployment as in Recipe 1; `operator-iaca.pem`
@@ -398,11 +428,17 @@ expired certificate) is refused by step 2, as `openssl verify` refuses it.
   self-signed root or `--anchor`, and then RFC 5280 path validation by the JDK `CertPathValidator` (PKIX, revocation
   not checked) anchored at that root, which is itself judged as an issuing CA — every issuer `CA:true` with
   keyCertSign (when keyUsage is present), within its pathLen, every certificate valid now, no unknown critical
-  extension. A single self-signed certificate (a standalone signing key) remains accepted. Only EC P-256/384/521 keys
-  are accepted. `--profile mdoc-dsc` judges `[DSC, IACA]` (the IACA from the chain or `--anchor`) with `validateDs`,
-  `validateIaca` and `DS_KEY_IS_IACA_KEY`, and stores that pair. The IACA key itself is never imported: a key whose
-  certificate is an Annex B IACA (`KEY_IS_IACA`), or that is the key of a certificate above it in the chain
-  (`KEY_IS_ISSUER_KEY`), is refused (D3).
+  extension. An `--anchor` that is not self-signed is one the JDK trusts by key and name without examining it, so the
+  CLI judges it itself the same way: no critical extension outside those the validator processes (OpenSSL error 34,
+  unhandled critical extension), `CA:true`, keyCertSign, pathLen, valid now. A single self-signed end-entity
+  certificate (a standalone signing key) remains accepted. Only EC P-256/384/521 keys are accepted. `--profile
+  mdoc-dsc` judges `[DSC, IACA]` (the IACA from the chain or `--anchor`) with `validateDs`, `validateIaca` and
+  `DS_KEY_IS_IACA_KEY`, and stores that pair; `keys list` shows it with the purpose `mdoc-dsc`, which the keystore does
+  not store but derives from the Document Signer's mDL extended key usage, as the `jca` and `x509-file` providers do.
+  No CA key is ever imported (D3): a key whose certificate is an Annex B IACA (`KEY_IS_IACA`), any other CA certificate
+  — `CA:true`, or keyUsage keyCertSign or cRLSign (`KEY_IS_CA`; `openssl req -x509` writes `CA:true` unless given
+  `-addext basicConstraints=critical,CA:FALSE`) — or that is the key of a certificate above it in the chain
+  (`KEY_IS_ISSUER_KEY`), is refused.
 - `keys csr` keeps the key certificate's subject as its DER (attribute order and string types), or builds a subject of
   one CN from `--cn`, never parsing it, so a comma in the value cannot add an attribute.
 - Keymanager CSRs from older releases may carry RSA keys; `Csr` refuses them by name

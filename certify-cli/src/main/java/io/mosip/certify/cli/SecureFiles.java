@@ -4,9 +4,12 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -205,8 +208,23 @@ final class SecureFiles {
                 channel.close();
             }
             jvmLock.unlock();
+            if (e instanceof IOException io) {
+                throw new IOException("cannot take the lock " + lockFile.getFileName() + " in the directory "
+                        + lockFile.getParent() + ": " + cause(io), io);
+            }
             throw e;
         }
+    }
+
+    /** What went wrong with a file operation, in words: the exception type alone is the message of several. */
+    static String cause(IOException e) {
+        String reason = e instanceof FileSystemException failure ? failure.getReason() : null;
+        String kind = e instanceof AccessDeniedException ? "permission denied (is the directory"
+                + " writable by this user, and not on a read-only medium?)"
+                : e instanceof NoSuchFileException ? "no such file or directory"
+                : e instanceof FileSystemException ? e.getClass().getSimpleName()
+                : e.getMessage();
+        return reason != null && !reason.isBlank() ? kind + ": " + reason : kind;
     }
 
     /** A held lock, or a set of them; closing it releases them. */
@@ -321,8 +339,9 @@ final class SecureFiles {
         }
         if (links instanceof Integer count && count > 1) {
             throw new UsageException(file + " has " + count + " hard links; replacing it would update one name and"
-                    + " leave the others on the old content. Keep one name (copy it, delete the other links) and"
-                    + " rerun");
+                    + " leave the others on the old content. Give this name its own copy first, which leaves the"
+                    + " other names as they are: cp -p '" + file + "' '" + file + ".new' && mv '" + file + ".new' '"
+                    + file + "', then rerun");
         }
     }
 

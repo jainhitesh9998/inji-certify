@@ -53,6 +53,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeSet;
 
 /**
  * Files and keys the {@code pki} and {@code keys} commands share: PKCS#12 keystores read whole and written whole
@@ -407,6 +409,7 @@ final class PkiFiles {
             requireIssuingCa(root, at, path.size() - 1);
         }
         if (path.size() == 1 && sameCertificate(path.get(0), root) && !selfSigned) {
+            requireNoUnknownCriticalExtension(root, "the certificate");
             requireValidAt(root, at);
             return;
         }
@@ -430,9 +433,37 @@ final class PkiFiles {
         }
     }
 
-    /** RFC 5280 6.1.4 for an anchor that is not self-signed: CA, keyCertSign, pathLen, valid at {@code at}. */
+    /**
+     * The critical extensions the JDK {@code PKIX} validator processes (basic and name constraints, key and extended key
+     * usage, subject alternative name, the policy extensions); RFC 5280 4.2 requires a certificate with any other
+     * critical extension to be rejected, as OpenSSL does (error 34, unhandled critical extension).
+     */
+    static final Set<String> PROCESSED_CRITICAL_EXTENSIONS = Set.of(
+            "2.5.29.15", "2.5.29.17", "2.5.29.19", "2.5.29.30", "2.5.29.32", "2.5.29.33", "2.5.29.36", "2.5.29.37",
+            "2.5.29.54");
+
+    /** Refuses a certificate with a critical extension that cannot be processed (RFC 5280 4.2). */
+    static void requireNoUnknownCriticalExtension(X509Certificate certificate, String what) {
+        Set<String> critical = certificate.getCriticalExtensionOIDs();
+        if (critical == null) {
+            return;
+        }
+        SortedSet<String> unknown = new TreeSet<>(critical);
+        unknown.removeAll(PROCESSED_CRITICAL_EXTENSIONS);
+        if (!unknown.isEmpty()) {
+            throw new IllegalArgumentException(what + " " + certificate.getSubjectX500Principal().getName()
+                    + " has the critical extension(s) " + unknown + ", which cannot be processed; RFC 5280 4.2 requires"
+                    + " such a certificate to be rejected (OpenSSL: unhandled critical extension)");
+        }
+    }
+
+    /**
+     * RFC 5280 6.1.4 for an anchor that is not self-signed, which the JDK takes as a trust anchor by its key and name
+     * only and never examines: no critical extension it cannot process, CA, keyCertSign, pathLen, valid at {@code at}.
+     */
     private static void requireIssuingCa(X509Certificate ca, Instant at, int intermediatesBelow) {
         String name = ca.getSubjectX500Principal().getName();
+        requireNoUnknownCriticalExtension(ca, "the --anchor");
         int pathLen = ca.getBasicConstraints();
         if (pathLen < 0) {
             throw new IllegalArgumentException("the --anchor " + name + " is not a CA certificate (basicConstraints"

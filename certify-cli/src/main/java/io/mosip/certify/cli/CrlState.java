@@ -23,6 +23,7 @@ import java.security.cert.X509Certificate;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HexFormat;
@@ -33,7 +34,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.SortedMap;
-import java.util.SortedSet;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.stream.Collectors;
@@ -58,14 +58,19 @@ import java.util.stream.Collectors;
  * }
  * </pre>
  *
- * <p>One inventory per IACA identity: the file is {@code iaca-<ski-hex>.crlstate.json} in the real directory of the IACA
- * keystore or PEM file (symbolic links resolved), or the file {@code --state} names. Every run for the IACA first takes
- * the identity lock {@code .<ski-hex>.crl.lock} in that directory (and in the {@code --state} directory when it is
- * another one), then discovers the state under the lock ({@link #discover}), so two copies of one IACA in one directory
+ * <p>One inventory per IACA identity, found through one authoritative slot: {@code iaca-<ski-hex>.crlstate.json} in
+ * the <em>home</em> directory, the real directory of the IACA keystore or PEM file (symbolic links resolved) or, when
+ * that directory is read-only (offline media, D3), the directory of {@code --state}. The slot holds the inventory
+ * itself or, when {@code --state} keeps it elsewhere, a pointer ({@code {"format": "certify-cli/crl-state-pointer/1",
+ * "iaca": "<ski>", "stateAt": "<real path>"}}) written under the identity lock on first use; discovery follows it, so a
+ * later run without {@code --state} finds the same file, and a {@code --state} naming any other file is refused. Every
+ * run first takes the identity lock {@code .<ski-hex>.crl.lock} in the home directory (and in the {@code --state}
+ * directory when it is another one), then discovers under the lock ({@link #discover}): copies of one IACA
  * ({@code a.p12}, {@code b.p12}, {@code iaca-key.pem}) find, create and update the same file and never start two
  * inventories. Writes then also hold the file's own lock ({@code <state>.lock}), so two IACAs sharing a {@code --state}
  * file are serialised too. A file under the round-2 name {@code <iaca-store>.crlstate.json} is still read and, when it
- * holds only this IACA, renamed to the canonical name under the lock.
+ * holds only this IACA, renamed to the canonical name under the lock. Other files recording the IACA (copies, the
+ * round-2 name next to the canonical one) are holders: the inventory in use must be at or ahead of every one of them.
  *
  * <p>Files are written atomically ({@code rw-------}). An empty or unreadable file is a hard error, never an empty
  * inventory: it is the only record of what was revoked. Discovery reads every {@code *.crlstate.json} in the directory,
@@ -75,6 +80,7 @@ import java.util.stream.Collectors;
 final class CrlState {
 
     static final String FORMAT = "certify-cli/crl-state/1";
+    static final String POINTER_FORMAT = "certify-cli/crl-state-pointer/1";
     static final String SUFFIX = ".crlstate.json";
 
     private static final ObjectMapper MAPPER = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
@@ -178,91 +184,216 @@ final class CrlState {
         return directory.resolve("." + keyId + ".crl.lock");
     }
 
-    /** Where discovery found (or will create) the IACA's inventory; {@code migratedFrom} when a legacy file was renamed. */
-    record Location(Path path, Path migratedFrom) {}
+    /**
+     * The home directory of the IACA's authoritative slot: the IACA's real directory when it is writable, else the
+     * directory of {@code --state}; a read-only IACA directory without {@code --state} is refused (exit 1), since the
+     * lock and the state must live where the CLI can write and every run must name the same place.
+     */
+    static Path home(Path iacaStore, Path explicit) {
+        Path directory = iacaStore.getParent();
+        if (Files.isWritable(directory)) {
+            return directory;
+        }
+        if (explicit == null) {
+            throw new UsageException("the IACA directory " + directory + " is read-only; pass --state <file> in a"
+                    + " writable directory and use the same --state on every run");
+        }
+        return explicit.getParent();
+    }
 
     /**
-     * The inventory file of the IACA with {@code keyId}; the caller holds the identity locks of the IACA's directory and
-     * of the {@code explicit} file's directory. Every {@code *.crlstate.json} in those directories is read, and the
-     * files that record this IACA are its holders (canonical paths, so a symbolic link and its target count once).
+     * Where discovery found (or will create) the IACA's inventory. {@code migratedFrom} when a round-2 file was
+     * renamed; {@code pointer}, the slot to write a pointer to {@code path} into once the run is about to record its
+     * CRL; {@code otherHolders}, the other files recording the IACA, which the inventory must not be behind.
+     */
+    record Location(Path path, Path migratedFrom, Path pointer, List<Path> otherHolders) {}
+
+    /** A pointer slot: the IACA it is for and the real path of the state file it names. */
+    record Pointer(String keyId, Path stateAt) {}
+
+    /**
+     * The inventory file of the IACA with {@code keyId}; the caller holds the identity locks of {@code home} and of the
+     * {@code explicit} file's directory.
      *
-     * <ul>
-     *   <li>{@code --state} given: that file when it is a holder or when there is none; refused when another file
-     *       records the IACA, which would start a second inventory.</li>
-     *   <li>One holder: that file; the legacy {@code <iaca-store>.crlstate.json} holding only this IACA is renamed to
-     *       {@code iaca-<ski-hex>.crlstate.json} first.</li>
-     *   <li>No holder: {@code iaca-<ski-hex>.crlstate.json} in the IACA's directory, for a first CRL.</li>
-     *   <li>Two or more holders: refused, listing them; {@code --state} says which one is current.</li>
-     * </ul>
+     * <ol>
+     *   <li>The authority: the slot {@code iaca-<ski>.crlstate.json} in {@code home} (the state itself, or the file its
+     *       pointer names, which must exist and record the IACA: a dangling pointer is a hard error, never a fresh
+     *       start), and a pointer in the IACA's own directory when that is read-only. Two authorities that disagree
+     *       are refused.</li>
+     *   <li>The holders: every {@code *.crlstate.json} in the IACA's directory, {@code home} and the {@code --state}
+     *       directory that records this IACA, the authority and the {@code --state} file (canonical paths, so a
+     *       symbolic link and its target count once).</li>
+     *   <li>{@code --state} given: refused when it is a pointer, or names another file than the authority (exit 1,
+     *       naming both); otherwise used, with a pointer to it written into the empty slot.</li>
+     *   <li>No {@code --state}: the authority; else the one holder (the round-2 name is renamed to the slot first,
+     *       another name gets a pointer); two or more holders are refused until {@code --state} names one; none: the
+     *       slot, for a first CRL.</li>
+     * </ol>
      *
      * @param iacaStore the canonical (real) path of the IACA keystore or PEM file
      * @param explicit  the canonical {@code --state} path, or {@code null}
+     * @param home      {@link #home}
      */
-    static Location discover(Path iacaStore, String keyId, Path explicit) throws IOException {
-        Path home = iacaStore.getParent();
-        Set<Path> directories = new LinkedHashSet<>();
-        directories.add(home);
+    static Location discover(Path iacaStore, String keyId, Path explicit, Path home) throws IOException {
+        Path iacaDirectory = iacaStore.getParent();
+        Path slot = home.resolve(canonicalName(keyId));
+        // the authority, and what said so
+        Map<Path, String> authorities = new LinkedHashMap<>();
+        Set<Path> holders = new TreeSet<>();
+        Set<Path> slots = new LinkedHashSet<>(List.of(slot, iacaDirectory.resolve(canonicalName(keyId))));
+        for (Path candidate : slots) {
+            Object entry = readEntry(candidate);
+            if (entry instanceof Pointer pointer) {
+                authorities.putIfAbsent(follow(candidate, pointer, keyId), "the pointer " + candidate);
+            } else if (entry instanceof CrlState state) {
+                if (state.inventory(keyId) == null) {
+                    throw new IllegalStateException("the CRL state file " + candidate + " is named for this IACA but"
+                            + " does not record it; restore it, or move it aside and rebuild with --base-crl <the last"
+                            + " published CRL>");
+                }
+                if (candidate.equals(slot)) {
+                    authorities.putIfAbsent(SecureFiles.canonical(candidate), "the state file " + candidate);
+                } else {
+                    holders.add(SecureFiles.canonical(candidate)); // the read-only IACA directory's own slot
+                }
+            }
+        }
+        if (authorities.size() > 1) {
+            throw new UsageException("the CRL state of this IACA is claimed by " + authorities.entrySet().stream()
+                    .map(e -> e.getKey() + " (" + e.getValue() + ")").collect(Collectors.joining(" and "))
+                    + "; keep one: move the other pointer or state aside");
+        }
+        Path authority = authorities.isEmpty() ? null : authorities.keySet().iterator().next();
+        Set<Path> directories = new LinkedHashSet<>(List.of(iacaDirectory, home));
         if (explicit != null) {
             directories.add(explicit.getParent());
         }
-        SortedSet<Path> holders = new TreeSet<>();
         for (Path directory : directories) {
             if (!Files.isDirectory(directory)) {
                 continue;
             }
             try (DirectoryStream<Path> files = Files.newDirectoryStream(directory, "*" + SUFFIX)) {
                 for (Path file : files) {
-                    if (Files.isRegularFile(file) && holds(file, keyId)) {
+                    if (!Files.isRegularFile(file) || slots.contains(file)) {
+                        continue;
+                    }
+                    Object entry = readEntry(file);
+                    if (entry instanceof CrlState state && state.inventory(keyId) != null) {
                         holders.add(SecureFiles.canonical(file));
+                    } else if (entry instanceof Pointer pointer && pointer.keyId().equals(keyId)) {
+                        holders.add(follow(file, pointer, keyId)); // a copied pointer: its target is a holder
                     }
                 }
             }
         }
+        if (authority != null) {
+            holders.add(authority);
+        }
+        Path chosen;
+        Path migratedFrom = null;
         if (explicit != null) {
-            // a --state of any name that records the IACA is the operator's choice among several holders
-            if (holders.isEmpty() || holders.contains(explicit) || holds(explicit, keyId)) {
-                return new Location(explicit, null);
+            Object entry = readEntry(explicit);
+            if (entry instanceof Pointer pointer) {
+                throw new UsageException("--state " + explicit + " is a CRL state pointer to " + pointer.stateAt()
+                        + ", not a state; pass --state " + pointer.stateAt() + ", or omit --state");
             }
-            throw new UsageException("--state " + explicit + " does not record this IACA, but " + list(holders)
-                    + " does: a second file would start a second inventory and reuse CRL numbers; pass --state with"
-                    + " that file");
-        }
-        if (holders.size() > 1) {
+            if (authority != null && !authority.equals(explicit)) {
+                throw new UsageException("--state " + explicit + " is not the CRL state of this IACA: " + authority
+                        + " is (" + authorities.get(authority) + "). Pass --state " + authority + " or omit --state;"
+                        + " to rebuild the inventory in " + explicit + " instead, move " + slot + " aside and pass"
+                        + " --state " + explicit + " --base-crl <the last CRL this IACA published>");
+            }
+            if (entry instanceof CrlState state && state.inventory(keyId) != null) {
+                holders.add(explicit);
+            }
+            chosen = explicit;
+        } else if (authority != null) {
+            chosen = authority;
+        } else if (holders.size() > 1) {
             throw new UsageException("the CRL state of this IACA is recorded in more than one file " + list(holders)
-                    + "; pass --state <file> to say which one is current");
-        }
-        Path canonical = home.resolve(canonicalName(keyId));
-        if (holders.isEmpty()) {
-            return new Location(canonical, null);
-        }
-        Path holder = holders.first();
-        if (holder.equals(legacyPath(iacaStore)) && !Files.exists(canonical, LinkOption.NOFOLLOW_LINKS)) {
-            try (SecureFiles.Lock files = SecureFiles.lockAll(
-                    List.of(SecureFiles.lockFile(holder), SecureFiles.lockFile(canonical)))) {
-                CrlState legacy = read(holder);
-                if (legacy != null && legacy.iacas.size() == 1 && legacy.inventory(keyId) != null
-                        && !Files.exists(canonical, LinkOption.NOFOLLOW_LINKS)) {
-                    SecureFiles.rename(holder, canonical);
-                    return new Location(canonical, holder);
+                    + "; pass --state <file> to say which one is current (it must be at or ahead of the others), and"
+                    + " move the stale copies aside");
+        } else if (holders.size() == 1) {
+            Path holder = holders.iterator().next();
+            chosen = holder;
+            if (holder.equals(legacyPath(iacaStore)) && home.equals(iacaDirectory)
+                    && !Files.exists(slot, LinkOption.NOFOLLOW_LINKS)) {
+                try (SecureFiles.Lock files = SecureFiles.lockAll(
+                        List.of(SecureFiles.lockFile(holder), SecureFiles.lockFile(slot)))) {
+                    CrlState legacy = read(holder);
+                    if (legacy != null && legacy.iacas.size() == 1 && legacy.inventory(keyId) != null
+                            && !Files.exists(slot, LinkOption.NOFOLLOW_LINKS)) {
+                        SecureFiles.rename(holder, slot);
+                        holders.remove(holder);
+                        holders.add(slot);
+                        chosen = slot;
+                        migratedFrom = holder;
+                    }
                 }
             }
+        } else {
+            chosen = slot;
         }
-        return new Location(holder, null);
+        Path pointer = chosen.equals(slot) || Files.exists(slot, LinkOption.NOFOLLOW_LINKS) ? null : slot;
+        List<Path> others = new ArrayList<>(holders);
+        others.remove(chosen);
+        return new Location(chosen, migratedFrom, pointer, others);
+    }
+
+    /** The real path a pointer names; it must exist and record the IACA, or discovery stops (fails closed). */
+    private static Path follow(Path file, Pointer pointer, String keyId) throws IOException {
+        if (!pointer.keyId().equals(keyId)) {
+            throw new IllegalStateException("the CRL state pointer " + file + " is for the IACA " + pointer.keyId()
+                    + ", not for this one (" + keyId + "); move it aside");
+        }
+        Path target = pointer.stateAt();
+        if (!Files.exists(target)) {
+            throw new IllegalStateException("the CRL state pointer " + file + " names " + target + ", which does not"
+                    + " exist (is the medium that holds it mounted?): this IACA's revocation inventory is there."
+                    + " Restore " + target + " from a backup; if it is lost, move " + file + " aside and rebuild the"
+                    + " inventory with --state <file> --base-crl <the last CRL this IACA published>");
+        }
+        Path real = SecureFiles.canonical(target);
+        Object entry = readEntry(real);
+        if (!(entry instanceof CrlState state) || state.inventory(keyId) == null) {
+            throw new IllegalStateException("the CRL state pointer " + file + " names " + real + ", which does not"
+                    + " record this IACA; restore it, or move " + file + " aside and rebuild the inventory with"
+                    + " --state <file> --base-crl <the last CRL this IACA published>");
+        }
+        return real;
     }
 
     private static String list(Collection<Path> paths) {
         return paths.stream().map(Path::toString).collect(Collectors.joining(", ", "[", "]"));
     }
 
-    private static boolean holds(Path path, String keyId) throws IOException {
-        CrlState state = read(path);
-        return state != null && state.inventory(keyId) != null;
+    /** Writes the pointer {@code slot -> stateAt} ({@code rw-------}); the slot must not exist (CREATE_NEW). */
+    static void writePointer(Path slot, String keyId, Path stateAt) throws IOException {
+        ObjectNode root = MAPPER.createObjectNode();
+        root.put("format", POINTER_FORMAT);
+        root.put("iaca", keyId);
+        root.put("stateAt", stateAt.toString());
+        byte[] bytes = (MAPPER.writeValueAsString(root) + System.lineSeparator()).getBytes(StandardCharsets.UTF_8);
+        SecureFiles.write(slot, bytes, SecureFiles.Visibility.SECRET, false);
     }
 
     // ------------------------------------------------------------------ read and write
 
-    /** The state at {@code path}, or {@code null} when the file does not exist. Empty or corrupt is an error. */
+    /** The state at {@code path}, or {@code null} when the file does not exist. Empty, corrupt or a pointer is an error. */
     static CrlState read(Path path) throws IOException {
+        Object entry = readEntry(path);
+        if (entry instanceof Pointer pointer) {
+            throw new IllegalStateException(path + " is a CRL state pointer to " + pointer.stateAt() + ", not a CRL"
+                    + " state");
+        }
+        return (CrlState) entry;
+    }
+
+    /**
+     * The file at {@code path}: a {@link CrlState}, a {@link Pointer}, or {@code null} when it does not exist. Empty or
+     * corrupt is an error, never an empty inventory.
+     */
+    static Object readEntry(Path path) throws IOException {
         if (!Files.exists(path)) {
             return null;
         }
@@ -276,8 +407,17 @@ final class CrlState {
         } catch (IOException e) {
             throw corrupt(path, "not JSON: " + e.getMessage());
         }
+        if (root != null && root.isObject() && POINTER_FORMAT.equals(text(root, "format"))) {
+            String keyId = text(root, "iaca");
+            String stateAt = text(root, "stateAt");
+            if (keyId == null || !keyId.matches("[0-9a-f]{2,128}") || stateAt == null
+                    || !Path.of(stateAt).isAbsolute()) {
+                throw corrupt(path, "a pointer needs \"iaca\" (a key identifier) and an absolute \"stateAt\"");
+            }
+            return new Pointer(keyId, Path.of(stateAt));
+        }
         if (root == null || !root.isObject() || !FORMAT.equals(text(root, "format"))) {
-            throw corrupt(path, "\"format\" is not " + FORMAT);
+            throw corrupt(path, "\"format\" is not " + FORMAT + " or " + POINTER_FORMAT);
         }
         JsonNode iacas = root.get("iacas");
         if (iacas == null || !iacas.isObject()) {

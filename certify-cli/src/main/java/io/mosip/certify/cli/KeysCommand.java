@@ -46,6 +46,7 @@ class KeysCommand {
         private Integer generate() throws Exception {
             PkiFiles.requireLowerCaseAlias(alias, "--alias");
             Path path = SecureFiles.canonical(keystore.keystore);
+            SecureFiles.requireSingleLink(path);
             try (SecureFiles.Lock lock = SecureFiles.lock(path)) {
                 char[] password = keystore.password();
                 boolean exists = Files.exists(path);
@@ -119,7 +120,7 @@ class KeysCommand {
         private Integer csr() throws Exception {
             try {
                 SecureFiles.requireDistinct(SecureFiles.paths("-k", keystore.keystore), SecureFiles.paths("--out", out));
-                PkiCommand.refuseExisting(out, overwrite);
+                PkiCommand.refuseExisting(out, overwrite, PkiCommand.OutKind.CSR);
                 JcaKeyProvider provider = keystore.load();
                 SigningKey key = provider.resolve(new KeyRef(provider.id(), alias));
                 if (!(key.providerHandle() instanceof PrivateKey privateKey)) {
@@ -180,6 +181,7 @@ class KeysCommand {
                 Path path = SecureFiles.canonical(keystore.keystore);
                 SecureFiles.requireDistinct(SecureFiles.paths("--key", key, "--chain", chain, "--anchor", anchor),
                         SecureFiles.paths("-k", path, "the lock of -k", SecureFiles.lockFile(path)));
+                SecureFiles.requireSingleLink(path);
                 String keyPem = Files.readString(key, StandardCharsets.US_ASCII);
                 if (Pem.isEncryptedPrivateKey(keyPem)) {
                     keySecret = PkiFiles.password(keyPassword, PkiFiles.KEY_PASSWORD_ENV, "PEM key password",
@@ -191,6 +193,10 @@ class KeysCommand {
                         Files.readString(chain, StandardCharsets.US_ASCII));
                 if (certificates.isEmpty()) {
                     throw new UsageException(chain + " holds no certificate");
+                }
+                if (PkiCommand.DS_PROFILE.equals(profile) && certificates.size() < 2 && anchor == null) {
+                    throw new UsageException("--profile mdoc-dsc needs the IACA: a [DSC, IACA] chain, or --anchor"
+                            + " iaca.pem");
                 }
                 PkiFiles.requireSupportedKey(certificates.get(0).getPublicKey(), "the first certificate of " + chain);
                 if (!PkiFiles.matches(privateKey, certificates.get(0).getPublicKey())) {
@@ -205,6 +211,7 @@ class KeysCommand {
                             + " key stays offline (D3) and never enters an issuer keystore. Pass the IACA PEM key and"
                             + " certificate to the --iaca option of the pki commands instead");
                 }
+                refuseCaKey(certificates.get(0));
                 List<X509Certificate> stored = certificates;
                 if (PkiCommand.DS_PROFILE.equals(profile)) {
                     stored = documentSignerChain(certificates, anchorCertificate);
@@ -240,6 +247,33 @@ class KeysCommand {
         }
 
         /**
+         * {@code KEY_IS_CA}: the key's own certificate is a CA's (basicConstraints {@code CA:true}, or keyUsage
+         * keyCertSign or cRLSign), whether or not it is an Annex B IACA. A CA key, an IACA's or any other, stays offline
+         * (D3) and never enters an issuer keystore, which holds signing keys with end-entity certificates only.
+         */
+        static void refuseCaKey(X509Certificate certificate) {
+            List<String> reasons = new ArrayList<>();
+            if (certificate.getBasicConstraints() >= 0) {
+                reasons.add("basicConstraints CA:true");
+            }
+            boolean[] usage = certificate.getKeyUsage();
+            if (usage != null && usage.length > 5 && usage[5]) {
+                reasons.add("keyUsage keyCertSign");
+            }
+            if (usage != null && usage.length > 6 && usage[6]) {
+                reasons.add("keyUsage cRLSign");
+            }
+            if (!reasons.isEmpty()) {
+                throw new IllegalArgumentException("KEY_IS_CA: the key's certificate "
+                        + certificate.getSubjectX500Principal().getName() + " is a CA certificate ("
+                        + String.join(", ", reasons) + "); a CA key, an IACA's or any other, stays offline (D3) and"
+                        + " never enters an issuer keystore. Import the signing key with an end-entity certificate"
+                        + " (basicConstraints CA:false, no keyCertSign or cRLSign; with OpenSSL, req -x509 adds"
+                        + " CA:true unless given -addext basicConstraints=critical,CA:FALSE)");
+            }
+        }
+
+        /**
          * Refuses a key that is also the key of a certificate above it (in the chain or {@code --anchor}): that is the
          * issuer's private key, an IACA's or another CA's, and a CA key is never an issuer signing key (D3).
          */
@@ -268,9 +302,6 @@ class KeysCommand {
             }
             X509Certificate dsc = certificates.get(0);
             X509Certificate iaca = certificates.size() == 2 ? certificates.get(1) : anchor;
-            if (iaca == null) {
-                throw new UsageException("--profile mdoc-dsc needs the IACA: a [DSC, IACA] chain, or --anchor iaca.pem");
-            }
             List<AnnexBValidator.Violation> violations = new ArrayList<>(AnnexBValidator.validateIaca(iaca));
             violations.addAll(AnnexBValidator.validateDs(dsc, iaca));
             PkiCommand.Check.sameKey(dsc, iaca).ifPresent(violations::add);

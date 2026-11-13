@@ -1,15 +1,19 @@
 package io.mosip.certify.cli;
 
+import io.mosip.certify.keyprovider.jca.VersionLabels;
 import io.mosip.certify.pki.AnnexBValidator;
 import io.mosip.certify.pki.CrlBuilder;
 import io.mosip.certify.pki.Csr;
 import io.mosip.certify.pki.IsoMdocProfiles;
 import io.mosip.certify.pki.Pem;
+import org.bouncycastle.openssl.PEMParser;
+import org.bouncycastle.pkcs.PKCS10CertificationRequest;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.StringReader;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileAlreadyExistsException;
@@ -128,11 +132,86 @@ class PkiCommand {
         return value == null || value.isBlank() ? null : value;
     }
 
-    /** A certificate or CRL {@code --out} that exists is refused unless {@code --overwrite}. */
-    static void refuseExisting(Path out, boolean overwrite) {
-        if (out != null && !overwrite && Files.exists(out)) {
+    /** What an existing {@code --out} must already hold to be replaced: the kind of object the command writes. */
+    enum OutKind {
+        CRL("a CRL", Set.of("X509 CRL")),
+        CERTIFICATES("PEM certificate(s)", Set.of("CERTIFICATE")),
+        CSR("a PKCS#10 request", Set.of("CERTIFICATE REQUEST", "NEW CERTIFICATE REQUEST"));
+
+        private static final Pattern BEGIN = Pattern.compile("-----BEGIN ([A-Z0-9 ]+)-----");
+        private static final long LIMIT = 64L * 1024 * 1024;
+
+        final String what;
+        private final Set<String> labels;
+
+        OutKind(String what, Set<String> labels) {
+            this.what = what;
+            this.labels = labels;
+        }
+
+        /** Whether the file parses as this kind and nothing else: every PEM block of it, or the whole file as DER. */
+        boolean holds(Path file) {
+            try {
+                if (!Files.isRegularFile(file) || Files.size(file) > LIMIT) {
+                    return false;
+                }
+                byte[] bytes = Files.readAllBytes(file);
+                String text = new String(bytes, StandardCharsets.ISO_8859_1);
+                Matcher begin = BEGIN.matcher(text);
+                boolean pem = false;
+                while (begin.find()) {
+                    pem = true;
+                    if (!labels.contains(begin.group(1))) {
+                        return false; // a private key, a CSR beside a certificate, …: never replaced as this kind
+                    }
+                }
+                switch (this) {
+                    case CRL -> readCrl(file);
+                    case CERTIFICATES -> {
+                        if (!pem || Pem.readCertificates(text).isEmpty()) {
+                            return false;
+                        }
+                    }
+                    case CSR -> {
+                        if (pem) {
+                            try (PEMParser parser = new PEMParser(new StringReader(text))) {
+                                if (!(parser.readObject() instanceof PKCS10CertificationRequest)) {
+                                    return false;
+                                }
+                            }
+                        } else {
+                            new PKCS10CertificationRequest(bytes);
+                        }
+                    }
+                }
+                return true;
+            } catch (IOException | RuntimeException e) {
+                return false;
+            }
+        }
+    }
+
+    /**
+     * An {@code --out} that exists is refused unless {@code --overwrite}, and even then unless it already holds the
+     * kind of object the command writes (a CRL for {@code crl issue}, PEM certificates for a chain, a CSR for
+     * {@code keys csr}): {@code --overwrite} replaces the previous output, never a keystore, a CRL state or a key that
+     * happens to be named. A hard-linked {@code --out} is refused here too (exit 1), before a key is generated or a CRL
+     * number reserved.
+     */
+    static void refuseExisting(Path out, boolean overwrite, OutKind kind) throws IOException {
+        if (out == null || !Files.exists(out)) {
+            return;
+        }
+        if (!overwrite) {
             throw new IllegalArgumentException(out + " already exists; pass --overwrite to replace it");
         }
+        Path real = SecureFiles.canonical(out);
+        if (!kind.holds(real)) {
+            throw new IllegalArgumentException("--out " + out + " exists and is not " + kind.what + "; --overwrite"
+                    + " replaces only a previous output of this command, never another file (a keystore, a CRL state,"
+                    + " a key): refusing to replace it. Name another --out or move the file aside");
+        }
+        SecureFiles.requireSingleLink(real);
     }
 
     static String pem(Path path) throws IOException {
@@ -253,6 +332,9 @@ class PkiCommand {
                 PkiFiles.curve(algorithm);
                 PkiFiles.requireLowerCaseAlias(alias, "--alias");
                 Path store = keystore == null ? null : SecureFiles.canonical(keystore);
+                if (store != null) {
+                    SecureFiles.requireSingleLink(store);
+                }
                 char[] secret = PkiFiles.password(password, PkiFiles.IACA_PASSWORD_ENV, IACA_PASSWORD, "-p");
                 try {
                     X509Certificate iaca;
@@ -382,7 +464,7 @@ class PkiCommand {
                     }
                     SecureFiles.requireDistinct(SecureFiles.paths("--iaca", iaca, "--csr", csr),
                             SecureFiles.paths("--out", out));
-                    refuseExisting(out, overwrite);
+                    refuseExisting(out, overwrite, OutKind.CERTIFICATES);
                     char[] secret = PkiFiles.password(password, PkiFiles.IACA_PASSWORD_ENV, IACA_PASSWORD, "-p");
                     try {
                         IacaKey authority = IacaKey.load(iaca, secret, iacaAlias);
@@ -404,7 +486,8 @@ class PkiCommand {
                 Path store = SecureFiles.canonical(keystore);
                 SecureFiles.requireDistinct(SecureFiles.paths("--iaca", iaca),
                         SecureFiles.paths("-k", store, "--out", out, "the lock of -k", SecureFiles.lockFile(store)));
-                refuseExisting(out, overwrite);
+                SecureFiles.requireSingleLink(store);
+                refuseExisting(out, overwrite, OutKind.CERTIFICATES);
                 char[] secret = PkiFiles.password(password, PkiFiles.IACA_PASSWORD_ENV, IACA_PASSWORD, "-p");
                 char[] issuerSecret = null;
                 try {
@@ -481,7 +564,8 @@ class PkiCommand {
                 Path store = SecureFiles.canonical(keystore);
                 SecureFiles.requireDistinct(SecureFiles.paths("--iaca", iaca),
                         SecureFiles.paths("-k", store, "--out", out, "the lock of -k", SecureFiles.lockFile(store)));
-                refuseExisting(out, overwrite);
+                SecureFiles.requireSingleLink(store);
+                refuseExisting(out, overwrite, OutKind.CERTIFICATES);
                 char[] secret = PkiFiles.password(password, PkiFiles.IACA_PASSWORD_ENV, IACA_PASSWORD, "-p");
                 char[] issuerSecret = null;
                 try {
@@ -571,8 +655,9 @@ class PkiCommand {
      * Versioned Document Signer aliases, consistent with the {@code x509-file} provider (M-05): one key entry per
      * version, {@code <prefix>@<yyyy-MM>} and, for a second rotation in the same month, {@code <prefix>@<yyyy-MM>.<N>}
      * with N from 2. {@code x509-file:<prefix>} resolves to the entry valid now with the newest {@code notBefore}, ties
-     * broken by the version label compared numerically (runs of digits as numbers, so {@code 2026-11.10} comes after
-     * {@code 2026-11.9}, as M-05's {@code VersionLabels} orders them); a versioned reference resolves to that entry.
+     * broken by the version label in M-05's {@link VersionLabels} order (runs of digits as numbers, so {@code 2026-11.10}
+     * comes after {@code 2026-11.9}), the order the provider itself applies; a versioned reference resolves to that
+     * entry.
      */
     static final class Rotation {
 
@@ -622,45 +707,10 @@ class PkiCommand {
             return candidates.entrySet().stream()
                     .max(Comparator.<Map.Entry<String, X509Certificate>, Instant>comparing(
                                     e -> e.getValue().getNotBefore().toInstant())
-                            .thenComparing(e -> e.getKey(), Rotation::compareLabels))
+                            .thenComparing(e -> VersionLabels.versionOf(e.getKey()), VersionLabels.ORDER))
                     .map(Map.Entry::getKey);
         }
 
-        /**
-         * Version labels in numeric-aware order: digit runs compare as numbers ({@code .10} after {@code .9}, leading
-         * zeros ignored), other runs as text, a label that is a prefix of another first; equal by that order, the
-         * plain string order decides.
-         */
-        static int compareLabels(String a, String b) {
-            List<String> left = runs(a);
-            List<String> right = runs(b);
-            for (int i = 0; i < Math.min(left.size(), right.size()); i++) {
-                String x = left.get(i);
-                String y = right.get(i);
-                int order;
-                if (Character.isDigit(x.charAt(0)) && Character.isDigit(y.charAt(0))) {
-                    order = new BigInteger(x).compareTo(new BigInteger(y));
-                } else {
-                    order = x.compareTo(y);
-                }
-                if (order != 0) {
-                    return order;
-                }
-            }
-            int bySize = Integer.compare(left.size(), right.size());
-            return bySize != 0 ? bySize : a.compareTo(b);
-        }
-
-        private static final Pattern RUNS = Pattern.compile("[0-9]+|[^0-9]+");
-
-        private static List<String> runs(String label) {
-            List<String> runs = new ArrayList<>();
-            Matcher matcher = RUNS.matcher(label);
-            while (matcher.find()) {
-                runs.add(matcher.group());
-            }
-            return runs;
-        }
     }
 
     // ------------------------------------------------------------------ pki crl
@@ -688,8 +738,10 @@ class PkiCommand {
             String crlNumber;
             @Option(names = "--next-update-days", defaultValue = "30", description = "days until the next CRL is due")
             int nextUpdateDays;
-            @Option(names = "--state", description = "revocation inventory file (default: the file in the IACA's"
-                    + " directory that records this IACA, else iaca-<ski>" + CrlState.SUFFIX + " there)")
+            @Option(names = "--state", description = "revocation inventory file (default: iaca-<ski>" + CrlState.SUFFIX
+                    + " in the IACA's directory, or the file its pointer names). Another name is recorded there as a"
+                    + " pointer on first use; required, and the same on every run, when the IACA's directory is"
+                    + " read-only")
             Path state;
             @Option(names = "--base-crl", description = "import the entries and number of a CRL this IACA published"
                     + " (verified under the IACA), e.g. when the inventory was never kept or is older than that CRL;"
@@ -740,18 +792,24 @@ class PkiCommand {
                 }
                 SecureFiles.requireDistinct(SecureFiles.paths("--iaca", iaca), SecureFiles.paths("--out", out,
                         "--state", state));
-                refuseExisting(out, overwrite);
+                // a non-CRL or hard-linked --out is refused before the password is asked and a number reserved
+                refuseExisting(out, overwrite, OutKind.CRL);
+                // one real path for the IACA: discovery looks in its real directory, never the link's
+                Path iacaPath = SecureFiles.canonical(iaca);
+                Path explicit = state == null ? null : SecureFiles.canonical(state);
+                if (explicit != null && !Files.isDirectory(explicit.getParent())) {
+                    throw new UsageException("the directory of --state " + explicit.getParent() + " does not exist;"
+                            + " create it (or mount the medium that holds the state) first");
+                }
+                // a read-only IACA directory (offline media) is refused here without --state, before the password
+                Path home = CrlState.home(iacaPath, explicit);
                 char[] secret = PkiFiles.password(password, PkiFiles.IACA_PASSWORD_ENV, IACA_PASSWORD, "-p");
                 try {
-                    // one real path for the IACA: discovery looks in its real directory, never the link's
-                    Path iacaPath = SecureFiles.canonical(iaca);
                     IacaKey authority = IacaKey.load(iacaPath, secret, iacaAlias);
                     String keyId = CrlState.keyId(authority.certificate());
-                    Path explicit = state == null ? null : SecureFiles.canonical(state);
                     Map<String, Path> identityLocks = new LinkedHashMap<>();
-                    identityLocks.put("the CRL lock of this IACA",
-                            CrlState.identityLock(iacaPath.getParent(), keyId));
-                    if (explicit != null && !explicit.getParent().equals(iacaPath.getParent())) {
+                    identityLocks.put("the CRL lock of this IACA", CrlState.identityLock(home, keyId));
+                    if (explicit != null && !explicit.getParent().equals(home)) {
                         identityLocks.put("the CRL lock of this IACA beside --state",
                                 CrlState.identityLock(explicit.getParent(), keyId));
                     }
@@ -759,11 +817,12 @@ class PkiCommand {
                     // the identity lock comes before discovery: two copies of one IACA (a.p12, b.p12) can neither
                     // both find no inventory nor both create one
                     try (SecureFiles.Lock identity = SecureFiles.lockAll(identityLocks.values())) {
-                        CrlState.Location location = CrlState.discover(iacaPath, keyId, explicit);
+                        CrlState.Location location = CrlState.discover(iacaPath, keyId, explicit, home);
                         Path statePath = location.path();
                         Map<String, Path> written = new LinkedHashMap<>();
                         written.put("the CRL state", statePath);
                         written.put("the lock of the CRL state", SecureFiles.lockFile(statePath));
+                        written.put("the CRL state pointer", location.pointer());
                         written.putAll(identityLocks);
                         // --base-crl may be the --out file: it is read whole before anything is written
                         SecureFiles.requireDistinct(SecureFiles.paths("--iaca", iacaPath, "--base-crl", baseCrl),
@@ -775,8 +834,10 @@ class PkiCommand {
                             System.err.println("renamed the CRL state " + location.migratedFrom() + " to " + statePath
                                     + " (one inventory per IACA, named by its subject key identifier)");
                         }
+                        // a hard-linked state is refused before a pointer or a number is written
+                        SecureFiles.requireSingleLink(statePath);
                         try (SecureFiles.Lock file = SecureFiles.lock(statePath)) {
-                            return issue(authority, keyId, statePath, base, requested, serials);
+                            return issue(authority, keyId, location, base, requested, serials);
                         }
                     }
                 } finally {
@@ -784,11 +845,18 @@ class PkiCommand {
                 }
             }
 
-            private Integer issue(IacaKey authority, String keyId, Path statePath, X509CRL base, BigInteger requested,
-                                  Set<BigInteger> serials) throws IOException {
+            private Integer issue(IacaKey authority, String keyId, CrlState.Location location, X509CRL base,
+                                  BigInteger requested, Set<BigInteger> serials) throws IOException {
+                Path statePath = location.path();
                 CrlState current = CrlState.read(statePath);
                 CrlState.Inventory inventory = current == null ? null : current.inventory(keyId);
                 if (inventory == null) {
+                    if (base == null && !location.otherHolders().isEmpty()) {
+                        throw new UsageException("--state " + statePath + " does not record this IACA, but "
+                                + location.otherHolders() + " does: a second file would start a second inventory and"
+                                + " reuse CRL numbers; pass --state with that file, or rebuild " + statePath
+                                + " from what was published with --base-crl <the last CRL this IACA published>");
+                    }
                     if (base == null && !initial && !force) {
                         throw new IllegalArgumentException("no revocation inventory for this IACA in " + statePath
                                 + ": a CRL issued now would drop every earlier revocation. Pass --base-crl <the last"
@@ -808,6 +876,7 @@ class PkiCommand {
                 if (base != null) {
                     inventory.importCrl(base, CrlState.crlNumber(base));
                 }
+                refuseBehind(inventory, keyId, statePath, location.otherHolders());
                 BigInteger last = inventory.lastCrlNumber();
                 BigInteger number = requested != null ? requested
                         : last == null ? BigInteger.ONE : last.add(BigInteger.ONE);
@@ -847,7 +916,27 @@ class PkiCommand {
                 inventory.lastCrlNumber(number);
                 CrlState updated = current == null ? CrlState.empty() : current;
                 updated.put(keyId, inventory);
-                updated.write(statePath);
+                // the pointer first: a crash between the two leaves a pointer to a missing file, which stops the next
+                // run (fails closed) instead of a state no later run would find
+                if (location.pointer() != null) {
+                    CrlState.writePointer(location.pointer(), keyId, statePath);
+                }
+                try {
+                    updated.write(statePath);
+                } catch (IOException | RuntimeException e) {
+                    if (location.pointer() != null) {
+                        Files.deleteIfExists(location.pointer());
+                    }
+                    throw e;
+                }
+                if (location.pointer() != null) {
+                    System.err.println("recorded " + statePath + " as the CRL state of this IACA in "
+                            + location.pointer() + "; later runs find it there, with or without --state");
+                }
+                for (Path other : location.otherHolders()) {
+                    System.err.println("warning: " + other + " also records this IACA and is now behind " + statePath
+                            + "; move it aside so it is never mistaken for the current inventory");
+                }
                 boolean der = out.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".der");
                 try {
                     SecureFiles.write(out, der ? encoded(crl) : Pem.writeCrl(crl).getBytes(StandardCharsets.US_ASCII),
@@ -874,7 +963,8 @@ class PkiCommand {
 
             /**
              * The CRL {@code --out} already holds when this IACA signed it (the CRL about to be replaced); {@code null}
-             * when there is no file, or it is not a CRL of this IACA (it is replaced, with a warning).
+             * when there is no file, or it is a CRL of another IACA (it is replaced, with a warning). Anything else was
+             * refused before ({@link OutKind#CRL}) and is refused again here.
              */
             private X509CRL previousCrl(X509Certificate iaca) {
                 if (!Files.exists(out)) {
@@ -884,8 +974,7 @@ class PkiCommand {
                 try {
                     previous = readCrl(out);
                 } catch (IOException | RuntimeException e) {
-                    System.err.println("warning: --out " + out + " is not a CRL; replacing it");
-                    return null;
+                    throw new IllegalArgumentException("--out " + out + " is not a CRL; refusing to replace it", e);
                 }
                 try {
                     if (!previous.getIssuerX500Principal().equals(iaca.getSubjectX500Principal())) {
@@ -942,6 +1031,44 @@ class PkiCommand {
                             + " IACA) revokes " + String.join(", ", missing) + ", which the revocation inventory "
                             + statePath + " does not list: the inventory is behind the last published CRL, and this"
                             + " CRL would drop the revocation." + remedy);
+                }
+            }
+
+            /**
+             * Refuses an inventory behind another file that records the IACA (a copy, the round-2 name, the file a
+             * copied pointer names): one whose CRL number is above it, or that lists a serial it lacks. Issuing from
+             * it would reuse a number or drop a revocation; {@code --base-crl} with the last published CRL catches it
+             * up.
+             */
+            private static void refuseBehind(CrlState.Inventory inventory, String keyId, Path statePath,
+                                             List<Path> others) throws IOException {
+                for (Path other : others) {
+                    CrlState state = CrlState.read(other);
+                    CrlState.Inventory held = state == null ? null : state.inventory(keyId);
+                    if (held == null) {
+                        continue;
+                    }
+                    BigInteger mine = inventory.lastCrlNumber();
+                    if (mine == null || mine.compareTo(held.lastCrlNumber()) < 0) {
+                        throw new IllegalArgumentException("the CRL state " + statePath + " (CRL number "
+                                + (mine == null ? "none" : mine) + ") is behind " + other + " (CRL number "
+                                + held.lastCrlNumber() + "), which also records this IACA: issuing from it would"
+                                + " reuse a number. Pass --state " + other + " if that is the current inventory, or"
+                                + " catch up with --base-crl <the last CRL this IACA published>");
+                    }
+                    List<String> missing = new ArrayList<>();
+                    for (BigInteger serial : held.revoked().keySet()) {
+                        if (!inventory.isRevoked(serial)) {
+                            missing.add("0x" + serial.toString(16));
+                        }
+                    }
+                    if (!missing.isEmpty()) {
+                        throw new IllegalArgumentException("the CRL state " + statePath + " does not list "
+                                + String.join(", ", missing) + ", which " + other + " (also recording this IACA)"
+                                + " revokes: the next CRL would drop the revocation. Pass --state " + other
+                                + " if that is the current inventory, or catch up with --base-crl <the last CRL"
+                                + " this IACA published>");
+                    }
                 }
             }
 
