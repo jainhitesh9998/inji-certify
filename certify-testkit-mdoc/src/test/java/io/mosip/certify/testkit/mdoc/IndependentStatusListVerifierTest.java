@@ -43,6 +43,7 @@ import org.multipaz.util.CompressionKt;
 
 import com.nimbusds.jose.jwk.JWK;
 
+import java.io.ByteArrayOutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.cert.X509Certificate;
@@ -53,8 +54,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.zip.Deflater;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -116,9 +119,9 @@ class IndependentStatusListVerifierTest {
         Fixture fixture = new Fixture();
         VerificationReport report = verify(fixture, fixture.token(), IndependentStatusListVerifier.StatusListOptions.strictMode());
 
-        assertEquals(IndependentStatusListVerifier.CHECKS,
+        assertEquals(IndependentStatusListVerifier.TOKEN_CHECKS,
                 report.checks().stream().map(VerificationReport.Check::name).toList(),
-                "every check runs, in report order");
+                "every token check runs, in report order");
         assertEquals(List.of(), report.failures(), () -> "the Multipaz-built token must pass: " + report);
         assertTrue(report.passed(), () -> report.toString());
         assertEquals("served as application/statuslist+cwt", report.check(IndependentStatusListVerifier.CHECK_HTTP).message());
@@ -159,9 +162,14 @@ class IndependentStatusListVerifierTest {
     }
 
     @Test
-    void theOptionsRefuseAStatusOutsideTheTokenStatusListRegistry() {
-        assertTrue(assertThrowsIllegalArgument(() -> new IndependentStatusListVerifier.StatusListOptions(true, 4, true)));
+    void theOptionsAcceptOnlyTheTwoMdocStatuses() {
+        new IndependentStatusListVerifier.StatusListOptions(true, 0, true);
+        new IndependentStatusListVerifier.StatusListOptions(true, 1, false);
+        assertTrue(assertThrowsIllegalArgument(() -> new IndependentStatusListVerifier.StatusListOptions(true, 2, true)),
+                "ISO/IEC 18013-5 second edition 12.3.6.1: an mdoc status is revoked or valid, and bits=1 has no 2");
+        assertTrue(assertThrowsIllegalArgument(() -> new IndependentStatusListVerifier.StatusListOptions(true, 3, true)));
         assertTrue(assertThrowsIllegalArgument(() -> new IndependentStatusListVerifier.StatusListOptions(true, -1, false)));
+        assertTrue(assertThrowsIllegalArgument(() -> new IndependentStatusListVerifier.StatusListOptions(true, 4, false)));
     }
 
     // ---- statusList.http -------------------------------------------------------------------------------------------
@@ -195,6 +203,15 @@ class IndependentStatusListVerifierTest {
         assertEquals(List.of(), report.failures(), () -> "TSL 8.2 compares the media type, not its parameters: " + report);
     }
 
+    @Test
+    void aMissingContentTypeIsRefused() {
+        Fixture fixture = new Fixture();
+        VerificationReport report = IndependentStatusListVerifier.verify(fixture.token(), null, URI, 3,
+                javaCerts(List.of(fixture.dsc)), fixture.iacaJava, NOW,
+                IndependentStatusListVerifier.StatusListOptions.strictMode());
+        assertProblems(report, Map.of(IndependentStatusListVerifier.CHECK_HTTP, List.of("contentType")));
+    }
+
     // ---- statusList.envelope ---------------------------------------------------------------------------------------
 
     @Test
@@ -211,6 +228,31 @@ class IndependentStatusListVerifierTest {
         byte[] nested = wrap(61, fixture.token()); // 61(18(COSE_Sign1)) — the CWT tag TSL 5.2 forbids
         VerificationReport report = verify(fixture, nested, IndependentStatusListVerifier.StatusListOptions.strictMode());
         assertProblems(report, Map.of(IndependentStatusListVerifier.CHECK_ENVELOPE, List.of("cwtTag61")));
+    }
+
+    @Test
+    void aSecondTagAroundTheTag18IsRefusedIncludingTheSelfDescribeTag() {
+        Fixture fixture = new Fixture();
+        VerificationReport doubled = verify(fixture, wrap(18, fixture.token()),
+                IndependentStatusListVerifier.StatusListOptions.strictMode());
+        assertProblems(doubled, Map.of(IndependentStatusListVerifier.CHECK_ENVELOPE, List.of("notTagged18")));
+        assertTrue(doubled.check(IndependentStatusListVerifier.CHECK_ENVELOPE).message().contains("[18, 18]"),
+                "the report names the whole tag stack: " + doubled);
+
+        VerificationReport selfDescribed = verify(fixture, wrap(55799, fixture.token()),
+                IndependentStatusListVerifier.StatusListOptions.strictMode());
+        assertProblems(selfDescribed, Map.of(IndependentStatusListVerifier.CHECK_ENVELOPE, List.of("notTagged18")));
+        assertTrue(selfDescribed.check(IndependentStatusListVerifier.CHECK_ENVELOPE).message().contains("[55799, 18]"),
+                "55799 (RFC 8949 3.4.6) is refused, as @owf/cose 0.6.0 refuses it: "
+                        + selfDescribed.check(IndependentStatusListVerifier.CHECK_ENVELOPE).message());
+    }
+
+    @Test
+    void aTagOtherThan17And18And61IsRefused() {
+        Fixture fixture = new Fixture();
+        VerificationReport report = verify(fixture, fixture.builder().tag(99L).build(),
+                IndependentStatusListVerifier.StatusListOptions.strictMode());
+        assertProblems(report, Map.of(IndependentStatusListVerifier.CHECK_ENVELOPE, List.of("notTagged18")));
     }
 
     @Test
@@ -330,6 +372,45 @@ class IndependentStatusListVerifierTest {
         assertProblems(report, Map.of(IndependentStatusListVerifier.CHECK_CHAIN, List.of("untrusted")));
     }
 
+    /**
+     * The review-round-1 major: {@code fromCwt} caps {@code exp} at {@code maxValidity} (365 days, the Multipaz wallet
+     * default {@code CachingRevocationChecker} uses), so a Document Signer valid for the Annex B 457 days cannot carry a
+     * list four hundred days out even though every field passes the individual checks. Only the chain check can report
+     * it: {@code statusList.chain:untrusted} is "fromCwt refuses".
+     */
+    @Test
+    void anExpFourHundredDaysOutIsRefusedByMultipazsMaxValidity() {
+        Fixture fixture = new Fixture();
+        X509Cert longLived = fixture.issuedValid(fixture.statusKey, "Long-Lived Status Signer", 21L,
+                List.of(IndependentStatusListVerifier.STATUS_SIGNING_EKU), true, NOW.minusSeconds(86_400),
+                NOW.plusSeconds(457L * 24 * 3600));
+        Map<DataItem, DataItem> claims = fixture.canonicalClaims();
+        claims.put(claim(4), DataItemExtensionsKt.toDataItem(NOW.plusSeconds(400L * 24 * 3600).getEpochSecond()));
+        VerificationReport report = verify(fixture, fixture.builder().signer(longLived, fixture.statusKey).claims(claims).build(),
+                new IndependentStatusListVerifier.StatusListOptions(true, 0, true), longLived);
+        assertProblems(report, Map.of(IndependentStatusListVerifier.CHECK_CHAIN, List.of("untrusted")));
+        assertTrue(report.check(IndependentStatusListVerifier.CHECK_CHAIN).message().contains("maxValidity"),
+                "the refusal names maxValidity: " + report.check(IndependentStatusListVerifier.CHECK_CHAIN));
+    }
+
+    /** A signer past its notAfter at the evaluation instant fails the chain, not a claim, for the trust decision. */
+    @Test
+    void aSignerExpiredAtTheEvaluationInstantIsUntrusted() {
+        Fixture fixture = new Fixture();
+        X509Cert expired = fixture.issuedValid(fixture.statusKey, "Expired Status Signer", 22L,
+                List.of(IndependentStatusListVerifier.STATUS_SIGNING_EKU), true, NOW.minusSeconds(10L * 24 * 3600),
+                NOW.minusSeconds(3600));
+        Map<DataItem, DataItem> claims = fixture.canonicalClaims();
+        claims.put(claim(4), DataItemExtensionsKt.toDataItem(NOW.minusSeconds(7200).getEpochSecond()));
+        claims.put(claim(6), DataItemExtensionsKt.toDataItem(NOW.minusSeconds(3 * 3600).getEpochSecond()));
+        VerificationReport report = verify(fixture, fixture.builder().signer(expired, fixture.statusKey).claims(claims).build(),
+                new IndependentStatusListVerifier.StatusListOptions(true, 0, true), expired);
+        assertTrue(report.check(IndependentStatusListVerifier.CHECK_CHAIN).codes().contains("untrusted"),
+                () -> "the chain refuses a signer past notAfter: " + report);
+        assertEquals(List.of("expired"), report.check(IndependentStatusListVerifier.CHECK_CLAIMS).codes(),
+                "exp is before at too, and that is the claim check's code");
+    }
+
     // ---- statusList.issuanceChain ----------------------------------------------------------------------------------
 
     @Test
@@ -380,9 +461,10 @@ class IndependentStatusListVerifierTest {
     @Test
     void anExpiredExpIsRefused() {
         Fixture fixture = new Fixture();
-        VerificationReport report = verify(fixture, fixture.tokenWithClaims(
-                        claims -> claims.put(claim(4), DataItemExtensionsKt.toDataItem(NOW.minusSeconds(60).getEpochSecond()))),
-                IndependentStatusListVerifier.StatusListOptions.strictMode());
+        VerificationReport report = verify(fixture, fixture.tokenWithClaims(claims -> {
+                    claims.put(claim(4), DataItemExtensionsKt.toDataItem(NOW.minusSeconds(60).getEpochSecond()));
+                    claims.put(claim(6), DataItemExtensionsKt.toDataItem(NOW.minusSeconds(120).getEpochSecond()));
+                }), IndependentStatusListVerifier.StatusListOptions.strictMode());
         assertProblems(report, Map.of(IndependentStatusListVerifier.CHECK_CLAIMS, List.of("expired")));
     }
 
@@ -397,6 +479,25 @@ class IndependentStatusListVerifierTest {
     }
 
     @Test
+    void anIatAfterExpIsRefused() {
+        Fixture fixture = new Fixture();
+        VerificationReport report = verify(fixture, fixture.tokenWithClaims(claims -> {
+                    claims.put(claim(4), DataItemExtensionsKt.toDataItem(NOW.plusSeconds(1).getEpochSecond()));
+                    claims.put(claim(6), DataItemExtensionsKt.toDataItem(NOW.plusSeconds(4).getEpochSecond()));
+                }), IndependentStatusListVerifier.StatusListOptions.strictMode(), fixture.dsc, 3);
+        assertProblems(report, Map.of(IndependentStatusListVerifier.CHECK_CLAIMS, List.of("iatAfterExp")));
+    }
+
+    @Test
+    void aTtlOfZeroIsRefused() {
+        Fixture fixture = new Fixture();
+        VerificationReport report = verify(fixture, fixture.tokenWithClaims(
+                        claims -> claims.put(claim(65534), DataItemExtensionsKt.toDataItem(0L))),
+                IndependentStatusListVerifier.StatusListOptions.strictMode());
+        assertProblems(report, Map.of(IndependentStatusListVerifier.CHECK_CLAIMS, List.of("ttlInvalid")));
+    }
+
+    @Test
     void aTtlThatIsNotAPositiveUnsignedIntegerIsRefused() {
         Fixture fixture = new Fixture();
         VerificationReport report = verify(fixture, fixture.tokenWithClaims(
@@ -406,6 +507,14 @@ class IndependentStatusListVerifierTest {
     }
 
     // ---- statusList.list -------------------------------------------------------------------------------------------
+
+    @Test
+    void aMissingStatusListClaimIsItsOwnCode() {
+        Fixture fixture = new Fixture();
+        VerificationReport report = verify(fixture, fixture.tokenWithClaims(claims -> claims.remove(claim(65533))),
+                IndependentStatusListVerifier.StatusListOptions.strictMode());
+        assertProblems(report, Map.of(IndependentStatusListVerifier.CHECK_LIST, List.of("missing")));
+    }
 
     @Test
     void aBitsValueOtherThanOneIsRefused() {
@@ -421,6 +530,15 @@ class IndependentStatusListVerifierTest {
         Fixture fixture = new Fixture();
         VerificationReport report = verify(fixture, fixture.tokenWithClaims(claims -> claims.put(claim(65533),
                         statusListClaim(1, new byte[] {(byte) 0xb9, (byte) 0xa3}))),
+                IndependentStatusListVerifier.StatusListOptions.strictMode());
+        assertProblems(report, Map.of(IndependentStatusListVerifier.CHECK_LIST, List.of("lstNotZlib")));
+    }
+
+    @Test
+    void aRawDeflateLstWithoutTheZlibWrapperIsRefused() {
+        Fixture fixture = new Fixture();
+        VerificationReport report = verify(fixture, fixture.tokenWithClaims(claims -> claims.put(claim(65533),
+                        statusListClaim(1, rawDeflate(STATUSES)))),
                 IndependentStatusListVerifier.StatusListOptions.strictMode());
         assertProblems(report, Map.of(IndependentStatusListVerifier.CHECK_LIST, List.of("lstNotZlib")));
     }
@@ -482,6 +600,77 @@ class IndependentStatusListVerifierTest {
         VerificationReport report = verify(fixture, fixture.token(), IndependentStatusListVerifier.StatusListOptions.strictMode());
         assertEquals(VerificationReport.State.PASS, report.check(IndependentStatusListVerifier.CHECK_SIGNER_PURPOSE).state());
         assertTrue(report.check(IndependentStatusListVerifier.CHECK_SIGNER_PURPOSE).message().contains("own Document Signer"));
+    }
+
+    // ---- the MSO reference and the combined gap set (review round 1) -----------------------------------------------
+
+    /**
+     * A present-but-malformed {@code status.status_list} must fail the sample instead of skipping the list: a wallet
+     * that cannot read {@code {uri, idx}} cannot fetch the list at all. Each malformed shape carries its own reason,
+     * and an absent status (or an unreadable MSO, which stays M-01's) is not malformed.
+     */
+    @Test
+    void everyMalformedMsoStatusListShapeIsMalformedWithItsReason() {
+        Fixture fixture = new Fixture();
+        record Case(String label, DataItem status, String reason) {}
+        List<Case> cases = List.of(
+                new Case("idx as text", statusWith(statusListMap(new Tstr(URI), new Tstr("3"))), "idx"),
+                new Case("idx negative", statusWith(statusListMap(new Tstr(URI), DataItemExtensionsKt.toDataItem(-1L))), "idx"),
+                new Case("idx missing", statusWith(statusListMap(new Tstr(URI), null)), "idx"),
+                new Case("uri missing", statusWith(statusListMap(null, DataItemExtensionsKt.toDataItem(3L))), "uri"),
+                new Case("uri as a bstr", statusWith(statusListMap(new Bstr(new byte[] {1}), DataItemExtensionsKt.toDataItem(3L))), "uri"),
+                new Case("status_list as an array", statusWith(new org.multipaz.cbor.CborArray(List.of(), false)), "status_list"),
+                new Case("status_list missing", new CborMap(new LinkedHashMap<>(), false), "status_list"),
+                new Case("status as text", new Tstr("status_list"), "status is"));
+        for (Case testCase : cases) {
+            MdocSamples.StatusListReference reference = MdocSamples.statusListReferenceOf(
+                    fixture.issuerSignedWithStatusItem(testCase.status()));
+            assertTrue(reference.isMalformed(), () -> testCase.label() + " must be malformed, was " + reference);
+            assertTrue(reference.malformed().orElseThrow().contains(testCase.reason()),
+                    () -> testCase.label() + " names " + testCase.reason() + ": " + reference.malformed().orElseThrow());
+            VerificationReport report = new VerificationReport(List.of(
+                    IndependentStatusListVerifier.mso(reference.malformed().orElse(null))));
+            assertEquals(List.of("malformed"), report.check(IndependentStatusListVerifier.CHECK_MSO).codes(),
+                    () -> testCase.label() + " must fail statusList.mso:malformed");
+        }
+
+        assertEquals(MdocSamples.StatusListReference.absent(),
+                MdocSamples.statusListReferenceOf(fixture.issuerSignedWithStatusItem(null)),
+                "a credential without status is absent, not malformed");
+        assertEquals(MdocSamples.StatusListReference.present(new MdocSamples.StatusListInfo(URI, 3)),
+                MdocSamples.statusListReferenceOf(fixture.issuerSignedWithStatus(URI, 3)),
+                "a well-formed reference is present, not malformed");
+        assertEquals(MdocSamples.StatusListReference.absent(),
+                MdocSamples.statusListReferenceOf("not a credential".getBytes(java.nio.charset.StandardCharsets.US_ASCII)),
+                "an unreadable IssuerAuth stays M-01's problem and is not this check's failure");
+    }
+
+    /**
+     * One sidecar, one combined report: the credential's checks and the status list's share {@code .gaps}, exactly both
+     * ways across both, so the sample can declare one {@code statusList.*} problem like any M-01 code.
+     */
+    @Test
+    void oneGapSetCoversTheCredentialAndItsStatusList() {
+        Fixture fixture = new Fixture();
+        VerificationReport listReport = verify(fixture, fixture.tokenWithClaims(
+                        claims -> claims.put(claim(2), new Tstr("https://issuer.example/other"))),
+                IndependentStatusListVerifier.StatusListOptions.strictMode());
+        assertEquals(List.of("subMismatch"), listReport.check(IndependentStatusListVerifier.CHECK_CLAIMS).codes());
+
+        List<VerificationReport.Check> checks = new ArrayList<>();
+        checks.add(VerificationReport.Check.pass(IndependentMdocVerifier.CHECK_SHAPE, "the credential is a bare IssuerSigned"));
+        checks.addAll(listReport.checks());
+        VerificationReport combined = new VerificationReport(checks);
+
+        AcceptedGaps declared = AcceptedGaps.none().gap(IndependentStatusListVerifier.CHECK_CLAIMS, "subMismatch",
+                "synthetic sample: the declared statusList gap is the only problem");
+        declared.assertMatches(combined, "a-synthetic-sample");
+        assertThrows(AssertionError.class, () -> AcceptedGaps.none().assertMatches(combined, "a-synthetic-sample"),
+                "an undeclared statusList problem fails the combined set");
+        AcceptedGaps declaredButNotReported = AcceptedGaps.none().gap(IndependentStatusListVerifier.CHECK_LIST, "missing",
+                "synthetic sample: declared but not reported");
+        assertThrows(AssertionError.class, () -> declaredButNotReported.assertMatches(combined, "a-synthetic-sample"),
+                "a declared statusList code that is not reported fails too");
     }
 
     // ---- helpers ---------------------------------------------------------------------------------------------------
@@ -566,6 +755,40 @@ class IndependentStatusListVerifierTest {
         Map<DataItem, DataItem> map = new LinkedHashMap<>();
         map.put(new Tstr("bits"), DataItemExtensionsKt.toDataItem(bits));
         map.put(new Tstr("lst"), new Bstr(lst));
+        return new CborMap(map, false);
+    }
+
+    /** DEFLATE without the zlib wrapper (RFC 1951), the shape TSL 4.3 does not define for {@code lst}. */
+    private static byte[] rawDeflate(byte[] bytes) {
+        Deflater deflater = new Deflater(Deflater.BEST_COMPRESSION, true);
+        try {
+            deflater.setInput(bytes);
+            deflater.finish();
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buffer = new byte[256];
+            while (!deflater.finished()) {
+                out.write(buffer, 0, deflater.deflate(buffer));
+            }
+            return out.toByteArray();
+        } finally {
+            deflater.end();
+        }
+    }
+
+    private static DataItem statusWith(DataItem statusListValue) {
+        Map<DataItem, DataItem> status = new LinkedHashMap<>();
+        status.put(new Tstr("status_list"), statusListValue);
+        return new CborMap(status, false);
+    }
+
+    private static DataItem statusListMap(DataItem uri, DataItem idx) {
+        Map<DataItem, DataItem> map = new LinkedHashMap<>();
+        if (uri != null) {
+            map.put(new Tstr("uri"), uri);
+        }
+        if (idx != null) {
+            map.put(new Tstr("idx"), idx);
+        }
         return new CborMap(map, false);
     }
 
@@ -697,15 +920,17 @@ class IndependentStatusListVerifierTest {
          * status-list verifier, and not a credential M-01 would accept (its MSO has no namespaces of its own).
          */
         byte[] issuerSignedWithStatus(String uri, long idx) {
-            Map<DataItem, DataItem> statusList = new LinkedHashMap<>();
-            statusList.put(new Tstr("uri"), new Tstr(uri));
-            statusList.put(new Tstr("idx"), DataItemExtensionsKt.toDataItem(idx));
-            Map<DataItem, DataItem> status = new LinkedHashMap<>();
-            status.put(new Tstr("status_list"), new CborMap(statusList, false));
+            return issuerSignedWithStatusItem(statusWith(statusListMap(new Tstr(uri), DataItemExtensionsKt.toDataItem(idx))));
+        }
+
+        /** The same credential with {@code status} set to {@code statusItem}, or without a status key when null. */
+        byte[] issuerSignedWithStatusItem(DataItem statusItem) {
             Map<DataItem, DataItem> mso = new LinkedHashMap<>();
             mso.put(new Tstr("version"), new Tstr("1.0"));
             mso.put(new Tstr("docType"), new Tstr("org.iso.18013.5.1.mDL"));
-            mso.put(new Tstr("status"), new CborMap(status, false));
+            if (statusItem != null) {
+                mso.put(new Tstr("status"), statusItem);
+            }
             byte[] msoBytes = Cbor.INSTANCE.encode(new CborMap(mso, false));
             byte[] payload = Cbor.INSTANCE.encode(new Tagged(24L, new Bstr(msoBytes)));
             Map<CoseLabel, DataItem> unprotected = new LinkedHashMap<>();
@@ -724,6 +949,12 @@ class IndependentStatusListVerifierTest {
             return issuedUnder(iaca, iacaKey, commonName, serial, eku, digitalSignature, subjectKey);
         }
 
+        /** The same, with its own validity window (the Annex B 457-day cap, an expired signer). */
+        X509Cert issuedValid(EcPrivateKey subjectKey, String commonName, long serial, List<String> eku,
+                             boolean digitalSignature, Instant validFrom, Instant validUntil) {
+            return issuedUnder(iaca, iacaKey, commonName, serial, eku, digitalSignature, subjectKey, validFrom, validUntil);
+        }
+
         X509Cert issuedUnder(X509Cert anchor, EcPrivateKey anchorKey, String commonName, long serial, List<String> eku,
                              boolean digitalSignature) {
             return issuedUnder(anchor, anchorKey, commonName, serial, eku, digitalSignature, statusKey);
@@ -731,10 +962,15 @@ class IndependentStatusListVerifierTest {
 
         X509Cert issuedUnder(X509Cert anchor, EcPrivateKey anchorKey, String commonName, long serial, List<String> eku,
                              boolean digitalSignature, EcPrivateKey subjectKey) {
+            return issuedUnder(anchor, anchorKey, commonName, serial, eku, digitalSignature, subjectKey, notBefore, notAfter);
+        }
+
+        X509Cert issuedUnder(X509Cert anchor, EcPrivateKey anchorKey, String commonName, long serial, List<String> eku,
+                             boolean digitalSignature, EcPrivateKey subjectKey, Instant validFrom, Instant validUntil) {
             org.multipaz.crypto.X509Cert.Builder builder = new org.multipaz.crypto.X509Cert.Builder(subjectKey.getPublicKey(),
                     certified(anchor, anchorKey), new ASN1Integer(serial, 2),
                     X500Name.Companion.fromName("CN=" + commonName + ",C=IN"), anchor.getSubject(),
-                    kotlinInstant(notBefore), kotlinInstant(notAfter))
+                    kotlinInstant(validFrom), kotlinInstant(validUntil))
                     .includeSubjectKeyIdentifier(true)
                     .setAuthorityKeyIdentifierToCertificate(anchor);
             if (digitalSignature) {

@@ -21,13 +21,19 @@ import java.util.regex.Pattern;
  * that list: a reported problem whose code is not declared fails, and a declared code the check no longer reports fails
  * too ("gap no longer present, remove it"), so the fix that closes a gap has to delete its line in the same change.
  *
+ * <p>One sidecar serves one <b>combined</b> report per sample: the credential's own checks
+ * ({@link IndependentMdocVerifier#PROBLEM_CODES}) and, when its MSO carries
+ * {@code status.status_list}, the status list's checks ({@link IndependentStatusListVerifier#PROBLEM_CODES},
+ * {@code statusList.*} and {@code statusList.mso}). The two registries name disjoint checks, so a line has exactly one
+ * owner, and the exact both ways rule holds across both reports at once (M-11b review round 1).
+ *
  * <p>Format, one gap per line, {@code #} comments and blank lines ignored, the reason mandatory:
  * <pre>
  * mso.validityInfo.tdateTags:fractionalSeconds:signed # G1: tdate carries milliseconds; fixed by M-02
  * mdl.elementTypes:missing:given_name # G3: no mandatory-element check; M-03
  * </pre>
- * Check names and codes are those of {@link IndependentMdocVerifier#PROBLEM_CODES}; anything else is refused, and so
- * is a bare check name. There is no optional marker: a gap is declared exactly when the sample has it, so a producer
+ * Check names and codes are those of {@link IndependentMdocVerifier#PROBLEM_CODES} or
+ * {@link IndependentStatusListVerifier#PROBLEM_CODES}; anything else is refused, and so is a bare check name. There is no optional marker: a gap is declared exactly when the sample has it, so a producer
  * whose output varies from run to run (a keymanager serial is negative in about half the runs, G27) decides from the
  * bytes it wrote.
  */
@@ -37,13 +43,14 @@ public final class AcceptedGaps {
     public record Gap(String check, String code, String reason) {
 
         public Gap {
-            if (!IndependentMdocVerifier.PROBLEM_CODES.containsKey(check)) {
-                throw new IllegalArgumentException("unknown check " + check + "; the verifier runs "
-                        + IndependentMdocVerifier.CHECKS);
+            Map<String, List<String>> registry = registryOf(check);
+            if (registry == null) {
+                throw new IllegalArgumentException("unknown check " + check + "; the verifiers run "
+                        + IndependentMdocVerifier.CHECKS + " and " + IndependentStatusListVerifier.CHECKS);
             }
-            if (!IndependentMdocVerifier.isProblemCode(check, code)) {
+            if (!knownProblemCode(check, code)) {
                 throw new IllegalArgumentException("unknown problem code " + check + ":" + code + "; " + check
-                        + " reports " + IndependentMdocVerifier.PROBLEM_CODES.get(check));
+                        + " reports " + registry.get(check));
             }
             if (reason == null || reason.isBlank()) {
                 throw new IllegalArgumentException("the gap " + check + ":" + code + " needs a reason");
@@ -101,6 +108,19 @@ public final class AcceptedGaps {
         return new AcceptedGaps(copy);
     }
 
+    /** The registry that owns {@code check}, or null when neither verifier reports it. */
+    private static Map<String, List<String>> registryOf(String check) {
+        if (IndependentMdocVerifier.PROBLEM_CODES.containsKey(check)) {
+            return IndependentMdocVerifier.PROBLEM_CODES;
+        }
+        return IndependentStatusListVerifier.PROBLEM_CODES.get(check) == null ? null
+                : IndependentStatusListVerifier.PROBLEM_CODES;
+    }
+
+    private static boolean knownProblemCode(String check, String code) {
+        return IndependentMdocVerifier.isProblemCode(check, code) || IndependentStatusListVerifier.isProblemCode(check, code);
+    }
+
     /** The gaps by {@code check:code}. */
     public Map<String, Gap> gaps() {
         return gaps;
@@ -137,7 +157,8 @@ public final class AcceptedGaps {
     public String format(String sample) {
         StringBuilder out = new StringBuilder()
                 .append("# Accepted gaps of the mDoc sample ").append(sample).append(" (docs/design/20-mdl-issuer.md M-01).\n")
-                .append("# One problem per line, \"<check>:<code> # <reason>\" (IndependentMdocVerifier.PROBLEM_CODES).\n")
+                .append("# One problem per line, \"<check>:<code> # <reason>\" (IndependentMdocVerifier and\n")
+                .append("# IndependentStatusListVerifier PROBLEM_CODES: the credential and its status list share this file).\n")
                 .append("# certify-conformance-mdoc fails on a reported problem not listed here and on a listed one no longer reported.\n");
         gaps.values().forEach(gap -> out.append(gap.line()).append('\n'));
         return out.toString();

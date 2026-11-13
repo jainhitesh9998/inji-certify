@@ -41,6 +41,7 @@ class ProblemCodeRegistryTest {
     @Test
     void theStatusListVerifierListsTheM11bTable() {
         Map<String, List<String>> expected = new LinkedHashMap<>();
+        expected.put("statusList.mso", List.of("malformed"));
         expected.put("statusList.http", List.of("contentType"));
         expected.put("statusList.envelope", List.of("notTagged18", "cwtTag61", "mac0", "detachedPayload"));
         expected.put("statusList.typ", List.of("missing", "unprotected", "notText", "wrong"));
@@ -48,15 +49,20 @@ class ProblemCodeRegistryTest {
         expected.put("statusList.signature", List.of("invalid:multipaz", "invalid:authlete"));
         expected.put("statusList.chain", List.of("untrusted", "noAnchorSupplied"));
         expected.put("statusList.issuanceChain", List.of("differs"));
-        expected.put("statusList.claims", List.of("subMismatch", "iatMissing", "iatFuture", "expMissing", "expired",
-                "expAfterSigner", "ttlInvalid"));
-        expected.put("statusList.list", List.of("bitsNotOne", "lstNotZlib", "idxOutOfRange", "statusMismatch:*"));
+        expected.put("statusList.claims", List.of("subMismatch", "iatMissing", "iatFuture", "iatAfterExp", "expMissing",
+                "expired", "expAfterSigner", "ttlInvalid"));
+        expected.put("statusList.list", List.of("missing", "bitsNotOne", "lstNotZlib", "idxOutOfRange",
+                "statusMismatch:*"));
         expected.put("statusList.signerPurpose", List.of("ekuMissing", "kuMissing"));
 
         assertEquals(expected, IndependentStatusListVerifier.PROBLEM_CODES,
                 "IndependentStatusListVerifier.PROBLEM_CODES must be the M-11b table");
         assertEquals(List.copyOf(expected.keySet()), IndependentStatusListVerifier.CHECKS,
                 "CHECKS lists the status-list checks in the same report order as PROBLEM_CODES");
+        assertEquals(IndependentStatusListVerifier.CHECKS.get(0), "statusList.mso",
+                "the MSO's own reference is checked before the token it points at");
+        assertEquals(IndependentStatusListVerifier.CHECKS.subList(1, IndependentStatusListVerifier.CHECKS.size()),
+                IndependentStatusListVerifier.TOKEN_CHECKS, "verify() runs TOKEN_CHECKS, mso() runs statusList.mso");
         assertTrue(IndependentStatusListVerifier.CHECKS.stream().noneMatch(IndependentMdocVerifier.CHECKS::contains),
                 "the two registries name disjoint checks, so a .gaps line always has exactly one owner");
         assertTrue(IndependentStatusListVerifier.isProblemCode("statusList.list", "statusMismatch:1"));

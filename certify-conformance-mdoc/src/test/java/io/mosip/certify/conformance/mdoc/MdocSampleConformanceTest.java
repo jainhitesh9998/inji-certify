@@ -113,49 +113,61 @@ class MdocSampleConformanceTest {
         MdocSamples.Sample sample = MdocSamples.read(found.mdoc());
         // the bytes as the wallet received them: a draft-13 Document is the verifier's credential.shape problem, and
         // its docType is held to the MSO's by mso.docType, so neither is decided here
-        VerificationReport report = new IndependentMdocVerifier().verify(sample.received(), sample.holder(),
+        VerificationReport mdocReport = new IndependentMdocVerifier().verify(sample.received(), sample.holder(),
                 sample.iaca(), Instant.now(), Options.strict(sample.docType()));
-        assertEquals(IndependentMdocVerifier.CHECKS, report.checks().stream().map(VerificationReport.Check::name).toList(),
+        assertEquals(IndependentMdocVerifier.CHECKS,
+                mdocReport.checks().stream().map(VerificationReport.Check::name).toList(),
                 found.id() + ": the verifier did not run every check");
-        assertFalse(report.check(IndependentMdocVerifier.CHECK_SIGNATURE_MULTIPAZ).message().isBlank());
+        assertFalse(mdocReport.check(IndependentMdocVerifier.CHECK_SIGNATURE_MULTIPAZ).message().isBlank());
+        // M-11b: one combined report per sample, one combined gap set. The MSO's status_list is checked even when the
+        // sample records no list, so a present-but-malformed reference fails instead of being skipped.
+        List<VerificationReport.Check> checks = new ArrayList<>(mdocReport.checks());
+        checks.addAll(statusList(found, sample));
+        VerificationReport report = new VerificationReport(checks);
         sample.gaps().assertMatches(report, found.id());
-        verifyStatusList(found, sample);
         System.out.println("[mdoc-conformance] " + found.id() + " accepted " + report.checks().stream()
                 .flatMap(check -> check.codes().stream().map(code -> check.name() + ":" + code)).toList() + "; " + report);
     }
 
     /**
-     * M-11b: when the MSO carries {@code status.status_list}, the sample's status list is verified against the mDL it
-     * belongs to — the IACA the credential chains to (ISO/IEC 18013-5 second edition 12.3.6.2) and the IssuerAuth
-     * {@code x5chain} it must equal (Credo's rule, Paradym's configuration).
+     * M-11b: the sample's status list, verified against the mDL it belongs to — the IACA the credential chains to
+     * (ISO/IEC 18013-5 second edition 12.3.6.2) and the IssuerAuth {@code x5chain} it must equal (Credo's rule,
+     * Paradym's configuration) — and, first, the MSO reference that points at it.
      *
-     * <p>Held to the {@code .gaps} the way M-01 holds a credential: a problem the sample declares as a gap would be
-     * accepted, but no sidecar can name a {@code statusList.*} code yet, so a list must pass every check. That is the
-     * exact form of "exactly its codes" while no producer records a list (M-11b); M-11e's samples pass with no
-     * {@code statusList.*} gap, and M-11h extends the sidecar when the dedicated signer needs one.
+     * <p>The returned checks join the credential's in one report, so the sample's single {@code .gaps} sidecar holds the
+     * combined result to its declared problems exactly both ways ({@code AcceptedGaps}). A malformed
+     * {@code status.status_list} is {@code statusList.mso:malformed}: it fails here unless the sample declares that
+     * gap, never silently skips the list.
      */
-    static void verifyStatusList(Found found, MdocSamples.Sample sample) {
-        boolean list = sample.statusList().isPresent();
-        boolean info = sample.statusListInfo().isPresent();
-        if (!list && !info) {
-            return;
+    static List<VerificationReport.Check> statusList(Found found, MdocSamples.Sample sample) {
+        String malformed = sample.statusListMalformed().orElse(null);
+        Optional<MdocSamples.StatusListInfo> info = sample.statusListInfo();
+        if (info.isEmpty()) {
+            if (sample.statusList().isPresent() && malformed == null) {
+                fail(found.id() + ": the sample records " + MdocSamples.STATUSLIST_CWT + " but its MSO carries no "
+                        + "status.status_list, so the list cannot be tied to the credential");
+            }
+            return List.of(IndependentStatusListVerifier.mso(malformed));
         }
-        assertTrue(info, found.id() + ": " + MdocSamples.STATUSLIST_CWT + " is recorded but the MSO carries no readable "
-                + "status.status_list {uri, idx}, so the list cannot be tied to the credential");
-        assertTrue(list, found.id() + ": the MSO carries status.status_list, so the producer must record the list it "
-                + "points at (" + MdocSamples.STATUSLIST_CWT + " and " + MdocSamples.STATUSLIST_CONTENT_TYPE + ")");
-        MdocSamples.StatusListInfo statusList = sample.statusListInfo().orElseThrow();
-        MdocSamples.StatusListToken token = sample.statusList().orElseThrow();
+        MdocSamples.StatusListInfo statusList = info.orElseThrow();
+        MdocSamples.StatusListToken token = sample.statusList().orElseThrow(() -> new AssertionError(found.id()
+                + ": the MSO carries status.status_list, so the producer must record the list it points at ("
+                + MdocSamples.STATUSLIST_CWT + " and " + MdocSamples.STATUSLIST_CONTENT_TYPE + ")"));
         VerificationReport listReport = IndependentStatusListVerifier.verify(token.body(), token.contentType(),
                 statusList.uri(), statusList.idx(), sample.issuerAuthX5chain(), sample.iaca().orElse(null), Instant.now(),
                 IndependentStatusListVerifier.StatusListOptions.strictMode());
-        assertEquals(IndependentStatusListVerifier.CHECKS,
+        assertEquals(IndependentStatusListVerifier.TOKEN_CHECKS,
                 listReport.checks().stream().map(VerificationReport.Check::name).toList(),
-                found.id() + ": the status-list verifier did not run every check");
-        assertEquals(List.of(), listReport.failures(),
-                () -> found.id() + ": the status list at idx " + statusList.idx() + " must pass every check: " + listReport);
+                found.id() + ": the status-list verifier did not run every token check");
+        List<VerificationReport.Check> combined = new ArrayList<>();
+        combined.add(IndependentStatusListVerifier.mso(malformed));
+        combined.addAll(listReport.checks());
+        assertEquals(IndependentStatusListVerifier.CHECKS,
+                combined.stream().map(VerificationReport.Check::name).toList(),
+                found.id() + ": the status-list side of the report must be " + IndependentStatusListVerifier.CHECKS);
         System.out.println("[mdoc-conformance] " + found.id() + " status list " + statusList.uri() + " idx "
-                + statusList.idx() + " passed every statusList.* check");
+                + statusList.idx() + " verified with " + listReport.failures().size() + " problem(s)");
+        return combined;
     }
 
     static List<Found> found(Optional<Instant> buildStart) {

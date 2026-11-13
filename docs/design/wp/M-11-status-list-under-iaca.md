@@ -531,36 +531,70 @@ token.
 ```java
 public static VerificationReport verify(byte[] body, String contentType, String uri, long idx,
         List<X509Certificate> issuerAuthX5chain, X509Certificate iaca /* nullable */, Instant at, StatusListOptions options)
-public record StatusListOptions(boolean strict, int expectedStatus /* 0 */, boolean requireIssuanceChain /* true */) {}
+public record StatusListOptions(boolean strict, int expectedStatus /* 0, or 1 for a revoked sample */,
+                                boolean requireIssuanceChain /* true */) {}
+public static VerificationReport.Check mso(String malformed /* null when absent or well formed */)
 ```
+
+`expectedStatus` is 0 or 1 only: ISO2 12.3.6.1 allows an mdoc no status besides revoked, and `bits` is 1 (12.3.6.5).
+
+`verify` runs `TOKEN_CHECKS` over the token; `mso` runs `statusList.mso` over the sample's own
+`status.status_list` reference (present, absent, or present-but-malformed). `CHECKS` is the two together, in report
+order. The conformance run puts the credential's checks and these in **one** report, matched against the sample's one
+`.gaps` sidecar (review round 1).
 
 Call Multipaz's `suspend` functions through the existing `IndependentMdocVerifier.await` pattern
 (`IndependentMdocVerifier.java:1524`).
+
+**Merge gate.** `statusList.chain` runs Multipaz's own `CompressedStatusList.fromCwt(cwt, iaca, {SUB: uri}, at)` —
+the reader `CachingRevocationChecker` uses, and the gate §4.9 names — not a reimplementation of its rules. Kotlin
+mangles the method name because `maxValidity: Duration` is a value class (`fromCwt-myKFqkg`), so the synthetic
+`$default` bridge is called through one reflective adapter that passes mask 16 (keeping Multipaz's 365-day
+`maxValidity`) and fails loudly if a Multipaz upgrade changes the signature. Its refusal is `statusList.chain:untrusted`
+per the table, but only when no more specific check (envelope, `typ`, signature, claims, list) already failed, so one
+mutation still fires one code; the direct `trustedRootCertificateChainValidator` call stays as the trust decision on its
+own, so a `fromCwt` refusal caused by a claim does not also fail the chain and a genuine chain failure is reported even
+when a claim is wrong. This is what refuses an `exp` more than 365 days after `at` on a DSC valid for the Annex B 457
+days.
 
 **Checks and problem codes** (registered beside `IndependentMdocVerifier.PROBLEM_CODES`; a failed check carries
 **every** problem it found):
 
 | Check | Codes | Clause |
 | --- | --- | --- |
+| `statusList.mso` | `malformed` (the MSO's `status.status_list` is present but not `{uri: tstr, idx: uint}`: missing/typed `uri`, missing/negative/text `idx`, `status_list` not a map) | ISO2 12.3.6 |
 | `statusList.http` | `contentType` (not `application/statuslist+cwt`, parameters ignored) | TSL §8.2 |
-| `statusList.envelope` | `notTagged18`, `cwtTag61`, `mac0`, `detachedPayload` | TSL §5.2, RFC 9052 §4.2 |
+| `statusList.envelope` | `notTagged18` (untagged, a tag other than 17/18/61, or any tag stack other than exactly `[18]` — `18(18(…))` and the self-describe `55799(18(…))` included), `cwtTag61`, `mac0`, `detachedPayload` | TSL §5.2, RFC 9052 §4.2; RFC 8949 §3.4.6; `@owf/cose` 0.6.0 |
 | `statusList.typ` | `missing`, `unprotected`, `notText`, `wrong` | TSL §5.2 |
 | `statusList.x5chain` | `missing`, `unprotectedOnly`, `carriesAnchor` (any self-signed certificate), `serialNumber` (≤ 0 or > 20 octets) | ISO2 12.3.6.3; HAIP §6.1 analogue; RFC 5280 §4.1.2.2 |
 | `statusList.signature` | `invalid:multipaz`, `invalid:authlete` | TSL §5.2 rule 2 |
 | `statusList.chain` | `untrusted` (Multipaz `fromCwt` against `iaca` refuses), `noAnchorSupplied` | ISO2 12.3.6.2 |
 | `statusList.issuanceChain` | `differs` (the token `x5chain` is not certificate-for-certificate equal to `issuerAuthX5chain`) | Credo `mdocUtil.ts:76-115` |
-| `statusList.claims` | `subMismatch`, `iatMissing`, `iatFuture` (> `at` + 60 s), `expMissing`, `expired`, `expAfterSigner` (exp > leaf `notAfter`), `ttlInvalid` | TSL §5.2, §8.3 4a/4c; ISO2 12.3.6.3 |
-| `statusList.list` | `bitsNotOne`, `lstNotZlib`, `idxOutOfRange`, `statusMismatch:<n>` | ISO2 12.3.6.5; TSL §4.1, §8.3 step 6 |
+| `statusList.claims` | `subMismatch`, `iatMissing`, `iatFuture` (> `at` + 5 s, Multipaz `validateCwt`'s own clock allowance), `iatAfterExp`, `expMissing`, `expired`, `expAfterSigner` (exp > leaf `notAfter`), `ttlInvalid` | TSL §5.2, §8.3 4a/4c; ISO2 12.3.6.3 |
+| `statusList.list` | `missing` (no `status_list` claim, or not a map), `bitsNotOne`, `lstNotZlib` (including raw DEFLATE without the zlib wrapper), `idxOutOfRange`, `statusMismatch:<n>` (read with Multipaz's `StatusList.get`) | ISO2 12.3.6.5; TSL §4.3, §4.1, §8.3 step 6 |
 | `statusList.signerPurpose` | `ekuMissing`, `kuMissing`: only when the token leaf's public key differs from the IssuerAuth leaf's | Credo `assertStatusListSignerKeyPurpose.ts:14-25` with `requireStatusSigningKeyPurpose` |
 
 **Samples.**
 
 - A producer writes `<sample>.statuslist.cwt` (the response body as received) and `<sample>.statuslist.ct` (the
   `Content-Type`) beside `<sample>.mdoc`.
-- `MdocSampleConformanceTest`: when the MSO carries `status.status_list`, both sidecars are required (failing with
-  `CI` set, reported locally). The list is verified with `iaca` = the sample's `.iaca.pem` (when present) and
-  `issuerAuthX5chain` = the sample's IssuerAuth `x5chain`, and held to the sample's `.gaps` exactly like M-01.
-- No producer writes these sidecars yet (M-11e does).
+- `MdocSamples` reads three outcomes of the MSO's `status.status_list`: absent, `{uri: tstr, idx: uint}`, or
+  present-but-malformed with the reason (an unreadable IssuerAuth or MSO answers absent, which is M-01's check).
+- `MdocSampleConformanceTest`: the credential's checks and the status list's join one report, held to the sample's one
+  `.gaps` sidecar exactly both ways like M-01 — a declared `statusList.*` line covers its problem, an undeclared one
+  fails, a declared one no longer reported fails ("gap no longer present"). When the MSO carries a well-formed
+  `status.status_list`, both sidecars are required and the list is verified with `iaca` = the sample's `.iaca.pem`
+  (when present) and `issuerAuthX5chain` = the sample's IssuerAuth `x5chain`; a present-but-malformed reference fails as
+  `statusList.mso:malformed` instead of being skipped.
+- No producer writes these sidecars yet (M-11e does; its samples must pass with no `statusList.*` gap).
+
+**Review round 1 (2026-11-13).** Fixed here: `fromCwt` is actually run (the major above); the malformed-MSO skip
+became `statusList.mso:malformed`; the gap set is one per sample across both reports; the whole tag stack is recorded
+and only exactly `[18]` is accepted (`55799` refused, as `@owf/cose` 0.6.0's `Cwt.decodeCoseStructure` refuses
+anything that is not the `Sign1`/`Mac0` tag itself; RFC 8949 §3.4.6 only permits, does not require, tolerance);
+`iatFuture` aligned to Multipaz's 5 s; `iatAfterExp`, `statusList.list:missing` and `statusList.mso:malformed` added;
+`expectedStatus` restricted to 0/1; the bit at `idx` read with Multipaz's `StatusList`. **Open, not in this round:** an
+algorithm allow-list (isomdl accepts only ES256/ES384) — owner decision later.
 
 **Acceptance checklist.**
 
@@ -576,7 +610,11 @@ Call Multipaz's `suspend` functions through the existing `IndependentMdocVerifie
 - a token signed by a key whose certificate chains to a different IACA (`statusList.chain:untrusted`);
 - a token with the right signer but `x5chain` only in the unprotected header (`statusList.x5chain:unprotectedOnly`);
 - a JWT body with `Content-Type` `application/statuslist+jwt` (`statusList.http:contentType`, and the envelope check
-  reports that it is not CBOR).
+  reports that it is not CBOR);
+- a DSC valid for the Annex B 457 days with `exp` 400 days out (`statusList.chain:untrusted`: `fromCwt`'s
+  `maxValidity`);
+- `18(18(…))` and `55799(18(…))` (`statusList.envelope:notTagged18`);
+- every malformed `status.status_list` shape (`statusList.mso:malformed`).
 
 ### M-11c CWT codec, signer pinning, signer policy (certify-service, certify-issuance)
 

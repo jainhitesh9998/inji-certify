@@ -28,9 +28,14 @@ import org.multipaz.crypto.Algorithm;
 import org.multipaz.crypto.X509Cert;
 import org.multipaz.crypto.X509CertChain;
 import org.multipaz.crypto.X509CertChainJvmKt;
+import org.multipaz.revocation.CompressedStatusList;
+import org.multipaz.revocation.StatusList;
 import org.multipaz.util.CompressionKt;
 import org.multipaz.webtoken.ValidateJwtKt;
+import org.multipaz.webtoken.WebTokenCheck;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.math.BigInteger;
 import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
@@ -50,12 +55,15 @@ import java.util.regex.Pattern;
  * ISO/IEC 18013-5 second edition 12.3.6 (M-11b in {@code docs/design/wp/M-11-status-list-under-iaca.md}).
  *
  * <p>It applies the rules to the bytes a wallet downloads, with libraries Certify does not maintain: OpenWallet
- * Foundation <b>Multipaz</b> parses the CBOR, decides the certificate chain's trust against the IACA (the same
- * {@code trustedRootCertificateChainValidator} that {@code CompressedStatusList.fromCwt} uses) and checks the
- * COSE_Sign1 signature; <b>Authlete CBOR</b> parses and verifies the same COSE_Sign1 as a second oracle; the JDK's
- * X.509 API reads the signer's EKU and key usage. {@code @owf/mdoc} 0.9.1 (Paradym) and Credo's
+ * Foundation <b>Multipaz</b> parses the CBOR, checks the COSE_Sign1 signature, runs its own
+ * {@code CompressedStatusList.fromCwt} (typ, sub, exp, maxValidity and the chain to the IACA, exactly as
+ * {@code CachingRevocationChecker} calls it) and decides the chain's trust independently with
+ * {@code trustedRootCertificateChainValidator}; <b>Authlete CBOR</b> parses and verifies the same COSE_Sign1 as a second
+ * oracle; the JDK's X.509 API reads the signer's EKU and key usage. {@code @owf/mdoc} 0.9.1 (Paradym) and Credo's
  * {@code assertMdocStatusListChainsMatchIssuanceChain} are emulated, not imported: the list's {@code x5chain} must be
- * certificate-for-certificate equal to the mDL's IssuerAuth {@code x5chain}.
+ * certificate-for-certificate equal to the mDL's IssuerAuth {@code x5chain}, and the CBOR envelope must be exactly one
+ * tag, 18 — {@code @owf/cose} 0.6.0 refuses any other tag stack including the self-describe tag 55799 (M-11b review
+ * round 1).
  *
  * <p>Each rule is a named check in a {@link VerificationReport}; a failed check carries <b>every</b> problem it found,
  * each under a stable code from {@link #PROBLEM_CODES}. The codes are the ones
@@ -65,6 +73,8 @@ import java.util.regex.Pattern;
  * <table>
  *   <caption>Checks and clauses</caption>
  *   <tr><th>Check</th><th>Clause</th></tr>
+ *   <tr><td>{@code statusList.mso}</td><td>ISO/IEC 18013-5 second edition 12.3.6 (the MSO {@code status.status_list}
+ *       {uri: tstr, idx: uint} that points at the list)</td></tr>
  *   <tr><td>{@code statusList.http}</td><td>TSL 8.2 (content type)</td></tr>
  *   <tr><td>{@code statusList.envelope}</td><td>TSL 5.2, RFC 9052 4.2 (tag 18, never CWT tag 61; no MAC0; no
  *       detached payload)</td></tr>
@@ -97,6 +107,8 @@ public final class IndependentStatusListVerifier {
     /** ISO/IEC 18013-5 Annex B: the mDL Document Signer EKU. */
     public static final String DOCUMENT_SIGNER_EKU = "1.0.18013.5.1.2";
 
+    /** The MSO's own {@code status.status_list}, before any token is fetched: present, absent, or malformed. */
+    public static final String CHECK_MSO = "statusList.mso";
     public static final String CHECK_HTTP = "statusList.http";
     public static final String CHECK_ENVELOPE = "statusList.envelope";
     public static final String CHECK_TYP = "statusList.typ";
@@ -108,8 +120,12 @@ public final class IndependentStatusListVerifier {
     public static final String CHECK_LIST = "statusList.list";
     public static final String CHECK_SIGNER_PURPOSE = "statusList.signerPurpose";
 
-    /** Every check, in report order. */
-    public static final List<String> CHECKS = List.of(CHECK_HTTP, CHECK_ENVELOPE, CHECK_TYP, CHECK_X5CHAIN,
+    /** Every check this class can report, in report order: the MSO's reference first, then the token's checks. */
+    public static final List<String> CHECKS = List.of(CHECK_MSO, CHECK_HTTP, CHECK_ENVELOPE, CHECK_TYP, CHECK_X5CHAIN,
+            CHECK_SIGNATURE, CHECK_CHAIN, CHECK_ISSUANCE_CHAIN, CHECK_CLAIMS, CHECK_LIST, CHECK_SIGNER_PURPOSE);
+
+    /** The checks {@link #verify} runs on a token; {@link #mso} runs {@link #CHECK_MSO} beside them. */
+    public static final List<String> TOKEN_CHECKS = List.of(CHECK_HTTP, CHECK_ENVELOPE, CHECK_TYP, CHECK_X5CHAIN,
             CHECK_SIGNATURE, CHECK_CHAIN, CHECK_ISSUANCE_CHAIN, CHECK_CLAIMS, CHECK_LIST, CHECK_SIGNER_PURPOSE);
 
     /**
@@ -137,14 +153,19 @@ public final class IndependentStatusListVerifier {
     static final long TAG_COSE_SIGN1 = 18;
     static final long TAG_CWT = 61;
     static final long TAG_COSE_MAC0 = 17;
-    /** TSL 8.3: an {@code iat} in the future by more than a minute is not a fresh list. */
-    static final long IAT_FUTURE_SKEW_SECONDS = 60;
+    /**
+     * The clock allowance for {@code iat}, the same five seconds Multipaz's {@code validateCwt} uses
+     * ("Allow no more than 5 seconds clock mismatch"), so this verifier and the wallet stack agree on when a list is
+     * "not yet issued".
+     */
+    static final long IAT_FUTURE_SKEW_SECONDS = 5;
     static final int MAX_SERIAL_OCTETS = 20;
 
     private static final Pattern CODE = Pattern.compile("([A-Za-z][A-Za-z0-9]*)(?::([A-Za-z0-9_./-]+))?");
 
     private static Map<String, List<String>> problemCodes() {
         Map<String, List<String>> codes = new LinkedHashMap<>();
+        codes.put(CHECK_MSO, List.of("malformed"));
         codes.put(CHECK_HTTP, List.of("contentType"));
         codes.put(CHECK_ENVELOPE, List.of("notTagged18", "cwtTag61", "mac0", "detachedPayload"));
         codes.put(CHECK_TYP, List.of("missing", "unprotected", "notText", "wrong"));
@@ -152,9 +173,9 @@ public final class IndependentStatusListVerifier {
         codes.put(CHECK_SIGNATURE, List.of("invalid:multipaz", "invalid:authlete"));
         codes.put(CHECK_CHAIN, List.of("untrusted", "noAnchorSupplied"));
         codes.put(CHECK_ISSUANCE_CHAIN, List.of("differs"));
-        codes.put(CHECK_CLAIMS, List.of("subMismatch", "iatMissing", "iatFuture", "expMissing", "expired",
+        codes.put(CHECK_CLAIMS, List.of("subMismatch", "iatMissing", "iatFuture", "iatAfterExp", "expMissing", "expired",
                 "expAfterSigner", "ttlInvalid"));
-        codes.put(CHECK_LIST, List.of("bitsNotOne", "lstNotZlib", "idxOutOfRange", "statusMismatch:*"));
+        codes.put(CHECK_LIST, List.of("missing", "bitsNotOne", "lstNotZlib", "idxOutOfRange", "statusMismatch:*"));
         codes.put(CHECK_SIGNER_PURPOSE, List.of("ekuMissing", "kuMissing"));
         if (!List.copyOf(codes.keySet()).equals(CHECKS)) {
             throw new IllegalStateException("PROBLEM_CODES must list every check in report order");
@@ -177,16 +198,20 @@ public final class IndependentStatusListVerifier {
      *
      * @param strict              the list is a production sample: a check that cannot run because an input is missing
      *                            ({@code statusList.chain} without an IACA) fails instead of being skipped
-     * @param expectedStatus      the status the list must report at {@code idx}: {@code 0} VALID for a live mDL,
-     *                            {@code 1} INVALID for a revoked one (TSL 7.1)
+     * @param expectedStatus      the status the list must report at {@code idx}: {@code 0} VALID for a live mDL or
+     *                            {@code 1} INVALID for a revoked one. ISO/IEC 18013-5 second edition 12.3.6.1 allows
+     *                            "no other status besides 'revoked'", and {@code bits} is 1 (12.3.6.5), so 2
+     *                            SUSPENDED and 3 are refused as expectations
      * @param requireIssuanceChain the token's {@code x5chain} must equal the mDL's IssuerAuth {@code x5chain} (Credo's
      *                            rule, the default signer of D-M11-1); {@code false} for a dedicated status signer
      */
     public record StatusListOptions(boolean strict, int expectedStatus, boolean requireIssuanceChain) {
 
         public StatusListOptions {
-            if (expectedStatus < 0 || expectedStatus > 3) {
-                throw new IllegalArgumentException("expectedStatus must be 0, 1, 2 or 3 (TSL 7.1), is " + expectedStatus);
+            if (expectedStatus != 0 && expectedStatus != 1) {
+                throw new IllegalArgumentException("expectedStatus must be 0 (VALID) or 1 (INVALID): ISO/IEC 18013-5 "
+                        + "second edition 12.3.6.1 allows no mdoc status besides revoked, and 12.3.6.5 makes bits 1; is "
+                        + expectedStatus);
             }
         }
 
@@ -211,23 +236,52 @@ public final class IndependentStatusListVerifier {
     public static VerificationReport verify(byte[] body, String contentType, String uri, long idx,
                                             List<X509Certificate> issuerAuthX5chain, X509Certificate iaca, Instant at,
                                             StatusListOptions options) {
-        if (body == null || at == null || options == null) {
-            throw new IllegalArgumentException("body, at and options are required");
+        if (body == null || uri == null || at == null || options == null) {
+            throw new IllegalArgumentException("body, uri, at and options are required");
         }
         Token token = Token.parse(body);
         List<X509Certificate> issuanceChain = issuerAuthX5chain == null ? List.of() : List.copyOf(issuerAuthX5chain);
+        // The chain check reports fromCwt's refusal as "untrusted" only when no more specific check already failed, so
+        // one mutation still fires one code: compute those checks first, then the chain, and keep the report order.
+        VerificationReport.Check envelope = run(CHECK_ENVELOPE, token::envelope);
+        VerificationReport.Check typ = run(CHECK_TYP, token::typ);
+        VerificationReport.Check signature = run(CHECK_SIGNATURE, token::signature);
+        VerificationReport.Check claims = run(CHECK_CLAIMS, problems -> token.claims(problems, uri, at));
+        VerificationReport.Check list = run(CHECK_LIST, problems -> token.list(problems, idx, options.expectedStatus()));
+        // fromCwt also requires a status_list claim, so a list failure must not be charged to the chain twice
+        boolean specificsPassed = envelope.passed() && typ.passed() && signature.passed() && claims.passed()
+                && list.passed();
         List<VerificationReport.Check> checks = new ArrayList<>();
         checks.add(run(CHECK_HTTP, problems -> http(problems, contentType)));
-        checks.add(run(CHECK_ENVELOPE, token::envelope));
-        checks.add(run(CHECK_TYP, token::typ));
+        checks.add(envelope);
+        checks.add(typ);
         checks.add(run(CHECK_X5CHAIN, token::x5chain));
-        checks.add(run(CHECK_SIGNATURE, token::signature));
-        checks.add(run(CHECK_CHAIN, problems -> token.chain(problems, iaca, at, options)));
+        checks.add(signature);
+        checks.add(run(CHECK_CHAIN, problems -> token.chain(problems, iaca, at, uri, options, specificsPassed)));
         checks.add(run(CHECK_ISSUANCE_CHAIN, problems -> token.issuanceChain(problems, issuanceChain, options)));
-        checks.add(run(CHECK_CLAIMS, problems -> token.claims(problems, uri, at)));
-        checks.add(run(CHECK_LIST, problems -> token.list(problems, idx, options.expectedStatus())));
+        checks.add(claims);
+        checks.add(list);
         checks.add(run(CHECK_SIGNER_PURPOSE, problems -> token.signerPurpose(problems, issuanceChain)));
         return new VerificationReport(checks);
+    }
+
+    /**
+     * The sample-side check of the MSO's {@code status.status_list} itself (ISO/IEC 18013-5 second edition 12.3.6):
+     * a present-but-malformed reference must fail the gate rather than silently skip the list, because a wallet that
+     * cannot read {@code {uri, idx}} cannot fetch the list at all; only an unreadable IssuerAuth or MSO stays M-01's
+     * (the reference cannot be read there either).
+     *
+     * @param malformed why the reference is malformed, or {@code null} when the MSO has no {@code status_list} or a
+     *                  well-formed one
+     */
+    public static VerificationReport.Check mso(String malformed) {
+        return run(CHECK_MSO, problems -> {
+            if (malformed != null) {
+                problems.add("malformed", malformed);
+            }
+            return "the MSO's status.status_list is " + (malformed == null ? "absent or {uri: tstr, idx: uint}"
+                    : "malformed");
+        });
     }
 
     /** Check 0: the response carries the CWT media type, whatever its parameters (TSL 8.2). */
@@ -247,12 +301,15 @@ public final class IndependentStatusListVerifier {
         private final byte[] body;
         /** Non-null when the body is not a COSE_Sign1 CWT at all; every check that needs it reports notRun. */
         private String parseError;
-        private Long tag;
+        /** Every tag the body carried, outermost first: {@code 18} alone is the only shape TSL 5.2 allows. */
+        private List<Long> tags = List.of();
         private Map<CoseLabel, DataItem> protectedHeaders = new LinkedHashMap<>();
         private Map<CoseLabel, DataItem> unprotectedHeaders = new LinkedHashMap<>();
         private byte[] payload;
         private boolean detached;
         private byte[] signature;
+        /** The unwrapped COSE_Sign1 array as received, for the Authlete oracle (whose decoder auto-parses tags). */
+        private DataItem coseArray;
         private DataItem claims;
         /** The chain the token actually carries: the protected one ISO2 12.3.6.3 requires, else the unprotected one. */
         private List<X509Certificate> chain = List.of();
@@ -273,18 +330,18 @@ public final class IndependentStatusListVerifier {
                 return token;
             }
             try {
-                token.tag = null;
+                List<Long> tags = new ArrayList<>();
                 while (item.getMajorType() == MajorType.TAG) {
-                    if (token.tag == null) {
-                        token.tag = ((Tagged) item).getTagNumber();
-                    }
+                    tags.add(((Tagged) item).getTagNumber());
                     item = item.getAsTagged();
                 }
+                token.tags = List.copyOf(tags);
                 if (item.getMajorType() != MajorType.ARRAY || item.getAsArray().size() != 4) {
                     token.parseError = "the body is not a COSE_Sign1 array(4): it is " + item.getMajorType();
                     return token;
                 }
                 List<DataItem> array = item.getAsArray();
+                token.coseArray = item;
                 if (array.get(0).getMajorType() != MajorType.BYTE_STRING) {
                     token.parseError = "the COSE_Sign1 protected header is not a bstr";
                     return token;
@@ -345,17 +402,22 @@ public final class IndependentStatusListVerifier {
                 problems.add("notTagged18", "not a status-list CWT: " + parseError);
                 return null;
             }
-            if (tag == null) {
+            if (tags.isEmpty()) {
                 problems.add("notTagged18", "the COSE_Sign1 is untagged; TSL 5.2 requires COSE_Sign1_Tagged (18) "
                         + "(RFC 9052 4.2), never the bare COSE_Sign1");
-            } else if (tag == TAG_CWT) {
-                problems.add("cwtTag61", "the CWT is tagged 61; TSL 5.2: \"The Status List Token MUST NOT be tagged with "
-                        + "the CWT tag defined in Section 6 of [RFC8392]\" (the COSE message is tag 18)");
-            } else if (tag == TAG_COSE_MAC0) {
+            } else if (tags.contains(TAG_CWT)) {
+                problems.add("cwtTag61", "the token is tagged " + tags + "; TSL 5.2: \"The Status List Token MUST NOT be "
+                        + "tagged with the CWT tag defined in Section 6 of [RFC8392]\" (the COSE message is tag 18)");
+            } else if (tags.size() != 1) {
+                problems.add("notTagged18", "the token carries the tag stack " + tags + "; exactly one tag, 18, wraps the "
+                        + "COSE_Sign1 (RFC 9052 4.2). A second tag — the self-describe tag 55799 (RFC 8949 3.4.6) or a "
+                        + "repeated 18 — is refused: @owf/cose 0.6.0's Cwt.decodeCoseStructure requires the decoded "
+                        + "value to be the tag-18 Sign1 or tag-17 Mac0 itself, so Paradym/Credo refuse it too");
+            } else if (tags.get(0) == TAG_COSE_MAC0) {
                 problems.add("mac0", "the COSE message is tag 17 (COSE_Mac0_Tagged); the status list is signed, so TSL 5.2 "
                         + "requires COSE_Sign1_Tagged (18)");
-            } else if (tag != TAG_COSE_SIGN1) {
-                problems.add("notTagged18", "the COSE_Sign1 carries tag " + tag + ", not 18 (RFC 9052 4.2)");
+            } else if (tags.get(0) != TAG_COSE_SIGN1) {
+                problems.add("notTagged18", "the token is tagged " + tags.get(0) + ", not 18 (RFC 9052 4.2)");
             }
             if (detached) {
                 problems.add("detachedPayload", "the COSE_Sign1 payload is detached (null); a status list is a CWT whose "
@@ -482,11 +544,14 @@ public final class IndependentStatusListVerifier {
         }
 
         private void signatureWithAuthlete(Problems problems, X509Certificate leaf) throws Exception {
+            // Authlete's decoder builds a COSESign1 itself for tag 18, so a second tag makes it refuse before the
+            // signature is reached. Hand it the unwrapped array instead: the signed bytes are the protected header
+            // bstr, the payload bstr and the signature bstr, and re-encoding the array preserves all three exactly.
             CBORItem item;
             try {
-                item = new CBORDecoder(body).next();
+                item = new CBORDecoder(Cbor.INSTANCE.encode(coseArray)).next();
             } catch (Exception e) {
-                problems.add("invalid:authlete", "Authlete cannot decode the body: " + describe(e));
+                problems.add("invalid:authlete", "Authlete cannot decode the COSE_Sign1 array: " + describe(e));
                 return;
             }
             while (item instanceof CBORTaggedItem tagged) {
@@ -515,7 +580,8 @@ public final class IndependentStatusListVerifier {
          * Check 5: the token's chain reaches the IACA, decided by the very Multipaz validator
          * {@code CompressedStatusList.fromCwt} passes to {@code validateCwt} (ISO/IEC 18013-5 second edition 12.3.6.2).
          */
-        String chain(Problems problems, X509Certificate iaca, Instant at, StatusListOptions options) {
+        String chain(Problems problems, X509Certificate iaca, Instant at, String uri, StatusListOptions options,
+                     boolean specificsPassed) {
             if (notRun(problems)) {
                 return null;
             }
@@ -531,18 +597,47 @@ public final class IndependentStatusListVerifier {
                 problems.add(NOT_RUN, "not run: the token carries no x5chain (" + CHECK_X5CHAIN + ")");
                 return null;
             }
-            X509CertChain tokenChain = multipazChain(chain);
             X509Cert anchor = multipazCertificate(iaca);
+            // The gate: Multipaz's own reader, as CachingRevocationChecker calls it (typ, sub, exp, maxValidity, the
+            // chain to the IACA and the signature in one decision). It is the only check that refuses an exp more than
+            // 365 days after `at`, so a chain-validator-only verifier would accept a list Multipaz's wallet refuses.
+            Throwable fromCwtRefusal = null;
+            try {
+                MultipazFromCwt.read(body, anchor, uri, at);
+            } catch (Throwable e) {
+                rethrowIfFatal(e);
+                fromCwtRefusal = e;
+            }
+            // The trust decision on its own, so a fromCwt refusal caused by a field another check reports (typ, sub,
+            // exp, iat) is not also charged to the chain.
+            String chainRefusal = null;
             Function3<X509CertChain, kotlin.time.Instant, Continuation<? super Boolean>, Object> validator =
                     ValidateJwtKt.trustedRootCertificateChainValidator(anchor);
             try {
-                await(continuation -> validator.invoke(tokenChain, kotlinInstant(at), continuation));
+                await(continuation -> validator.invoke(multipazChain(chain), kotlinInstant(at), continuation));
             } catch (Throwable e) {
                 rethrowIfFatal(e);
-                problems.add("untrusted", "Multipaz's certificate-chain validator (what CompressedStatusList.fromCwt "
-                        + "runs against the IACA) refuses the token's x5chain at " + at + ": " + describe(e));
+                chainRefusal = describe(e);
             }
-            return "x5chain chains to " + iaca.getSubjectX500Principal();
+            if (fromCwtRefusal == null) {
+                return "CompressedStatusList.fromCwt accepts the token against " + iaca.getSubjectX500Principal() + " at "
+                        + at + " (typ, sub, exp and maxValidity included)";
+            }
+            String fromCwtReason = "CompressedStatusList.fromCwt refuses the token: " + describe(fromCwtRefusal);
+            if (chainRefusal != null) {
+                problems.add("untrusted", fromCwtReason + "; and Multipaz's certificate-chain validator refuses the "
+                        + "x5chain at " + at + ": " + chainRefusal);
+                return null;
+            }
+            if (specificsPassed) {
+                problems.add("untrusted", fromCwtReason + ", although the token's typ, signature, sub and exp pass and "
+                        + "its chain validates to " + iaca.getSubjectX500Principal() + ": the remaining rules are "
+                        + "Multipaz's own (maxValidity caps exp at 365 days after the evaluation instant, the wallet "
+                        + "default in CachingRevocationChecker)");
+                return null;
+            }
+            return "the x5chain validates to " + iaca.getSubjectX500Principal() + "; fromCwt refused for a reason another "
+                    + "check reports (" + describe(fromCwtRefusal) + ")";
         }
 
         /**
@@ -590,7 +685,8 @@ public final class IndependentStatusListVerifier {
                 problems.add("iatMissing", "the CWT has no integer iat (claim 6); TSL 5.2 makes it REQUIRED");
             } else if (iat > at.getEpochSecond() + IAT_FUTURE_SKEW_SECONDS) {
                 problems.add("iatFuture", "iat is " + Instant.ofEpochSecond(iat) + ", more than "
-                        + IAT_FUTURE_SKEW_SECONDS + "s after " + at + "; the wallet reads the list as not yet issued");
+                        + IAT_FUTURE_SKEW_SECONDS + "s after " + at + "; Multipaz's validateCwt and this verifier "
+                        + "allow five seconds of clock mismatch, so the wallet reads the list as not yet issued");
             }
             Long exp = numeric(claims, CLAIM_EXP);
             if (exp == null) {
@@ -605,6 +701,11 @@ public final class IndependentStatusListVerifier {
                 if (leaf != null && exp > leaf.getNotAfter().toInstant().getEpochSecond()) {
                     problems.add("expAfterSigner", "exp is " + Instant.ofEpochSecond(exp) + ", after the signer's notAfter "
                             + leaf.getNotAfter().toInstant() + "; a list must not outlive the certificate that signs it");
+                }
+                if (iat != null && iat > exp) {
+                    problems.add("iatAfterExp", "iat is " + Instant.ofEpochSecond(iat) + ", after exp "
+                            + Instant.ofEpochSecond(exp) + "; TSL 8.3 step 4c reads exp as the end of the list's validity, "
+                            + "so a list issued after it expires was never valid");
                 }
             }
             DataItem ttlItem = claims.getOrNull(CLAIM_TTL);
@@ -627,9 +728,15 @@ public final class IndependentStatusListVerifier {
                 return null;
             }
             DataItem statusListClaim = claims.getOrNull(CLAIM_STATUS_LIST);
-            if (statusListClaim == null || statusListClaim.getMajorType() != MajorType.MAP) {
-                throw new IllegalArgumentException("the CWT has no status_list claim (65533) as a map; TSL 5.2 makes it "
-                        + "REQUIRED, so the status of idx " + idx + " cannot be read");
+            if (statusListClaim == null) {
+                problems.add("missing", "the CWT has no status_list claim (65533); TSL 5.2 makes it REQUIRED, so the "
+                        + "status of idx " + idx + " cannot be read");
+                return null;
+            }
+            if (statusListClaim.getMajorType() != MajorType.MAP) {
+                problems.add("missing", "status_list (65533) is " + shortly(statusListClaim) + ", not the map TSL 4.3 "
+                        + "defines ({bits, lst}); the status of idx " + idx + " cannot be read");
+                return null;
             }
             DataItem bitsItem = statusListClaim.getOrNull("bits");
             if (bitsItem == null || bitsItem.getMajorType() != MajorType.UNSIGNED_INTEGER || bitsItem.getAsNumber() != 1) {
@@ -657,8 +764,10 @@ public final class IndependentStatusListVerifier {
                         + "MUST be rejected\"");
                 return null;
             }
-            // TSL 4.1: the bits are read from least significant to most significant; bits is 1, so eight per octet
-            int status = (statuses[(int) (idx / 8)] >> (idx % 8)) & 1;
+            // Multipaz's own reader, so the bit order is the reference implementation's (TSL 4.1: least significant
+            // bit first). The range check above stays ours: StatusList.get answers 0 for an index past the end, which
+            // TSL 8.3 step 6 requires to be rejected instead.
+            int status = new StatusList(1, statuses).get((int) idx);
             if (status != expectedStatus) {
                 problems.add("statusMismatch:" + status, "idx " + idx + " reports " + status + ", expected "
                         + expectedStatus + " (TSL 7.1: 0 VALID, 1 INVALID)");
@@ -878,6 +987,64 @@ public final class IndependentStatusListVerifier {
 
     private static kotlin.time.Instant kotlinInstant(Instant instant) {
         return kotlin.time.Instant.Companion.fromEpochMilliseconds(instant.toEpochMilli());
+    }
+
+    /**
+     * Multipaz's {@code CompressedStatusList.fromCwt(cwt, trustedRootCert, checks, atTime)} — the reader
+     * {@code CachingRevocationChecker} uses on the wallet path, and the merge gate the plan's 4.9 names. It checks the
+     * protected {@code typ}, {@code sub}, {@code exp}/{@code iat}, the 365-day {@code maxValidity} and the chain to the
+     * IACA in one decision, so no hand-written reimplementation of those rules can drift from it.
+     *
+     * <p>Kotlin mangles the method name because {@code maxValidity: Duration} is a value class:
+     * {@code fromCwt-myKFqkg}. Java cannot spell that identifier, so the synthetic {@code $default} bridge is resolved
+     * once. The call passes mask {@code 16} (bit 4, the {@code maxValidity} position) so Multipaz's own default is used.
+     * A Multipaz upgrade that changes the signature fails loudly here with the expected descriptor, rather than
+     * silently dropping the gate.
+     */
+    private static final class MultipazFromCwt {
+
+        private static final String METHOD = "fromCwt-myKFqkg$default";
+        private static final Method BRIDGE = resolve();
+
+        private static Method resolve() {
+            String companion = "org.multipaz.revocation.CompressedStatusList$Companion";
+            try {
+                Class<?> type = Class.forName(companion);
+                Method method = type.getDeclaredMethod(METHOD, type, byte[].class, X509Cert.class, Map.class,
+                        kotlin.time.Instant.class, long.class, Continuation.class, int.class, Object.class);
+                method.setAccessible(true);
+                return method;
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                throw new IllegalStateException("Multipaz CompressedStatusList$Companion." + METHOD + "(byte[], X509Cert, "
+                        + "Map, kotlin.time.Instant, long, Continuation, int, Object) is gone: a Multipaz upgrade changed "
+                        + "fromCwt, and the M-11b gate cannot run without it", e);
+            }
+        }
+
+        /** @throws RuntimeException whatever Multipaz refused the token with, as {@code fromCwt} throws it */
+        static void read(byte[] body, X509Cert anchor, String uri, Instant at) {
+            Map<WebTokenCheck, String> checks = Map.of(WebTokenCheck.SUB, uri);
+            await(continuation -> invoke(body, anchor, checks, at, continuation));
+        }
+
+        private static Object invoke(byte[] body, X509Cert anchor, Map<WebTokenCheck, String> checks, Instant at,
+                                     Continuation<?> continuation) {
+            try {
+                return BRIDGE.invoke(CompressedStatusList.Companion, CompressedStatusList.Companion, body, anchor, checks,
+                        kotlinInstant(at), 0L, continuation, 16, null);
+            } catch (InvocationTargetException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof RuntimeException runtime) {
+                    throw runtime;
+                }
+                if (cause instanceof Error error) {
+                    throw error;
+                }
+                throw new IllegalStateException("CompressedStatusList.fromCwt refused the token: " + describe(cause), cause);
+            } catch (IllegalAccessException e) {
+                throw new IllegalStateException("CompressedStatusList.fromCwt is not callable: " + describe(e), e);
+            }
+        }
     }
 
     /** Multipaz's cryptographic entry points are suspend on the JVM without ever suspending; runBlocking keeps that here. */
