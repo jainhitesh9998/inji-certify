@@ -307,6 +307,7 @@ which cbor2 also reads as a date, fails, even when another privilege carries the
 | --- | --- | --- | --- |
 | 2026-11-13 | `mdl-dev` | throwaway project, fresh database, `docker-compose.public.yaml` with scratch secrets, `CERTIFY_PUBLIC_URL=http://localhost:28091`, image `inji-certify:rebuild` with F-10 | 30/30 PASS (`smoke.py --mdl http://localhost:28091`) |
 | 2026-11-13 | `mdl-operator` | the public demo, `https://credentials.loremipsum.co.in`, with `--iaca` (the offline IACA) | 31/31 PASS (owner's session) |
+| 2026-11-13 | `mdl-dev` | throwaway project `mdl-r4-throwaway` on its own network (`mdl-r4-throwaway_network`; `mosip_network` untouched), fresh database, the r4 public overlay (allow-list nginx) with ports moved to `127.0.0.1:28090/28091`, scratch secrets, `CERTIFY_PUBLIC_URL=http://localhost:28091`, image `inji-certify:rebuild` `--no-build`; `down -v` after | 30/30 PASS (`smoke.py --mdl http://localhost:28091`; the public refusal check now covers `v2/credential-configurations`, `/jwtSign` and `/v3/api-docs`) |
 
 Before these, the non-strict run passed all 29 checks in both PKI modes on 2026-11-13.
 
