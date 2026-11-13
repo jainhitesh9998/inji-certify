@@ -7,43 +7,59 @@
  *
  * Plain Node (20 or later, the version CI pins), no npm dependencies, no browser, no server:
  * `node docs/design/tools/check-offer-page.mjs`. One line per check, then
- * `check-offer-page: all N checks passed`; a non-zero exit when anything fails.
+ * `check-offer-page: all N checks passed`; a non-zero exit when anything fails. A page that breaks the harness (an
+ * element renamed, a handler that throws) gives FAIL lines and the summary, never an uncaught exception: every numbered
+ * section runs inside `section()`, which records an exception as a failed check, and the summary is printed in a
+ * `finally`.
  *
  * Why it exists: round 1 of the F-15 review found that the JUnit page tests asserted source strings, which stayed green
  * while two real defects shipped (a `[hidden]` attribute that the page's own `label { display: block }` overrode, so a
  * stray subject label was always visible; and an "Other" sentinel value that a configured subject id could collide
  * with). Those two checks below are the regression tests for exactly those defects.
  *
- * Faithfulness (F-18). Round 2 of the F-15 review found the harness could pass where a real browser fails, so the fake
- * DOM now answers the way a browser does wherever the page depends on it (the page itself gains the F-18 spec fixes to
- * its wallet and prints a subject label once when it repeats the id):
- *   - `getElementById` returns null for an id the markup does not declare (it never invents an element), an id comes
- *     from an attribute whose name is exactly `id` (a `data-id` is not one), comments and raw-text content are not
- *     markup, and the first element with an id wins, so a page that looks up a missing id fails here as it throws in a
- *     browser;
- *   - a `<select>` tracks per-option selectedness and derives `value`/`selectedIndex` from it: a value no `<option>`
- *     carries reads back "" with `selectedIndex` -1, removing the selected option selects the first remaining one, a
- *     re-appended option marked selected takes the selection back, and an option without a `value` reads its text with
- *     whitespace collapsed;
- *   - `appendChild` moves a node out of its previous parent, `innerHTML = ""` clears the text as well as the children,
- *     and a disabled control dispatches no click;
+ * Faithfulness (F-18). The F-15 and F-18 reviews found the harness could pass where a real browser fails, so the fake
+ * DOM answers the way a browser does wherever the page depends on it:
+ *   - the markup is tokenised the way the HTML parser does for what the page uses: an id comes from an attribute whose
+ *     name is exactly `id` (a `data-id` is not one, an empty id is none, a duplicate attribute keeps its first
+ *     occurrence), comments and doctypes are not markup, `script`/`style` content is raw text and `textarea`/`title`
+ *     content is RCDATA (text with character references decoded: a tag inside them is text, never an element), the
+ *     containing element and its attributes are kept, the first element with an id wins, a new `<option>` closes an
+ *     open one, and only the page's inline scripts (no `src`) are run, in document order;
+ *   - `getElementById` returns null for an id the markup does not declare (it never invents an element), so a page
+ *     that looks up a missing id fails here as it throws in a browser;
+ *   - nodes are elements and text nodes: `textContent` reads the text of every descendant and setting it replaces the
+ *     children, `firstChild` sees text nodes, `appendChild` moves a node out of its previous parent, `innerHTML = ""`
+ *     clears everything (and reading `innerHTML` throws, because nothing here serialises markup);
+ *   - a `<select>` keeps per-option selectedness and runs the HTML selectedness setting algorithm: `value` and
+ *     `selectedIndex` are derived from it over the list of options (optgroups included), setting a value no option
+ *     carries leaves nothing selected ("" and -1), `option.selected = true` deselects the other options of a single
+ *     select and `selected = false` asks for a reset, an inserted selected option takes the selection, and inserting or
+ *     removing options leaves the first option that is not disabled selected when nothing is; an option without a
+ *     `value` reads its text with whitespace collapsed, and a `textarea` reads its text until its value is set;
+ *   - a disabled control dispatches no click;
  *   - the `QRCode` stub draws a child into the container it is handed, so the published QR can be located and a
  *     replaced one is seen to leave nothing behind;
  *   - the page's own wallet runs for real against the documents the live stack serves (issuer metadata and RFC 8414
  *     authorization server metadata at their well-known locations, the endpoints they name): Node's WebCrypto signs a
  *     P-256 proof, this file verifies that signature with an independent key check, and the token form, the
- *     transaction code, `authorization_details`, the nonce and the credential request are all asserted.
+ *     transaction code, `authorization_details`, the nonce and the credential request are all asserted, as are the
+ *     refusals (metadata whose identity does not match, relative or downgraded endpoints) that must send nothing.
  *
- * `OFFER_PAGE_HTML=<path>` evaluates another copy of the page. It exists for negative controls (break a copy in /tmp
- * and watch this file fail); a broken copy is never committed.
+ * `OFFER_PAGE_HTML=<path>` evaluates another copy of the page. It exists for negative controls (break a copy in a
+ * scratch directory and watch this file fail); a broken copy is never committed.
  *
  * What this harness CANNOT check:
  *   - computed CSS and layout. The `[hidden]` check below is a static assertion over the stylesheet's text, not a
  *     rendered cascade, so a later rule, a specificity question, a media query or anything geometric (positions, sizes,
  *     overflow, z-index, scroll) is out of reach; so is whether the page looks right;
+ *   - the full HTML parser: only the tokenisation rules listed above are modelled (no foster parenting, no other implied
+ *     end tags, no `<select>` content restrictions, a small set of named character references); a page that relies on
+ *     anything else is not modelled faithfully;
+ *   - user interaction: a visitor cannot pick a disabled `<option>`, which the harness asserts as the option's
+ *     `disabled` flag and the page's own refusal, not through a real picker; focus, keyboard, tab order, pointer and
+ *     drag-and-drop behaviour, form submission and navigation;
  *   - real QR rendering or scanning, image decoding, `Blob` URLs and portrait rendering (the `Cbor` stub is a stub);
  *   - CSP, CORS, cookies, TLS, real network timing, retries, and the clipboard;
- *   - focus, keyboard, tab order, pointer and drag-and-drop behaviour, form submission, and navigation;
  *   - anything about the issuer: every `fetch` answer is a fixture, so server behaviour (status codes, bodies, headers)
  *     is only as faithful as the fixtures below (their shapes are the ones the live stack serves, read from
  *     `docs/design/tools/smoke_mdl.py` and the server's metadata builders).
@@ -63,6 +79,7 @@ const html = readFileSync(PAGE, "utf8");
 const SUBJECT_LABEL = "Subject (the record id the data provider resolves, e.g. the CSV row id)";
 const CLAIMS_LABEL = "Or claims as JSON (used when the subject is empty)";
 const CLAIMS_LABEL_WITH_CHOICE = "Or claims as JSON (used when \"Other\" is chosen and the subject is left empty)";
+const MDOC_SURFACE_HINT = "ISO mdoc credentials are issued on the OpenID4VCI 1.0 surface only";
 
 let checks = 0;
 let failures = 0;
@@ -89,17 +106,52 @@ function equalFields(name, actual, expected) {
     check(name, same, same ? undefined : `got ${JSON.stringify(actual)}, wanted ${JSON.stringify(expected)}`);
 }
 
+/**
+ * Runs one numbered section of checks. An exception (a page whose element was renamed, a handler that throws, a check
+ * that reads a property of null) is recorded as a failed check of that section, and the next section still runs.
+ */
+async function section(name, body) {
+    try {
+        await body();
+    } catch (error) {
+        const where = error && error.stack ? error.stack.split("\n").slice(0, 2).join(" | ") : String(error);
+        check(`${name}: the section ran to its end`, false, where);
+    }
+}
+
 /* ---------------------------------------------------------------- fake DOM */
+
+/** A text node: the text an element's `textContent` is made of. */
+class Text {
+    constructor(data) {
+        this.nodeType = 3;
+        this.data = String(data);
+        this.parent = null;
+    }
+
+    get textContent() {
+        return this.data;
+    }
+
+    set textContent(text) {
+        this.data = String(text);
+    }
+}
+
+/** An option is disabled by its own attribute or by a disabled optgroup it is a child of (HTML 4.10.10). */
+const optionDisabled = (option) => option.disabled
+    || (option.parent !== null && option.parent.tagName === "optgroup" && option.parent.disabled);
 
 class Element {
     constructor(tag) {
+        this.nodeType = 1;
         this.tagName = tag;
-        this.children = [];
+        this.childNodes = [];
         this.parent = null;
+        this.attributes = new Map();
         this.listeners = new Map();
         this._value = undefined;
-        this._text = "";
-        this.selected = false;
+        this._selected = false;
         this.hidden = false;
         this.disabled = false;
         this.checked = false;
@@ -115,42 +167,107 @@ class Element {
         return this.tagName === "select";
     }
 
-    // a browser's textContent is the element's text and nothing else: setting it drops the children (the page clears
-    // the subject dropdown's options this way, so a fake that kept them would hide the re-filter it performs)
+    /** The element children (a browser's `children`; text nodes are in `childNodes` only). */
+    get children() {
+        return this.childNodes.filter((node) => node instanceof Element);
+    }
+
+    get firstChild() {
+        return this.childNodes.length ? this.childNodes[0] : null;
+    }
+
+    /** A select's list of options: its option children and the option children of its optgroup children, in tree order. */
+    get options() {
+        if (!this.isSelect) return [];
+        const list = [];
+        for (const child of this.children) {
+            if (child.tagName === "option") list.push(child);
+            else if (child.tagName === "optgroup") list.push(...child.children.filter((option) => option.tagName === "option"));
+        }
+        return list;
+    }
+
+    /** The select whose list of options this option is in, or null. */
+    ownerSelect() {
+        if (this.tagName !== "option" || this.parent === null) return null;
+        if (this.parent.isSelect) return this.parent;
+        const group = this.parent;
+        return group.tagName === "optgroup" && group.parent !== null && group.parent.isSelect ? group.parent : null;
+    }
+
+    /** The select whose list of options changes when `node` is inserted into or removed from this element, or null. */
+    selectFor(node) {
+        if (!(node instanceof Element) || (node.tagName !== "option" && node.tagName !== "optgroup")) return null;
+        if (this.isSelect) return this;
+        if (this.tagName === "optgroup" && node.tagName === "option" && this.parent !== null && this.parent.isSelect) return this.parent;
+        return null;
+    }
+
+    // a browser's textContent is the text of every descendant, in tree order; setting it replaces the children with one
+    // text node (the page clears the subject dropdown's options this way, so a fake that kept them would hide the
+    // re-filter it performs)
     get textContent() {
-        return this._text;
+        return this.childNodes.map((node) => node.textContent).join("");
     }
 
     set textContent(text) {
-        this._text = String(text);
-        this.clearChildren();
+        this.removeAllChildren();
+        const value = String(text);
+        if (value) this.appendChild(new Text(value));
     }
 
-    /** The selected option of a select, or null: a browser derives value and selectedIndex from per-option selectedness. */
-    selectedOption() {
-        return this.children.find((child) => child.tagName === "option" && child.selected) || null;
+    get selected() {
+        return this._selected;
+    }
+
+    /**
+     * HTML 4.10.10: setting an option's selectedness to true in a single select sets every other option's to false;
+     * either way the option then asks for a reset, which runs the select's selectedness setting algorithm.
+     */
+    set selected(value) {
+        this._selected = !!value;
+        const select = this.ownerSelect();
+        if (select === null) return;
+        if (this._selected) select.selectOnly(this);
+        select.runSelectednessSetting();
     }
 
     /** Makes `option` the only selected option of this select (null selects none). */
     selectOnly(option) {
-        for (const child of this.children) {
-            if (child.tagName === "option") child.selected = child === option;
+        for (const candidate of this.options) candidate._selected = candidate === option;
+    }
+
+    /**
+     * HTML 4.10.7, the selectedness setting algorithm of a single select of display size 1: with nothing selected the
+     * first option that is not disabled is selected; with more than one, only the last one stays selected.
+     */
+    runSelectednessSetting() {
+        const options = this.options;
+        const selected = options.filter((option) => option._selected);
+        if (!selected.length) {
+            const first = options.find((option) => !optionDisabled(option));
+            if (first) first._selected = true;
+        } else if (selected.length > 1) {
+            const last = selected[selected.length - 1];
+            for (const option of selected) option._selected = option === last;
         }
     }
 
     /**
-     * A browser's `value`: a select reads the value of the option that is selected ("" when none is), and an option
-     * without a `value` attribute reads its own text with its whitespace collapsed. Setting a select's value marks the
-     * matching option selected and leaves nothing selected when none matches (so `value` reads "" and `selectedIndex`
-     * is -1) — the F-18 finding.
+     * A browser's `value`: a select reads the value of its first selected option ("" when none is), an option without
+     * a `value` attribute reads its text with ASCII whitespace stripped and collapsed, and a textarea reads its text
+     * until a script sets its value. Setting a select's value deselects every option and selects the first one whose
+     * value matches, if any (no reset runs, so an unmatched value leaves nothing selected: "" and -1).
      */
     get value() {
         if (this.isSelect) {
-            const option = this.selectedOption();
-            return option === null ? "" : option.value;
+            const option = this.options.find((candidate) => candidate._selected);
+            return option === undefined ? "" : option.value;
         }
-        if (this._value !== undefined) return String(this._value);
-        return this.tagName === "option" ? this._text.replace(/\s+/g, " ").trim() : "";
+        if (this._value !== undefined) return this._value;
+        if (this.tagName === "option") return this.textContent.replace(/[\t\n\f\r ]+/g, " ").trim();
+        if (this.tagName === "textarea") return this.textContent;
+        return "";
     }
 
     set value(value) {
@@ -159,55 +276,59 @@ class Element {
             this._value = text;
             return;
         }
-        this.selectOnly(this.children.find((child) => child.tagName === "option" && child.value === text) || null);
+        const options = this.options;
+        for (const option of options) option._selected = false;
+        const match = options.find((option) => option.value === text);
+        if (match) match._selected = true;
     }
 
     get selectedIndex() {
         if (!this.isSelect) return -1;
-        return this.children.findIndex((child) => child.tagName === "option" && child.selected);
+        return this.options.findIndex((option) => option._selected);
     }
 
+    /** Indexes the list of options (not the children): every option deselected, then the one at the index selected. */
     set selectedIndex(index) {
         if (!this.isSelect) return;
+        const options = this.options;
+        for (const option of options) option._selected = false;
         const at = Number(index);
-        this.selectOnly(at >= 0 && at < this.children.length ? this.children[at] : null);
+        if (Number.isInteger(at) && at >= 0 && at < options.length) options[at]._selected = true;
     }
 
-    clearChildren() {
-        // a detached option keeps its own selectedness, which is what lets a re-appended option take the selection back
-        for (const child of this.children) child.parent = null;
-        this.children = [];
-    }
-
-    appendChild(child) {
+    appendChild(node) {
         // a browser moves the node out of its previous parent rather than copying it (the page relies on this to move
         // the QR the stub drew into the container it publishes)
-        if (child.parent) child.parent.removeChild(child);
-        child.parent = this;
-        this.children.push(child);
-        if (this.isSelect && child.tagName === "option") {
-            // inserting an option runs the selectedness setting algorithm: a selected one takes the selection of a
-            // single select, and a select with nothing selected selects its first option
-            if (child.selected) this.selectOnly(child);
-            else if (this.selectedOption() === null) this.selectOnly(this.children.find((o) => o.tagName === "option") || null);
+        if (node.parent) node.parent.removeChild(node);
+        node.parent = this;
+        this.childNodes.push(node);
+        const select = this.selectFor(node);
+        if (select !== null) {
+            // an inserted option whose selectedness is true takes the selection of a single select, then the
+            // selectedness setting algorithm runs because the list of options changed
+            const inserted = node.tagName === "option" ? [node] : node.children.filter((option) => option.tagName === "option");
+            const chosen = inserted.filter((option) => option._selected);
+            if (chosen.length) select.selectOnly(chosen[chosen.length - 1]);
+            select.runSelectednessSetting();
         }
-        return child;
+        return node;
     }
 
-    removeChild(child) {
-        const index = this.children.indexOf(child);
-        if (index < 0) return child;
-        this.children.splice(index, 1);
-        child.parent = null;
-        // removing the selected option leaves the first remaining one selected (Chrome), so no removal blanks a select
-        if (this.isSelect && child.selected && this.selectedOption() === null) {
-            this.selectOnly(this.children.find((o) => o.tagName === "option") || null);
-        }
-        return child;
+    removeChild(node) {
+        const index = this.childNodes.indexOf(node);
+        if (index < 0) throw new Error("NotFoundError: the node to be removed is not a child of this node");
+        this.childNodes.splice(index, 1);
+        node.parent = null;
+        // a detached option keeps its own selectedness, which is what lets a re-appended option take the selection back;
+        // the select runs the selectedness setting algorithm, so removing the selected option selects the first
+        // remaining option that is not disabled
+        const select = this.selectFor(node);
+        if (select !== null) select.runSelectednessSetting();
+        return node;
     }
 
-    get firstChild() {
-        return this.children.length ? this.children[0] : null;
+    removeAllChildren() {
+        for (const node of this.childNodes.slice()) this.removeChild(node);
     }
 
     addEventListener(type, listener) {
@@ -219,12 +340,12 @@ class Element {
     // markup, so every assignment is recorded and the checks below look for a non-empty one
     set innerHTML(value) {
         this.innerHTMLWrites.push(String(value));
-        this._text = "";
-        this.clearChildren();
+        this.removeAllChildren();
     }
 
+    // nothing here serialises markup, so a page that reads innerHTML is told rather than handed a made-up answer
     get innerHTML() {
-        return "";
+        throw new Error("the fake DOM does not serialise innerHTML; the page must not depend on reading it");
     }
 
     async fire(type) {
@@ -237,42 +358,63 @@ class Element {
 
 const VOID = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
     "track", "wbr"]);
+// HTML 13.1.2: raw text elements (content is text, nothing decoded) and escapable raw text elements (RCDATA: text with
+// character references decoded); neither ever contains elements
+const RAW_TEXT = new Set(["script", "style"]);
+const RCDATA = new Set(["textarea", "title"]);
+
+const NAMED_REFERENCES = { amp: "&", lt: "<", gt: ">", quot: "\"", apos: "'", nbsp: " " };
+
+/** Decodes the character references the page could use (numeric ones and a few named ones); others stay as written. */
+function decodeReferences(text) {
+    return text.replace(/&(?:#(\d+)|#[xX]([0-9a-fA-F]+)|(amp|lt|gt|quot|apos|nbsp));/g, (whole, decimal, hex, name) => {
+        if (name) return NAMED_REFERENCES[name];
+        const code = decimal ? Number(decimal) : parseInt(hex, 16);
+        return code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : "�";
+    });
+}
 
 /** The attributes of one start tag by name: `data-id="x"` is an attribute named `data-id`, never one named `id`. */
 function tagAttributes(attributes) {
     const found = new Map();
     for (const match of attributes.matchAll(/([^\s"'>/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g)) {
-        const [, name, doubleQuoted, singleQuoted, unquoted] = match;
-        found.set(name.toLowerCase(), doubleQuoted !== undefined ? doubleQuoted
-            : singleQuoted !== undefined ? singleQuoted : unquoted !== undefined ? unquoted : "");
+        const [, rawName, doubleQuoted, singleQuoted, unquoted] = match;
+        const name = rawName.toLowerCase();
+        // a duplicate attribute is a parse error and is dropped: the first occurrence is the attribute
+        if (found.has(name)) continue;
+        const value = doubleQuoted !== undefined ? doubleQuoted
+            : singleQuoted !== undefined ? singleQuoted : unquoted !== undefined ? unquoted : "";
+        found.set(name, decodeReferences(value));
     }
     return found;
 }
 
 /**
- * The elements the markup declares, nested as the markup nests them (so a select owns its options), with the state the
- * markup gives them (hidden, disabled, selected, value, the text between the tags). Only declared ids are returned:
- * anything else is absent, exactly as `document.getElementById` answers in a browser. Comments and raw-text content are
- * not markup, and a duplicate id answers with its first element, as a browser does.
+ * Parses the markup into elements and text nodes, nested as the markup nests them (so a select owns its options),
+ * with the state the markup gives them (hidden, disabled, selected, value, class). Returns the declared ids (the first
+ * element with a non-empty id wins, as `document.getElementById` answers in a browser), the script elements in
+ * document order, and the root.
  */
-function markupElements(markup) {
-    const elements = new Map();
-    const stack = [];
-    const source = markup
-        .replace(/<!--[\s\S]*?-->/g, "")
-        .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, "");
-    const tags = /<(\/?)([a-zA-Z][\w-]*)((?:"[^"]*"|'[^']*'|[^>"'])*?)(\/?)>/g;
+function parseMarkup(markup) {
+    const ids = new Map();
+    const scripts = [];
+    const root = new Element("#document");
+    const stack = [root];
+    const current = () => stack[stack.length - 1];
+    const appendText = (raw) => {
+        if (raw) current().appendChild(new Text(decodeReferences(raw)));
+    };
+    // a comment (to `-->`, or to the end when unterminated), a doctype or other `<!` declaration, or a tag
+    const token = /<!--[\s\S]*?(?:-->|$)|<![^>]*>|<(\/?)([a-zA-Z][^\t\n\f\r />]*)((?:"[^"]*"|'[^']*'|[^>"'])*)>/g;
     let cursor = 0;
-    for (const match of source.matchAll(tags)) {
-        const text = source.slice(cursor, match.index);
-        // `matchAll` iterates a copy of the regular expression, so `tags.lastIndex` stays 0: the next text starts
-        // after the tag that was just matched
-        cursor = match.index + match[0].length;
-        if (text && stack.length) stack[stack.length - 1]._text += text;
-        const [, closing, rawName, attributeText, selfClosing] = match;
-        const tag = rawName.toLowerCase();
-        if (closing) {
-            for (let i = stack.length - 1; i >= 0; i--) {
+    let match;
+    while ((match = token.exec(markup)) !== null) {
+        appendText(markup.slice(cursor, match.index));
+        cursor = token.lastIndex;
+        if (match[2] === undefined) continue; // a comment or a declaration: not markup
+        const tag = match[2].toLowerCase();
+        if (match[1] === "/") {
+            for (let i = stack.length - 1; i > 0; i--) {
                 if (stack[i].tagName === tag) {
                     stack.length = i;
                     break;
@@ -280,20 +422,49 @@ function markupElements(markup) {
             }
             continue;
         }
-        const attributes = tagAttributes(attributeText);
+        // the implied end tags of the elements the page uses: a new option closes an open option, a new optgroup closes
+        // an open option and optgroup, a new li closes an open li
+        if ((tag === "option" || tag === "optgroup") && current().tagName === "option") stack.pop();
+        if (tag === "optgroup" && current().tagName === "optgroup") stack.pop();
+        if (tag === "li" && current().tagName === "li") stack.pop();
+
+        const attributes = tagAttributes(match[3]);
         const element = new Element(tag);
+        element.attributes = attributes;
         element.hidden = attributes.has("hidden");
         element.disabled = attributes.has("disabled");
         element.checked = attributes.has("checked");
-        element.selected = attributes.has("selected");
-        if (attributes.has("value")) element._value = attributes.get("value");
-        if (stack.length) stack[stack.length - 1].appendChild(element);
+        element._selected = attributes.has("selected");
+        if (attributes.has("class")) element.className = attributes.get("class");
+        if (attributes.has("value") && tag !== "textarea" && tag !== "select") element._value = attributes.get("value");
+        current().appendChild(element);
         const id = attributes.get("id");
-        if (id !== undefined && !elements.has(id)) elements.set(id, element);
-        if (!VOID.has(tag) && !selfClosing) stack.push(element);
+        if (id !== undefined && id !== "" && !ids.has(id)) ids.set(id, element);
+
+        if (RAW_TEXT.has(tag) || RCDATA.has(tag)) {
+            // everything up to the element's own end tag is text: a tag inside a textarea, a title, a script or a
+            // style is never an element (the containing element and its attributes are kept)
+            const end = new RegExp("</" + tag + "(?=[\\t\\n\\f\\r />])", "gi");
+            end.lastIndex = cursor;
+            const found = end.exec(markup);
+            const stop = found ? found.index : markup.length;
+            const content = markup.slice(cursor, stop);
+            if (content) element.appendChild(new Text(RCDATA.has(tag) ? decodeReferences(content) : content));
+            const close = found ? markup.indexOf(">", stop) : -1;
+            cursor = close < 0 ? markup.length : close + 1;
+            token.lastIndex = cursor;
+            if (tag === "script") scripts.push(element);
+            continue;
+        }
+        // a `/` before `>` does not close a non-void HTML element: it is parsed as an open tag
+        if (!VOID.has(tag)) stack.push(element);
     }
-    return elements;
+    appendText(markup.slice(cursor));
+    return { ids, scripts, root };
 }
+
+/** The declared ids of a piece of markup (see parseMarkup). */
+const markupElements = (markup) => parseMarkup(markup).ids;
 
 /* ---------------------------------------------------------------- fixtures: the documents the live stack serves */
 
@@ -310,15 +481,15 @@ const OID4VCI_CREDENTIAL_ENDPOINT = OID4VCI_ISSUER + "/credential";
 const LEGACY_NONCE_ENDPOINT = DOMAIN + "/v1/certify/nonce";
 const LEGACY_CREDENTIAL_ENDPOINT = DOMAIN + "/v1/certify/issuance/credential";
 const OFFER_DOCUMENT = DOMAIN + "/v1/certify/credential-offer-data/";
+const ATTACKER = "https://attacker.example";
 
 const CONFIGURATIONS = {
     mdl: { format: "ldp_vc" },
     demo: { format: "ldp_vc" },
     farmer: { format: "ldp_vc" },
+    // an ISO/IEC 18013-5 configuration, which the compatibility surface cannot issue (D5)
+    mdoc: { format: "mso_mdoc" },
 };
-
-/** The compatibility document the page loads for its configuration dropdown (its credentials never leave the page). */
-const METADATA = { credential_configurations_supported: CONFIGURATIONS };
 
 /** The /oid4vci document (Oid4vciDiscoveryController): its own identity, this surface's endpoints, the deployment's AS. */
 const OID4VCI_DOCUMENT = {
@@ -390,20 +561,22 @@ const SUBJECTS = [
 ];
 
 /**
- * Opens the page: the markup's elements, the inline script evaluated against them, and the requests it makes on load
+ * Opens the page: the markup's elements, the inline scripts evaluated against them, and the requests it makes on load
  * (the configuration document and the demo-subject list; the wallet's metadata is read when it redeems an offer).
+ * Never throws: a page whose script throws reports it in `scriptError`, as a browser reports it in the console.
  *
  * @param demo the answer to `GET /offer/demo-subjects`: a JSON value, a raw string, `false` for a 404, or `null` for a
  *             fetch that throws
- * @param options the page source (`html`), the issuer metadata documents by issuer (`issuerMetadata`), the
- *                authorization server documents by server (`asMetadata`), the answer to `POST /pre-authorized-data`
- *                (`offer`, or `offers` consumed one per click, the last one repeating), the answers to the by-reference
- *                offer fetch (`offerFetches`, an entry of `"throw"` being a fetch that rejects), and the `token`,
- *                `nonce` and `credential` answers of the page's wallet
+ * @param options the page source (`html`), the configurations the page's own document lists (`configurations`), the
+ *                issuer metadata documents by issuer (`issuerMetadata`), the authorization server documents by server
+ *                (`asMetadata`), the answer to `POST /pre-authorized-data` (`offer`, or `offers` consumed one per
+ *                click, the last one repeating) and a promise it waits for before answering (`offerGate`), the answers
+ *                to the by-reference offer fetch (`offerFetches`, an entry of `"throw"` being a fetch that rejects),
+ *                and the `token`, `nonce` and `credential` answers of the page's wallet
  */
 function openPage(demo, options = {}) {
     const source = options.html === undefined ? html : options.html;
-    const elements = markupElements(source);
+    const { ids: elements, scripts } = parseMarkup(source);
     const created = [];
     const requests = [];
     const missingIds = [];
@@ -411,14 +584,17 @@ function openPage(demo, options = {}) {
     const document = {
         // a browser has no element for an id the markup does not declare; returning an invented one let page bugs pass
         getElementById(id) {
-            const element = elements.get(id);
+            const element = elements.get(String(id));
             if (element === undefined) missingIds.push(id);
             return element === undefined ? null : element;
         },
         createElement(tag) {
-            const element = new Element(tag);
+            const element = new Element(String(tag).toLowerCase());
             created.push(element);
             return element;
+        },
+        createTextNode(data) {
+            return new Text(data);
         },
     };
 
@@ -427,6 +603,7 @@ function openPage(demo, options = {}) {
         text: async () => (typeof body === "string" ? body : JSON.stringify(body)),
     });
 
+    const ownMetadata = { credential_configurations_supported: options.configurations || CONFIGURATIONS };
     const tokenAnswer = options.token || { status: 200, body: { access_token: "at-f18", token_type: "Bearer" } };
     const nonceAnswer = options.nonce || { status: 200, body: { c_nonce: "nonce-f18" } };
     const credentialAnswer = options.credential
@@ -469,8 +646,8 @@ function openPage(demo, options = {}) {
         if (method === "GET" && issuerDocuments.has(target)) return answer(200, issuerDocuments.get(target));
         if (method === "GET" && asDocuments.has(target)) return answer(200, asDocuments.get(target));
         // the page's own configuration list, loaded from its own surface
-        if (method === "GET" && target.endsWith("/.well-known/openid-credential-issuer")) return answer(200, METADATA);
-        if (method === "GET" && target.endsWith("/offer/demo-subjects")) {
+        if (method === "GET" && target === "/v1/certify/.well-known/openid-credential-issuer") return answer(200, ownMetadata);
+        if (method === "GET" && target === "/v1/certify/offer/demo-subjects") {
             if (demo === null) throw new TypeError("fetch failed");
             if (demo === false) return answer(404, "not found");
             return answer(200, demo);
@@ -481,7 +658,10 @@ function openPage(demo, options = {}) {
             if (next === "throw") throw new TypeError("fetch failed");
             return answer(next.status, next.body);
         }
-        if (method === "POST" && target.endsWith("/pre-authorized-data")) return answer(200, nextOffer());
+        if (method === "POST" && target === "/v1/certify/pre-authorized-data") {
+            if (options.offerGate) await options.offerGate;
+            return answer(200, nextOffer());
+        }
         if (method === "POST" && tokenEndpoints.has(target)) return answer(tokenAnswer.status, tokenAnswer.body);
         if (method === "POST" && nonceEndpoints.has(target)) return answer(nonceAnswer.status, nonceAnswer.body);
         if (method === "POST" && credentialEndpoints.has(target)) return answer(credentialAnswer.status, credentialAnswer.body);
@@ -491,9 +671,9 @@ function openPage(demo, options = {}) {
     // the real library draws a QR into the container it is given; this stub appends a stand-in whose src names the
     // encoded text, so a check can say which offer's QR is where
     class QRCode {
-        constructor(container, options) {
+        constructor(container, settings) {
             const image = document.createElement("img");
-            image.src = "qr:" + options.text;
+            image.src = "qr:" + settings.text;
             image.alt = "QR code";
             container.appendChild(image);
         }
@@ -521,17 +701,19 @@ function openPage(demo, options = {}) {
         btoa,
         atob,
     });
-    const inline = [...source.matchAll(/<script>([\s\S]*?)<\/script>/g)]
-        .map((match) => match[1]).find((script) => script.includes("(function () {"));
-    if (!inline) throw new Error("the page's inline script is missing");
+    // a browser runs every inline script (no src) in document order; the `src` scripts are the QRCode and Cbor stubs
+    const inline = scripts.filter((script) => !script.attributes.has("src"));
     // a page that looks up an id the markup does not declare throws here, as it does in a browser; the checks report it
-    let scriptError = null;
-    try {
-        vm.runInContext(inline, context, { filename: "static/offer/index.html" });
-    } catch (error) {
-        scriptError = error;
+    let scriptError = inline.length ? null : new Error("the page has no inline script");
+    for (const script of inline) {
+        try {
+            vm.runInContext(script.textContent, context, { filename: "static/offer/index.html" });
+        } catch (error) {
+            if (scriptError === null) scriptError = error;
+        }
     }
 
+    const posts = () => requests.filter((request) => request.method === "POST");
     const page = {
         el: (id) => document.getElementById(id),
         created,
@@ -542,31 +724,30 @@ function openPage(demo, options = {}) {
         async settle() {
             for (let i = 0; i < 20; i++) await new Promise((done) => setImmediate(done));
         },
+        /** Presses a control and returns the POSTs the press made. */
+        async press(id) {
+            const before = posts().length;
+            const button = page.el(id);
+            if (button === null) {
+                check(`the page has the control the checks press (#${id})`, false, `the markup declares no #${id}`);
+                return [];
+            }
+            await button.fire("click");
+            return posts().slice(before);
+        },
         /** Presses "Create offer" and returns the parsed body of the POST it made (an empty object, and a failed
          *  check, when it made none). */
         async createOffer() {
-            const button = page.el("create");
-            if (button === null) {
-                check("the page has the Create button the checks press (#create)", false, "the markup declares no #create");
-                return {};
-            }
-            const before = requests.filter((request) => request.method === "POST").length;
-            await button.fire("click");
-            const posts = requests.filter((request) => request.method === "POST");
-            if (posts.length <= before) {
+            const made = await page.press("create");
+            if (!made.length) {
                 check("the page creates an offer when Create offer is pressed", false, "it made no POST");
                 return {};
             }
-            return JSON.parse(posts[posts.length - 1].body);
+            return JSON.parse(made[made.length - 1].body);
         },
         /** Presses the in-page wallet button ("Run the pre-authorized code flow here"). */
         async runWallet() {
-            const button = page.el("wallet");
-            if (button === null) {
-                check("the page has the wallet button the checks press (#wallet)", false, "the markup declares no #wallet");
-                return;
-            }
-            await button.fire("click");
+            await page.press("wallet");
         },
         innerHTMLOfEverything() {
             return [...elements.values(), ...created].flatMap((element) => element.innerHTMLWrites);
@@ -599,6 +780,11 @@ const nonceRequest = (page) => page.requests.filter((request) => request.method 
 const credentialRequest = (page) => page.requests
     .filter((request) => request.method === "POST" && typeof request.body === "string" && request.body.includes("\"proofs\""))
     .pop();
+
+/** The requests that carry any of the secrets anywhere (URL, body or headers). */
+const carrying = (requests, secrets) => requests.filter((request) => secrets.some((secret) =>
+    [request.url, request.body === undefined ? "" : String(request.body), JSON.stringify(request.headers)]
+        .some((part) => part.includes(secret))));
 
 /** The stand-in QR images published in the page's `#qr` container, by the text they encode. */
 const qrImages = (page) => page.el("qr").children.filter((child) => child.tagName === "img").map((child) => child.src);
@@ -688,40 +874,88 @@ async function unchanged(name, demo) {
     });
 }
 
+/**
+ * Creates an offer whose grant asks for a transaction code, then runs the wallet against the given documents, and
+ * asserts that the redemption was refused before anything secret left the page: no POST at all, neither the
+ * pre-authorized code, the transaction code nor an access token in any request, and no request to the attacker's host.
+ */
+async function refusedRedemption(label, setup) {
+    const code = "code-secret-" + label.replace(/[^a-z0-9]+/gi, "-");
+    const page = openPage({ subjects: [] }, Object.assign({
+        offers: [offerByValue("refused", offerDocument(setup.offerIssuer || OID4VCI_ISSUER, "demo", code, TX_CODE))],
+    }, setup.options));
+    await page.settle();
+    const el = page.el;
+    el("subject").value = "refused-subject";
+    el("txCode").value = "8642";
+    await page.createOffer();
+    check(`${label}: the offer is published and the wallet offered`, el("wallet").disabled === false);
+    const from = page.requests.length;
+    await page.runWallet();
+    const sent = page.requests.slice(from);
+    equal(`${label}: the wallet made no POST (no token, nonce or credential request)`,
+        sent.filter((request) => request.method !== "GET").map((request) => request.url), []);
+    equal(`${label}: neither the pre-authorized code, the transaction code nor an access token is sent anywhere`,
+        carrying(sent, [code, "8642", "at-f18"]).map((request) => request.method + " " + request.url), []);
+    equal(`${label}: nothing is sent to a host the checked metadata did not vouch for`,
+        sent.filter((request) => request.url.includes("attacker.example")).map((request) => request.method + " " + request.url), []);
+    check(`${label}: the refusal is reported`, el("walletStatus").className.includes("bad")
+        && el("walletStatus").textContent.includes(setup.reason), el("walletStatus").textContent);
+    check(`${label}: the wallet can be pressed again`, el("wallet").disabled === false);
+}
+
 /* ---------------------------------------------------------------- checks */
 
+process.on("unhandledRejection", (reason) => {
+    check("no promise of the page or the harness rejects unhandled", false, String(reason && reason.stack ? reason.stack : reason));
+    process.exitCode = 1;
+});
+process.on("uncaughtException", (error) => {
+    check("no exception escapes the page or the harness", false, String(error && error.stack ? error.stack : error));
+    process.exitCode = 1;
+});
+
+try {
+
 // 1. the CSS rule the labels depend on: the page's own `label { display: block }` beats the UA's `[hidden]` rule
-check("[hidden] is display:none !important in the page's stylesheet",
-    /\[hidden\]\s*\{[^}]*display:\s*none\s*!important/.test(html));
+await section("1. [hidden] rule", async () => {
+    check("[hidden] is display:none !important in the page's stylesheet",
+        /\[hidden\]\s*\{[^}]*display:\s*none\s*!important/.test(html));
+});
 
 // 2. the state a deployment without demo subjects shows
-const untouched = openPage({ subjects: [] });
-const initial = untouched.el;
-check("the page's inline script runs against the markup's own ids", untouched.scriptError === null,
-    untouched.scriptError && String(untouched.scriptError.message));
-check("before the fetch: the dropdown ships hidden", initial("subjectChoice").hidden === true);
-check("before the fetch: the dropdown label ships hidden", initial("subjectChoiceLabel").hidden === true);
-check("before the fetch: the typed field and its label ship visible",
-    initial("subject").hidden === false && initial("subjectLabel").hidden === false);
-check("before the fetch: the offer URI and document stay hidden", initial("offerUri").hidden === true && initial("offerDoc").hidden === true);
-check("before the fetch: the wallet's results stay hidden", initial("credential").hidden === true && initial("mdocView").hidden === true);
-check("before the fetch: the deep link stays hidden", initial("open").hidden === true);
+await section("2. initial state", async () => {
+    const untouched = openPage({ subjects: [] });
+    const initial = untouched.el;
+    check("the page's inline script runs against the markup's own ids", untouched.scriptError === null,
+        untouched.scriptError && String(untouched.scriptError.message));
+    check("before the fetch: the dropdown ships hidden", initial("subjectChoice").hidden === true);
+    check("before the fetch: the dropdown label ships hidden", initial("subjectChoiceLabel").hidden === true);
+    check("before the fetch: the typed field and its label ship visible",
+        initial("subject").hidden === false && initial("subjectLabel").hidden === false);
+    check("before the fetch: the offer URI and document stay hidden", initial("offerUri").hidden === true && initial("offerDoc").hidden === true);
+    check("before the fetch: the wallet's results stay hidden", initial("credential").hidden === true && initial("mdocView").hidden === true);
+    check("before the fetch: the deep link stays hidden", initial("open").hidden === true);
+});
 
 // 3. everything that is not a well-formed list leaves the page exactly as it was
-await unchanged("empty list", { subjects: [] });
-await unchanged("404", false);
-await unchanged("a fetch that throws", null);
-await unchanged("a list that is not JSON", "<html>not json</html>");
-await unchanged("subjects is not an array", { subjects: {} });
-await unchanged("label is a number", { subjects: [{ id: "x", label: 42, credential_configuration_ids: [] }] });
-await unchanged("an id that is not a subject id", { subjects: [{ id: "bad id", label: "Bad", credential_configuration_ids: [] }] });
-await unchanged("an id with markup", { subjects: [{ id: "<script>", label: "Bad", credential_configuration_ids: [] }] });
-await unchanged("a configuration id that is not a string",
-    { subjects: [{ id: "x", label: "X", credential_configuration_ids: [1] }] });
-await unchanged("one bad entry among good ones", { subjects: [SUBJECTS[0], { id: "x", label: 42, credential_configuration_ids: [] }] });
+for (const [name, demo] of [
+    ["empty list", { subjects: [] }],
+    ["404", false],
+    ["a fetch that throws", null],
+    ["a list that is not JSON", "<html>not json</html>"],
+    ["subjects is not an array", { subjects: {} }],
+    ["label is a number", { subjects: [{ id: "x", label: 42, credential_configuration_ids: [] }] }],
+    ["an id that is not a subject id", { subjects: [{ id: "bad id", label: "Bad", credential_configuration_ids: [] }] }],
+    ["an id with markup", { subjects: [{ id: "<script>", label: "Bad", credential_configuration_ids: [] }] }],
+    ["a configuration id that is not a string", { subjects: [{ id: "x", label: "X", credential_configuration_ids: [1] }] }],
+    ["one bad entry among good ones", { subjects: [SUBJECTS[0], { id: "x", label: 42, credential_configuration_ids: [] }] }],
+]) {
+    await section(`3. ${name}`, () => unchanged(name, demo));
+}
 
 // 4. the dropdown with configured subjects
-{
+await section("4. demo subjects", async () => {
     const page = openPage({ subjects: SUBJECTS });
     await page.settle();
     const el = page.el;
@@ -767,10 +1001,8 @@ await unchanged("one bad entry among good ones", { subjects: [SUBJECTS[0], { id:
     await el("subjectChoice").fire("change");
     check("other: the typed subject field is revealed", el("subject").hidden === false && el("subjectLabel").hidden === false);
     equal("other: the dropdown stays on screen", el("subjectChoice").hidden, false);
-    equal("other: the offer sends the typed id", (await (async () => {
-        el("subject").value = "typed-9";
-        return page.createOffer();
-    })()).subject, "typed-9");
+    el("subject").value = "typed-9";
+    equal("other: the offer sends the typed id", (await page.createOffer()).subject, "typed-9");
 
     // Other with an empty subject: the claims are what the offer carries
     el("subject").value = "";
@@ -820,14 +1052,13 @@ await unchanged("one bad entry among good ones", { subjects: [SUBJECTS[0], { id:
     check("a created offer leaves the wallet's results hidden until used",
         el("credential").hidden === true && el("mdocView").hidden === true);
     equal("subjects: the page looked up only ids the markup declares", page.missingIds, []);
-}
+});
 
 // 5. a label is display text, whatever it contains
-{
+await section("5. labels are text", async () => {
     const label = '<img src=x onerror=alert(1)> "quoted" <b>bold</b>';
     const page = openPage({ subjects: [{ id: "evil-1", label, credential_configuration_ids: [] }] });
     await page.settle();
-    const el = page.el;
     equal("a label with markup becomes an option's text", options(page), [
         ["evil-1", `${label} (evil-1)`],
         ["", "Other (type a subject id)"],
@@ -837,21 +1068,21 @@ await unchanged("one bad entry among good ones", { subjects: [SUBJECTS[0], { id:
     equal("no label reached innerHTML", page.innerHTMLOfEverything().filter((written) => written !== ""), []);
     check("the label is text on the option, not markup",
         page.el("subjectChoice").children[0]?.textContent.includes("<img src=x onerror=alert(1)>"));
-}
+});
 
 // 6. a subject configured for another configuration leaves the page as it was: the dropdown hidden, the typed field and
 //    the original claims label in place (this is the state a deployment whose subjects name other configurations shows,
 //    not a reload: the page never reloads itself)
-{
+await section("6. subjects for another configuration", async () => {
     const page = openPage({ subjects: [{ id: "only-1", label: "Only", credential_configuration_ids: ["farmer"] }] });
     await page.settle();
     equal("a configuration with no subject hides the dropdown again", page.el("subjectChoice").hidden, true);
     equal("and shows the typed field", page.el("subject").hidden, false);
     equal("and restores the claims label", page.el("claimsLabel").textContent, CLAIMS_LABEL);
-}
+});
 
 // 7. the markup parser and the DOM rules the page depends on
-{
+await section("7. markup parser", async () => {
     const parsed = markupElements(`<div id="first"><!-- <span id="in-a-comment"> --><script>var trap = '<b id="in-a-script">';</script>` +
         `<style>#in-a-style { color: red }</style><button data-id="not-an-id">x</button><span id="first">y</span></div>`);
     equal("an attribute named data-id is not an id", parsed.has("not-an-id"), false);
@@ -860,11 +1091,45 @@ await unchanged("one bad entry among good ones", { subjects: [SUBJECTS[0], { id:
     equal("raw text inside a style is not markup", parsed.has("in-a-style"), false);
     equal("the first element with an id wins, as in a browser", parsed.get("first") && parsed.get("first").tagName, "div");
 
+    // RCDATA (textarea, title) and raw text (script, style): the content is text, the element and its attributes stay
+    const { ids, scripts } = parseMarkup(`<title id="t">A &amp; B <b id="in-a-title">x</b></title>` +
+        `<textarea id="area" hidden><button id="in-a-textarea">x</button> &lt;ok&gt;</textarea>` +
+        `<script id="s" data-x="1">if (a < b) { document.write('<p id="in-script">') }</script>` +
+        `<style id="css" media="print">p { color: red }</style><p id="after">after</p>`);
+    equal("an element inside a textarea is text, not an element", ids.has("in-a-textarea"), false);
+    equal("an element inside a title is text, not an element", ids.has("in-a-title"), false);
+    equal("an element written by a script's text is not an element", ids.has("in-script"), false);
+    equal("the textarea itself and its attributes are kept",
+        [ids.get("area") && ids.get("area").tagName, ids.get("area") && ids.get("area").hidden], ["textarea", true]);
+    equal("a textarea's value is its text, character references decoded (RCDATA)",
+        ids.get("area") && ids.get("area").value, '<button id="in-a-textarea">x</button> <ok>');
+    equal("a title's text decodes character references and keeps tags as text",
+        ids.get("t") && ids.get("t").textContent, 'A & B <b id="in-a-title">x</b>');
+    equal("a script keeps its attributes and its raw text",
+        [scripts.length, scripts[0] && scripts[0].attributes.get("data-x"), scripts[0] && scripts[0].textContent],
+        [1, "1", "if (a < b) { document.write('<p id=\"in-script\">') }"]);
+    equal("a style element and its attributes are kept",
+        [ids.get("css") && ids.get("css").attributes.get("media"), ids.get("css") && ids.get("css").textContent], ["print", "p { color: red }"]);
+    equal("markup after a raw text element is parsed again", ids.get("after") && ids.get("after").textContent, "after");
+
+    // a duplicate attribute keeps its first occurrence (the second is a parse error and is dropped)
+    const duplicates = markupElements(`<span id="first-id" id="second-id" class="a" class="b"></span>`);
+    equal("a duplicate id attribute keeps the first value", [duplicates.has("first-id"), duplicates.has("second-id")], [true, false]);
+    equal("any duplicate attribute keeps the first value", duplicates.get("first-id") && duplicates.get("first-id").className, "a");
+    equal("an empty id is not an id", markupElements(`<span id="">x</span>`).has(""), false);
+
+    // textContent is the text of every descendant, in tree order
+    const nested = markupElements(`<div id="outer">a<span>b<i>c</i></span>d</div>`);
+    equal("textContent reads every descendant's text", nested.get("outer") && nested.get("outer").textContent, "abcd");
+    const options = parseMarkup(`<select id="s"><option value="1">one<option value="2" selected>two</select>`).ids.get("s");
+    equal("a new option closes the open one, and a selected attribute selects it",
+        [options && options.options.length, options && options.value], [2, "2"]);
+
     const cleared = new Element("div");
     cleared.textContent = "old text";
     cleared.appendChild(new Element("span"));
     cleared.innerHTML = "";
-    equal("innerHTML = \"\" clears the text and the children", [cleared.textContent, cleared.children.length], ["", 0]);
+    equal("innerHTML = \"\" clears the text and the children", [cleared.textContent, cleared.childNodes.length], ["", 0]);
 
     const disabledControl = new Element("button");
     let clicks = 0;
@@ -872,10 +1137,32 @@ await unchanged("one bad entry among good ones", { subjects: [SUBJECTS[0], { id:
     disabledControl.disabled = true;
     await disabledControl.fire("click");
     equal("a disabled control does not dispatch a click", clicks, 0);
-}
+});
+
+// 7b. F-18 round 2: the exact mutation that passed the previous harness. The real Create button is renamed to `data-id`
+//     and a button carrying id="create" is hidden inside a textarea (and, separately, a title): a browser has no #create
+//     element, so the page's script throws, and the harness must see the same
+await section("7b. markup inside RCDATA is not an element", async () => {
+    const realButton = '<button id="create">Create offer</button>';
+    for (const [where, mutation] of [
+        ["a textarea", '<textarea hidden><button id="create"></button></textarea><button data-id="create">Create offer</button>'],
+        ["the title", null],
+    ]) {
+        const mutated = mutation === null
+            ? html.replace("<title>Credential offer</title>", '<title>Credential offer<button id="create"></button></title>')
+                .replace(realButton, '<button data-id="create">Create offer</button>')
+            : html.replace(realButton, mutation);
+        check(`mutation inside ${where}: the page copy was mutated`, mutated !== html && !mutated.includes(realButton));
+        const page = openPage({ subjects: [] }, { html: mutated });
+        equal(`mutation inside ${where}: #create is not an element`, page.el("create"), null);
+        check(`mutation inside ${where}: the page's script fails on the missing #create, as in a browser`,
+            page.scriptError !== null && /addEventListener|null/.test(String(page.scriptError && page.scriptError.message)),
+            page.scriptError && String(page.scriptError.message));
+    }
+});
 
 // 8. a <select>'s selection is per-option selectedness, as in a browser (HTML selectedness setting algorithm)
-{
+await section("8. select semantics", async () => {
     const select = new Element("select");
     const option = (value) => {
         const element = new Element("option");
@@ -913,10 +1200,51 @@ await unchanged("one bad entry among good ones", { subjects: [SUBJECTS[0], { id:
     const bare = new Element("option");
     bare.textContent = "  a   b  ";
     equal("an option without a value reads its text, whitespace collapsed", bare.value, "a b");
-}
+
+    // option.selected: setting it true deselects every other option of a single select; false asks for a reset
+    const single = new Element("select");
+    const p = option("p"), q = option("q"), r = option("r");
+    single.appendChild(p);
+    single.appendChild(q);
+    single.appendChild(r);
+    r.selected = true;
+    equal("option.selected = true selects that option alone",
+        [single.value, [p, q, r].map((entry) => entry.selected)], ["r", [false, false, true]]);
+    p.selected = true;
+    equal("selecting an earlier option deselects the later one", [single.value, [p, q, r].map((entry) => entry.selected)],
+        ["p", [true, false, false]]);
+    p.selected = false;
+    equal("deselecting the only selected option resets to the first option that is not disabled",
+        [single.value, single.selectedIndex], ["p", 0]);
+
+    // disabled options are skipped by the selectedness setting algorithm (but a script can still select one)
+    const guarded = new Element("select");
+    const off = option("off"), on = option("on"), last = option("last");
+    off.disabled = true;
+    guarded.appendChild(off);
+    equal("a select whose only option is disabled has nothing selected", [guarded.value, guarded.selectedIndex], ["", -1]);
+    guarded.appendChild(on);
+    guarded.appendChild(last);
+    equal("the first option that is not disabled is selected", guarded.value, "on");
+    guarded.value = "last";
+    guarded.removeChild(last);
+    equal("removing the selected option selects the first option that is not disabled", [guarded.value, guarded.selectedIndex], ["on", 1]);
+    guarded.value = "off";
+    equal("a script can select a disabled option by value", guarded.value, "off");
+
+    // selectedIndex indexes the list of options, not the children (a stray element child is not an option)
+    const mixed = new Element("select");
+    mixed.appendChild(option("m1"));
+    mixed.appendChild(new Element("hr"));
+    mixed.appendChild(option("m2"));
+    mixed.selectedIndex = 1;
+    equal("selectedIndex = 1 selects the second option, not the second child", [mixed.value, mixed.selectedIndex], ["m2", 1]);
+    mixed.selectedIndex = 7;
+    equal("an index past the options selects nothing", [mixed.value, mixed.selectedIndex], ["", -1]);
+});
 
 // 9. the page against that DOM: no invented elements, and an unofferable select value takes the Other path
-{
+await section("9. no invented elements", async () => {
     const page = openPage({ subjects: SUBJECTS });
     await page.settle();
     const el = page.el;
@@ -943,10 +1271,10 @@ await unchanged("one bad entry among good ones", { subjects: [SUBJECTS[0], { id:
     equal("an unofferable select value with an empty subject falls through to the claims",
         (await page.createOffer()).claims, { fullName: "Typed Fallback" });
     el("claims").value = "";
-}
+});
 
 // 10. a subject whose label repeats its id is shown as the id alone (F-18 nit 6), and so is a subject with no label
-{
+await section("10. label equal to the id", async () => {
     const page = openPage({
         subjects: [
             { id: "same-1", label: "same-1", credential_configuration_ids: [] },
@@ -961,10 +1289,10 @@ await unchanged("one bad entry among good ones", { subjects: [SUBJECTS[0], { id:
         ["named-1", "Named (named-1)"],
         ["", "Other (type a subject id)"],
     ]);
-}
+});
 
 // 11. the published QR: the stub draws into the container it is given, and a new offer replaces the old QR
-{
+await section("11. QR", async () => {
     const page = openPage({ subjects: [] }, {
         offers: [offerByValue("qr-one", offerDocument(OID4VCI_ISSUER, "demo", "code-one")),
             offerByValue("qr-two", offerDocument(OID4VCI_ISSUER, "demo", "code-two"))],
@@ -975,13 +1303,14 @@ await unchanged("one bad entry among good ones", { subjects: [SUBJECTS[0], { id:
     await page.createOffer();
     equal("qr: the first offer's QR is published into the page's container",
         qrImages(page), ["qr:" + deepLink("qr-one")]);
+    equal("qr: the placeholder text is gone", page.el("qr").textContent, "");
     await page.createOffer();
     equal("qr: the container holds the current offer's QR and no other",
         qrImages(page), ["qr:" + deepLink("qr-two")]);
-}
+});
 
 // 12. an offer by reference: the page fetches the document its deep link names, and publishes it
-{
+await section("12. by reference", async () => {
     const page = openPage({ subjects: [] }, {
         offers: [offerByReference("by-reference")],
         offerFetches: [{ status: 200, body: REFERRED_OFFER }],
@@ -999,69 +1328,91 @@ await unchanged("one bad entry among good ones", { subjects: [SUBJECTS[0], { id:
     check("by reference: the fetched grant enables the wallet", el("wallet").disabled === false);
     equal("by reference: the QR carries the deep link", qrImages(page), ["qr:" + deepLink("by-reference")]);
     equal("by reference: the page looked up only ids the markup declares", page.missingIds, []);
-}
+});
 
 // 13. a replacement the page cannot complete leaves the previous offer, its document, its QR and the wallet's offer in
-//     place — after a first offer has been published, which is the state these refusals have to preserve
-for (const [label, answer] of [
-    ["404", { status: 404, body: "not found" }],
-    ["a fetch that throws", "throw"],
-    ["a document without the pre-authorized grant", { status: 200, body: { grants: {} } }],
+//     place — after a first offer has been published, which is the state these refusals have to preserve. The same
+//     rule (OpenID4VCI 1.0 section 4.1.1: credential_issuer, credential_configuration_ids, a pre-authorized_code) holds
+//     for an offer that came by reference and one that came by value
+const withoutIssuer = offerDocument(OID4VCI_ISSUER, "demo", "broken-code");
+delete withoutIssuer.credential_issuer;
+const BROKEN_DOCUMENTS = [
+    ["a document without the pre-authorized grant", { credential_issuer: OID4VCI_ISSUER, credential_configuration_ids: ["demo"], grants: {} }],
+    ["a grant without a pre-authorized_code", Object.assign(offerDocument(OID4VCI_ISSUER, "demo", "x"),
+        { grants: { [GRANT]: { tx_code: TX_CODE } } })],
+    ["an empty pre-authorized_code", offerDocument(OID4VCI_ISSUER, "demo", "")],
+    ["a document without credential_issuer", withoutIssuer],
+    ["empty credential_configuration_ids", Object.assign(offerDocument(OID4VCI_ISSUER, "demo", "broken-code"), { credential_configuration_ids: [] })],
+    ["a tx_code that is not an object", offerDocument(OID4VCI_ISSUER, "demo", "broken-code", "1234")],
+    ["a document that is not an object", "not an offer"],
+];
+for (const [label, offers, fetches] of [
+    ["404", [offerByReference("kept"), offerByReference("broken")], [{ status: 200, body: REFERRED_OFFER }, { status: 404, body: "not found" }]],
+    ["a fetch that throws", [offerByReference("kept"), offerByReference("broken")], [{ status: 200, body: REFERRED_OFFER }, "throw"]],
+    ...BROKEN_DOCUMENTS.map(([name, document]) => [`by reference, ${name}`, [offerByReference("kept"), offerByReference("broken")],
+        [{ status: 200, body: REFERRED_OFFER }, { status: 200, body: document }]]),
+    ...BROKEN_DOCUMENTS.map(([name, document]) => [`by value, ${name}`,
+        [offerByValue("kept", REFERRED_OFFER), offerByValue("broken", document)], []]),
+    ["by value, a null credential_offer", [offerByValue("kept", REFERRED_OFFER), offerByValue("broken", null)], []],
 ]) {
-    const page = openPage({ subjects: [] }, {
-        offers: [offerByReference("kept"), offerByReference("broken")],
-        offerFetches: [{ status: 200, body: REFERRED_OFFER }, answer],
+    await section(`13. ${label}`, async () => {
+        const page = openPage({ subjects: [] }, { offers, offerFetches: fetches });
+        await page.settle();
+        const el = page.el;
+        el("subject").value = "kept-subject";
+        await page.createOffer();
+        const keptUri = el("offerUri").textContent;
+        const keptDocument = el("offerDoc").textContent;
+        const keptQr = qrImages(page);
+        equal(`${label}: the previous offer was published first`, [keptUri, keptQr],
+            [deepLink("kept"), ["qr:" + deepLink("kept")]]);
+
+        await page.createOffer();
+        // a rejected fetch reaches the page's outer catch, a refused one its by-reference message and an unusable
+        // document the common validation: either way the page reports the failure and publishes nothing
+        check(`${label}: the failed replacement is reported`,
+            el("offerStatus").className.includes("bad"), el("offerStatus").textContent);
+        equal(`${label}: the previous deep link stays`, el("offerUri").textContent, keptUri);
+        equal(`${label}: the previous document stays`, el("offerDoc").textContent, keptDocument);
+        equal(`${label}: the previous QR stays`, qrImages(page), keptQr);
+        check(`${label}: the wallet stays enabled`, el("wallet").disabled === false);
+        equal(`${label}: the Create button is usable again`, prop(page, "create", "disabled"), false);
+
+        // and the wallet still redeems the offer that is on screen, not the one that failed
+        await page.runWallet();
+        equalFields(`${label}: the wallet redeems the kept offer's pre-authorized code`,
+            tokenRequest(page) && tokenRequest(page).form, { grant_type: GRANT, "pre-authorized_code": "ref-code" });
+        checkCredentialRequest(`${label}: the wallet redeems the kept offer's configuration`,
+            credentialRequest(page), { audience: OID4VCI_ISSUER, nonce: "nonce-f18", configurationId: "demo" });
     });
-    await page.settle();
-    const el = page.el;
-    el("subject").value = "kept-subject";
-    await page.createOffer();
-    const keptUri = el("offerUri").textContent;
-    const keptDocument = el("offerDoc").textContent;
-    const keptQr = qrImages(page);
-    equal(`${label}: the previous offer was published first`, [keptUri, keptQr],
-        [deepLink("kept"), ["qr:" + deepLink("kept")]]);
-
-    await page.createOffer();
-    // a rejected fetch reaches the page's outer catch and a refused one its by-reference message: either way the page
-    // reports the failure and publishes nothing
-    check(`${label}: the failed replacement is reported`,
-        el("offerStatus").className.includes("bad"), el("offerStatus").textContent);
-    equal(`${label}: the previous deep link stays`, el("offerUri").textContent, keptUri);
-    equal(`${label}: the previous document stays`, el("offerDoc").textContent, keptDocument);
-    equal(`${label}: the previous QR stays`, qrImages(page), keptQr);
-    check(`${label}: the wallet stays enabled`, el("wallet").disabled === false);
-    equal(`${label}: the Create button is usable again`, prop(page, "create", "disabled"), false);
-
-    // and the wallet still redeems the offer that is on screen, not the one that failed
-    await page.runWallet();
-    equalFields(`${label}: the wallet redeems the kept offer's pre-authorized code`,
-        tokenRequest(page) && tokenRequest(page).form, { grant_type: GRANT, "pre-authorized_code": "ref-code" });
-    checkCredentialRequest(`${label}: the wallet redeems the kept offer's configuration`,
-        credentialRequest(page), { audience: OID4VCI_ISSUER, nonce: "nonce-f18", configurationId: "demo" });
 }
 
-// 14. a first offer the page cannot publish leaves nothing published, and its disabled wallet dispatches nothing
-{
-    const page = openPage({ subjects: [] }, {
-        offers: [offerByReference("no-grant")],
-        offerFetches: [{ status: 200, body: { grants: {} } }],
+// 14. a first offer the page cannot publish leaves nothing published, and its disabled wallet dispatches nothing — by
+//     reference and by value alike
+for (const [label, offers, fetches] of [
+    ["by reference", [offerByReference("no-grant")], [{ status: 200, body: { credential_issuer: OID4VCI_ISSUER, credential_configuration_ids: ["demo"], grants: {} } }]],
+    ["by value", [offerByValue("no-grant", { credential_issuer: OID4VCI_ISSUER, credential_configuration_ids: ["demo"], grants: {} })], []],
+    ["by value without a code", [offerByValue("no-code", offerDocument(OID4VCI_ISSUER, "demo", ""))], []],
+]) {
+    await section(`14. first offer unusable, ${label}`, async () => {
+        const page = openPage({ subjects: [] }, { offers, offerFetches: fetches });
+        await page.settle();
+        const el = page.el;
+        el("subject").value = "no-grant-subject";
+        await page.createOffer();
+        check(`${label}: a document without a usable pre-authorized grant is refused`,
+            el("offerStatus").className.includes("bad") && el("offerStatus").textContent.includes("not a usable pre-authorized code offer"),
+            el("offerStatus").textContent);
+        equal(`${label}: and nothing is published`, [el("offerUri").hidden, el("offerDoc").hidden, el("wallet").disabled], [true, true, true]);
+        equal(`${label}: and no QR is drawn`, qrImages(page), []);
+        const before = page.requests.length;
+        await page.runWallet();
+        equal(`${label}: a disabled wallet button dispatches no click`, page.requests.slice(before), []);
     });
-    await page.settle();
-    const el = page.el;
-    el("subject").value = "no-grant-subject";
-    await page.createOffer();
-    check("a document without the pre-authorized grant is refused",
-        el("offerStatus").textContent.includes("could not be fetched"), el("offerStatus").textContent);
-    equal("and nothing is published", [el("offerUri").hidden, el("wallet").disabled], [true, true]);
-    equal("and no QR is drawn", qrImages(page), []);
-    const before = page.requests.length;
-    await page.runWallet();
-    equal("a disabled wallet button dispatches no click", page.requests.slice(before), []);
 }
 
 // 15. the page's own wallet: the metadata documents, the token form, the nonce, a real P-256 proof, the credential
-{
+await section("15. wallet", async () => {
     const page = openPage({ subjects: [] }, { offers: [offerByValue("wallet", offerDocument(OID4VCI_ISSUER, "demo", "code-f18"))] });
     await page.settle();
     const el = page.el;
@@ -1102,46 +1453,68 @@ for (const [label, answer] of [
     check("wallet: the flow reports success", el("walletStatus").textContent.includes("Credential issued"),
         el("walletStatus").textContent);
     equal("wallet: the page looked up only ids the markup declares", page.missingIds, []);
-}
+});
 
 // 16. section 6.1: the transaction code is sent for exactly the offers whose grant names one, with the value entered
 //     for that offer
-{
-    const page = openPage({ subjects: [] }, {
-        offers: [offerByValue("wallet-tx", offerDocument(OID4VCI_ISSUER, "demo", "code-tx", TX_CODE))],
-    });
-    await page.settle();
-    const el = page.el;
-    el("subject").value = "wallet-subject";
-    el("txCode").value = "1234";
-    equal("tx_code: the offer itself carries the transaction code", (await page.createOffer()).tx_code, "1234");
-    el("txCode").value = ""; // edited after the offer was created: the offer still asks for the value it was made with
-    await page.runWallet();
-    equalFields("tx_code: the token form carries the value entered for this offer", tokenRequest(page) && tokenRequest(page).form, {
-        grant_type: GRANT,
-        "pre-authorized_code": "code-tx",
-        tx_code: "1234",
-    });
-}
-{
-    const page = openPage({ subjects: [] }, {
-        offers: [offerByValue("wallet-no-tx", offerDocument(OID4VCI_ISSUER, "demo", "code-plain"))],
-    });
-    await page.settle();
-    const el = page.el;
-    el("subject").value = "wallet-subject";
-    el("txCode").value = "";
-    await page.createOffer();
-    el("txCode").value = "9999"; // filled, but this offer's grant names no transaction code
-    await page.runWallet();
-    equalFields("tx_code: an offer whose grant names none never sends the field", tokenRequest(page) && tokenRequest(page).form, {
-        grant_type: GRANT,
-        "pre-authorized_code": "code-plain",
-    });
-}
+await section("16. tx_code", async () => {
+    {
+        const page = openPage({ subjects: [] }, {
+            offers: [offerByValue("wallet-tx", offerDocument(OID4VCI_ISSUER, "demo", "code-tx", TX_CODE))],
+        });
+        await page.settle();
+        const el = page.el;
+        el("subject").value = "wallet-subject";
+        el("txCode").value = "1234";
+        equal("tx_code: the offer itself carries the transaction code", (await page.createOffer()).tx_code, "1234");
+        el("txCode").value = ""; // edited after the offer was created: the offer still asks for the value it was made with
+        await page.runWallet();
+        equalFields("tx_code: the token form carries the value entered for this offer", tokenRequest(page) && tokenRequest(page).form, {
+            grant_type: GRANT,
+            "pre-authorized_code": "code-tx",
+            tx_code: "1234",
+        });
+    }
+    {
+        const page = openPage({ subjects: [] }, {
+            offers: [offerByValue("wallet-no-tx", offerDocument(OID4VCI_ISSUER, "demo", "code-plain"))],
+        });
+        await page.settle();
+        const el = page.el;
+        el("subject").value = "wallet-subject";
+        el("txCode").value = "";
+        await page.createOffer();
+        el("txCode").value = "9999"; // filled, but this offer's grant names no transaction code
+        await page.runWallet();
+        equalFields("tx_code: an offer whose grant names none never sends the field", tokenRequest(page) && tokenRequest(page).form, {
+            grant_type: GRANT,
+            "pre-authorized_code": "code-plain",
+        });
+    }
+    {
+        // the grant asks for a transaction code, but none was entered when the offer was created: the token endpoint
+        // would spend the pre-authorized code on a request that cannot succeed (gap G36), so nothing is sent
+        const page = openPage({ subjects: [] }, {
+            offers: [offerByValue("wallet-tx-missing", offerDocument(OID4VCI_ISSUER, "demo", "code-tx-missing", TX_CODE))],
+        });
+        await page.settle();
+        const el = page.el;
+        el("subject").value = "wallet-subject";
+        el("txCode").value = "";
+        await page.createOffer();
+        el("txCode").value = "5555"; // typed afterwards: not the value this offer was created with
+        const from = page.requests.length;
+        await page.runWallet();
+        const sent = page.requests.slice(from);
+        equal("tx_code asked but not entered: nothing is sent", sent.map((request) => request.method + " " + request.url), []);
+        check("tx_code asked but not entered: the refusal is reported",
+            el("walletStatus").className.includes("bad") && el("walletStatus").textContent.includes("transaction code"),
+            el("walletStatus").textContent);
+    }
+});
 
 // 17. section 8.2: an access token that names credential identifiers is redeemed with credential_identifier
-{
+await section("17. authorization_details", async () => {
     const page = openPage({ subjects: [] }, {
         offers: [offerByValue("wallet-authz", offerDocument(OID4VCI_ISSUER, "demo", "code-authz"))],
         token: {
@@ -1154,8 +1527,7 @@ for (const [label, answer] of [
         },
     });
     await page.settle();
-    const el = page.el;
-    el("subject").value = "wallet-subject";
+    page.el("subject").value = "wallet-subject";
     await page.createOffer();
     await page.runWallet();
     checkCredentialRequest("authorization_details", credentialRequest(page), {
@@ -1163,10 +1535,10 @@ for (const [label, answer] of [
         nonce: "nonce-f18",
         credentialIdentifier: "credential-identifier-1",
     });
-}
+});
 
 // 18. a compatibility-surface offer: its own metadata, the AS it names (itself), and aud = the issuer the offer named
-{
+await section("18. legacy offer", async () => {
     const page = openPage({ subjects: [] }, {
         offers: [offerByValue("wallet-legacy", offerDocument(LEGACY_ISSUER, "demo", "code-legacy"))],
     });
@@ -1192,10 +1564,23 @@ for (const [label, answer] of [
     });
     check("legacy offer: the issued credential is shown", el("credential").hidden === false && el("walletStatus").textContent.includes("Credential issued"),
         el("walletStatus").textContent);
-}
+});
+await section("18b. an answer without notification_id", async () => {
+    // OpenID4VCI 1.0 section 8.3: notification_id is optional, and the compatibility endpoint returns none (seen end to
+    // end on the F-18 round 3 stack, where the page printed "notification id undefined")
+    const page = openPage({ subjects: [] }, {
+        offers: [offerByValue("wallet-no-notification", offerDocument(LEGACY_ISSUER, "demo", "code-no-notification"))],
+        credential: { status: 200, body: { credentials: [{ credential: "ldp-credential" }] } },
+    });
+    await page.settle();
+    page.el("subject").value = "wallet-subject";
+    await page.createOffer();
+    await page.runWallet();
+    equal("no notification_id: the success names no notification id", page.el("walletStatus").textContent, "Credential issued (1)");
+});
 
 // 19. an authorization server with a path of its own: RFC 8414 puts the well-known segment between host and path
-{
+await section("19. AS with a path", async () => {
     const as = "https://as.example/v1/esignet";
     const page = openPage({ subjects: [] }, {
         offers: [offerByValue("wallet-as-path", offerDocument(OID4VCI_ISSUER, "demo", "code-as"))],
@@ -1211,8 +1596,7 @@ for (const [label, answer] of [
         },
     });
     await page.settle();
-    const el = page.el;
-    el("subject").value = "wallet-subject";
+    page.el("subject").value = "wallet-subject";
     await page.createOffer();
     await page.runWallet();
     equal("AS with a path: its metadata is read at the RFC 8414 location",
@@ -1224,50 +1608,247 @@ for (const [label, answer] of [
         grant_type: GRANT,
         "pre-authorized_code": "code-as",
     });
-}
+});
 
 // 20. section 7: the nonce endpoint is optional, and any 2xx from it is an answer
-{
-    const withoutNonce = Object.assign({}, OID4VCI_DOCUMENT);
-    delete withoutNonce.nonce_endpoint;
-    const page = openPage({ subjects: [] }, {
-        offers: [offerByValue("wallet-no-nonce", offerDocument(OID4VCI_ISSUER, "demo", "code-no-nonce"))],
-        issuerMetadata: { [OID4VCI_ISSUER]: withoutNonce },
-    });
-    await page.settle();
-    const el = page.el;
-    el("subject").value = "wallet-subject";
-    await page.createOffer();
-    await page.runWallet();
-    equal("no nonce_endpoint: the wallet asks for no c_nonce", nonceRequest(page), undefined);
-    checkCredentialRequest("no nonce_endpoint", credentialRequest(page), {
-        audience: OID4VCI_ISSUER,
-        nonce: undefined,
-        configurationId: "demo",
-    });
-}
-{
-    const page = openPage({ subjects: [] }, {
-        offers: [offerByValue("wallet-nonce-201", offerDocument(OID4VCI_ISSUER, "demo", "code-201"))],
-        nonce: { status: 201, body: { c_nonce: "nonce-201" } },
-    });
-    await page.settle();
-    const el = page.el;
-    el("subject").value = "wallet-subject";
-    await page.createOffer();
-    await page.runWallet();
-    checkCredentialRequest("a 201 nonce answer", credentialRequest(page), {
-        audience: OID4VCI_ISSUER,
-        nonce: "nonce-201",
-        configurationId: "demo",
-    });
-    check("a 201 nonce answer: the credential is issued", el("walletStatus").textContent.includes("Credential issued"),
-        el("walletStatus").textContent);
-}
+await section("20. nonce endpoint", async () => {
+    {
+        const withoutNonce = Object.assign({}, OID4VCI_DOCUMENT);
+        delete withoutNonce.nonce_endpoint;
+        const page = openPage({ subjects: [] }, {
+            offers: [offerByValue("wallet-no-nonce", offerDocument(OID4VCI_ISSUER, "demo", "code-no-nonce"))],
+            issuerMetadata: { [OID4VCI_ISSUER]: withoutNonce },
+        });
+        await page.settle();
+        page.el("subject").value = "wallet-subject";
+        await page.createOffer();
+        await page.runWallet();
+        equal("no nonce_endpoint: the wallet asks for no c_nonce", nonceRequest(page), undefined);
+        checkCredentialRequest("no nonce_endpoint", credentialRequest(page), {
+            audience: OID4VCI_ISSUER,
+            nonce: undefined,
+            configurationId: "demo",
+        });
+    }
+    {
+        const page = openPage({ subjects: [] }, {
+            offers: [offerByValue("wallet-nonce-201", offerDocument(OID4VCI_ISSUER, "demo", "code-201"))],
+            nonce: { status: 201, body: { c_nonce: "nonce-201" } },
+        });
+        await page.settle();
+        const el = page.el;
+        el("subject").value = "wallet-subject";
+        await page.createOffer();
+        await page.runWallet();
+        checkCredentialRequest("a 201 nonce answer", credentialRequest(page), {
+            audience: OID4VCI_ISSUER,
+            nonce: "nonce-201",
+            configurationId: "demo",
+        });
+        check("a 201 nonce answer: the credential is issued", el("walletStatus").textContent.includes("Credential issued"),
+            el("walletStatus").textContent);
+    }
+});
 
-console.log();
-if (failures) {
-    console.log(`check-offer-page: ${failures} of ${checks} checks FAILED`);
-    process.exit(1);
+// 21. F-18 round 2: the transaction code is read when Create is pressed. Editing the field while the issuer has not
+//     answered yet changes neither the POST nor the code this offer is redeemed with
+await section("21. tx_code snapshot", async () => {
+    let release;
+    const gate = new Promise((done) => { release = done; });
+    const page = openPage({ subjects: [] }, {
+        offers: [offerByValue("snapshot", offerDocument(OID4VCI_ISSUER, "demo", "code-snapshot", TX_CODE))],
+        offerGate: gate,
+    });
+    await page.settle();
+    const el = page.el;
+    el("subject").value = "snapshot-subject";
+    el("txCode").value = "1234";
+    const pending = el("create").fire("click");
+    await page.settle();
+    check("snapshot: the offer is pending (Create disabled, nothing published)",
+        el("create").disabled === true && el("offerUri").hidden === true);
+    el("txCode").value = "9999"; // edited while the issuer has not answered
+    release();
+    await pending;
+    await page.settle();
+    const post = find(page, "POST", /\/pre-authorized-data$/);
+    equal("snapshot: the POST carried the value read when Create was pressed", post && JSON.parse(post.body).tx_code, "1234");
+    check("snapshot: the offer was published", el("wallet").disabled === false && el("offerUri").hidden === false);
+    await page.runWallet();
+    equalFields("snapshot: the wallet redeems with the value read when Create was pressed, not the edited one",
+        tokenRequest(page) && tokenRequest(page).form, { grant_type: GRANT, "pre-authorized_code": "code-snapshot", tx_code: "1234" });
+});
+
+// 22. OpenID4VCI 1.0 section 12.2.2 and RFC 8414 section 3.3: metadata whose identity is not the identifier it was
+//     fetched for is not used, and every endpoint is an absolute URL, https unless its identifier is http. Each refusal
+//     happens before the pre-authorized code, the transaction code or an access token leaves the page
+await section("22a. issuer metadata names another issuer", () => refusedRedemption("issuer metadata names another issuer", {
+    reason: "nothing was sent",
+    options: {
+        issuerMetadata: {
+            [OID4VCI_ISSUER]: Object.assign({}, OID4VCI_DOCUMENT, {
+                credential_issuer: ATTACKER,
+                authorization_servers: [ATTACKER],
+                credential_endpoint: ATTACKER + "/credential",
+                nonce_endpoint: ATTACKER + "/nonce",
+            }),
+        },
+        asMetadata: { [AS]: AS_DOCUMENT, [ATTACKER]: { issuer: ATTACKER, token_endpoint: ATTACKER + "/token" } },
+    },
+}));
+await section("22b. issuer metadata with a trailing slash", () => refusedRedemption("issuer metadata differs by a trailing slash", {
+    reason: "nothing was sent",
+    options: { issuerMetadata: { [OID4VCI_ISSUER]: Object.assign({}, OID4VCI_DOCUMENT, { credential_issuer: OID4VCI_ISSUER + "/" }) } },
+}));
+await section("22c. AS metadata names another issuer", () => refusedRedemption("AS metadata names another issuer", {
+    reason: "nothing was sent",
+    options: { asMetadata: { [AS]: Object.assign({}, AS_DOCUMENT, { issuer: ATTACKER, token_endpoint: ATTACKER + "/token" }) } },
+}));
+await section("22d. AS metadata without issuer", () => refusedRedemption("AS metadata without an issuer", {
+    reason: "nothing was sent",
+    options: { asMetadata: { [AS]: Object.assign({}, AS_DOCUMENT, { issuer: undefined }) } },
+}));
+await section("22e. relative token endpoint", () => refusedRedemption("a relative token_endpoint", {
+    reason: "token_endpoint",
+    options: { asMetadata: { [AS]: Object.assign({}, AS_DOCUMENT, { token_endpoint: "/v1/certify/oauth/token" }) } },
+}));
+await section("22f. relative credential endpoint", () => refusedRedemption("a relative credential_endpoint", {
+    reason: "credential_endpoint",
+    options: { issuerMetadata: { [OID4VCI_ISSUER]: Object.assign({}, OID4VCI_DOCUMENT, { credential_endpoint: "/v1/certify/oid4vci/credential" }) } },
+}));
+await section("22g. relative nonce endpoint", () => refusedRedemption("a relative nonce_endpoint", {
+    reason: "nonce_endpoint",
+    options: { issuerMetadata: { [OID4VCI_ISSUER]: Object.assign({}, OID4VCI_DOCUMENT, { nonce_endpoint: "nonce" }) } },
+}));
+await section("22h. http credential endpoint", () => refusedRedemption("an http credential_endpoint for an https issuer", {
+    reason: "credential_endpoint",
+    options: { issuerMetadata: { [OID4VCI_ISSUER]: Object.assign({}, OID4VCI_DOCUMENT,
+        { credential_endpoint: "http://credentials.example/v1/certify/oid4vci/credential" }) } },
+}));
+await section("22i. http token endpoint", () => refusedRedemption("an http token_endpoint for an https authorization server", {
+    reason: "token_endpoint",
+    options: { asMetadata: { [AS]: Object.assign({}, AS_DOCUMENT, { token_endpoint: "http://credentials.example/v1/certify/oauth/token" }) } },
+}));
+await section("22j. http authorization server", () => refusedRedemption("an http authorization server for an https issuer", {
+    reason: "authorization server",
+    options: {
+        issuerMetadata: { [OID4VCI_ISSUER]: Object.assign({}, OID4VCI_DOCUMENT, { authorization_servers: ["http://credentials.example"] }) },
+        asMetadata: { "http://credentials.example": Object.assign({}, AS_DOCUMENT,
+            { issuer: "http://credentials.example", token_endpoint: "http://credentials.example/v1/certify/oauth/token" }) },
+    },
+}));
+
+// 23. what the identity rules still allow: endpoints on other origins (no same-origin rule), and a local development
+//     stack whose identifiers are http
+await section("23. endpoints elsewhere and an http development stack", async () => {
+    {
+        const api = "https://api.credentials.example";
+        const login = "https://login.example/realm";
+        const page = openPage({ subjects: [] }, {
+            offers: [offerByValue("elsewhere", offerDocument(OID4VCI_ISSUER, "demo", "code-elsewhere"))],
+            issuerMetadata: { [OID4VCI_ISSUER]: Object.assign({}, OID4VCI_DOCUMENT, {
+                authorization_servers: [login],
+                credential_endpoint: api + "/credential",
+                nonce_endpoint: api + "/nonce",
+            }) },
+            asMetadata: { [login]: { issuer: login, token_endpoint: "https://tokens.example/token" } },
+        });
+        await page.settle();
+        page.el("subject").value = "elsewhere-subject";
+        await page.createOffer();
+        await page.runWallet();
+        equal("elsewhere: the token goes to the token endpoint the checked AS metadata names",
+            tokenRequest(page) && tokenRequest(page).url, "https://tokens.example/token");
+        equal("elsewhere: the nonce and credential endpoints on another origin are used",
+            [nonceRequest(page) && nonceRequest(page).url, credentialRequest(page) && credentialRequest(page).url],
+            [api + "/nonce", api + "/credential"]);
+        check("elsewhere: the credential is issued", page.el("walletStatus").textContent.includes("Credential issued"),
+            page.el("walletStatus").textContent);
+    }
+    {
+        const local = "http://127.0.0.1:28191";
+        const issuer = local + "/v1/certify/oid4vci";
+        const page = openPage({ subjects: [] }, {
+            offers: [offerByValue("local", offerDocument(issuer, "demo", "code-local"))],
+            issuerMetadata: { [issuer]: Object.assign({}, OID4VCI_DOCUMENT, {
+                credential_issuer: issuer,
+                authorization_servers: [local],
+                credential_endpoint: issuer + "/credential",
+                nonce_endpoint: issuer + "/nonce",
+            }) },
+            asMetadata: { [local]: { issuer: local, token_endpoint: local + "/v1/certify/oauth/token" } },
+        });
+        await page.settle();
+        page.el("subject").value = "local-subject";
+        await page.createOffer();
+        await page.runWallet();
+        equal("http development stack: its metadata is read at the 12.2.2 location",
+            metadataRequest(page, "openid-credential-issuer") && metadataRequest(page, "openid-credential-issuer").url,
+            local + "/.well-known/openid-credential-issuer/v1/certify/oid4vci");
+        equal("http development stack: the http endpoints of an http identifier are used",
+            [tokenRequest(page) && tokenRequest(page).url, credentialRequest(page) && credentialRequest(page).url],
+            [local + "/v1/certify/oauth/token", issuer + "/credential"]);
+        checkCredentialRequest("http development stack", credentialRequest(page), { audience: issuer, nonce: "nonce-f18", configurationId: "demo" });
+    }
+});
+
+// 24. D5: an ISO mdoc (mso_mdoc) configuration is issued on the OpenID4VCI 1.0 surface only, so the legacy surface is
+//     unavailable for it; every other format can use either surface
+await section("24. mso_mdoc surface", async () => {
+    const page = openPage({ subjects: [] }, {
+        offers: [offerByValue("mdoc", offerDocument(OID4VCI_ISSUER, "mdoc", "code-mdoc")),
+            offerByValue("ldp", offerDocument(OID4VCI_ISSUER, "demo", "code-ldp"))],
+    });
+    await page.settle();
+    const el = page.el;
+    el("subject").value = "surface-subject";
+    equal("ldp_vc: both surfaces are offered and the compatibility one is the default",
+        [el("surfaceLegacy").disabled, el("surface").value, el("surfaceHint").hidden], [false, "legacy", true]);
+
+    el("configuration").value = "mdoc";
+    await el("configuration").fire("change");
+    equal("mso_mdoc: the legacy surface option is disabled", el("surfaceLegacy").disabled, true);
+    equal("mso_mdoc: the surface is forced to /oid4vci", el("surface").value, "oid4vci");
+    equal("mso_mdoc: the explanation is shown", [el("surfaceHint").hidden, el("surfaceHint").textContent], [false, MDOC_SURFACE_HINT]);
+    equal("mso_mdoc: the offer targets /oid4vci", (await page.createOffer()).issuer, "oid4vci");
+    await page.runWallet();
+    checkCredentialRequest("mso_mdoc on /oid4vci", credentialRequest(page), { audience: OID4VCI_ISSUER, nonce: "nonce-f18", configurationId: "mdoc" });
+    check("mso_mdoc on /oid4vci: the IssuerSigned view is shown", el("mdocView").hidden === false);
+
+    // a script (not a visitor: a disabled option cannot be picked) selecting the legacy option is refused by the page
+    el("surface").value = "legacy";
+    const made = await page.press("create");
+    equal("mso_mdoc with the legacy surface forced by a script: no offer is created", made.map((request) => request.url), []);
+    check("mso_mdoc with the legacy surface forced by a script: the refusal is explained",
+        el("offerStatus").className.includes("bad") && el("offerStatus").textContent.includes(MDOC_SURFACE_HINT),
+        el("offerStatus").textContent);
+
+    el("configuration").value = "demo";
+    await el("configuration").fire("change");
+    equal("back to ldp_vc: the legacy option is available again and the default",
+        [el("surfaceLegacy").disabled, el("surface").value, el("surfaceHint").hidden], [false, "legacy", true]);
+    el("surface").value = "oid4vci";
+    equal("ldp_vc: /oid4vci can be chosen", (await page.createOffer()).issuer, "oid4vci");
+    el("surface").value = "legacy";
+    equal("ldp_vc: legacy can be chosen", (await page.createOffer()).issuer, "legacy");
+});
+await section("24b. mso_mdoc first", async () => {
+    // a deployment whose first configuration is an mdoc: the page loads with the legacy option already unavailable
+    const page = openPage({ subjects: [] }, { configurations: { aamva: { format: "mso_mdoc" }, zfarmer: { format: "ldp_vc" } } });
+    await page.settle();
+    const el = page.el;
+    equal("mso_mdoc on load: the legacy option is disabled and /oid4vci selected",
+        [el("configuration").value, el("surfaceLegacy").disabled, el("surface").value, el("surfaceHint").hidden],
+        ["aamva", true, "oid4vci", false]);
+});
+
+} finally {
+    console.log();
+    if (!checks) check("the harness ran at least one check", false);
+    if (failures) {
+        console.log(`check-offer-page: ${failures} of ${checks} checks FAILED`);
+    } else {
+        console.log(`check-offer-page: all ${checks} checks passed`);
+    }
+    process.exitCode = failures ? 1 : 0;
 }
-console.log(`check-offer-page: all ${checks} checks passed`);

@@ -58,13 +58,17 @@ class OfferPageTest {
         assertEquals(200, page.getResponse().getStatus());
         String html = page.getResponse().getContentAsString();
         assertTrue(html.contains("<title>Credential offer</title>") && html.contains("/pre-authorized-data") && html.contains("openid4vci-proof+jwt"), "the page creates offers and plays the wallet");
-        // M-09: the page can target either surface, defaults to the new one for mso_mdoc, and reads an IssuerSigned it is
-        // handed; the IACA it verifies against is published next to it
+        // M-09/F-18: the page can target either surface for every format except mso_mdoc, which the compatibility
+        // endpoint cannot issue (D5: its legacy option is disabled and the surface forced to /oid4vci), and reads an
+        // IssuerSigned it is handed; the IACA it verifies against is published next to it. The behaviour is asserted by
+        // docs/design/tools/check-offer-page.mjs (CI step "Offer page behaviour (node)")
         assertTrue(html.contains("id=\"surface\"") && html.contains("offer_by_value"), "the page offers the surface selector and by-value offers");
+        assertTrue(html.contains("id=\"surfaceLegacy\"") && html.contains("el(\"surfaceLegacy\").disabled = mdoc;"),
+                "an mso_mdoc configuration cannot be offered on the compatibility surface");
         assertTrue(html.contains("Cbor.decode") && html.contains("../mdoc/iaca"), "the page decodes mso_mdoc and links the IACA");
-        // M-09/F-18: the in-page wallet stays available for a legacy offer and now redeems it where the offer's own
-        // metadata says (the compatibility credential endpoint, whose audience the shipped configuration allows), and a
-        // replaced portrait releases its blob URL
+        // F-18: the in-page wallet is offered for every published offer, on either surface, and redeems it where the offer
+        // issuer's own metadata says once that metadata's identity is checked (whether a compatibility-surface offer then
+        // verifies depends on the deployment's identity configuration, gap G34); a replaced portrait releases its blob URL
         assertTrue(html.contains("el(\"wallet\").disabled = !grant;"), "the wallet is offered for either surface");
         assertTrue(html.contains("portraitObjectUrls.forEach((url) => URL.revokeObjectURL(url))"), "a replaced portrait's object URL is revoked");
         MvcResult script = mockMvc.perform(get("/offer/qrcode.min.js")).andReturn();
