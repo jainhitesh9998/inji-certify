@@ -52,7 +52,8 @@ class X509FileKeyProvidersTest {
     /**
      * F-10: the dev-mode keystore holds private keys, so it is created rw------- whatever the umask (the JVM cannot set
      * its own; the test first shows the umask in force would leave a plain file readable by group or others, as 022
-     * does), and a keystore written by an older release with rw-r--r-- becomes rw------- when dev mode adds a key to it.
+     * does); an existing keystore keeps the permissions its operator gave it (review round 1, CLAUDE.md rule 3) when dev
+     * mode adds a key to it.
      */
     @Test
     void theDevModeKeystoreIsOwnerOnlyUnderAPermissiveUmask() throws Exception {
@@ -70,10 +71,11 @@ class X509FileKeyProvidersTest {
         X509FileKeyProviders.open(props(file, true, List.of(new X509FileProperties.KeySpec("a", "ES256", "CN=a"))));
         assertEquals(ownerOnly, Files.getPosixFilePermissions(file), "created owner-only");
 
-        Files.setPosixFilePermissions(file, java.nio.file.attribute.PosixFilePermissions.fromString("rw-r--r--")); // as an older release left it
+        java.util.Set<java.nio.file.attribute.PosixFilePermission> groupRead = java.nio.file.attribute.PosixFilePermissions.fromString("rw-r-----");
+        Files.setPosixFilePermissions(file, groupRead); // as an operator set it, for a group that reads the keystore
         JcaKeyProvider grown = X509FileKeyProviders.open(props(file, true, List.of(new X509FileProperties.KeySpec("a", "ES256", "CN=a"),
                 new X509FileProperties.KeySpec("b", "EdDSA", "CN=b"))));
-        assertEquals(ownerOnly, Files.getPosixFilePermissions(file), "replaced owner-only");
+        assertEquals(groupRead, Files.getPosixFilePermissions(file), "an existing keystore keeps its permissions");
         assertTrue(grown.aliases().containsAll(List.of("a", "b")));
         assertTrue(X509FileKeyProviders.open(props(file, false, List.of(new X509FileProperties.KeySpec("b", "EdDSA", "CN=b")))).aliases().contains("b"),
                 "the replaced keystore loads");
