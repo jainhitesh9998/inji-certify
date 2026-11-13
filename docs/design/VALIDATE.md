@@ -46,6 +46,7 @@ authorization server, which is what the pre-authorized code flow needs.
 
 ```bash
 docker network inspect mosip_network >/dev/null 2>&1 || docker network create mosip_network   # the compose file expects it
+# never a second project of this stack on mosip_network next to a running one: section 6f
 docker compose -f docker-compose.yaml -f docker-compose.rebuild.yaml up -d --build
 docker compose logs -f certify | grep -m1 'INJI Certify -- Started'
 curl -s http://localhost:8090/v1/certify/.well-known/openid-credential-issuer | jq '.credential_configurations_supported | keys'
@@ -229,6 +230,86 @@ driver pins IPv4 and sets a user agent because Cloudflare stalls Python's defaul
 
 `attester.pem` is the private key of the JWK in the two `attesters` properties. The run of 2026-09-19 found four
 defects that the unit suite could not see (F-02 to F-05 in `docs/design/wp/PROGRESS.md`); all are fixed.
+
+## 6f. The mDL issuer
+
+The ISO/IEC 18013-5 mDL of `docs/design/20-mdl-issuer.md` (M-10) runs on the same stack through a third overlay,
+`docker-compose.mdl.yaml`. It adds profile `mdl` plus the PKI profile `MDL_PKI_PROFILE` names, which has no default:
+`mdl-dev` (a generated dev IACA; local runs and demos) or `mdl-operator` (the offline `certify-cli` PKI; the public
+host). It also adds the demo holders and the `mdl-seed` service that writes the configuration `org.iso.18013.5.1.mDL`
+through the v2 API. `docker-compose/docker-compose-injistack/config/mdl/README.md` is the runbook. Locally, in short:
+
+```bash
+cd "$(git rev-parse --show-toplevel)/docker-compose/docker-compose-injistack"
+mkdir -p loader_path/certify-mdl && cp loader_path/certify/mock-certify-plugin.jar loader_path/certify-mdl/
+MDL_PKI_PROFILE=mdl-dev docker compose -f docker-compose.yaml -f docker-compose.rebuild.yaml -f docker-compose.mdl.yaml \
+    up -d --no-build database certify certify-nginx mdl-seed
+cd ../.. && python3.12 -m venv .venv && .venv/bin/pip install -r docs/design/tools/requirements-smoke.txt
+.venv/bin/python docs/design/tools/smoke.py --mdl http://localhost:8091
+```
+
+A public host (or any machine others can reach) runs `MDL_PKI_PROFILE=mdl-operator MDL_PKI_DIR=<dir>` with
+`docker-compose.public.yaml` as the last file: certify and certify-nginx on `127.0.0.1` only, no PostgreSQL port, and
+the PostgreSQL, keymanager and issuer keystore passwords from Compose secret files in `CERTIFY_SECRETS_DIR` (Compose
+2.24.4 or later; README "The public host"). That overlay also leaves `CERTIFY_KEYSTORE_PASSWORD` out of the container's
+environment even when the shell has it, exposes only actuator `health`, removes the mimoto and inji-web ports, and
+puts the project on a network of its own (`<project>_network`) instead of the shared `mosip_network`. For a public
+(`CF-Ray`) request certify-nginx passes only an allow-list of wallet and verifier paths under `/v1/certify/` and
+refuses everything else with `403`: admin APIs, actuator, springdoc and the keymanager controllers the service scans
+in (`/sign`, `/jwtSign`, `/coseSign1`, `/encrypt`, ...). CI runs `docs/design/tools/check-public-guard.sh` (the nginx
+file against a stub upstream, on a docker network of its own) and `docs/design/tools/check-public-overlay.sh`
+(`docker compose config` with and without the public overlay, both PKI profiles: certify's environment differs only
+by the expected keys).
+
+**One project per network.** `docker-compose.yaml` joins every service to the external `mosip_network`, which all
+projects on the Docker host share. Never start a second project of this stack (another checkout, another `-p`, a
+throwaway run) on `mosip_network` while one is running: its `database`, `certify` and `certify-nginx` would register
+the same aliases there and Docker's DNS would mix the two stacks' connections. A second copy runs with
+`docker-compose.public.yaml` last (project-private network) and its own host ports, as the throwaway run below does:
+
+```bash
+cd "$(git rev-parse --show-toplevel)/docker-compose/docker-compose-injistack"
+cp docker-compose.public.yaml "$SCRATCH/public-28.yaml"      # the same overlay with the ports moved to 28090/28091
+sed -i.bak 's/127.0.0.1:8090:8090/127.0.0.1:28090:8090/; s/127.0.0.1:8091:80/127.0.0.1:28091:80/' "$SCRATCH/public-28.yaml"
+export MDL_PKI_PROFILE=mdl-dev CERTIFY_PUBLIC_URL=http://localhost:28091 CERTIFY_SECRETS_DIR="$SCRATCH/secrets"
+throwaway() { docker compose -p mdl-throwaway -f docker-compose.yaml -f docker-compose.rebuild.yaml \
+    -f docker-compose.mdl.yaml -f "$SCRATCH/public-28.yaml" "$@"; }
+throwaway up -d --no-build database certify certify-nginx mdl-seed   # network mdl-throwaway_network, not mosip_network
+(cd ../.. && .venv/bin/python docs/design/tools/smoke.py --mdl http://localhost:28091)
+throwaway down -v
+```
+
+`$SCRATCH/secrets` holds the three files of the README's secrets block (`keystore_password` too, which `mdl-dev` never
+reads). The ports-only copy can live anywhere: Compose resolves relative paths against the first file's directory.
+The bind mounts (`./data/MDL_PKI`, `./data/CERTIFY_PKCS12`, `./loader_path/certify-mdl/`) are this checkout's, so a
+throwaway run belongs in a checkout (or worktree) no running stack uses: `mdl-dev` writes its dev PKI into
+`./data/MDL_PKI` for one `CERTIFY_PUBLIC_URL`, and keymanager its keystore into `./data/CERTIFY_PKCS12`. Its smoke run passes the public URL and pins the
+offline IACA: `smoke.py --mdl "$CERTIFY_PUBLIC_URL" --iaca "$MDL_PKI_DIR/iaca.pem"`. Changing `CERTIFY_PUBLIC_URL`
+needs a fresh database and, in `mdl-dev`, a fresh `data/MDL_PKI`. With F-10 a status list's `sub` follows the current
+URL, so mDLs issued under the old one (whose MSO names the old list URI) must be reissued.
+
+The plugin jars of step 2 bundle BouncyCastle 1.69 unshaded. On `loader.path` they shadow the service's 1.78; between
+M-04 and F-10 that stopped the service at startup (`certify-pki`, `NoSuchMethodError`). Since F-10 Certify's code links
+against 1.69 as well (`BcCompat`, `-Pbc169`, `check-bc169-linkage.sh`): the mDL overlay mounts the published CSV plugin
+as it is (verified on 2026-11-13 by the public deployment, which runs it unmodified).
+
+The smoke plays a wallet through certify-nginx: offers by reference and by value, metadata at the 12.2.2 location,
+and a P-256 holder (Bearer) and an Ed25519 holder (DPoP) through the token, nonce and credential endpoints. It then
+runs `verify_mdoc.py` with the IACA downloaded from `/v1/certify/mdoc/iaca/<id>.pem`, `openssl crl -CAfile` over the
+CRL at the Document Signer's distribution point, and `openssl verify -x509_strict -crl_check` over the Document
+Signer. Last come the status list and three refusals. The checks are strict: every element against `holders.json`
+in value and CBOR type, each full-date checked as tag 1004 at its own path (decoded with the tags kept, so tag 100,
+which cbor2 also reads as a date, fails, even when another privilege carries the same date as tag 1004), and the list's
+`sub`, `iat` and `exp` (requiring `exp` is Certify policy; draft-ietf-oauth-status-list makes it RECOMMENDED).
+`test_smoke_mdl.py` covers those helpers. Strict runs:
+
+| Date | Mode | Stack | Result |
+| --- | --- | --- | --- |
+| 2026-11-13 | `mdl-dev` | throwaway project, fresh database, `docker-compose.public.yaml` with scratch secrets, `CERTIFY_PUBLIC_URL=http://localhost:28091`, image `inji-certify:rebuild` with F-10 | 30/30 PASS (`smoke.py --mdl http://localhost:28091`) |
+| 2026-11-13 | `mdl-operator` | the public demo, `https://credentials.loremipsum.co.in`, with `--iaca` (the offline IACA) | 31/31 PASS (owner's session) |
+| 2026-11-13 | `mdl-dev` | throwaway project `mdl-r4-throwaway` on its own network (`mdl-r4-throwaway_network`; `mosip_network` untouched), fresh database, the r4 public overlay (allow-list nginx) with ports moved to `127.0.0.1:28090/28091`, scratch secrets, `CERTIFY_PUBLIC_URL=http://localhost:28091`, image `inji-certify:rebuild` `--no-build`; `down -v` after | 30/30 PASS (`smoke.py --mdl http://localhost:28091`; the public refusal check now covers `v2/credential-configurations`, `/jwtSign` and `/v3/api-docs`) |
+
+Before these, the non-strict run passed all 29 checks in both PKI modes on 2026-11-13.
 
 ## 7. Verify the credential independently
 

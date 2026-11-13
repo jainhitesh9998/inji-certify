@@ -1,0 +1,52 @@
+## The mDL template of the mdl profile (docs/design/20-mdl-issuer.md, M-10): renders the mDoc formatter's template
+## JSON for one holders.json record (data source "mdldemo", keyed by the access token's sub). The formatter types each
+## element by ISO/IEC 18013-5 Table 5 (full-date, bstr, uint, bool, driving_privileges), draws the digestIDs, checks
+## the mandatory elements and that docType equals the configuration's doctype, and decides validityInfo at signing.
+## Every string value is written through $_esc.java: the "_esc" EscapeTool (velocity-tools 3.1, which has no json())
+## that every template's context carries. Its Java string escaping (commons-lang3 escapeJava: \" \\ \n \t \uXXXX) is
+## also valid JSON string content, so a double quote, a backslash or a control character in holders.json stays inside
+## its JSON string. "$!_esc.java($x)" renders a missing value as an empty string, which the mDoc formatter refuses for
+## a mandatory element instead of signing it. Optional elements are written only when the record has them ("$!x" is
+## empty for a missing field, and keeps a false or 0 value, which #if($x) would drop). sex (uint) is written bare only
+## when holders.json has a JSON number (it answers longValue(); a string does not) whose text is a canonical JSON
+## integer (0|[1-9][0-9]*: no sign, no leading zero, no fraction or exponent), and age_over_18 (bool) only when it is a
+## JSON boolean (it answers booleanValue(); the string "true" does not). Anything else goes in as an escaped string,
+## which the formatter refuses as the wrong type rather than letting it change the JSON or its type. codes is written
+## only when it is a non-empty list (Velocity 1.7, which certify-service runs, treats an empty list as true).
+{
+    "docType": "org.iso.18013.5.1.mDL",
+    "nameSpaces": {
+        "org.iso.18013.5.1": [
+            {"elementIdentifier": "family_name", "elementValue": "$!_esc.java($family_name)"},
+            {"elementIdentifier": "given_name", "elementValue": "$!_esc.java($given_name)"},
+            {"elementIdentifier": "birth_date", "elementValue": "$!_esc.java($birth_date)"},
+            {"elementIdentifier": "issue_date", "elementValue": "$!_esc.java($issue_date)"},
+            {"elementIdentifier": "expiry_date", "elementValue": "$!_esc.java($expiry_date)"},
+            {"elementIdentifier": "issuing_country", "elementValue": "$!_esc.java($issuing_country)"},
+            {"elementIdentifier": "issuing_authority", "elementValue": "$!_esc.java($issuing_authority)"},
+            {"elementIdentifier": "document_number", "elementValue": "$!_esc.java($document_number)"},
+            {"elementIdentifier": "portrait", "elementValue": "$!_esc.java($portrait)"},
+            {"elementIdentifier": "driving_privileges", "elementValue": [
+#foreach($privilege in $driving_privileges)
+                {"vehicle_category_code": "$!_esc.java($privilege.vehicle_category_code)"#if("$!privilege.issue_date" != ""), "issue_date": "$!_esc.java($privilege.issue_date)"#{end}#if("$!privilege.expiry_date" != ""), "expiry_date": "$!_esc.java($privilege.expiry_date)"#{end}#if($privilege.codes && $privilege.codes.size() > 0), "codes": [#foreach($code in $privilege.codes){"code": "$!_esc.java($code.code)"#if("$!code.sign" != ""), "sign": "$!_esc.java($code.sign)"#{end}#if("$!code.value" != ""), "value": "$!_esc.java($code.value)"#{end}}#if($foreach.hasNext), #{end}#{end}]#{end}}#if($foreach.hasNext),#{end}
+#end
+            ]},
+#set($sexText = "$!sex")
+#if($sexText != "")
+            {"elementIdentifier": "sex", "elementValue": #if("$!sex.longValue()" != "" && $sexText.matches("0|[1-9][0-9]*"))$sexText#{else}"$!_esc.java($sex)"#end},
+#end
+#set($ageText = "$!age_over_18")
+#set($ageBoolean = "$!age_over_18.booleanValue()")
+#if($ageText != "")
+            {"elementIdentifier": "age_over_18", "elementValue": #if($ageBoolean == "true" || $ageBoolean == "false")$ageBoolean#{else}"$!_esc.java($age_over_18)"#end},
+#end
+#if("$!nationality" != "")
+            {"elementIdentifier": "nationality", "elementValue": "$!_esc.java($nationality)"},
+#end
+#if("$!resident_city" != "")
+            {"elementIdentifier": "resident_city", "elementValue": "$!_esc.java($resident_city)"},
+#end
+            {"elementIdentifier": "un_distinguishing_sign", "elementValue": "$!_esc.java($un_distinguishing_sign)"}
+        ]
+    }
+}

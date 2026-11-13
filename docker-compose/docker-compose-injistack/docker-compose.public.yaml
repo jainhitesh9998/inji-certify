@@ -1,0 +1,111 @@
+# Hardening for a stack that serves a public host (the mDL demo behind its tunnel, M-12) or runs on any machine others
+# can reach. Last in the -f list, after docker-compose.mdl.yaml (config/mdl/README.md, "The public host"), and with
+# these four services named on the command line, never a bare `up`:
+#
+#   docker compose -p certify-mdl -f docker-compose.yaml -f docker-compose.rebuild.yaml -f docker-compose.mdl.yaml \
+#       -f docker-compose.public.yaml up -d --no-build database certify certify-nginx mdl-seed
+#
+# mimoto-service and inji-web are not part of the mDL stack; their ports are removed here too, so starting one by
+# mistake publishes nothing (they would still run on the defaults of docker-compose.yaml, which is not hardened).
+#
+# The stack runs on a network of its own project (4. below), never on the shared mosip_network.
+# docs/design/tools/check-public-overlay.sh (CI) asserts what this file changes in certify's environment and network.
+#
+# Needs Docker Compose 2.24.4 or later (`!override` and `!reset`); an older Compose fails on the tags instead of
+# silently keeping the base file's ports.
+#
+# 1. Ports. docker-compose.yaml publishes certify 8090, certify-nginx 8091 and PostgreSQL 5433 on every interface. A
+#    client on the LAN could then call the admin APIs on 8090 (no guard at all) or on 8091 without CF-Ray (treated as
+#    local by certify-nginx, D12), and log in to PostgreSQL. Here certify and certify-nginx listen on 127.0.0.1 only (the
+#    tunnel connector runs on the host and reaches 127.0.0.1:8091), and PostgreSQL is not published.
+#
+# 2. Passwords. The base stack's PostgreSQL password and keymanager keystore password are the public defaults
+#    (postgres, local). Here they, and the operator keystore's password, come from files in CERTIFY_SECRETS_DIR
+#    (required), mounted as Compose secrets under /run/secrets/ and never as environment variables (which
+#    `docker inspect` shows):
+#
+#      db_password                   PostgreSQL's password (POSTGRES_PASSWORD_FILE) and spring.datasource.password
+#      keymanager_keystore_password  mosip.kernel.keymanager.hsm.keystore-pass (the PKCS#12 in data/CERTIFY_PKCS12)
+#      keystore_password             CERTIFY_KEYSTORE_PASSWORD, the issuer.p12 password of profile mdl-operator
+#
+#    Certify reads its two through spring.config.import=optional:configtree:/run/secrets/ (each file name is a property
+#    name, a trailing newline is dropped), which takes precedence over the properties files. PostgreSQL applies its
+#    password only when it initialises an empty data directory, and keymanager creates its keystore with the password
+#    of the first start: both need a fresh start (config/mdl/README.md, "The public host"). CERTIFY_KEYSTORE_PASSWORD
+#    is left out of certify's environment (which docker-compose.mdl.yaml passes through from the shell), so a value left
+#    in the shell never reaches the container (`docker compose config` shows no such variable) and never outranks the
+#    secret file.
+#
+# 3. Actuator. certify-default.properties exposes every actuator endpoint (`include=*`) and shows env values; with the
+#    secrets in Certify's Environment (configtree), /actuator/env and /actuator/configprops would print them and
+#    /actuator/heapdump would carry the Document Signer key. Here only health is exposed and env values are never
+#    shown; certify-nginx refuses /v1/certify/actuator for public requests as well (M-12a guard). Nothing in the stack
+#    calls actuator: the seed waits on the issuer metadata (config/mdl/seed.sh).
+services:
+  database:
+    ports: !reset []
+    environment: !override
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password
+    secrets:
+      - source: db_password
+        target: postgres_password
+
+  certify:
+    ports: !override
+      - "127.0.0.1:8090:8090"
+    # The whole environment, replacing the one docker-compose.yaml, docker-compose.rebuild.yaml and
+    # docker-compose.mdl.yaml build up, so that CERTIFY_KEYSTORE_PASSWORD (passed through from the shell by
+    # docker-compose.mdl.yaml) is not in it: it comes from the secret file below. A single key cannot be removed
+    # instead: Compose's `!reset` on one environment entry is ignored when an earlier file than the first declares it.
+    # Keep in step with those three files.
+    environment: !override
+      - container_user=mosip
+      - SPRING_CONFIG_NAME=certify
+      - SPRING_CONFIG_LOCATION=/home/mosip/config/
+      - enable_certify_artifactory=false
+      - download_hsm_client=false
+      - active_profile_env=default, csvdp-farmer, rebuild, mdl, ${MDL_PKI_PROFILE:?set MDL_PKI_PROFILE to mdl-dev or mdl-operator}
+      - mosip_certify_domain_url=${CERTIFY_PUBLIC_URL:-http://localhost:8091}
+      - MDL_DSC_ALIAS
+      - SPRING_CONFIG_IMPORT=optional:configtree:/run/secrets/
+      # actuator: health only, env values never shown (header, 3)
+      - MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE=health
+      - MANAGEMENT_ENDPOINT_ENV_SHOW_VALUES=NEVER
+    secrets:
+      - source: db_password
+        target: spring.datasource.password
+      - source: keymanager_keystore_password
+        target: mosip.kernel.keymanager.hsm.keystore-pass
+      - source: keystore_password
+        target: CERTIFY_KEYSTORE_PASSWORD
+
+  certify-nginx:
+    ports: !override
+      - "127.0.0.1:8091:80"
+
+  # not part of the mDL stack (see the header): nothing published even when started by mistake
+  mimoto-service:
+    ports: !reset []
+
+  inji-web:
+    ports: !reset []
+
+secrets:
+  db_password:
+    file: ${CERTIFY_SECRETS_DIR:?set CERTIFY_SECRETS_DIR to the directory with db_password, keymanager_keystore_password and keystore_password}/db_password
+  keymanager_keystore_password:
+    file: ${CERTIFY_SECRETS_DIR:?set CERTIFY_SECRETS_DIR}/keymanager_keystore_password
+  keystore_password:
+    file: ${CERTIFY_SECRETS_DIR:?set CERTIFY_SECRETS_DIR}/keystore_password
+
+# 4. Network. docker-compose.yaml joins every service to the external network mosip_network, shared by every project on
+#    the Docker host. A second copy of this stack on it (another checkout, a throwaway smoke run, a different -p) would
+#    register a second `database`, `certify` and `certify-nginx` alias there, and Docker's DNS would then send this
+#    stack's connections to either copy at random. Here the network is the project's own (`<project>_network`, created
+#    and removed by Compose), so two projects never share an alias. A tunnel connector that runs as a container instead
+#    of on the host joins that network (`docker network connect certify-mdl_network <connector>` for project
+#    certify-mdl) and forwards to http://certify-nginx:80.
+networks:
+  network: !override
+    driver: bridge

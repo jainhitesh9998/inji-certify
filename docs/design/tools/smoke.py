@@ -5,8 +5,21 @@ the v2 configuration API and did.json.
 
     python3 -m venv .venv && .venv/bin/pip install pyjwt cryptography
     .venv/bin/python docs/design/tools/smoke.py http://localhost:8090/v1/certify FarmerCredential
+
+The mDL run of the compose mdl profile (docs/design/20-mdl-issuer.md M-10; smoke_mdl.py, VALIDATE.md 6f) takes the
+public URL instead and needs the verifier's environment too:
+
+    python3.12 -m venv .venv && .venv/bin/pip install -r docs/design/tools/requirements-smoke.txt
+    .venv/bin/python docs/design/tools/smoke.py --mdl http://localhost:8091
+    .venv/bin/python docs/design/tools/smoke.py --mdl "$CERTIFY_PUBLIC_URL" --iaca "$MDL_PKI_DIR/iaca.pem"   # mdl-operator
 """
 import json, sys, time, urllib.request, urllib.parse, urllib.error
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--mdl":
+    sys.dont_write_bytecode = True  # no __pycache__ in the repository
+    import smoke_mdl  # this script's directory is first on sys.path
+    sys.exit(smoke_mdl.main(sys.argv[2:]))
+
 import jwt
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization
