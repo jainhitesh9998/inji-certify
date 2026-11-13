@@ -247,6 +247,7 @@ The digest multibase can be hardcoded or if the template has been stored with Ce
 2. Deploying Inji Certify over a public URL, _using ngrok to demonstrate this_
 
 - change the value of the `mosip_certify_domain_url` environment variable under the `certify` service in ./docker-compose.yaml (currently `http://certify-nginx:80`) to point to the public URL where the Certify service will be accessible, when using locally with ngrok create an HTTP tunnel for the port `8091`, which is the certify-nginx port that exposes the root `/.well-known/...` discovery paths and proxies `/v1/certify/` to Certify and access the Inji Web at http://localhost:3004, to access Inji Web you may have to create another client with the Authorization service and more configuration should be required at Mimoto side
+- change it before credentials are issued: credentials keep the status-list URIs of the domain they were issued under, and a Token Status List is signed with `sub` under the current domain, so after a later change keep the old host routed to Certify and reissue the SD-JWT VC and mDoc credentials issued before it (see `docs/design/15-deployment.md`)
 
 3. While downloading credentials with `inji-web`, there are 2 modes supported. 
 - First is `Continue as guest` which does not require any auth setup and works out of the box. This is the recommended option for quick testing.
