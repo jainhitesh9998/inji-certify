@@ -74,9 +74,11 @@ jobs:
         # second attempt on (to force past the cached failure), and the repository saved at the end of the job even when
         # this step fails.
         #
-        # Each attempt asks for the throttled artifact alone first (`-N dependency:get`, seconds) and only then builds
-        # the reactor, so a 429 is reported in seconds instead of after the minutes `test-compile` spends compiling
-        # before reaching the same fetch. Both commands are classified the same way.
+        # Each attempt asks for the throttled artifact alone first (`-N -Dtransitive=false dependency:get`, about a
+        # second) and only then builds the reactor, so a 429 is reported in seconds instead of after the minutes
+        # `test-compile` spends compiling before reaching the same fetch. Both commands are classified the same way, so
+        # the rest of the resolution is not the probe's job: the artifact's own transitive dependencies are releases
+        # that come from Central, and the reactor build below resolves them (and fails, and is classified, on its own).
         #
         # Goal: `test-compile`, not `install` and not `dependency:go-offline`.
         #  - `test-compile` builds the whole reactor, so no module has to fetch a sibling snapshot from a remote
@@ -106,9 +108,12 @@ jobs:
           # Only a transport problem is worth retrying: a compile error, a missing artifact or a bad pom fails
           # identically five times and four delays later. One grep, over Maven's own `[ERROR]` lines only — a bare
           # `429` also matches `[WARNING] Could not transfer metadata ... (429)` and a source line such as `[429,17]` —
-          # and never `grep | grep`, whose first grep takes SIGPIPE under `pipefail`.
+          # and never `grep | grep`, whose first grep takes SIGPIPE under `pipefail`. `Could not transfer` alone is
+          # deliberately NOT an alternative: it also carries permanent failures (a JitPack 401, a PKIX error), which
+          # would burn four delays to fail identically; the transient ones are named instead (a 429 or any 5xx status
+          # code, a reset or refused connection, a terminated handshake, a connect or read timeout).
           retryable() {
-            grep -Eq '^\[ERROR\].*(status code: (429|5[0-9]{2})|Too Many Requests|Could not transfer|Connection reset|(Connect|Read) timed out)' "$log"
+            grep -Eq '^\[ERROR\].*(status code: (429|5[0-9]{2})|Too Many Requests|Connection reset|Connection refused|Remote host terminated the handshake|(Connect|Read) timed out)' "$log"
           }
 
           for attempt in $(seq 1 "$attempts"); do
@@ -116,7 +121,12 @@ jobs:
             if [ "$attempt" -gt 1 ]; then
               fetch+=(-U)                # force the snapshot recheck the first attempt left cached as failed
             fi
-            fetch+=(-Dartifact="$artifact" dependency:get)
+            # `-Dtransitive=false`: the probe answers one question — does the throttled host serve this artifact —
+            # and that costs a pom and its metadata, about a second. Its transitive dependencies are release
+            # artifacts from Central; the reactor build below resolves them, and a failure there is classified by
+            # the same `retryable`. Asking for them here made the probe as slow and as failure-prone as the build it
+            # is meant to precede, which is the whole point of the probe.
+            fetch+=(-Dtransitive=false -Dartifact="$artifact" dependency:get)
             echo "attempt ${attempt}/${attempts}: ${fetch[*]}"
             set +e
             "${fetch[@]}" 2>&1 | tee "$log"
@@ -266,20 +276,38 @@ jobs:
       - name: Strip failure markers from the Maven repository
         # Maven records a failed fetch in ~/.m2 as `*.lastUpdated` and `resolver-status.properties`, and honours them
         # for the update interval (`will not be reattempted until ... updates are forced`). Caching those would hand the
-        # 429 back to every later run that restores this cache, so they are deleted before the save. Reactor artifacts
-        # are dropped for the same reason `install` is not used: a later run must build its siblings, not resolve them.
+        # 429 back to every later run that restores this cache, so the markers that RECORD AN ERROR are deleted before
+        # the save. A marker that records a success is left alone: it is what stops the next run from re-fetching.
+        # Reactor artifacts are dropped for the same reason `install` is not used: a later run must build its siblings,
+        # not resolve them.
         if: always()
         shell: bash
         run: |
-          # Nothing to strip if no attempt ever created the repository (and `find` on a missing path would fail the job).
+          # Nothing to strip if no attempt ever created the repository (and `grep` on a missing path would fail the job).
           [ -d ~/.m2/repository ] || exit 0
           rm -rf ~/.m2/repository/io/inji/certify
-          find ~/.m2/repository \( -name '*.lastUpdated' -o -name resolver-status.properties \) -delete
+
+          # Both marker files record an outcome per repository and artifact, e.g.
+          #   https\://central.sonatype.com/.../.lastUpdated=<epoch millis>
+          #   https\://central.sonatype.com/.../.error=...status code: 429, reason phrase: Too Many Requests (429)
+          # so `.error=` is the line that says the fetch failed; a marker without one records a success and stays.
+          set +e
+          grep -rlE '\.error=.+' --include='*.lastUpdated' --include='resolver-status.properties' ~/.m2/repository \
+            | xargs -r rm -f
+          status=$?
+          set -e
+          # grep exits 1 when no marker records an error, i.e. nothing to delete. That is the healthy case, not a
+          # failure of this step, and `-e` (already on: `bash --noprofile --norc -eo pipefail`) would end it there.
+          if [ "$status" -gt 1 ]; then
+            echo "::error::reading the Maven repository's failure markers failed (exit $status)"
+            exit "$status"
+          fi
 
       - name: Save the Maven repository cache
         # At the end of the job and unconditionally: a repository that resolved on attempt 3 must be kept even if a
         # later step fails, and so must a partial one (both are far better than the cold start that caused the 429 in
-        # the first place). The key is the restore step's (`steps.maven-cache`), i.e. this run's own key.
+        # the first place). The key is the one the restore step computed (`cache-primary-key`, i.e. this run's own key),
+        # taken from its output rather than repeated here, so a change to the key is a change in one place only.
         # `continue-on-error` is belt and braces: reserving a key that already exists is only a warning in
         # actions/cache/save (it happens on a re-run of the same run id), and a best-effort cache must never turn a green
         # build red.
@@ -288,4 +316,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ~/.m2/repository
-          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}-v3-${{ github.run_id }}
+          key: ${{ steps.maven-cache.outputs.cache-primary-key }}

@@ -27,6 +27,12 @@
             <id>ossrh-inji</id>
             <name>CentralRepositoryInji</name>
             <url>https://central.sonatype.com/repository/maven-snapshots</url>
+            <!-- Snapshot host: it serves snapshots only, and it throttles (429 Too Many Requests). With releases
+                 enabled it was asked for every missing RELEASE artifact and a single 429 failed the build, so
+                 releases are refused here and every release artifact goes to Central. -->
+            <releases>
+                <enabled>false</enabled>
+            </releases>
             <snapshots>
                 <enabled>true</enabled>
             </snapshots>

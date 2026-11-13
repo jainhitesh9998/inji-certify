@@ -39,6 +39,11 @@
 			<name>MavenCentralRepository</name>
 			<url>https://central.sonatype.com/repository/maven-snapshots/</url>
 			<layout>default</layout>
+			<!-- Snapshot host: it serves snapshots only, and it throttles (429 Too Many Requests). It is asked for
+			     snapshots and never for a RELEASE artifact, which goes to Central (the super POM's `central`). -->
+			<releases>
+				<enabled>false</enabled>
+			</releases>
 			<snapshots>
 				<enabled>true</enabled>
 			</snapshots>
