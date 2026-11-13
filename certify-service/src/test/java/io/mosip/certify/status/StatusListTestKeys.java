@@ -35,6 +35,7 @@ import java.security.Signature;
 import java.security.cert.X509CRL;
 import java.security.cert.X509Certificate;
 import java.security.spec.ECGenParameterSpec;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Date;
@@ -114,10 +115,10 @@ final class StatusListTestKeys {
             IACA_KEYS, List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true,
             Instant.now().plus(1, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
 
-    /** A plain intermediate between the IACA and a Document Signer. */
+    /** A CA intermediate between the IACA and a Document Signer: cA TRUE, keyCertSign, no pathLen limit. */
     static final KeyPair INTERMEDIATE_KEYS = p256();
-    static final X509Certificate INTERMEDIATE = signer(INTERMEDIATE_KEYS, "Status List Test Intermediate", IACA,
-            IACA_KEYS, List.of(), true, LONG_AGO.plus(100, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
+    static final X509Certificate INTERMEDIATE = ca(INTERMEDIATE_KEYS, "Status List Test Intermediate", IACA,
+            IACA_KEYS, null, LONG_AGO.plus(100, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
 
     static final KeyPair BEHIND_INTERMEDIATE_KEYS = p256();
     static final X509Certificate BEHIND_INTERMEDIATE = signer(BEHIND_INTERMEDIATE_KEYS,
@@ -137,6 +138,57 @@ final class StatusListTestKeys {
             ROLLOVER_KEYS, List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true,
             LONG_AGO.plus(100, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
 
+    /**
+     * An end-entity certificate (no basicConstraints, only {@code digitalSignature}) that signs another certificate: the
+     * shape a signature-only chain check would accept as an intermediate.
+     */
+    static final KeyPair END_ENTITY_INTERMEDIATE_KEYS = p256();
+    static final X509Certificate END_ENTITY_INTERMEDIATE = signer(END_ENTITY_INTERMEDIATE_KEYS,
+            "Status List Test End Entity Intermediate", IACA, IACA_KEYS, List.of(), true,
+            LONG_AGO.plus(100, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
+    static final KeyPair BEHIND_END_ENTITY_INTERMEDIATE_KEYS = p256();
+    static final X509Certificate BEHIND_END_ENTITY_INTERMEDIATE = signer(BEHIND_END_ENTITY_INTERMEDIATE_KEYS,
+            "Status List Test Behind An End Entity", END_ENTITY_INTERMEDIATE, END_ENTITY_INTERMEDIATE_KEYS,
+            List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true, LONG_AGO.plus(100, ChronoUnit.DAYS),
+            Instant.now().plus(200, ChronoUnit.DAYS));
+
+    /** A CA with {@code pathLenConstraint} 0 and a CA intermediate below it: RFC 5280 section 6.1.4 forbids that. */
+    static final KeyPair PATHLEN_ZERO_KEYS = p256();
+    static final X509Certificate PATHLEN_ZERO = ca(PATHLEN_ZERO_KEYS, "Status List Test PathLen Zero CA", IACA,
+            IACA_KEYS, 0, LONG_AGO.plus(100, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
+    static final KeyPair SUB_INTERMEDIATE_KEYS = p256();
+    static final X509Certificate SUB_INTERMEDIATE = ca(SUB_INTERMEDIATE_KEYS, "Status List Test Sub Intermediate",
+            PATHLEN_ZERO, PATHLEN_ZERO_KEYS, null, LONG_AGO.plus(100, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
+    static final KeyPair SUB_INTERMEDIATE_DSC_KEYS = p256();
+    static final X509Certificate SUB_INTERMEDIATE_DSC = signer(SUB_INTERMEDIATE_DSC_KEYS,
+            "Status List Test Sub Intermediate DSC", SUB_INTERMEDIATE, SUB_INTERMEDIATE_KEYS,
+            List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true, LONG_AGO.plus(100, ChronoUnit.DAYS),
+            Instant.now().plus(200, ChronoUnit.DAYS));
+
+    /** An IACA whose validity ended long ago, and a signer it issued that is valid now (only the anchor's dates are odd). */
+    static final KeyPair EXPIRED_IACA_KEYS = p256();
+    static final X509Certificate EXPIRED_IACA = IsoMdocProfiles.iaca(EXPIRED_IACA_KEYS).country("IN")
+            .commonName("Status List Test Expired IACA").issuerAltUri("https://expired.example.test")
+            .crlDistributionPoint("https://expired.example.test/iaca.crl")
+            .notBefore(Instant.now().minus(400, ChronoUnit.DAYS)).validity(Duration.ofDays(100)).build();
+    static final KeyPair UNDER_EXPIRED_IACA_KEYS = p256();
+    static final X509Certificate UNDER_EXPIRED_IACA = signer(UNDER_EXPIRED_IACA_KEYS,
+            "Status List Test Under An Expired IACA", EXPIRED_IACA, EXPIRED_IACA_KEYS,
+            List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true, Instant.now().minus(50, ChronoUnit.DAYS),
+            Instant.now().plus(100, ChronoUnit.DAYS));
+
+    /** An IACA that is not yet valid, and a signer it issued that is valid now. */
+    static final KeyPair FUTURE_IACA_KEYS = p256();
+    static final X509Certificate FUTURE_IACA = IsoMdocProfiles.iaca(FUTURE_IACA_KEYS).country("IN")
+            .commonName("Status List Test Future IACA").issuerAltUri("https://future.example.test")
+            .crlDistributionPoint("https://future.example.test/iaca.crl")
+            .notBefore(Instant.now().plus(10, ChronoUnit.DAYS)).validity(Duration.ofDays(300)).build();
+    static final KeyPair UNDER_FUTURE_IACA_KEYS = p256();
+    static final X509Certificate UNDER_FUTURE_IACA = signer(UNDER_FUTURE_IACA_KEYS,
+            "Status List Test Under A Future IACA", FUTURE_IACA, FUTURE_IACA_KEYS,
+            List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true, Instant.now().minus(1, ChronoUnit.DAYS),
+            Instant.now().plus(100, ChronoUnit.DAYS));
+
     private StatusListTestKeys() {}
 
     static KeyPair p256() {
@@ -153,7 +205,14 @@ final class StatusListTestKeys {
                                   List<String> extendedKeyUsage, boolean digitalSignature, Instant notBefore,
                                   Instant notAfter) {
         return issue(subject, new X500Name("CN=" + commonName), issuer, issuerKeys, extendedKeyUsage,
-                digitalSignature, notBefore, notAfter);
+                digitalSignature, notBefore, notAfter, false, null);
+    }
+
+    /** A CA certificate: {@code basicConstraints cA TRUE} (with {@code pathLen} when given) and key usage keyCertSign. */
+    static X509Certificate ca(KeyPair subject, String commonName, X509Certificate issuer, KeyPair issuerKeys,
+                              Integer pathLen, Instant notBefore, Instant notAfter) {
+        return issue(subject, new X500Name("CN=" + commonName), issuer, issuerKeys, List.of(), true, notBefore,
+                notAfter, true, pathLen);
     }
 
     /** The key-rollover intermediate: its subject and issuer names are equal, so the chain library calls it self-signed. */
@@ -175,7 +234,7 @@ final class StatusListTestKeys {
 
     private static X509Certificate issue(KeyPair subject, X500Name subjectName, X509Certificate issuer, KeyPair issuerKeys,
                                          List<String> extendedKeyUsage, boolean digitalSignature, Instant notBefore,
-                                         Instant notAfter) {
+                                         Instant notAfter, boolean ca, Integer pathLen) {
         try {
             JcaX509v3CertificateBuilder builder = new JcaX509v3CertificateBuilder(
                     X500Name.getInstance(issuer.getSubjectX500Principal().getEncoded()), serial(),
@@ -185,8 +244,14 @@ final class StatusListTestKeys {
                     extensions.createAuthorityKeyIdentifier(issuer.getPublicKey()));
             builder.addExtension(Extension.subjectKeyIdentifier, false,
                     extensions.createSubjectKeyIdentifier(subject.getPublic()));
-            builder.addExtension(Extension.keyUsage, true, new KeyUsage(digitalSignature
-                    ? KeyUsage.digitalSignature : KeyUsage.keyEncipherment));
+            if (ca) {
+                builder.addExtension(Extension.basicConstraints, true,
+                        pathLen == null ? new BasicConstraints(true) : new BasicConstraints(pathLen));
+                builder.addExtension(Extension.keyUsage, true, new KeyUsage(KeyUsage.keyCertSign | KeyUsage.cRLSign));
+            } else {
+                builder.addExtension(Extension.keyUsage, true, new KeyUsage(digitalSignature
+                        ? KeyUsage.digitalSignature : KeyUsage.keyEncipherment));
+            }
             if (!extendedKeyUsage.isEmpty()) {
                 builder.addExtension(Extension.extendedKeyUsage, false, new ExtendedKeyUsage(
                         extendedKeyUsage.stream().map(oid -> KeyPurposeId.getInstance(new ASN1ObjectIdentifier(oid)))

@@ -31,6 +31,13 @@ import org.slf4j.LoggerFactory;
  * {@code jca} alias is {@code mdl-dsc}, but its key's {@code kid} is the entry's full alias {@code mdl-dsc@2026-11} —
  * and is the configured reference where it does not (keymanager rotates under one reference). {@link #resolve} then
  * refuses a signer whose certificate changed: a persisted index belongs to the certificate that allocated it.
+ *
+ * <p>The retirement clock is the certificate stored with the list (the leaf of the token's protected {@code x5chain}),
+ * not whatever the provider resolves today, so no extra field is needed in the section 4.4 envelope. Limitation: an
+ * <em>unversioned</em> DSC alias that rotates while its old certificate is still valid leaves the old version
+ * unreachable by any {@link KeyRef} (the provider only ever resolves the current one), so such a list cannot be
+ * re-signed by its pinned certificate and is answered {@code STATUS_SIGNER_GONE}; a versioned alias
+ * ({@code mdl-dsc@2026-11}) is what document-signer mode should be configured with.
  */
 public class StatusListSigners {
 
@@ -109,16 +116,47 @@ public class StatusListSigners {
      * certificate describes, not whatever the current configuration says): moving a list to another algorithm or
      * certificate would change who signed it.
      *
-     * @throws IllegalStateException    {@code STATUS_SIGNER_GONE} when the pinned reference now names another
-     *                                  certificate (a keymanager key rotated under the same reference), and
-     *                                  {@code STATUS_SIGNER_NO_CHAIN} when it names none
+     * <p>The caller passes the signer certificate stored with the list — the leaf of the stored token's protected
+     * {@code x5chain}, whose SHA-256 it has already checked against {@link Pinned#x5tS256()} — and the retirement
+     * decision is made from <em>that</em> certificate before the key provider is asked for anything. A provider cannot
+     * name a version whose certificate has expired (an unversioned {@code mdl-dsc} alias resolves to nothing, and a
+     * rotated keymanager reference names another certificate), so resolving first would turn retirement into a plain
+     * {@code STATUS_SIGNER_GONE} 503 forever instead of the {@code 410} of D-M11-7.
+     *
+     * @throws IllegalStateException     {@code STATUS_SIGNER_GONE} when the stored certificate is not the pinned one,
+     *                                  when the pinned reference now names another certificate (a keymanager key rotated
+     *                                  under the same reference), when it names none, or when the provider cannot resolve
+     *                                  it at all (wrapped, with its cause)
      * @throws StatusListRetiredException when the pinned certificate is past its {@code notAfter}: the list is not
      *                                  signed again (D-M11-7)
      */
-    public SigningContext resolve(Pinned pinned) {
+    public SigningContext resolve(Pinned pinned, X509Certificate pinnedLeaf) {
         Objects.requireNonNull(pinned, "pinned");
-        KeyProvider provider = keyProviders.provider(pinned.keyRef().provider());
-        SigningKey key = provider.resolve(pinned.keyRef());
+        Objects.requireNonNull(pinnedLeaf, "pinnedLeaf");
+        String pinnedHash = x5tS256(pinnedLeaf);
+        if (!pinnedHash.equals(pinned.x5tS256())) {
+            throw new IllegalStateException(GONE + ": the stored signer certificate "
+                    + pinnedLeaf.getSubjectX500Principal() + " (SHA-256 " + pinnedHash + ") is not the one the list was"
+                    + " pinned to (SHA-256 " + pinned.x5tS256() + "); the stored token and its signer do not belong"
+                    + " together, so nothing is re-signed");
+        }
+        Instant notAfter = pinnedLeaf.getNotAfter().toInstant();
+        if (clock.instant().isAfter(notAfter)) {
+            throw new StatusListRetiredException("the pinned status list signer " + pinned.keyRef() + " ("
+                    + pinnedLeaf.getSubjectX500Principal() + ") expired at " + notAfter
+                    + ", so the list is retired rather than signed again; every mDL that indexed it has expired too"
+                    + " (D-M11-7)");
+        }
+        KeyProvider provider;
+        SigningKey key;
+        try {
+            provider = keyProviders.provider(pinned.keyRef().provider());
+            key = provider.resolve(pinned.keyRef());
+        } catch (RuntimeException e) {
+            throw new IllegalStateException(GONE + ": the pinned signer " + pinned.keyRef() + " cannot be resolved ("
+                    + e.getMessage() + "); a status list is re-signed only by the certificate that allocated its"
+                    + " indices (docs/design/wp/M-11-status-list-under-iaca.md section 4.3)", e);
+        }
         X509Certificate leaf = leaf(key);
         String x5tS256 = x5tS256(leaf);
         if (!x5tS256.equals(pinned.x5tS256())) {
@@ -127,13 +165,6 @@ public class StatusListSigners {
                     + " allocated against (SHA-256 " + pinned.x5tS256() + "); a status list is re-signed only by the"
                     + " signer whose certificates the mDLs on it carry (docs/design/wp/M-11-status-list-under-iaca.md"
                     + " section 4.3)");
-        }
-        Instant notAfter = leaf.getNotAfter().toInstant();
-        if (clock.instant().isAfter(notAfter)) {
-            throw new StatusListRetiredException("the pinned status list signer " + pinned.keyRef() + " ("
-                    + leaf.getSubjectX500Principal() + ") expired at " + notAfter
-                    + ", so the list is retired rather than signed again; every mDL that indexed it has expired too"
-                    + " (D-M11-7)");
         }
         return new SigningContext(SigningConfig.of(pinned.keyRef(), key.algorithm()), key, provider);
     }

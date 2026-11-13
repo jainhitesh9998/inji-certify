@@ -29,10 +29,15 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * M-11c: signer pinning (docs/design/wp/M-11-status-list-under-iaca.md sections 4.3 and 4.4). A list belongs to one
- * signer — Credo accepts an mDL's list only when the list's validated chain equals the mDL's issuance chain — so the
- * stored envelope records the key reference to re-sign with and the SHA-256 of the leaf certificate, and re-signing
- * refuses a signer whose certificate changed or expired.
+ * M-11c: signer pinning and retirement (docs/design/wp/M-11-status-list-under-iaca.md sections 4.3 and 4.4). A list
+ * belongs to one signer — Credo accepts an mDL's list only when the list's validated chain equals the mDL's issuance
+ * chain — so the stored envelope records the key reference to re-sign with and the SHA-256 of the leaf certificate, and
+ * re-signing refuses a signer whose certificate changed or expired.
+ *
+ * <p>The retirement tests use the <b>real</b> {@link JcaKeyProvider}, not a stub: it is the provider that refuses an
+ * expired {@code mdoc-dsc} alias outright, so resolving before checking the stored certificate would turn D-M11-7's
+ * {@code 410} into a plain {@code STATUS_SIGNER_GONE} 503 forever. {@code resolve} therefore judges the stored leaf's
+ * {@code notAfter} first and only then asks the provider for the pinned reference.
  */
 class StatusListSignersTest {
 
@@ -102,7 +107,7 @@ class StatusListSignersTest {
         StatusListSigners.Pinned pinned = signers.pin(registry.signingContext(
                 SigningConfig.of(KeyRef.parse("x509-file:mdl-dsc"), SignatureAlgorithm.ES256)));
 
-        SigningContext resolved = signers.resolve(pinned);
+        SigningContext resolved = signers.resolve(pinned, DSC);
         assertEquals(pinned.keyRef(), resolved.key().ref());
         assertEquals(SignatureAlgorithm.ES256, resolved.key().algorithm());
         assertArrayEquals(DSC.getEncoded(), resolved.key().chain().leaf().orElseThrow().getEncoded());
@@ -122,22 +127,63 @@ class StatusListSignersTest {
         // the provider now hands out another certificate under the same reference: the indices on this list belong to
         // the old one, so no token is signed with the new one
         provider.holds(key("thumbprint", DEDICATED_KEYS, DEDICATED, IACA));
-        IllegalStateException refused = assertThrows(IllegalStateException.class, () -> signers.resolve(pinned));
+        IllegalStateException refused = assertThrows(IllegalStateException.class, () -> signers.resolve(pinned, DSC));
         assertTrue(refused.getMessage().startsWith("STATUS_SIGNER_GONE: "), refused.getMessage());
     }
 
     @Test
-    void resolveRetiresAListWhosePinnedSignerExpired() {
-        StatusListTestKeys.MutableProvider provider = new StatusListTestKeys.MutableProvider("keymanager",
-                key("dsc", EXPIRED_KEYS, EXPIRED, IACA));
+    void resolveRetiresAnUnversionedDscWhoseStoredCertificateExpired() {
+        // the real provider: an expired mdoc-dsc alias resolves to nothing, so checking the stored certificate first is
+        // what keeps D-M11-7's 410 reachable (a GONE here would be a 503 forever)
+        JcaKeyProvider provider = new JcaKeyProvider("x509-file");
+        provider.add("mdl-dsc", EXPIRED_KEYS.getPrivate(), CertificateChain.of(EXPIRED, IACA),
+                SignatureAlgorithm.ES256, "mdoc-dsc");
         StatusListSigners signers = new StatusListSigners(new KeyProviderRegistry(List.of(provider)));
-        StatusListSigners.Pinned pinned = signers.pin(new SigningContext(
-                SigningConfig.of(KeyRef.parse("keymanager:dsc"), SignatureAlgorithm.ES256),
-                key("dsc", EXPIRED_KEYS, EXPIRED, IACA), SIGNER));
+        StatusListSigners.Pinned pinned = new StatusListSigners.Pinned(KeyRef.parse("x509-file:mdl-dsc"),
+                StatusListSigners.x5tS256(EXPIRED));
 
-        // pinning reads the certificate; re-signing refuses it once its notAfter passed (D-M11-7: the list is served
-        // as stored while its exp holds, then answered 410)
-        assertThrows(StatusListRetiredException.class, () -> signers.resolve(pinned));
+        assertThrows(StatusListRetiredException.class, () -> signers.resolve(pinned, EXPIRED));
+    }
+
+    @Test
+    void resolveRetiresAKeymanagerShapedListRotatedAfterItsCertificateExpired() {
+        // the provider already holds the new certificate under the one reference keymanager rotates; the stored token
+        // still names the old, expired one, which is the retirement decision
+        JcaKeyProvider provider = new JcaKeyProvider("keymanager");
+        provider.add("APP/REF", DEDICATED_KEYS.getPrivate(), CertificateChain.of(DEDICATED, IACA),
+                SignatureAlgorithm.ES256, JcaKeyProvider.PURPOSE_VC_SIGNING);
+        StatusListSigners signers = new StatusListSigners(new KeyProviderRegistry(List.of(provider)));
+        StatusListSigners.Pinned pinned = new StatusListSigners.Pinned(KeyRef.parse("keymanager:APP/REF"),
+                StatusListSigners.x5tS256(EXPIRED));
+
+        assertThrows(StatusListRetiredException.class, () -> signers.resolve(pinned, EXPIRED));
+    }
+
+    @Test
+    void resolveWrapsAProviderFailureAsGone() {
+        // the pinned reference is gone from the provider: the cause is kept, and the type is the one the service maps
+        JcaKeyProvider provider = new JcaKeyProvider("x509-file");
+        StatusListSigners signers = new StatusListSigners(new KeyProviderRegistry(List.of(provider)));
+        StatusListSigners.Pinned pinned = new StatusListSigners.Pinned(KeyRef.parse("x509-file:mdl-dsc"),
+                StatusListSigners.x5tS256(DSC));
+
+        IllegalStateException refused = assertThrows(IllegalStateException.class, () -> signers.resolve(pinned, DSC));
+        assertTrue(refused.getMessage().startsWith("STATUS_SIGNER_GONE: "), refused.getMessage());
+        assertTrue(refused.getCause() instanceof io.mosip.certify.signing.SigningException, "the provider's cause is kept");
+    }
+
+    @Test
+    void resolveRefusesAStoredLeafThatIsNotThePinnedOne() {
+        StatusListTestKeys.MutableProvider provider = new StatusListTestKeys.MutableProvider("keymanager",
+                key("thumbprint", DSC_KEYS, DSC, IACA));
+        StatusListSigners signers = new StatusListSigners(new KeyProviderRegistry(List.of(provider)));
+        StatusListSigners.Pinned pinned = new StatusListSigners.Pinned(KeyRef.parse("keymanager:APP/REF"),
+                StatusListSigners.x5tS256(DSC));
+
+        IllegalStateException refused = assertThrows(IllegalStateException.class,
+                () -> signers.resolve(pinned, DEDICATED));
+        assertTrue(refused.getMessage().startsWith("STATUS_SIGNER_GONE: "), refused.getMessage());
+        assertTrue(refused.getMessage().contains("not the one the list was pinned to"), refused.getMessage());
     }
 
     @Test
@@ -147,7 +193,7 @@ class StatusListSignersTest {
         StatusListSigners signers = new StatusListSigners(new KeyProviderRegistry(List.of(provider)));
         StatusListSigners.Pinned pinned = new StatusListSigners.Pinned(KeyRef.parse("keymanager:APP/REF"),
                 StatusListSigners.x5tS256(DSC));
-        IllegalStateException refused = assertThrows(IllegalStateException.class, () -> signers.resolve(pinned));
+        IllegalStateException refused = assertThrows(IllegalStateException.class, () -> signers.resolve(pinned, DSC));
         assertTrue(refused.getMessage().startsWith("STATUS_SIGNER_NO_CHAIN: "), refused.getMessage());
     }
 

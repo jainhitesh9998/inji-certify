@@ -1,6 +1,5 @@
 package io.mosip.certify.status;
 
-import io.mosip.certify.pki.AnnexBValidator;
 import io.mosip.certify.signing.CertificateChain;
 import io.mosip.certify.signing.CertificateChainPolicy;
 import io.mosip.certify.signing.CertificateLinks;
@@ -8,6 +7,8 @@ import io.mosip.certify.signing.SigningException;
 import io.mosip.certify.signing.TrustAnchorRegistry;
 import io.mosip.certify.spi.SigningContext;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.security.cert.CertificateExpiredException;
 import java.security.cert.CertificateNotYetValidException;
 import java.security.cert.CertificateParsingException;
@@ -16,6 +17,7 @@ import java.security.cert.X509CRLEntry;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -27,19 +29,25 @@ import java.util.Set;
  * message is what the service logs and what an operator acts on: at renewal it becomes the existing back-off and 503
  * path, at issuance {@code FormatException("status_list_unavailable")}.
  *
+ * <p>{@link TokenStatusListCwt#encode} runs {@link #check} itself, before the envelope is built, so there is no public
+ * way to sign a status-list CWT without this policy.
+ *
  * <p>Two groups, as for the mDoc Document Signer ({@code MdocDscPolicy}):
  * <ul>
- *     <li><b>always</b>: the signer has a certificate chain, the leaf is not self-signed, the signing instant lies
- *     inside every certificate's validity and every link verifies ({@link CertificateChainPolicy}), and the
- *     {@code x5chain} the token would carry holds no self-signed certificate;</li>
+ *     <li><b>always</b>: the signer has a certificate chain, the leaf is not self-signed, every certificate that issues
+ *     another one in the path is a CA allowed to do so (RFC 5280 section 6.1.4: {@code basicConstraints cA} TRUE,
+ *     {@code pathLenConstraint} respected, key usage {@code keyCertSign}), the signing instant lies inside every
+ *     certificate's validity and every link verifies ({@link CertificateChainPolicy}), and the {@code x5chain} the
+ *     token would carry holds no self-signed certificate;</li>
  *     <li><b>once an {@code mdoc-iaca} anchor is configured</b> ({@link #enforced()}): an IACA issued the chain's top
- *     certificate, the anchor's CRL does not list the leaf and is not stale, and the leaf carries the extended key
- *     usage its {@link Mode} needs plus {@code digitalSignature} key usage.</li>
+ *     certificate and is valid at the signing instant, that certificate's serial is not on the anchor's CRL, the CRL is
+ *     not stale, and the leaf carries the extended key usage its {@link Mode} needs plus {@code digitalSignature} key
+ *     usage.</li>
  * </ul>
  *
  * <p>This class runs <b>before every</b> {@code CwtEnvelope.signOrdered} call: M-11a's envelope refuses only an empty
- * chain, a self-signed leaf and an emitted chain that carries a self-signed certificate, and checks no validity, EKU,
- * revocation or IACA. Its own {@link SigningException}s use the same {@code STATUS_SIGNER_} prefixes, and
+ * chain, a self-signed leaf and an emitted chain that carries a self-signed certificate, and checks no CA bits,
+ * validity, EKU, revocation or IACA. Its own {@link SigningException}s use the same {@code STATUS_SIGNER_} prefixes, and
  * {@link #refusal} maps them onto this class's type so both layers fail the same way.
  *
  * <p>Without anchors none of the second group runs, so a deployment whose mDLs are signed by keymanager's
@@ -58,11 +66,17 @@ public final class StatusListSignerPolicy {
     public static final String NOT_YET_VALID = "STATUS_SIGNER_NOT_YET_VALID";
     /** A link of the chain does not verify. */
     public static final String CHAIN_LINK_INVALID = "CHAIN_LINK_INVALID";
+    /** A certificate that issues another one in the path is not a CA, or is not allowed to issue it. */
+    public static final String ISSUER_NOT_CA = "STATUS_SIGNER_ISSUER_NOT_CA";
     /** The {@code x5chain} the token would emit holds a self-signed certificate above the leaf. */
     public static final String CARRIES_ANCHOR = "STATUS_SIGNER_CARRIES_ANCHOR";
     /** No configured IACA issued the chain's top certificate. */
     public static final String NO_TRUSTED_IACA = "STATUS_SIGNER_NO_TRUSTED_IACA";
-    /** The anchor's CRL lists the signer's certificate. */
+    /** The IACA that issued the signer's chain expired before the signing instant. */
+    public static final String IACA_EXPIRED = "STATUS_SIGNER_IACA_EXPIRED";
+    /** The IACA that issued the signer's chain is not yet valid at the signing instant. */
+    public static final String IACA_NOT_YET_VALID = "STATUS_SIGNER_IACA_NOT_YET_VALID";
+    /** The anchor's CRL lists the certificate the IACA issued. */
     public static final String REVOKED = "STATUS_SIGNER_REVOKED";
     /** The anchor's CRL passed its {@code nextUpdate} beyond the stale-CRL grace before the signing instant. */
     public static final String CRL_STALE = "CRL_STALE";
@@ -77,9 +91,11 @@ public final class StatusListSignerPolicy {
     /** The prefix every refusal of this layer (and of M-11a's envelope) carries. */
     public static final String PREFIX = "STATUS_SIGNER_";
 
-    /** The rules this class names. */
-    public static final Set<String> RULES = Set.of(NO_CHAIN, SELF_SIGNED, EXPIRED, NOT_YET_VALID, CHAIN_LINK_INVALID,
-            CARRIES_ANCHOR, NO_TRUSTED_IACA, REVOKED, CRL_STALE, PURPOSE);
+    /**
+     * The rules this class names, read off the constants above so a rule added without a negative test fails
+     * {@code StatusListSignerPolicyTest.everyNamedRuleHasANegativeTest} instead of passing silently.
+     */
+    public static final Set<String> RULES = declaredRules();
 
     /** Which extended key usage the leaf must carry: the mDL Document Signer's, or the dedicated status signer's. */
     public enum Mode {
@@ -132,6 +148,7 @@ public final class StatusListSignerPolicy {
         } catch (SigningException e) {
             throw validityRefusal(e);
         }
+        requireIssuersAreCas(certificates, registry.entries(TrustAnchorRegistry.MDOC_IACA));
         List<X509Certificate> emitted = chain.withoutAnchor().leafFirst();
         for (int index = 1; index < emitted.size(); index++) {
             X509Certificate certificate = emitted.get(index);
@@ -154,6 +171,48 @@ public final class StatusListSignerPolicy {
         return refuse(rule, failure.getMessage(), failure);
     }
 
+    /**
+     * RFC 5280 section 6.1.4 for every certificate of the chain that issues the one below it: {@code basicConstraints}
+     * must say {@code cA} TRUE, {@code pathLenConstraint} must allow the intermediates beneath it, and key usage must
+     * include {@code keyCertSign}. Without this an end-entity certificate (no basicConstraints, only
+     * {@code digitalSignature}) could stand in as an intermediate and the path would look complete to every signature
+     * check while no RFC 5280 verifier would build it. The trust anchor is not checked here: a leaf-only chain leaves it
+     * to the registry, which validates an IACA when it loads it ({@code FileTrustAnchorRegistry}).
+     */
+    private static void requireIssuersAreCas(List<X509Certificate> certificates,
+                                             List<TrustAnchorRegistry.Anchor> anchors) {
+        for (int index = 1; index < certificates.size(); index++) {
+            X509Certificate issuer = certificates.get(index);
+            int pathLen = issuer.getBasicConstraints();
+            if (pathLen < 0) {
+                throw refuse(ISSUER_NOT_CA, "the certificate " + issuer.getSubjectX500Principal() + " at position "
+                        + index + " issues " + certificates.get(index - 1).getSubjectX500Principal() + " but is not a CA:"
+                        + " basicConstraints cA TRUE is required for a certificate that issues another one"
+                        + " (RFC 5280 section 4.2.1.9 and 6.1.4), so an end-entity certificate cannot act as an"
+                        + " intermediate of a status list signer's chain");
+            }
+            boolean[] keyUsage = issuer.getKeyUsage();
+            if (keyUsage == null || keyUsage.length <= 5 || !keyUsage[5]) {
+                throw refuse(ISSUER_NOT_CA, "the certificate " + issuer.getSubjectX500Principal() + " at position "
+                        + index + " issues " + certificates.get(index - 1).getSubjectX500Principal() + " but its key"
+                        + " usage does not assert keyCertSign (RFC 5280 section 4.2.1.3), which a certificate that issues"
+                        + " another one needs");
+            }
+            if (isAnchor(issuer, anchors) || (index == certificates.size() - 1 && CertificateLinks.selfIssued(issuer))) {
+                // the trust anchor is an input to path validation, not a certificate of the path (RFC 5280 section
+                // 6.1.1): its own pathLenConstraint is the verifier's business, and an Annex B IACA carries 0 because
+                // an ISO/IEC 18013-5 Document Signer is issued directly
+                continue;
+            }
+            int intermediatesBelow = index - 1;
+            if (intermediatesBelow > pathLen) {
+                throw refuse(ISSUER_NOT_CA, "the certificate " + issuer.getSubjectX500Principal() + " at position "
+                        + index + " has pathLenConstraint " + pathLen + " but " + intermediatesBelow
+                        + " intermediate certificate(s) follow it in the path (RFC 5280 section 6.1.4)");
+            }
+        }
+    }
+
     private void checkTrust(X509Certificate leaf, List<X509Certificate> certificates, Instant now, Mode mode) {
         List<TrustAnchorRegistry.Anchor> anchors = registry.entries(TrustAnchorRegistry.MDOC_IACA);
         X509Certificate candidate = topmostNonAnchor(certificates, anchors);
@@ -164,17 +223,34 @@ public final class StatusListSignerPolicy {
                         + " (issuer " + candidate.getIssuerX500Principal() + ", at the top of the signer's chain) was"
                         + " not issued by any configured IACA " + anchors.stream().map(TrustAnchorRegistry.Anchor::id).toList()
                         + "; status lists are signed only under certify.pki.trust-anchors.mdoc-iaca (D16)"));
+        requireAnchorValid(anchor, now);
         Optional<X509CRL> crl = registry.crl(anchor.id());
         if (crl.isPresent()) {
-            X509CRLEntry entry = crl.get().getRevokedCertificate(leaf.getSerialNumber());
+            // the CRL is the IACA's: it lists the certificates the IACA issued, which is the top of the signer's chain
+            // (the leaf itself when the IACA issued it directly), never a certificate behind an intermediate
+            X509CRLEntry entry = crl.get().getRevokedCertificate(candidate.getSerialNumber());
             if (entry != null) {
-                throw refuse(REVOKED, "the status list signer " + leaf.getSubjectX500Principal() + " (serial "
-                        + leaf.getSerialNumber().toString(16) + ") is revoked by the CRL of the IACA " + anchor.id()
+                throw refuse(REVOKED, "the certificate " + candidate.getSubjectX500Principal() + " (serial "
+                        + candidate.getSerialNumber().toString(16) + ") is revoked by the CRL of the IACA " + anchor.id()
                         + " since " + entry.getRevocationDate().toInstant());
             }
             requireFresh(crl.get(), anchor, now);
         }
         requirePurpose(leaf, mode);
+    }
+
+    /** The anchor must be inside its own validity at the signing instant, as {@code MdocDscPolicy} holds for an mDL. */
+    private static void requireAnchorValid(TrustAnchorRegistry.Anchor anchor, Instant now) {
+        X509Certificate iaca = anchor.certificate();
+        if (now.isBefore(iaca.getNotBefore().toInstant())) {
+            throw refuse(IACA_NOT_YET_VALID, "the IACA " + anchor.id() + " is valid from "
+                    + iaca.getNotBefore().toInstant() + ", after the signing instant " + now
+                    + "; a verifier cannot build the path to a not-yet-valid anchor");
+        }
+        if (now.isAfter(iaca.getNotAfter().toInstant())) {
+            throw refuse(IACA_EXPIRED, "the IACA " + anchor.id() + " expired at " + iaca.getNotAfter().toInstant()
+                    + ", before the signing instant " + now + "; a verifier rejects a status list whose anchor expired");
+        }
     }
 
     /**
@@ -197,8 +273,9 @@ public final class StatusListSignerPolicy {
     /**
      * RFC 5280 6.3.3: a verifier that finds the anchor's CRL past its {@code nextUpdate} cannot establish the signer's
      * status and rejects the token, so signing past {@link TrustAnchorRegistry#staleCrlGrace()} would only produce a
-     * list that fails verification. {@link AnnexBValidator#CLOCK_SKEW} is added to the window so a few seconds of clock
-     * difference between this issuer and the IACA do not retire a list that still verifies.
+     * list that fails verification. The window is exactly {@code nextUpdate + grace}, as {@code MdocDscPolicy} holds for
+     * an mDL: no clock skew is added, because the CRL's dates are the anchor's own statement and a stale one is refused
+     * by the verifier that reads the same dates.
      */
     private void requireFresh(X509CRL crl, TrustAnchorRegistry.Anchor anchor, Instant at) {
         if (crl.getNextUpdate() == null) {
@@ -206,11 +283,10 @@ public final class StatusListSignerPolicy {
         }
         Instant nextUpdate = crl.getNextUpdate().toInstant();
         Duration grace = registry.staleCrlGrace();
-        if (at.isAfter(nextUpdate.plus(grace).plus(AnnexBValidator.CLOCK_SKEW))) {
+        if (at.isAfter(nextUpdate.plus(grace))) {
             throw refuse(CRL_STALE, "the CRL of the IACA " + anchor.id() + " passed its nextUpdate " + nextUpdate
-                    + ", more than the grace " + grace + " (certify.pki.stale-crl-grace) and the clock skew "
-                    + AnnexBValidator.CLOCK_SKEW + " before the signing instant " + at + "; a verifier rejects a status"
-                    + " list whose IACA CRL is stale (RFC 5280 6.3.3): publish a new CRL");
+                    + ", more than the grace " + grace + " (certify.pki.stale-crl-grace) before the signing instant " + at
+                    + "; a verifier rejects a status list whose IACA CRL is stale (RFC 5280 6.3.3): publish a new CRL");
         }
     }
 
@@ -248,10 +324,10 @@ public final class StatusListSignerPolicy {
      * The one exception a caller maps: a refusal of this policy (already an {@link IllegalStateException}) or a
      * {@link SigningException} from M-11a's envelope whose message starts with {@value #PREFIX}, wrapped as an
      * {@link IllegalStateException} with the same message and cause. Anything else is returned unchanged, so an
-     * unrelated failure keeps its own type.
+     * unrelated failure (a caller's {@link IllegalArgumentException}, a provider's own error) keeps its own type.
      *
-     * <p>Renewal turns the result into the back-off and 503 path, issuance into
-     * {@code FormatException("status_list_unavailable")}.
+     * <p>{@link TokenStatusListCwt#encode} applies this mapping itself, so renewal turns it into the back-off and 503
+     * path and issuance into {@code FormatException("status_list_unavailable")} without the call site re-deciding.
      */
     public static RuntimeException refusal(RuntimeException failure) {
         Objects.requireNonNull(failure, "failure");
@@ -271,5 +347,26 @@ public final class StatusListSignerPolicy {
 
     private static IllegalStateException refuse(String rule, String message, Throwable cause) {
         return new IllegalStateException(rule + ": " + message, cause);
+    }
+
+    /** The rule constants of this class, read by reflection so the guard test sees every one of them. */
+    private static Set<String> declaredRules() {
+        Set<String> rules = new LinkedHashSet<>();
+        for (Field field : StatusListSignerPolicy.class.getDeclaredFields()) {
+            int modifiers = field.getModifiers();
+            if (!Modifier.isStatic(modifiers) || !Modifier.isFinal(modifiers) || !Modifier.isPublic(modifiers)
+                    || field.getType() != String.class || field.getName().equals("PREFIX")) {
+                continue;
+            }
+            try {
+                String value = (String) field.get(null);
+                if (value.startsWith(PREFIX) || value.equals(CHAIN_LINK_INVALID) || value.equals(CRL_STALE)) {
+                    rules.add(value);
+                }
+            } catch (IllegalAccessException e) {
+                throw new IllegalStateException("Cannot read the rule constant " + field.getName(), e);
+            }
+        }
+        return Set.copyOf(rules);
     }
 }

@@ -2,6 +2,7 @@ package io.mosip.certify.status;
 
 import com.upokecenter.cbor.CBORObject;
 import com.upokecenter.cbor.CBORType;
+import io.mosip.certify.signing.CertificateChain;
 import io.mosip.certify.signing.CoseEnvelope;
 import io.mosip.certify.signing.CoseHeaderPolicy;
 import io.mosip.certify.signing.CwtEnvelope;
@@ -32,10 +33,19 @@ import java.util.Objects;
  * base64url encoded, and index {@code i} is bit {@code i mod 8} of byte {@code i / 8}, least significant bit first
  * ({@link TokenStatusListService#get}).
  *
- * <p>{@link #decode} reads a token back without verifying its signature: it is the codec, not a verifier. What it does
- * refuse is anything that is not this profile — so a stored or served token cannot silently change shape — while a
- * verifier still has the last word on the signature, the trust path and the signer's authorisation
- * ({@code StatusListSignerPolicy} runs before either signing or re-signing).
+ * <p><b>{@link #encode} is the only way this code signs a status-list CWT, and it always runs
+ * {@link StatusListSignerPolicy#check} first</b>: an expired, revoked, untrusted or wrongly-purposed signer is refused
+ * before the envelope is built, and both the policy's {@link IllegalStateException} and M-11a's
+ * {@link SigningException}s carrying a {@code STATUS_SIGNER_} prefix come out through
+ * {@link StatusListSignerPolicy#refusal} in one shape. There is no public path around it.
+ *
+ * <p>{@link #decode} reads a token back without verifying its signature: it is the codec, not a verifier. It does
+ * refuse anything that is not this profile — so a stored or served token cannot silently change shape — including
+ * malformed COSE (extra or nested tags, a non-map unprotected header, a label in both header buckets, a missing
+ * {@code alg}, a non-{@code bstr} payload or signature), a {@code ttl} that is not a positive integer, an
+ * {@code exp} that is not after {@code iat}, and an {@code lst} that does not inflate as zlib within the size ceiling.
+ * Floating-point NumericDates are refused too: RFC 8392 permits them, Certify never writes them, and a token that
+ * carried one would not be one of ours.
  */
 public final class TokenStatusListCwt {
 
@@ -51,6 +61,14 @@ public final class TokenStatusListCwt {
 
     /** ISO/IEC 18013-5 second edition 12.3.6.5: an mDoc status list carries one bit per index. */
     public static final int BITS = 1;
+
+    /**
+     * The size ceiling {@link #decode(byte[])} applies to an inflated {@code lst}: eight times the largest configured
+     * list ({@code certify.status.token-status-list.size-bits} defaults to 131072), i.e. 1 MiB of bits. A stream that
+     * inflates past it is refused before it is allocated, so a decompression bomb in a stored or fetched token cannot
+     * exhaust the heap; a caller that knows its configured size passes it to {@link #decode(byte[], int)}.
+     */
+    public static final int MAX_BITS = 1 << 23;
 
     private TokenStatusListCwt() {}
 
@@ -71,22 +89,30 @@ public final class TokenStatusListCwt {
     }
 
     /**
-     * Signs a status list as a CWT.
+     * Signs a status list as a CWT, after holding the signer to {@link StatusListSignerPolicy}.
      *
      * @param sub     the {@code status_list.uri} of the Referenced Tokens this list answers for (claim 2, TSL section
      *                8.3 step 4a)
      * @param iat     the signing instant, in whole seconds (claim 6)
-     * @param exp     when the token expires, in whole seconds and later than {@code iat}; never later than the signer's
-     *                {@code notAfter} (claim 4 is REQUIRED for an mDoc list, ISO2 12.3.6.3)
-     * @param ttl     how long a verifier may cache the list (claim 65534)
+     * @param exp     when the token expires, in whole seconds, later than {@code iat} and never later than the signer
+     *                certificate's {@code notAfter} (claim 4 is REQUIRED for an mDoc list, ISO2 12.3.6.3; section 4.1)
+     * @param ttl     how long a verifier may cache the list (claim 65534); its whole seconds must be positive
      * @param bits    the bit array, one bit per index, least significant bit first
-     * @param signing the signer — {@code StatusListSignerPolicy} must have accepted it already
+     * @param signing the signer
+     * @param policy  the signer policy, with the configured IACA anchors, CRLs and stale-CRL grace
+     * @param now     the instant the policy judges validity, revocation and CRL freshness at
+     * @param mode    which extended key usage the signer needs (the mDL Document Signer's or a dedicated signer's)
      * @throws IllegalArgumentException when a claim could not be represented faithfully, so no ambiguous token is signed
-     * @throws SigningException         when the signer chain is one no verifier could anchor (M-11a's envelope refuses
-     *                                  an empty chain, a self-signed leaf and an emitted chain carrying an anchor)
+     * @throws IllegalStateException    a policy refusal (the message starts with its rule), or a {@code STATUS_SIGNER_}
+     *                                  refusal of M-11a's envelope mapped by {@link StatusListSignerPolicy#refusal}
      */
-    public static byte[] encode(String sub, Instant iat, Instant exp, Duration ttl, byte[] bits, SigningContext signing) {
+    public static byte[] encode(String sub, Instant iat, Instant exp, Duration ttl, byte[] bits,
+                                SigningContext signing, StatusListSignerPolicy policy, Instant now,
+                                StatusListSignerPolicy.Mode mode) {
         Objects.requireNonNull(signing, "signing");
+        Objects.requireNonNull(policy, "policy");
+        Objects.requireNonNull(now, "now");
+        Objects.requireNonNull(mode, "mode");
         if (sub == null || sub.isBlank()) {
             throw new IllegalArgumentException("A status list names the uri of its Referenced Tokens (claim 2, TSL section 8.3)");
         }
@@ -96,18 +122,33 @@ public final class TokenStatusListCwt {
             throw new IllegalArgumentException("exp " + exp + " must be later than iat " + iat
                     + ": a token is not signed already expired, and both claims are whole seconds (RFC 8392 section 2)");
         }
-        if (ttl == null || ttl.isNegative()) {
-            throw new IllegalArgumentException("ttl must be a non-negative duration, got " + ttl);
+        if (ttl == null || ttl.getSeconds() < 1) {
+            throw new IllegalArgumentException("ttl must be at least one second, got " + ttl
+                    + ": TSL section 5.2 makes the time to live a positive unsigned integer");
         }
         Objects.requireNonNull(bits, "bits");
 
-        LinkedHashMap<Integer, CBORObject> claims = new LinkedHashMap<>();
-        claims.put(CLAIM_SUB, CBORObject.FromObject(sub));
-        claims.put(CLAIM_EXP, CBORObject.FromObject(exp.getEpochSecond()));
-        claims.put(CLAIM_IAT, CBORObject.FromObject(iat.getEpochSecond()));
-        claims.put(CLAIM_STATUS_LIST, statusList(bits));
-        claims.put(CLAIM_TTL, CBORObject.FromObject(ttl.getSeconds()));
-        return CwtEnvelope.signOrdered(claims, CoseHeaderPolicy.statusListCwt(), signing.key(), signing.signer());
+        try {
+            // mandatory, before anything is encoded or signed: no public path signs a status-list CWT without it
+            policy.check(signing, now, mode);
+            X509Certificate leaf = leaf(signing);
+            Instant notAfter = leaf.getNotAfter().toInstant();
+            if (exp.isAfter(notAfter)) {
+                throw new IllegalArgumentException("exp " + exp + " is after the signer certificate's notAfter " + notAfter
+                        + "; a list is not signed to outlive the certificate that signs it (section 4.1, D7)");
+            }
+            LinkedHashMap<Integer, CBORObject> claims = new LinkedHashMap<>();
+            claims.put(CLAIM_SUB, CBORObject.FromObject(sub));
+            claims.put(CLAIM_EXP, CBORObject.FromObject(exp.getEpochSecond()));
+            claims.put(CLAIM_IAT, CBORObject.FromObject(iat.getEpochSecond()));
+            claims.put(CLAIM_STATUS_LIST, statusList(bits));
+            claims.put(CLAIM_TTL, CBORObject.FromObject(ttl.getSeconds()));
+            return CwtEnvelope.signOrdered(claims, CoseHeaderPolicy.statusListCwt(), signing.key(), signing.signer());
+        } catch (RuntimeException e) {
+            // the policy's IllegalStateException and M-11a's STATUS_SIGNER_ SigningException become one shape; a
+            // caller's own IllegalArgumentException keeps its type (refusal returns it unchanged)
+            throw StatusListSignerPolicy.refusal(e);
+        }
     }
 
     /**
@@ -119,24 +160,53 @@ public final class TokenStatusListCwt {
                 .Add(CBORObject.FromObject("bits"), CBORObject.FromObject(BITS));
     }
 
+    private static X509Certificate leaf(SigningContext signing) {
+        CertificateChain chain = signing.key().chain();
+        if (chain == null || chain.isEmpty() || chain.leaf().isEmpty()) {
+            throw new IllegalStateException(StatusListSignerPolicy.NO_CHAIN + ": the key " + signing.key().ref()
+                    + " has no certificate");
+        }
+        return chain.leaf().orElseThrow();
+    }
+
+    /** As {@link #decode(byte[], int)} with the ceiling {@link #MAX_BITS}. */
+    public static Decoded decode(byte[] token) {
+        return decode(token, MAX_BITS);
+    }
+
     /**
      * Reads a CWT Status List Token back, without verifying its signature (TSL section 5.2; ISO2 12.3.6.3).
      *
-     * @throws IllegalStateException when the bytes are not this profile: not tag 18 around a four-element COSE_Sign1, no
-     *                               protected {@code typ} 16 equal to {@value #MEDIA_TYPE}, no protected {@code x5chain}
-     *                               33, a missing claim 2/6/4/65533, or {@code bits} other than 1
+     * @param maxBits the largest list this caller accepts, in bits; the {@code lst} must inflate to at most
+     *                {@code maxBits / 8} bytes (a multiple of 8, positive)
+     * @throws IllegalStateException when the bytes are not this profile: not exactly one tag 18 around an untagged
+     *                               four-element COSE_Sign1 with a {@code bstr} payload and signature, a non-map or
+     *                               missing protected/unprotected header, a label in both headers (RFC 9052 section 3),
+     *                               no protected {@code alg} 1, no protected {@code typ} 16 equal to
+     *                               {@value #MEDIA_TYPE}, no protected {@code x5chain} 33, a missing claim 2/6/4/65533,
+     *                               an {@code exp} not after {@code iat}, a {@code ttl} that is not a positive
+     *                               unsigned integer, {@code bits} other than 1, or an {@code lst} that is not zlib
+     *                               data within {@code maxBits}
      */
-    public static Decoded decode(byte[] token) {
+    public static Decoded decode(byte[] token, int maxBits) {
         Objects.requireNonNull(token, "token");
+        if (maxBits <= 0 || maxBits % 8 != 0) {
+            throw new IllegalArgumentException("maxBits must be a positive multiple of 8, got " + maxBits);
+        }
         CBORObject outer = cbor(token);
-        if (!outer.isTagged() || !String.valueOf(CoseEnvelope.TAG_COSE_SIGN1).equals(outer.getMostOuterTag().toString())) {
-            // a CWT tag 61 around a COSE_Sign1 is the shape TSL section 5.2 forbids, and an untagged array is no
-            // Status List Token at all
-            throw refuse("not COSE_Sign1_Tagged (tag 18)" + (outer.isTagged()
-                    ? ", it is tagged " + outer.getMostOuterTag() + " (a Status List Token is never tag 61, TSL section 5.2)"
-                    : " and untagged"));
+        if (!outer.isTagged()) {
+            throw refuse("untagged; a Status List Token is COSE_Sign1_Tagged (18) (TSL section 5.2)");
+        }
+        if (!String.valueOf(CoseEnvelope.TAG_COSE_SIGN1).equals(outer.getMostOuterTag().toString())) {
+            // a CWT tag 61 around a COSE_Sign1 is the shape TSL section 5.2 forbids
+            throw refuse("tagged " + outer.getMostOuterTag() + ", not 18 (a Status List Token is never tag 61,"
+                    + " TSL section 5.2)");
         }
         CBORObject sign1 = outer.UntagOne();
+        if (sign1.isTagged()) {
+            // 18(18(…)) or 18(61(…)): exactly one tag 18 around an untagged COSE_Sign1 (RFC 9052 section 4.2)
+            throw refuse("more than one tag; exactly one tag 18 wraps an untagged COSE_Sign1 (RFC 9052 section 4.2)");
+        }
         if (sign1.getType() != CBORType.Array || sign1.size() != 4) {
             throw refuse("the tag wraps " + (sign1.getType() == CBORType.Array
                     ? "an array of " + sign1.size() : "a " + sign1.getType()) + ", not a four-element COSE_Sign1");
@@ -144,6 +214,22 @@ public final class TokenStatusListCwt {
         CBORObject protectedHeader = cbor(bytes(sign1.get(0), "the protected header"));
         if (protectedHeader.getType() != CBORType.Map) {
             throw refuse("the protected header is a " + protectedHeader.getType() + ", not a map");
+        }
+        CBORObject unprotectedHeader = sign1.get(1);
+        if (unprotectedHeader == null || unprotectedHeader.getType() != CBORType.Map) {
+            throw refuse("the unprotected header is " + (unprotectedHeader == null ? "absent" : "a "
+                    + unprotectedHeader.getType()) + ", not a map");
+        }
+        for (CBORObject label : unprotectedHeader.getKeys()) {
+            if (protectedHeader.ContainsKey(label)) {
+                throw refuse("label " + label + " is in both the protected and the unprotected header, which RFC 9052"
+                        + " section 3 forbids");
+            }
+        }
+        CBORObject alg = protectedHeader.get(CBORObject.FromObject(CoseEnvelope.LABEL_ALG));
+        if (alg == null || alg.getType() != CBORType.Integer) {
+            throw refuse("no protected alg (label 1) as an integer; RFC 9052 section 3 requires the algorithm to be"
+                    + " integrity protected");
         }
         CBORObject typ = protectedHeader.get(CBORObject.FromObject(CoseEnvelope.LABEL_TYP));
         if (typ == null) {
@@ -165,14 +251,28 @@ public final class TokenStatusListCwt {
         if (payload.getType() != CBORType.Map) {
             throw refuse("the payload is a " + payload.getType() + ", not a claim map");
         }
+        bytes(sign1.get(3), "the signature");
+
         CBORObject sub = claim(payload, CLAIM_SUB, "sub");
         if (sub.getType() != CBORType.TextString) {
             throw refuse("claim 2 (sub) is a " + sub.getType() + ", not the uri text");
         }
         Instant iat = instant(claim(payload, CLAIM_IAT, "iat"), "iat");
         Instant exp = instant(claim(payload, CLAIM_EXP, "exp"), "exp");
+        if (!exp.isAfter(iat)) {
+            throw refuse("exp " + exp + " is not after iat " + iat + "; a Status List Token is not issued already"
+                    + " expired (RFC 8392 section 2)");
+        }
         CBORObject ttlClaim = payload.get(CBORObject.FromObject(CLAIM_TTL));
-        Long ttl = ttlClaim == null ? null : integer(ttlClaim, "ttl");
+        Long ttl = null;
+        if (ttlClaim != null) {
+            long seconds = unsigned(ttlClaim, "ttl");
+            if (seconds < 1) {
+                throw refuse("ttl is " + seconds + "; TSL section 5.2 makes the time to live a positive unsigned"
+                        + " integer");
+            }
+            ttl = seconds;
+        }
         CBORObject statusList = claim(payload, CLAIM_STATUS_LIST, "status list");
         if (statusList.getType() != CBORType.Map) {
             throw refuse("claim 65533 (status_list) is a " + statusList.getType() + ", not a StatusList map");
@@ -189,7 +289,13 @@ public final class TokenStatusListCwt {
         if (lst == null) {
             throw refuse("claim 65533 (status_list) has no lst");
         }
-        return new Decoded(sub.AsString(), iat, exp, ttl, BITS, bytes(lst, "status_list.lst"), x5chain);
+        byte[] bitArray;
+        try {
+            bitArray = TokenStatusListService.inflate(bytes(lst, "status_list.lst"), maxBits / 8);
+        } catch (IllegalStateException e) {
+            throw refuse("status_list.lst is not a usable zlib stream: " + e.getMessage(), e);
+        }
+        return new Decoded(sub.AsString(), iat, exp, ttl, BITS, bitArray, x5chain);
     }
 
     private static CBORObject claim(CBORObject payload, int label, String name) {
@@ -204,11 +310,29 @@ public final class TokenStatusListCwt {
         return Instant.ofEpochSecond(integer(value, name));
     }
 
+    /**
+     * An integer claim. Floating-point NumericDates are refused: RFC 8392 section 2 permits them, but Certify never
+     * writes one and a token carrying one is not one of its lists. A uint64 above {@code Long.MAX_VALUE} is refused as
+     * an {@link IllegalStateException} too, never as an {@link ArithmeticException} escaping to the caller.
+     */
     private static long integer(CBORObject value, String name) {
         if (value.getType() != CBORType.Integer) {
             throw refuse(name + " is a " + value.getType() + ", not an integer (RFC 8392 section 3.1)");
         }
-        return value.AsInt64();
+        try {
+            return value.AsInt64();
+        } catch (ArithmeticException e) {
+            throw refuse(name + " " + value + " is outside the signed 64-bit range Certify reads", e);
+        }
+    }
+
+    /** An unsigned integer claim: a negative value is refused rather than reinterpreted. */
+    private static long unsigned(CBORObject value, String name) {
+        long number = integer(value, name);
+        if (number < 0) {
+            throw refuse(name + " is " + number + ", which is not an unsigned integer");
+        }
+        return number;
     }
 
     private static byte[] bytes(CBORObject value, String what) {
@@ -256,5 +380,9 @@ public final class TokenStatusListCwt {
 
     private static IllegalStateException refuse(String reason) {
         return new IllegalStateException("Not a CWT Status List Token: " + reason);
+    }
+
+    private static IllegalStateException refuse(String reason, Throwable cause) {
+        return new IllegalStateException("Not a CWT Status List Token: " + reason, cause);
     }
 }

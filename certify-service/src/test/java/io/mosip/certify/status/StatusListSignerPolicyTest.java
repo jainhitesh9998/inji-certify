@@ -10,9 +10,12 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 import org.junit.jupiter.api.function.Executable;
 
+import java.math.BigInteger;
 import java.security.cert.X509CRL;
 import java.security.cert.X509Certificate;
+import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -20,14 +23,20 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
+import static io.mosip.certify.status.StatusListTestKeys.BEHIND_END_ENTITY_INTERMEDIATE;
+import static io.mosip.certify.status.StatusListTestKeys.BEHIND_END_ENTITY_INTERMEDIATE_KEYS;
 import static io.mosip.certify.status.StatusListTestKeys.BEHIND_INTERMEDIATE;
 import static io.mosip.certify.status.StatusListTestKeys.BEHIND_INTERMEDIATE_KEYS;
 import static io.mosip.certify.status.StatusListTestKeys.DEDICATED;
 import static io.mosip.certify.status.StatusListTestKeys.DEDICATED_KEYS;
 import static io.mosip.certify.status.StatusListTestKeys.DSC;
 import static io.mosip.certify.status.StatusListTestKeys.DSC_KEYS;
+import static io.mosip.certify.status.StatusListTestKeys.END_ENTITY_INTERMEDIATE;
+import static io.mosip.certify.status.StatusListTestKeys.END_ENTITY_INTERMEDIATE_KEYS;
 import static io.mosip.certify.status.StatusListTestKeys.EXPIRED;
+import static io.mosip.certify.status.StatusListTestKeys.EXPIRED_IACA;
 import static io.mosip.certify.status.StatusListTestKeys.EXPIRED_KEYS;
+import static io.mosip.certify.status.StatusListTestKeys.FUTURE_IACA;
 import static io.mosip.certify.status.StatusListTestKeys.IACA;
 import static io.mosip.certify.status.StatusListTestKeys.IACA_KEYS;
 import static io.mosip.certify.status.StatusListTestKeys.INTERMEDIATE;
@@ -39,9 +48,17 @@ import static io.mosip.certify.status.StatusListTestKeys.NO_EKU_KEYS;
 import static io.mosip.certify.status.StatusListTestKeys.NOT_YET_VALID;
 import static io.mosip.certify.status.StatusListTestKeys.NOT_YET_VALID_KEYS;
 import static io.mosip.certify.status.StatusListTestKeys.OTHER_CA;
+import static io.mosip.certify.status.StatusListTestKeys.PATHLEN_ZERO;
 import static io.mosip.certify.status.StatusListTestKeys.ROLLOVER;
 import static io.mosip.certify.status.StatusListTestKeys.ROLLOVER_DSC;
 import static io.mosip.certify.status.StatusListTestKeys.ROLLOVER_DSC_KEYS;
+import static io.mosip.certify.status.StatusListTestKeys.SUB_INTERMEDIATE;
+import static io.mosip.certify.status.StatusListTestKeys.SUB_INTERMEDIATE_DSC;
+import static io.mosip.certify.status.StatusListTestKeys.SUB_INTERMEDIATE_DSC_KEYS;
+import static io.mosip.certify.status.StatusListTestKeys.UNDER_EXPIRED_IACA;
+import static io.mosip.certify.status.StatusListTestKeys.UNDER_EXPIRED_IACA_KEYS;
+import static io.mosip.certify.status.StatusListTestKeys.UNDER_FUTURE_IACA;
+import static io.mosip.certify.status.StatusListTestKeys.UNDER_FUTURE_IACA_KEYS;
 import static io.mosip.certify.status.StatusListTestKeys.UNTRUSTED;
 import static io.mosip.certify.status.StatusListTestKeys.UNTRUSTED_KEYS;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
@@ -54,19 +71,20 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * M-11c: {@link StatusListSignerPolicy}, rule by rule (docs/design/wp/M-11-status-list-under-iaca.md section 4.7).
  * Each named rule has a test that breaks only that rule and is refused with the rule as the message prefix, and the
- * coverage of {@link StatusListSignerPolicy#RULES} is recorded, not declared
- * ({@link #everyNamedRuleHasANegativeTest}, run last).
+ * coverage of {@link StatusListSignerPolicy#RULES} — read by reflection off the rule constants — is recorded, not
+ * declared ({@link #everyNamedRuleHasANegativeTest}, run last).
  *
- * <p>Two groups, as for the mDoc Document Signer: the rules that hold whatever is configured, and — only once an
- * {@code mdoc-iaca} anchor exists (D16's enforcement switch) — the trust anchor, revocation, CRL freshness and the
- * extended key usage of the mode. The mode is the one real difference between a Document Signer and a dedicated
- * signer: {@code 1.0.18013.5.1.2} versus {@code 1.3.6.1.5.5.7.3.45}.
+ * <p>Two groups, as for the mDoc Document Signer: the rules that hold whatever is configured (including RFC 5280
+ * section 6.1.4 for every certificate that issues another one in the path), and — only once an {@code mdoc-iaca}
+ * anchor exists (D16's enforcement switch) — the trust anchor and its validity, revocation of the certificate the IACA
+ * issued, CRL freshness, and the extended key usage of the mode. The mode is the one real difference between a
+ * Document Signer and a dedicated signer: {@code 1.0.18013.5.1.2} versus {@code 1.3.6.1.5.5.7.3.45}.
  */
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class StatusListSignerPolicyTest {
 
     static final Set<String> REFUSED = ConcurrentHashMap.newKeySet();
-    static final Instant NOW = Instant.now();
+    static final Instant NOW = Instant.now().truncatedTo(ChronoUnit.SECONDS);
 
     static void refused(String rule, Executable executable) {
         IllegalStateException refused = assertThrows(IllegalStateException.class, executable, rule);
@@ -82,6 +100,10 @@ class StatusListSignerPolicyTest {
 
     /** A registry trusting {@code iacas} under ids {@code iaca-0}, {@code iaca-1}…, with CRLs by id. */
     static TrustAnchorRegistry registry(List<X509Certificate> iacas, Map<String, X509CRL> crls) {
+        return registry(iacas, crls, TrustAnchorRegistry.DEFAULT_STALE_CRL_GRACE);
+    }
+
+    static TrustAnchorRegistry registry(List<X509Certificate> iacas, Map<String, X509CRL> crls, Duration grace) {
         List<TrustAnchorRegistry.Anchor> anchors = new ArrayList<>();
         for (int i = 0; i < iacas.size(); i++) {
             anchors.add(new TrustAnchorRegistry.Anchor("iaca-" + i, TrustAnchorRegistry.MDOC_IACA, iacas.get(i)));
@@ -95,6 +117,11 @@ class StatusListSignerPolicyTest {
             @Override
             public Optional<X509CRL> crl(String anchorId) {
                 return Optional.ofNullable(crls.get(anchorId));
+            }
+
+            @Override
+            public Duration staleCrlGrace() {
+                return grace;
             }
         };
     }
@@ -135,6 +162,24 @@ class StatusListSignerPolicyTest {
                 context(ROLLOVER_DSC_KEYS, ROLLOVER_DSC, ROLLOVER, IACA), NOW, StatusListSignerPolicy.Mode.DOCUMENT_SIGNER));
     }
 
+    // ---- RFC 5280 6.1.4: whoever issues another certificate must be a CA ----------------------------------------
+
+    @Test
+    void anEndEntityCertificateCannotActAsAnIntermediate() {
+        // [leaf, end entity, IACA]: every signature verifies, but no RFC 5280 verifier would build the path
+        refused(StatusListSignerPolicy.ISSUER_NOT_CA, () -> StatusListSignerPolicy.notEnforced().check(
+                context(BEHIND_END_ENTITY_INTERMEDIATE_KEYS, BEHIND_END_ENTITY_INTERMEDIATE, END_ENTITY_INTERMEDIATE, IACA),
+                NOW, StatusListSignerPolicy.Mode.DOCUMENT_SIGNER));
+    }
+
+    @Test
+    void pathLenConstraintIsRespected() {
+        // a CA with pathLenConstraint 0 has a CA intermediate below it in the path
+        refused(StatusListSignerPolicy.ISSUER_NOT_CA, () -> StatusListSignerPolicy.notEnforced().check(
+                context(SUB_INTERMEDIATE_DSC_KEYS, SUB_INTERMEDIATE_DSC, SUB_INTERMEDIATE, PATHLEN_ZERO, IACA),
+                NOW, StatusListSignerPolicy.Mode.DOCUMENT_SIGNER));
+    }
+
     // ---- with an anchor: the trust path ------------------------------------------------------------------------
 
     @Test
@@ -146,7 +191,7 @@ class StatusListSignerPolicyTest {
                 "a leaf-only chain is issued by the anchor directly");
         assertDoesNotThrow(() -> policy.check(context(BEHIND_INTERMEDIATE_KEYS, BEHIND_INTERMEDIATE, INTERMEDIATE, IACA),
                 NOW, StatusListSignerPolicy.Mode.DOCUMENT_SIGNER),
-                "the chain's top certificate is the intermediate the IACA issued, and the emitted x5chain keeps it");
+                "the chain's top certificate is the CA intermediate the IACA issued, and the emitted x5chain keeps it");
     }
 
     @Test
@@ -159,11 +204,41 @@ class StatusListSignerPolicyTest {
     }
 
     @Test
+    void theIacaMustBeValidAtTheSigningInstant() {
+        // a leaf-only chain leaves the anchor's own window to this rule (the chain holds only the signer)
+        refused(StatusListSignerPolicy.IACA_EXPIRED, () -> enforcedBy(EXPIRED_IACA).check(
+                context(UNDER_EXPIRED_IACA_KEYS, UNDER_EXPIRED_IACA), NOW, StatusListSignerPolicy.Mode.DOCUMENT_SIGNER));
+        refused(StatusListSignerPolicy.IACA_NOT_YET_VALID, () -> enforcedBy(FUTURE_IACA).check(
+                context(UNDER_FUTURE_IACA_KEYS, UNDER_FUTURE_IACA), NOW, StatusListSignerPolicy.Mode.DOCUMENT_SIGNER));
+    }
+
+    @Test
     void aRevokedSignerIsRefused() {
-        X509CRL revoking = StatusListTestKeys.crl(Instant.now().minus(1, java.time.temporal.ChronoUnit.HOURS),
-                Instant.now().plus(20, java.time.temporal.ChronoUnit.DAYS), DSC.getSerialNumber());
+        X509CRL revoking = StatusListTestKeys.crl(NOW.minus(1, ChronoUnit.HOURS), NOW.plus(20, ChronoUnit.DAYS),
+                DSC.getSerialNumber());
         refused(StatusListSignerPolicy.REVOKED, () -> new StatusListSignerPolicy(withCrl(revoking)).check(
                 context(DSC_KEYS, DSC, IACA), NOW, StatusListSignerPolicy.Mode.DOCUMENT_SIGNER));
+    }
+
+    @Test
+    void aRevokedIntermediateIsRefused() {
+        // the IACA's CRL lists the certificate the IACA issued, which is the intermediate here, not the leaf
+        X509CRL revoking = StatusListTestKeys.crl(NOW.minus(1, ChronoUnit.HOURS), NOW.plus(20, ChronoUnit.DAYS),
+                INTERMEDIATE.getSerialNumber());
+        refused(StatusListSignerPolicy.REVOKED, () -> new StatusListSignerPolicy(withCrl(revoking)).check(
+                context(BEHIND_INTERMEDIATE_KEYS, BEHIND_INTERMEDIATE, INTERMEDIATE, IACA), NOW,
+                StatusListSignerPolicy.Mode.DOCUMENT_SIGNER));
+    }
+
+    @Test
+    void theIacasCrlIsReadForTheCertificateTheIacaIssued() {
+        // an unrelated serial, and the leaf's own serial, are not revocations of the intermediate the IACA issued
+        for (BigInteger serial : List.of(BigInteger.valueOf(424242), BEHIND_INTERMEDIATE.getSerialNumber())) {
+            X509CRL crl = StatusListTestKeys.crl(NOW.minus(1, ChronoUnit.HOURS), NOW.plus(20, ChronoUnit.DAYS), serial);
+            assertDoesNotThrow(() -> new StatusListSignerPolicy(withCrl(crl)).check(
+                    context(BEHIND_INTERMEDIATE_KEYS, BEHIND_INTERMEDIATE, INTERMEDIATE, IACA), NOW,
+                    StatusListSignerPolicy.Mode.DOCUMENT_SIGNER), "serial " + serial);
+        }
     }
 
     @Test
@@ -173,6 +248,22 @@ class StatusListSignerPolicyTest {
         // a fresh CRL that lists nothing lets the signer through
         assertDoesNotThrow(() -> new StatusListSignerPolicy(withCrl(StatusListTestKeys.freshCrl()))
                 .check(context(DSC_KEYS, DSC, IACA), NOW, StatusListSignerPolicy.Mode.DOCUMENT_SIGNER));
+    }
+
+    @Test
+    void theStaleCrlWindowIsNextUpdatePlusTheGraceAndNothingElse() {
+        // grace is a non-zero hour here: 30 minutes past nextUpdate is inside the window, one second past the window
+        // is stale — no clock skew is added on top, exactly as MdocDscPolicy holds for an mDL
+        Duration grace = Duration.ofHours(1);
+        TrustAnchorRegistry inside = registry(List.of(IACA), Map.of("iaca-0",
+                StatusListTestKeys.crl(NOW.minus(2, ChronoUnit.HOURS), NOW.minus(30, ChronoUnit.MINUTES))), grace);
+        assertDoesNotThrow(() -> new StatusListSignerPolicy(inside).check(
+                context(DSC_KEYS, DSC, IACA), NOW, StatusListSignerPolicy.Mode.DOCUMENT_SIGNER));
+        TrustAnchorRegistry past = registry(List.of(IACA), Map.of("iaca-0",
+                StatusListTestKeys.crl(NOW.minus(2, ChronoUnit.HOURS), NOW.minus(1, ChronoUnit.HOURS).minusSeconds(1))),
+                grace);
+        refused(StatusListSignerPolicy.CRL_STALE, () -> new StatusListSignerPolicy(past).check(
+                context(DSC_KEYS, DSC, IACA), NOW, StatusListSignerPolicy.Mode.DOCUMENT_SIGNER));
     }
 
     @Test
@@ -221,10 +312,17 @@ class StatusListSignerPolicyTest {
         assertTrue(policyRefusal.getMessage().startsWith(StatusListSignerPolicy.EXPIRED + ": "));
         // and a signer the policy let through but whose chain is unusable is refused by the envelope, in the same shape
         SigningContext noChain = context(DSC_KEYS, CertificateChain.EMPTY);
-        SigningException envelope = assertThrows(SigningException.class, () -> TokenStatusListCwt.encode(
-                "https://issuer.example.test/1", NOW, NOW.plusSeconds(7200), java.time.Duration.ofHours(1),
-                new byte[1], noChain));
-        assertTrue(StatusListSignerPolicy.refusal(envelope) instanceof IllegalStateException);
+        IllegalStateException envelope = assertThrows(IllegalStateException.class, () -> TokenStatusListCwt.encode(
+                "https://issuer.example.test/1", NOW, NOW.plusSeconds(7200), Duration.ofHours(1), new byte[1], noChain,
+                StatusListSignerPolicy.notEnforced(), NOW, StatusListSignerPolicy.Mode.DOCUMENT_SIGNER));
+        assertTrue(envelope.getMessage().startsWith(StatusListSignerPolicy.NO_CHAIN + ": "), envelope.getMessage());
+        // the policy refuses a chain-less signer before the envelope is reached; the envelope's own three refusals map
+        // to exactly this shape (anEnvelopeRefusalMapsLikeAPolicyRefusal holds that mapping)
+        SigningException fromEnvelope = new SigningException(StatusListSignerPolicy.NO_CHAIN + ": no certificate");
+        RuntimeException mapped = StatusListSignerPolicy.refusal(fromEnvelope);
+        assertEquals(IllegalStateException.class, mapped.getClass());
+        assertEquals(fromEnvelope.getMessage(), mapped.getMessage());
+        assertSame(fromEnvelope, mapped.getCause());
     }
 
     // ---- coverage ---------------------------------------------------------------------------------------------
@@ -234,6 +332,20 @@ class StatusListSignerPolicyTest {
     void everyNamedRuleHasANegativeTest() {
         assertEquals(StatusListSignerPolicy.RULES, Set.copyOf(REFUSED),
                 "each rule of section 4.7 has a test that breaks only it: " + StatusListSignerPolicy.RULES);
+    }
+
+    @Test
+    void theRuleGuardSeesEveryConstant() {
+        // the guard is only as good as the reflection behind RULES: a rule constant missing from it would pass unseen
+        assertTrue(StatusListSignerPolicy.RULES.containsAll(Set.of(StatusListSignerPolicy.NO_CHAIN,
+                StatusListSignerPolicy.SELF_SIGNED, StatusListSignerPolicy.EXPIRED, StatusListSignerPolicy.NOT_YET_VALID,
+                StatusListSignerPolicy.CHAIN_LINK_INVALID, StatusListSignerPolicy.ISSUER_NOT_CA,
+                StatusListSignerPolicy.CARRIES_ANCHOR, StatusListSignerPolicy.NO_TRUSTED_IACA,
+                StatusListSignerPolicy.IACA_EXPIRED, StatusListSignerPolicy.IACA_NOT_YET_VALID,
+                StatusListSignerPolicy.REVOKED, StatusListSignerPolicy.CRL_STALE, StatusListSignerPolicy.PURPOSE)));
+        assertFalse(StatusListSignerPolicy.RULES.contains(StatusListSignerPolicy.PREFIX), "the prefix is not a rule");
+        assertFalse(StatusListSignerPolicy.RULES.contains(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU),
+                "an EKU OID is not a rule");
     }
 
     @Test

@@ -413,6 +413,15 @@ public class TokenStatusListService {
 
     /** The bit array a zlib stream inflates to, for both the JWT and the CWT {@code lst} of one list. */
     static byte[] inflate(byte[] compressed) {
+        return inflate(compressed, Integer.MAX_VALUE);
+    }
+
+    /**
+     * As {@link #inflate(byte[])}, refusing a stream that inflates past {@code maxBytes} before it allocates more: a
+     * decompression bomb in a stored or fetched token is refused by the codec
+     * ({@link TokenStatusListCwt#decode(byte[], int)}), not bounded here for the JWT path, whose lists are its own.
+     */
+    static byte[] inflate(byte[] compressed, int maxBytes) {
         Inflater inflater = new Inflater();
         inflater.setInput(compressed);
         ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -422,6 +431,10 @@ public class TokenStatusListService {
                 int n = inflater.inflate(buffer);
                 if (n == 0 && (inflater.needsInput() || inflater.needsDictionary())) {
                     break;
+                }
+                if ((long) out.size() + n > maxBytes) {
+                    throw new IllegalStateException("Token status list lst inflates to more than " + maxBytes
+                            + " bytes, which no list of this size does");
                 }
                 out.write(buffer, 0, n);
             }
