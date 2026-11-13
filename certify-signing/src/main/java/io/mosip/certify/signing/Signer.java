@@ -5,8 +5,9 @@ import java.util.Optional;
 /**
  * Produces signatures. {@link #signRaw} is mandatory and returns the signature in JOSE/COSE wire form
  * ({@code R||S} for ECDSA, PKCS#1 v1.5 or PSS bytes for RSA, the 64-byte signature for Ed25519), never DER.
- * A provider that builds whole envelopes natively (keymanager does) may override {@link #signJws} and
- * {@link #signCose}; the envelope builders try those first and fall back to {@link #signRaw}.
+ * A provider that builds whole envelopes itself may override {@link #signJws} and {@link #signCose}; the envelope
+ * builders try those first and fall back to {@link #signRaw}. No provider overrides {@link #signCose} today (the
+ * keymanager provider overrides neither), so COSE envelopes are built by the library.
  */
 public interface Signer {
 

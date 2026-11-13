@@ -38,8 +38,8 @@ Wallet downloads the mDL, fetches the list ten times in one second, and fails th
    61). SD-JWT VC lists stay JWT, byte for byte.
 2. Protected header `{1: alg, 16: "application/statuslist+cwt", 33: x5chain}`, unprotected header `{}`, no `kid`. The
    `x5chain` is the signer chain without the IACA.
-3. Claims `{2 sub = the MSO uri, 4 exp (always present, capped at the signer's notAfter), 6 iat, 65533 {"bits": 1,
-   "lst"}, 65534 ttl}`.
+3. Claims `{2 sub = the MSO uri, 4 exp (always present, capped at the signer's notAfter), 6 iat, 65533 {"lst",
+   "bits": 1}, 65534 ttl}`, in RFC 8949 §4.2.1 bytewise order at both levels.
 4. Default signer: **the Document Signer that signed the mDLs on that list**, with the same certificate and the same
    `x5chain` as their IssuerAuth. Lists are partitioned by DSC certificate. No new certificate, no offline step.
 5. A rotated DSC keeps signing its own lists until its `notAfter`; the MSO validity is already capped there (D7). After
@@ -261,7 +261,7 @@ d2                                     tag 18: COSE_Sign1_Tagged (RFC 9052 §4.2
         02 78 .. "https://<host>/v1/certify/credentials/token-status-list/<id>"   2 sub = the MSO status_list.uri
         04 1a <exp>                    4 exp = min(iat + 2·ttl, signer notAfter) (ISO2 12.3.6.3: shall be present)
         06 1a <iat>                    6 iat = signing time, whole seconds
-        19 fffd a2 64 62697473 01 63 6c7374 59 xxxx <zlib bytes>   65533 {"bits": 1, "lst": bstr} (TSL §4.3)
+        19 fffd a2 63 6c7374 59 xxxx <zlib bytes> 64 62697473 01   65533 {"lst": bstr, "bits": 1} (TSL §4.3)
         19 fffe 19 0e10                65534 ttl = certify.status.token-status-list.ttl in seconds (default 3600)
     58 40 <r||s>                       signature
 ```
@@ -355,6 +355,10 @@ path; at issuance it becomes `FormatException("status_list_unavailable")`.
   - `CertificateChainPolicy.check(chain, now)`, which yields `STATUS_SIGNER_EXPIRED`, `STATUS_SIGNER_NOT_YET_VALID` and
     `CHAIN_LINK_INVALID`.
   - `STATUS_SIGNER_CARRIES_ANCHOR`: the `x5chain` to be emitted contains a self-signed certificate.
+  - "Self-signed" means subject and issuer names are equal, the test `CertificateChain.withoutAnchor()` itself uses, so
+    a self-issued key-rollover intermediate counts as self-signed. `CoseEnvelope` (`M-11a`) already refuses an empty
+    chain (`STATUS_SIGNER_NO_CHAIN`), a self-signed leaf (`STATUS_SIGNER_SELF_SIGNED`) and a self-signed certificate
+    further up the emitted chain (`STATUS_SIGNER_CARRIES_ANCHOR`) before a token is signed.
 - **Once `TrustAnchorRegistry` holds an `mdoc-iaca` anchor** (the D16 enforcement switch):
   - `STATUS_SIGNER_NO_TRUSTED_IACA`: the leaf, or the last certificate of the chain, was not issued by a configured
     IACA (AKI = SKI, else issuer name, plus signature).
@@ -503,11 +507,20 @@ Branch `wp/m-11a-cose-status-headers`. Depends on nothing. About 250 lines.
 
 **Negative tests.**
 
-- `x5chainInProtected` with `NONE` is refused.
+- `x5chainInProtected` with `NONE` is refused, and so is a `typ` without a protected chain: draft-21 §5.2 pairs the
+  protected `typ` with the protected `x5chain`, and the encoder would otherwise put 33 in the protected header against
+  the caller's instruction.
 - `typ` values `"statuslist+cwt"` (no type) and `"a b/c"` are refused.
-- A chain with only a self-signed certificate under `WITHOUT_ANCHOR` emits no `x5chain` at all (the existing
-  `withoutAnchor()` behaviour), and a test asserts it.
-- `signOrdered` output never starts with `d8 3d` (tag 61).
+- A key with no chain, and a chain that is a lone self-signed certificate under `WITHOUT_ANCHOR`, are **refused when
+  the token is signed** (`SigningException`, `STATUS_SIGNER_NO_CHAIN` / `STATUS_SIGNER_SELF_SIGNED`). The legacy
+  `withoutAnchor()` keeps a lone self-signed certificate, and `mdocIssuerAuth()` keeps forwarding it — a test proves
+  that is unchanged (I2) — so the status-list header path refuses it instead of emitting a token that carries its own
+  trust anchor; `[DSC, IACA]` emits the DSC alone and `[DSC, intermediate, IACA]` emits `[DSC, intermediate]`.
+- A `FULL` chain over `[DSC, intermediate, IACA]` is refused with `STATUS_SIGNER_CARRIES_ANCHOR` (a self-signed
+  certificate above the leaf); a `LEAF` policy inspects and emits only the end entity, so `[DSC, IACA]` signs with the DSC;
+  the refusals run before a provider's native `signCose` is asked, so a provider that builds the envelope cannot skip them.
+- `signOrdered` refuses claim keys that break RFC 8949 §4.2.1's bytewise lexicographic order of the encoded keys,
+  refuses an untagged status-list policy, and its output never starts with `d8 3d` (tag 61).
 
 **Non-goals:** any change to how mDoc IssuerAuth or claim-169 are built.
 
@@ -595,7 +608,7 @@ Branch `wp/m-11c-status-cwt-codec`. Depends on M-11a. About 450 lines.
 1. `TokenStatusListCwt.encode(String sub, Instant iat, Instant exp, Duration ttl, byte[] bits, SigningContext signing)`
    returns `byte[]`.
    - The claims are a `LinkedHashMap` with: 2 → `sub` (text); 4 → `exp.getEpochSecond()`; 6 →
-     `iat.getEpochSecond()`; 65533 → an ordered map `{"bits": 1, "lst": zlib(bits)}` (raw bytes, `Deflater`
+     `iat.getEpochSecond()`; 65533 → an ordered map `{"lst": zlib(bits), "bits": 1}` (raw bytes, `Deflater`
      `BEST_COMPRESSION` as `TokenStatusListService.encode` uses before base64url); 65534 → `ttl.getSeconds()`.
    - Signed with `CwtEnvelope.signOrdered(claims, CoseHeaderPolicy.statusListCwt(), signing.key(), signing.signer())`.
    - `iat` and `exp` are whole seconds, with `exp > iat`; otherwise `IllegalArgumentException`.
@@ -619,12 +632,19 @@ Branch `wp/m-11c-status-cwt-codec`. Depends on M-11a. About 450 lines.
    `TrustAnchorRegistry` bean (`TrustAnchorRegistry.EMPTY` when absent) and `AnnexBValidator.CLOCK_SKEW`.
    - `Mode` is `DOCUMENT_SIGNER` or `DEDICATED`.
    - Each rule is a distinct message prefix.
+   - `StatusListSignerPolicy` must still run before every `signOrdered`: the envelope refuses only an empty chain, a
+     self-signed leaf, or an emitted chain that carries a self-signed certificate (`M-11a`), and checks no EKU,
+     validity, revocation or IACA.
+   - A `SigningException` from `M-11a`'s envelope whose message starts with `STATUS_SIGNER_` is mapped like the
+     policy's `IllegalStateException`: renewal back-off and `503`, and at issuance `status_list_unavailable`.
 
 **Acceptance checklist.**
 
 - [ ] `zlib([0xb9, 0xa3])` equals `78dadbb918000217015d` (TSL §4.3 example).
 - [ ] A token from `encode` is accepted by `IndependentStatusListVerifier` (M-11b, test scope) against an x509-file
   dev-mode IACA and DSC, with `issuerAuthX5chain = [DSC]`.
+- [ ] The payload contains `19fffd a2 63 6c7374 … 64 62697473 01` (RFC 8949 §4.2.1 order; `signOrdered` checks only
+  top-level keys, so this nested order is the codec's job).
 - [ ] `decode(encode(...))` round-trips every claim.
 - [ ] `pin` gives `x509-file:mdl-dsc@<version>` for a versioned x509-file key and `keymanager:APP/REF` for keymanager.
 - [ ] Each policy rule has a test that fails with exactly its prefix; with no anchors only the "always" group runs.
