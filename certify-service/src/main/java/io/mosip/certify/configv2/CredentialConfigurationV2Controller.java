@@ -117,6 +117,10 @@ public class CredentialConfigurationV2Controller {
      */
     @ExceptionHandler(Exception.class)
     public ResponseEntity<Map<String, String>> unexpected(Exception e) throws Exception {
+        // Not reached today: access to /v2/** is decided by the security filter chain before the controller runs, and no
+        // v2 method carries a method-security annotation (@EnableMethodSecurity is on; only keymanager's controllers use it). Kept so
+        // a future @PreAuthorize here answers 401/403 through ExceptionTranslationFilter (a rethrown exception goes back
+        // up the filter chain) instead of 500 server_error.
         if (e instanceof org.springframework.security.access.AccessDeniedException
                 || e instanceof org.springframework.security.core.AuthenticationException) {
             throw e;
