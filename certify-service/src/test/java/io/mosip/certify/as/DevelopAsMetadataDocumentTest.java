@@ -6,6 +6,8 @@ import org.springframework.boot.context.properties.bind.Binder;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * F-17 review round 1 (m6): the authorization server document develop's compose stack serves is byte-identical before and
@@ -29,6 +31,17 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * binds for each property set, and serialised with a plain {@code ObjectMapper}; the throwaway copy was then deleted.
  */
 class DevelopAsMetadataDocumentTest {
+
+    /**
+     * Whether the deployment's token endpoint is Certify's own, shown by behaviour: the same configuration listing only
+     * {@code authorization_code}, with no client and no IAE, is rewritten to the pre-authorized grant only when own.
+     */
+    static boolean isOwn(Binder binder) {
+        io.mosip.certify.services.OAuthAuthorizationServerMetadataService service = ComposeProperties.documentService(binder);
+        org.springframework.test.util.ReflectionTestUtils.setField(service, "grantTypesSupported", "authorization_code");
+        org.springframework.test.util.ReflectionTestUtils.setField(service, "interactiveAuthorizationEndpoint", "");
+        return !service.getOAuthAuthorizationServerMetadata().getGrantTypesSupported().contains("authorization_code");
+    }
 
     /** Recorded from the {@code 4f67ee7c} implementation with the properties below (no golden file changed). */
     static final String DEVELOP_DOCUMENT = "{\"issuer\":\"http://certify-nginx:80\","
@@ -67,6 +80,10 @@ class DevelopAsMetadataDocumentTest {
 
         assertEquals(PLAIN_COMPOSE_DOCUMENT, document,
                 "develop's plain compose document must not change (F-17 review round 2, m5)");
+        // under the owner's identity-only rule (2026-11-13) this token endpoint is not Certify's own: it is on the
+        // authorization server's host (esignet-mock), not on Certify's identity (http://certify-nginx:80), so the
+        // document is served exactly as configured - which is the 4f67ee7c output above
+        assertFalse(isOwn(binder), "the plain compose token endpoint is not Certify's identity + mount + /oauth/token");
     }
 
     @Test
@@ -78,5 +95,8 @@ class DevelopAsMetadataDocumentTest {
 
         assertEquals(DEVELOP_DOCUMENT, document,
                 "an unchanged deployment's authorization server metadata must not change (F-17 review round 1, m6)");
+        // the rebuild overlay points the authorization server at Certify itself: own, and the grant rules keep the
+        // document's bytes because certify-default.properties configures the IAE
+        assertTrue(isOwn(binder), "the rebuild token endpoint is http://certify-nginx:80 + /v1/certify + /oauth/token");
     }
 }

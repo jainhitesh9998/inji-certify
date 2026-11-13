@@ -236,9 +236,8 @@ public class OAuthAuthorizationServerMetadataServiceTest {
         // with an identity configured, which is what makes eSignet's document safe
         for (String tokenEndpoint : List.of("https://esignet.example/v1/esignet/oauth/token", "https://idp.example/oauth/token")) {
             ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "tokenEndpoint", tokenEndpoint);
-            ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "authorizationUrl", "https://esignet.example");
-            ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "domainUrl", "https://idp.example");
-            ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "servletPath", "/v1/certify");
+            identity("https://credentials.example.org", "https://credentials.example.org");
+            dispatcherServletPath("/v1/certify");
             ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "grantTypesSupported",
                     "authorization_code,urn:ietf:params:oauth:grant-type:pre-authorized_code");
             ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "interactiveAuthorizationEndpoint", "");
@@ -430,9 +429,9 @@ public class OAuthAuthorizationServerMetadataServiceTest {
     }
 
     /**
-     * F-17 review round 2, M2: the own token URL is matched under every servlet path Spring Boot accepts, normalised as
-     * Boot does ({@code DispatcherServletPath#getPrefix}): {@code /} is the empty prefix and a trailing slash is dropped.
-     * Each pair is a deployment whose token endpoint is its own; the grant rule must apply (the uncompletable
+     * F-17 review round 2, M2: the own token URL is matched under every servlet path Spring Boot accepts, as Boot mounted
+     * it ({@code DispatcherServletPath#getPrefix}): {@code /} is the empty prefix and a trailing slash is dropped. Each
+     * pair is a deployment whose token endpoint is its own; the grant rule must apply (the uncompletable
      * {@code authorization_code} goes), as it did not before for {@code /} and {@code /v1/certify/}.
      */
     @Test
@@ -442,29 +441,20 @@ public class OAuthAuthorizationServerMetadataServiceTest {
                 {"/", "https://credentials.example.org/oauth/token"},
                 {"/v1/certify", "https://credentials.example.org/v1/certify/oauth/token"},
                 {"/v1/certify/", "https://credentials.example.org/v1/certify/oauth/token"},
-                {" /v1/certify/ ", "https://credentials.example.org/v1/certify/oauth/token/"},
+                {"/v1/certify/", "https://credentials.example.org/v1/certify/oauth/token/"},
         };
         for (String[] c : cases) {
-            ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "domainUrl", "https://credentials.example.org");
-            ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "servletPath", c[0]);
-            assertOwn("server.servlet.path '" + c[0] + "', token " + c[1], c[1]);
+            identity(null, "https://credentials.example.org");
+            dispatcherServletPath(c[0]);
+            assertOwn("spring.mvc.servlet.path '" + c[0] + "', token " + c[1], c[1]);
         }
-    }
-
-    /** Where Boot actually mounted the DispatcherServlet ({@code spring.mvc.servlet.path}) is a prefix too. */
-    @Test
-    public void getOAuthAuthorizationServerMetadata_OwnEndpointUnderTheMountedDispatcherServletPath() {
-        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "domainUrl", "https://credentials.example.org");
-        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "servletPath", null);
-        dispatcherServletPath("/v1/certify/");
-        assertOwn("spring.mvc.servlet.path /v1/certify/", "https://credentials.example.org/v1/certify/oauth/token");
     }
 
     /** {@code server.servlet.context-path} comes before the servlet path, normalised as Boot binds it. */
     @Test
     public void getOAuthAuthorizationServerMetadata_OwnEndpointUnderAContextPath() {
-        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "domainUrl", "https://credentials.example.org");
-        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "servletPath", "/v1/certify");
+        identity(null, "https://credentials.example.org");
+        dispatcherServletPath("/v1/certify");
         org.springframework.boot.autoconfigure.web.ServerProperties server = new org.springframework.boot.autoconfigure.web.ServerProperties();
         server.getServlet().setContextPath("/issuer/");
         org.springframework.beans.factory.support.DefaultListableBeanFactory beans =
@@ -476,51 +466,83 @@ public class OAuthAuthorizationServerMetadataServiceTest {
     }
 
     /**
-     * F-17 review round 2, m3: every base the deployment names - {@code mosip.certify.identifier} (also written with the
-     * servlet path, as the test profile does), {@code mosip.certify.oauth.issuer}, a comma-separated
-     * {@code mosip.certify.authorization.url} - identifies the own endpoint on its own.
+     * The owner's rule (2026-11-13): own means Certify's identity - {@code mosip.certify.identifier} or
+     * {@code mosip.certify.domain.url}, comma lists allowed - plus the mount and {@code /oauth/token}. Each identity
+     * makes the endpoint own on its own.
      */
     @Test
-    public void getOAuthAuthorizationServerMetadata_OwnEndpointFromEachBase() {
+    public void getOAuthAuthorizationServerMetadata_OwnEndpointFromEitherIdentity() {
         String token = "https://credentials.example.org/v1/certify/oauth/token";
-        String[][] bases = {
-                {"identifier", "https://credentials.example.org"},
-                {"identifier", "https://credentials.example.org/v1/certify"},
-                {"issuer", "https://credentials.example.org/"},
-                {"authorizationUrl", "https://other.example, https://credentials.example.org/"},
-                {"domainUrl", "https://credentials.example.org"},
+        String[][] identities = {
+                {"https://credentials.example.org", null},
+                {"https://other.example, https://credentials.example.org/", null},
+                {null, "https://credentials.example.org/"},
+                {"did:web:credentials.example.org", "https://internal.example, https://credentials.example.org"},
         };
-        for (String[] base : bases) {
-            for (String field : List.of("identifier", "issuer", "authorizationUrl", "domainUrl")) {
-                ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, field, null);
-            }
-            ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, base[0], base[1]);
-            ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "servletPath", "/v1/certify");
-            assertOwn(base[0] + "=" + base[1], token);
+        for (String[] identity : identities) {
+            identity(identity[0], identity[1]);
+            dispatcherServletPath("/v1/certify");
+            assertOwn("identifier=" + identity[0] + ", domain.url=" + identity[1], token);
         }
     }
 
     /**
-     * No false positive under any servlet path: eSignet's and a root-mounted AS's documents stay exactly as configured,
-     * even with {@code mosip.certify.authorization.url} and {@code mosip.certify.oauth.issuer} naming that AS. With an
-     * empty prefix {@code <AS base>/oauth/token} is any AS's token path, so only Certify's own origin
-     * ({@code domain.url}, {@code identifier}) may claim it there.
+     * F-17 review round 3 (GPT's reproduction, owner decision 2026-11-13): {@code mosip.certify.authorization.url} and
+     * {@code mosip.certify.oauth.issuer} name whichever authorization server the deployment uses, so they never make a
+     * token endpoint Certify's own. An external {@code https://idp.example/v1/certify/oauth/token} with both naming
+     * {@code https://idp.example}, Certify's identity elsewhere, the {@code /v1/certify} mount, no IAE and no client is
+     * served exactly as configured - {@code authorization_code} and PKCE kept. The round 2 rule counted the
+     * authorization-server bases under a non-empty mount and rewrote this document.
+     */
+    @Test
+    public void getOAuthAuthorizationServerMetadata_ExternalAuthorizationServerAtACertifyLikePathIsUnchanged() throws Exception {
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "issuer", "https://idp.example");
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "tokenEndpoint", "https://idp.example/v1/certify/oauth/token");
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "jwksUri", "https://idp.example/v1/certify/.well-known/jwks.json");
+        org.springframework.mock.env.MockEnvironment environment = identity("https://credentials.example.org", "https://credentials.example.org");
+        environment.setProperty("mosip.certify.authorization.url", "https://idp.example");
+        environment.setProperty("mosip.certify.oauth.issuer", "https://idp.example");
+        dispatcherServletPath("/v1/certify");
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "grantTypesSupported", "authorization_code");
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "interactiveAuthorizationEndpoint", "");
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "requireInteractiveAuthorizationRequest", true);
+        asProperties(as(Map.of(), false, false));
+
+        assertEquals("an external AS's document is served exactly as configured",
+                "{\"issuer\":\"https://idp.example\","
+                        + "\"token_endpoint\":\"https://idp.example/v1/certify/oauth/token\","
+                        + "\"jwks_uri\":\"https://idp.example/v1/certify/.well-known/jwks.json\","
+                        + "\"grant_types_supported\":[\"authorization_code\"],"
+                        + "\"response_types_supported\":[\"code\"],"
+                        + "\"code_challenge_methods_supported\":[\"S256\"],"
+                        + "\"require_interactive_authorization_request\":true}",
+                new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(
+                        oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata()));
+    }
+
+    /**
+     * No false positive under any mount: eSignet's and a root-mounted AS's documents stay exactly as configured, even
+     * with {@code mosip.certify.authorization.url} and {@code mosip.certify.oauth.issuer} naming that AS.
      */
     @Test
     public void getOAuthAuthorizationServerMetadata_ExternalAuthorizationServerUnchangedUnderEveryServletPath() throws Exception {
         String[][] externals = {
                 {"https://esignet.example", "https://esignet.example/v1/esignet/oauth/token"},
                 {"https://idp.example", "https://idp.example/oauth/token"},
+                {"https://idp.example", "https://idp.example/v1/certify/oauth/token"},
         };
         for (String servletPath : java.util.Arrays.asList(null, "", "/", "/v1/certify", "/v1/certify/")) {
             for (String[] external : externals) {
                 ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "tokenEndpoint", external[1]);
                 ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "issuer", external[0]);
-                ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "authorizationUrl", external[0]);
-                ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "domainUrl", "https://credentials.example.org");
-                ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "identifier", "https://credentials.example.org");
-                ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "servletPath", servletPath);
-                dispatcherServletPath(servletPath == null ? "" : servletPath);
+                org.springframework.mock.env.MockEnvironment environment = identity("https://credentials.example.org", "https://credentials.example.org");
+                environment.setProperty("mosip.certify.authorization.url", external[0]);
+                environment.setProperty("mosip.certify.oauth.issuer", external[0]);
+                if (servletPath == null) {
+                    ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "dispatcherServletPath", null);
+                } else {
+                    dispatcherServletPath(servletPath);
+                }
                 ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "grantTypesSupported",
                         "authorization_code,urn:ietf:params:oauth:grant-type:pre-authorized_code");
                 ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "interactiveAuthorizationEndpoint", "");
@@ -542,34 +564,75 @@ public class OAuthAuthorizationServerMetadataServiceTest {
     }
 
     /**
-     * F-17 review round 2, m3: a token endpoint that ends in {@code <prefix>/oauth/token} but matches no base is served
-     * as configured, and said once - not on every metadata request.
+     * F-17 review round 3, item 4: the anonymous flag keeps its historical predicate, the CONFIGURED grant list. An
+     * opted-in own deployment that configures only {@code authorization_code} becomes pre-authorized only (the grant
+     * rules), but does not newly gain {@code pre-authorized_grant_anonymous_access_supported}; one that configures the
+     * pre-authorized grant has it, as before F-17.
      */
     @Test
-    public void getOAuthAuthorizationServerMetadata_UnmatchedOwnLookingEndpointIsReportedOnce() {
+    public void getOAuthAuthorizationServerMetadata_AnonymousFlagFollowsTheConfiguredGrants() {
+        ownIdentity(TEST_ISSUER);
+        asProperties(as(Map.of(), false, true));
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "interactiveAuthorizationEndpoint", "");
+
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "grantTypesSupported", "authorization_code");
+        OAuthAuthorizationServerMetadataDTO authorizationCodeOnly = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+        assertEquals(List.of("urn:ietf:params:oauth:grant-type:pre-authorized_code"), authorizationCodeOnly.getGrantTypesSupported());
+        assertNull("not configured, so not advertised (historical predicate)", authorizationCodeOnly.getPreAuthorizedGrantAnonymousAccessSupported());
+
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "grantTypesSupported",
+                "authorization_code,urn:ietf:params:oauth:grant-type:pre-authorized_code");
+        OAuthAuthorizationServerMetadataDTO configured = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+        assertEquals(List.of("urn:ietf:params:oauth:grant-type:pre-authorized_code"), configured.getGrantTypesSupported());
+        assertEquals(Boolean.TRUE, configured.getPreAuthorizedGrantAnonymousAccessSupported());
+    }
+
+    /**
+     * A token endpoint on Certify's own origin whose path is not the mount's is said once, not on every metadata request;
+     * an authorization server on another origin (eSignet) is never reported, whatever its path.
+     */
+    @Test
+    public void getOAuthAuthorizationServerMetadata_OwnOriginMissIsReportedOnceAndOtherOriginsNever() {
         ch.qos.logback.classic.Logger logger = (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(OAuthAuthorizationServerMetadataService.class);
         ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender = new ch.qos.logback.core.read.ListAppender<>();
         appender.start();
         logger.addAppender(appender);
         try {
-            ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "tokenEndpoint", "https://typo.example/v1/certify/oauth/token");
             ownIdentity("https://credentials.example.org");
             asProperties(as(Map.of(), false, false));
             ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "interactiveAuthorizationEndpoint", "");
             ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "grantTypesSupported", "authorization_code");
 
+            // another origin: eSignet at /v1/esignet, and an AS at the Certify-like path, under the /v1/certify and root mounts
+            for (String mount : List.of("/v1/certify", "/")) {
+                dispatcherServletPath(mount);
+                for (String external : List.of("https://esignet.example/v1/esignet/oauth/token", "https://idp.example/v1/certify/oauth/token",
+                        "https://idp.example/oauth/token")) {
+                    ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "tokenEndpoint", external);
+                    assertEquals(List.of("authorization_code"),
+                            oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata().getGrantTypesSupported());
+                }
+            }
+            assertEquals("another origin is an external AS, never reported", 0, warnings(appender).size());
+
+            // Certify's own origin (default port written out), a path the mount does not give: served as configured, said once
+            dispatcherServletPath("/v1/certify");
+            ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "tokenEndpoint", "https://CREDENTIALS.example.org:443/v2/certify/oauth/token");
             for (int i = 0; i < 3; i++) {
                 assertEquals("not matched, so served as configured", List.of("authorization_code"),
                         oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata().getGrantTypesSupported());
             }
-
-            List<ch.qos.logback.classic.spi.ILoggingEvent> warnings = appender.list.stream()
-                    .filter(e -> e.getLevel() == ch.qos.logback.classic.Level.WARN).toList();
+            List<ch.qos.logback.classic.spi.ILoggingEvent> warnings = warnings(appender);
             assertEquals("one WARN for three builds: " + warnings, 1, warnings.size());
-            assertTrue(warnings.get(0).getFormattedMessage().contains("https://typo.example/v1/certify/oauth/token"));
+            assertTrue(warnings.get(0).getFormattedMessage().contains("/v2/certify/oauth/token"));
         } finally {
             logger.detachAppender(appender);
         }
+    }
+
+    private static List<ch.qos.logback.classic.spi.ILoggingEvent> warnings(
+            ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender) {
+        return appender.list.stream().filter(e -> e.getLevel() == ch.qos.logback.classic.Level.WARN).toList();
     }
 
     /** Builds with {@code authorization_code} only and no way to complete it: the own endpoint drops it. */
@@ -583,6 +646,7 @@ public class OAuthAuthorizationServerMetadataServiceTest {
                 oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata().getGrantTypesSupported());
     }
 
+    /** Where Boot mounted the DispatcherServlet ({@code spring.mvc.servlet.path}). */
     private void dispatcherServletPath(String path) {
         org.springframework.beans.factory.support.DefaultListableBeanFactory beans =
                 new org.springframework.beans.factory.support.DefaultListableBeanFactory();
@@ -591,11 +655,23 @@ public class OAuthAuthorizationServerMetadataServiceTest {
                 beans.getBeanProvider(org.springframework.boot.autoconfigure.web.servlet.DispatcherServletPath.class));
     }
 
-    /** The deployment's own identity, the base `mosip.certify.oauth.token-endpoint` is built from. */
+    /** Certify's identity, read through the Environment as the service reads it; {@code null} leaves a key unset. */
+    private org.springframework.mock.env.MockEnvironment identity(String identifier, String domainUrl) {
+        org.springframework.mock.env.MockEnvironment environment = new org.springframework.mock.env.MockEnvironment();
+        if (identifier != null) {
+            environment.setProperty("mosip.certify.identifier", identifier);
+        }
+        if (domainUrl != null) {
+            environment.setProperty("mosip.certify.domain.url", domainUrl);
+        }
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "environment", environment);
+        return environment;
+    }
+
+    /** The deployment's own identity, the base `mosip.certify.oauth.token-endpoint` is built from, mounted at /v1/certify. */
     private void ownIdentity(String base) {
-        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "authorizationUrl", base);
-        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "domainUrl", base);
-        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "servletPath", "/v1/certify");
+        identity(base, base);
+        dispatcherServletPath("/v1/certify");
     }
 
     private void asProperties(AsProperties properties) {

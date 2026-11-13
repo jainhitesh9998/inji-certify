@@ -26,6 +26,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 
 /**
  * F-17 review round 2, B1: loading a {@code credential_config} row in a read-write session and flushing must not write
@@ -130,6 +131,64 @@ class CredentialConfigurationEntityDirtyCheckTest {
             CredentialConfig reread = session.get(CredentialConfig.class, "dirty-check-change");
             assertEquals(true, reread.getMsoMdocClaims().get("org.iso.18013.5.1").get("family_name").isMandatory());
         }
+    }
+
+    /**
+     * F-17 review round 3, item 3: the second-level cache form. Hibernate disassembles an attribute into the cache and
+     * assembles it back through the attribute's mutability plan, which for a {@code @Type} is the user type. The
+     * inherited pair went through the same untyped clone as the snapshot, so a cache round trip handed back
+     * {@code LinkedHashMap}s that never equal the {@code Claims} written; the typed pair returns an equal, typed value.
+     */
+    @Test
+    void aCacheRoundTripIsTypedAndEqual() {
+        org.hibernate.type.descriptor.java.MutabilityPlan<Object> plan = mdocClaimsPlan();
+        Map<String, Map<String, Claims>> value = mdocRow("plan-cache").getMsoMdocClaims();
+        try (Session session = sessionFactory.openSession()) {
+            java.io.Serializable cached = plan.disassemble(value, session);
+            Object assembled = plan.assemble(cached, session);
+            assertEquals(value, assembled, "a cache round trip returns the value that was cached");
+            assertInstanceOf(Claims.class, ((Map<?, ?>) ((Map<?, ?>) assembled).get("org.iso.18013.5.1")).get("family_name"));
+            assertNotSame(assembled, plan.assemble(cached, session), "every assembly is a value of its own");
+        }
+    }
+
+    /**
+     * Copies are independent of what they came from, both ways: the load snapshot ({@code deepCopy}) and the cache form
+     * ({@code disassemble}/{@code assemble}). Changing a nested {@code Claims} in one never changes the other.
+     */
+    @Test
+    void copiesAndTheirOriginalsNeverShareState() {
+        org.hibernate.type.descriptor.java.MutabilityPlan<Object> plan = mdocClaimsPlan();
+        try (Session session = sessionFactory.openSession()) {
+            Map<String, Map<String, Claims>> original = mdocRow("plan-isolation").getMsoMdocClaims();
+            @SuppressWarnings("unchecked")
+            Map<String, Map<String, Claims>> copy = (Map<String, Map<String, Claims>>) plan.deepCopy(original);
+            assertEquals(original, copy);
+            copy.get("org.iso.18013.5.1").get("family_name").setMandatory(true);
+            assertFalse(original.get("org.iso.18013.5.1").get("family_name").isMandatory(), "changing the copy changed the original");
+            original.get("org.iso.18013.5.1").get("birth_date").setDisplay(List.of(new Claims.Display("Changed", "en")));
+            assertEquals("Date of birth", copy.get("org.iso.18013.5.1").get("birth_date").getDisplay().get(0).getName(),
+                    "changing the original changed the copy");
+
+            java.io.Serializable cached = plan.disassemble(original, session);
+            original.get("org.iso.18013.5.1").get("family_name").setMandatory(true); // after caching
+            @SuppressWarnings("unchecked")
+            Map<String, Map<String, Claims>> assembled = (Map<String, Map<String, Claims>>) plan.assemble(cached, session);
+            assertFalse(assembled.get("org.iso.18013.5.1").get("family_name").isMandatory(), "a change after caching reached the cache");
+            assembled.get("org.iso.18013.5.1").get("birth_date").setMandatory(true);
+            @SuppressWarnings("unchecked")
+            Map<String, Map<String, Claims>> again = (Map<String, Map<String, Claims>>) plan.assemble(cached, session);
+            assertFalse(again.get("org.iso.18013.5.1").get("birth_date").isMandatory(), "changing an assembled value changed the cache");
+        }
+    }
+
+    /** The mutability plan Hibernate built for {@code msoMdocClaims}: what it uses for the load snapshot and the cache. */
+    @SuppressWarnings("unchecked")
+    private static org.hibernate.type.descriptor.java.MutabilityPlan<Object> mdocClaimsPlan() {
+        org.hibernate.persister.entity.EntityPersister persister = sessionFactory.unwrap(org.hibernate.engine.spi.SessionFactoryImplementor.class)
+                .getMappingMetamodel().getEntityDescriptor(CredentialConfig.class);
+        return (org.hibernate.type.descriptor.java.MutabilityPlan<Object>)
+                persister.findAttributeMapping("msoMdocClaims").getAttributeMetadata().getMutabilityPlan();
     }
 
     /**

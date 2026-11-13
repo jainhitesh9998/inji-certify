@@ -74,6 +74,27 @@ class MdlAuthorizationServerPropertiesTest {
         }
     }
 
+    /**
+     * The demo's token endpoint is Certify's own under the owner's identity-only rule (2026-11-13):
+     * {@code mosip.certify.domain.url} (the public URL) + the {@code /v1/certify} mount + {@code /oauth/token}. Shown by
+     * behaviour, for both PKI profiles: the same configuration listing only {@code authorization_code}, with no client
+     * and no IAE, is rewritten to the pre-authorized grant, which only an own document is.
+     */
+    @Test
+    void theDemoTokenEndpointIsCertifysOwnByIdentity() throws Exception {
+        for (String pki : new String[]{"mdl-dev", "mdl-operator"}) {
+            Binder binder = profile(pki);
+            assertEquals(PUBLIC_URL + "/v1/certify/oauth/token", ComposeProperties.get(binder, "mosip.certify.oauth.token-endpoint"));
+            assertEquals(PUBLIC_URL, ComposeProperties.get(binder, "mosip.certify.domain.url"));
+            assertEquals("/v1/certify", ComposeProperties.get(binder, "spring.mvc.servlet.path"));
+
+            io.mosip.certify.services.OAuthAuthorizationServerMetadataService service = ComposeProperties.documentService(binder);
+            org.springframework.test.util.ReflectionTestUtils.setField(service, "grantTypesSupported", "authorization_code");
+            assertEquals(java.util.List.of(PRE_AUTHORIZED), service.getOAuthAuthorizationServerMetadata().getGrantTypesSupported(),
+                    pki + ": an own document advertises only completable grants");
+        }
+    }
+
     /** default, csvdp-farmer, rebuild, mdl then the PKI profile, as docker-compose.mdl.yaml sets active_profile_env. */
     private static Binder profile(String pki) throws Exception {
         return ComposeProperties.binder(ComposeProperties.sources(Map.of("mosip.certify.domain.url", PUBLIC_URL),

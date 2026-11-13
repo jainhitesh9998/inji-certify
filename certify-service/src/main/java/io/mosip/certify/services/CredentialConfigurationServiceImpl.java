@@ -250,7 +250,11 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
         }
     }
 
-    /** A pure read, like {@link #fetchCredentialIssuerMetadata()}: read-only, so loading the row can never write it. */
+    /**
+     * A pure read, like {@link #fetchCredentialIssuerMetadata()}: read-only, so loading the row can never write it. With
+     * {@code spring.jpa.open-in-view} on (the default), the entity loaded here stays read-only for the rest of the
+     * request; do not modify and save it later in the same request.
+     */
     @Override
     @Transactional(readOnly = true)
     public CredentialConfigurationDTO getCredentialConfigurationById(String credentialConfigKeyId) {
@@ -331,6 +335,9 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
      * whose {@code TEXT[]} columns are {@code VARCHAR}, the rewrite also nested the array columns one bracket level
      * deeper per read (G32, F-17 review rounds 1 and 2). Both the root fix and this read-only transaction hold;
      * {@code LegacyMetadataPostgresTest} checks the rows' {@code xmin} and Hibernate's update count.
+     *
+     * <p>With {@code spring.jpa.open-in-view} on (the default), the entities loaded here stay read-only for the rest of
+     * the request; do not modify and save them later in the same request.
      */
     @Override
     @Transactional(readOnly = true)

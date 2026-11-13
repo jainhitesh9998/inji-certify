@@ -68,8 +68,9 @@ final class ComposeProperties {
 
     /**
      * The service the deployment's configuration produces: every field it reads (`mosip.certify.oauth.*`, the identity
-     * its own token URL is built from, `certify.as`, the DPoP algorithms) resolved from the merged sources, exactly as
-     * the Spring context would bind them.
+     * its own token URL is built from - `mosip.certify.identifier`, `mosip.certify.domain.url` - and the
+     * DispatcherServlet's mount, `certify.as`, the DPoP algorithms) resolved from the merged sources, exactly as the
+     * Spring context would bind them.
      */
     static OAuthAuthorizationServerMetadataService documentService(Binder binder) {
         OAuthAuthorizationServerMetadataService service = new OAuthAuthorizationServerMetadataService();
@@ -82,10 +83,16 @@ final class ComposeProperties {
         ReflectionTestUtils.setField(service, "interactiveAuthorizationEndpoint", get(binder, "mosip.certify.oauth.interactive-authorization-endpoint"));
         String require = get(binder, "mosip.certify.oauth.require-interactive-authorization-request");
         ReflectionTestUtils.setField(service, "requireInteractiveAuthorizationRequest", require == null || Boolean.parseBoolean(require.trim()));
-        ReflectionTestUtils.setField(service, "authorizationUrl", get(binder, "mosip.certify.authorization.url"));
-        ReflectionTestUtils.setField(service, "domainUrl", get(binder, "mosip.certify.domain.url"));
-        ReflectionTestUtils.setField(service, "identifier", get(binder, "mosip.certify.identifier"));
-        ReflectionTestUtils.setField(service, "servletPath", get(binder, "server.servlet.path"));
+        // Certify's identity, which the service reads through the Environment (the legacy keys, resolved across the merged
+        // sources exactly as the container resolves them)
+        org.springframework.mock.env.MockEnvironment environment = new org.springframework.mock.env.MockEnvironment();
+        for (String key : List.of("mosip.certify.identifier", "mosip.certify.domain.url")) {
+            String value = get(binder, key);
+            if (value != null) {
+                environment.setProperty(key, value);
+            }
+        }
+        ReflectionTestUtils.setField(service, "environment", environment);
         // where Boot mounts the DispatcherServlet (spring.mvc.servlet.path; certify-default.properties sets it)
         String mounted = get(binder, "spring.mvc.servlet.path");
         if (mounted != null) {

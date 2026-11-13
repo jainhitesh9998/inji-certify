@@ -196,6 +196,44 @@ class CredentialConfigurationV2Test {
     }
 
     /**
+     * F-17 review round 3, item 9: {@code mso_mdoc_claims} is mapped with {@code TypedJsonBinaryType}, whose snapshot
+     * copy no longer makes every load dirty. A real change must still be written: a nested-claims update through the v2
+     * API is persisted to the column and reads back typed, from a fresh persistence context.
+     */
+    @Test
+    void mdocNestedClaimsUpdateIsPersistedAndReadBackTyped() throws Exception {
+        String id = "V2MdlClaimsUpdate";
+        configurations.findByTenantIdAndCredentialConfigKeyId("default", id).ifPresent(configurations::delete);
+        configurations.findByTenantIdAndCredentialFormatAndDocType("default", "mso_mdoc", "org.iso.18013.5.1.mDL")
+                .ifPresent(configurations::delete);
+        MvcResult created = call(post(PATH), mdocBody(id, mdocTemplate()));
+        assertEquals(201, created.getResponse().getStatus(), created.getResponse().getContentAsString());
+        io.mosip.certify.entity.attributes.Claims before = configurations.findByTenantIdAndCredentialConfigKeyId("default", id)
+                .orElseThrow().getMsoMdocClaims().get("org.iso.18013.5.1").get("family_name");
+        assertFalse(before.isMandatory());
+
+        Map<String, Object> body = mdocBody(id, mdocTemplate());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> formatConfig = new LinkedHashMap<>((Map<String, Object>) body.get("formatConfig"));
+        formatConfig.put("mdocClaims", Map.of("org.iso.18013.5.1", Map.of(
+                "family_name", Map.of("display", List.of(Map.of("name", "Family name", "locale", "en")), "mandatory", true),
+                "given_name", Map.of("display", List.of(Map.of("name", "Given name", "locale", "en"))))));
+        body.put("formatConfig", formatConfig);
+        MvcResult updated = call(put(PATH + "/" + id), body);
+        assertEquals(200, updated.getResponse().getStatus(), updated.getResponse().getContentAsString());
+
+        Map<String, io.mosip.certify.entity.attributes.Claims> namespace = configurations.findByTenantIdAndCredentialConfigKeyId("default", id)
+                .orElseThrow().getMsoMdocClaims().get("org.iso.18013.5.1");
+        assertEquals(java.util.Set.of("family_name", "given_name"), namespace.keySet(), "the update replaced the namespace's claims");
+        Object familyName = namespace.get("family_name");
+        assertTrue(familyName instanceof io.mosip.certify.entity.attributes.Claims, "read back typed: " + familyName.getClass());
+        assertTrue(namespace.get("family_name").isMandatory(), "the nested change was written");
+        assertEquals("Family name", namespace.get("family_name").getDisplay().get(0).getName());
+        assertEquals("Given name", namespace.get("given_name").getDisplay().get(0).getName());
+        configurations.findByTenantIdAndCredentialConfigKeyId("default", id).ifPresent(configurations::delete);
+    }
+
+    /**
      * ISO/IEC 18013-5 9.1.2.4 requires the document signer certificate in the IssuerAuth {@code x5chain}: an mso_mdoc
      * configuration that would leave the chain out ({@code signing.x5c: none}) is refused when it is saved.
      */
