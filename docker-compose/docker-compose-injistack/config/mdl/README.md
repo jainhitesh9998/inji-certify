@@ -9,7 +9,7 @@ case of the same stack (`docs/design/20-mdl-issuer.md`, M-10). Everything here i
 | --- | --- |
 | `../../docker-compose.mdl.yaml` | Overlay on `docker-compose.yaml` + `docker-compose.rebuild.yaml`: profile `mdl` plus `MDL_PKI_PROFILE` (`mdl-dev` or `mdl-operator`, required), the mounts, and the `mdl-seed` service |
 | `../../docker-compose.public.yaml` | Last overlay on a public host or shared machine: certify and certify-nginx on `127.0.0.1`, no PostgreSQL, mimoto or inji-web port, passwords from Compose secret files and never from the shell, actuator limited to `health` (Compose 2.24.4 or later) |
-| `../certify-mdl.properties` | Profile `mdl`: issuer display, offers on `/oid4vci` (D5), anonymous pre-authorized grant advertised (D13), x509-file provider, IACA publication (M-08), MSO validity `P30D`, the file data source `mdldemo` |
+| `../certify-mdl.properties` | Profile `mdl`: issuer display, offers on `/oid4vci` (D5), anonymous pre-authorized grant advertised (D13), x509-file provider, IACA publication (M-08), MSO validity `P30D`, the file data source `mdldemo`, the offer page's demo subjects (F-15) |
 | `../certify-mdl-dev.properties` | Profile `mdl-dev` (local runs and demos): x509-file dev mode generates the IACA and the Document Signer `mdl-dsc` |
 | `../certify-mdl-operator.properties` | Profile `mdl-operator`: the operator's keystore, IACA and CRL, made offline with `certify-cli` (D3) |
 | `mdl-configuration.json` | The v2 configuration body (`/v2/credential-configurations`); `"@@mdl.vm@@"` is replaced by `mdl.vm` |
@@ -24,6 +24,28 @@ or `EdDSA` (Ed25519, ISO/IEC 18013-5 9.1.5.2), D4; data source `mdldemo`; a Toke
 (`status.status_list {idx, uri}` in the MSO). The status list is a `statuslist+jwt` signed by keymanager's EC P-256 key,
 since `certify.status.token-status-list.key-ref` is not set. A Document Signer must not sign it (its extended key usage
 is mDL only), so the list's signer does not chain to the IACA (G23); the CWT list under the IACA is M-11. The issuer display is "Lorem Ipsum Demo Credentials".
+
+## The offer page's demo subjects
+
+The offer page (`certify.offer-page.enabled`, on in `certify-rebuild.properties`) creates a pre-authorized offer, shows
+it as a QR code and can play the wallet. It used to ask a visitor to type a subject id, which nobody knows on a public
+demo (`https://credentials.loremipsum.co.in/v1/certify/offer/`); it now offers a dropdown of the subjects the operator
+configures, and only those. `../certify-mdl.properties` lists the three records of `holders.json`:
+
+| Property | What it is |
+| --- | --- |
+| `certify.offer-page.demo-subjects[n].id` | the subject id the page sends as `request.subject`: one of the keys of `holders.json` (`mdl-demo-1`..`mdl-demo-3`), at most 128 characters of letters, digits, `.`, `_`, `:` and `-` |
+| `certify.offer-page.demo-subjects[n].label` | optional display text, at most 128 characters: the holder's `given_name` and `family_name` and nothing else from the record. Unset, the page shows the id |
+| `certify.offer-page.demo-subjects[n].credential-configuration-ids` | the configurations the subject is offered for (`org.iso.18013.5.1.mDL` here); empty or unset, every configuration |
+
+The page fetches them from `GET {servlet path}/offer/demo-subjects`, which answers the list above and nothing else
+(`{"subjects":[{"id","label","credential_configuration_ids"}]}`, `Cache-Control: no-store`). Nothing is derived from
+the data source, so no holder is enumerable: remove a block to hide that subject, and a deployment that configures none
+keeps the free-text field and the claims-JSON path exactly as they were. The entries are validated at startup — a
+blank, over-long, non-conforming or duplicate id, an over-long label and more than 50 subjects refuse the start with a
+message naming the entry; the records are bound only because `certify.offer-page.enabled` is on — and a label is
+written into the page as text, never as HTML, so a name containing `<` or `"` is harmless. nginx publishes that one
+exact path to the public host, for GET and HEAD (and the CORS preflight; `docs/design/20-mdl-issuer.md` D12).
 
 ## Run it locally (dev PKI)
 

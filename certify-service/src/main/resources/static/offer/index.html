@@ -7,6 +7,9 @@
 <style>
   :root { color-scheme: light; --ink: #1c1c1c; --muted: #6b6b6b; --line: #ddd; --accent: #1a5fb4; --ok: #2e7d32; --bad: #b3261e; --bg: #fafaf8; --card: #fff; }
   * { box-sizing: border-box; }
+  /* the UA's [hidden] rule is a plain `display: none`, which a later `label { display: block }` overrides: the
+     subject labels are toggled with `hidden` (F-15), so the attribute has to win over every display rule here */
+  [hidden] { display: none !important; }
   body { margin: 0; padding: 24px 16px 48px; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
   main { max-width: 960px; margin: 0 auto; }
   h1 { font-size: 1.5rem; margin: 0 0 4px; }
@@ -47,9 +50,11 @@
         <option value="oid4vci">/oid4vci (OpenID4VCI 1.0)</option>
         <option value="legacy">legacy (compatibility endpoints)</option>
       </select>
-      <label for="subject">Subject (the record id the data provider resolves, e.g. the CSV row id)</label>
+      <label for="subjectChoice" id="subjectChoiceLabel" hidden>Subject (one of this issuer's demo subjects)</label>
+      <select id="subjectChoice" hidden></select>
+      <label for="subject" id="subjectLabel">Subject (the record id the data provider resolves, e.g. the CSV row id)</label>
       <input id="subject" placeholder="2154189532">
-      <label for="claims">Or claims as JSON (used when the subject is empty)</label>
+      <label for="claims" id="claimsLabel">Or claims as JSON (used when the subject is empty)</label>
       <textarea id="claims" placeholder='{"fullName": "Gorge Cooper", "dateOfBirth": "1990-05-25"}'></textarea>
       <div class="row">
         <div style="flex:1"><label for="txCode">Transaction code (optional)</label><input id="txCode" placeholder="1234"></div>
@@ -136,6 +141,8 @@
     // ISO/IEC 18013-5 credentials are only issued on the OpenID4VCI 1.0 surface, so that is the default there (D5);
     // every other format keeps the compatibility surface the page has always used.
     syncSurfaceDefault();
+    // the operator's demo subjects, when there are any; a fetch that fails is not an error the visitor needs to see
+    try { await loadDemoSubjects(); } catch (e) { /* no dropdown: the typed id and the claims field work as before */ }
   }
 
   function formatOf(configurationId) {
@@ -152,7 +159,102 @@
     el("surface").value = selectedFormat() === "mso_mdoc" ? "oid4vci" : "legacy";
   }
 
-  el("configuration").addEventListener("change", syncSurfaceDefault);
+  // ---- demo subjects (F-15): the subjects the operator configured (certify.offer-page.demo-subjects), offered in a
+  // dropdown instead of a typed record id. A deployment that configures none keeps the free-text field and the claims
+  // path exactly as they were: no dropdown, no error.
+  const DEMO_SUBJECTS = "/offer/demo-subjects";
+  // the shape the endpoint promises (OfferPageProperties): one malformed entry makes the whole list untrustworthy
+  const SUBJECT_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+  const SUBJECT_LABEL_MAX = 128;
+  // the "Other" option's value: no configured subject id can be empty, so the empty value is free for it
+  const OTHER = "";
+  const CLAIMS_HINT = "Or claims as JSON (used when the subject is empty)";
+  const CLAIMS_HINT_WITH_CHOICE = "Or claims as JSON (used when \"Other\" is chosen and the subject is left empty)";
+  let demoSubjects = [];
+
+  /** One subject entry in the shape the endpoint promises; any other entry makes the whole list untrustworthy. */
+  function isDemoSubject(subject) {
+    return subject !== null && typeof subject === "object"
+      && typeof subject.id === "string" && SUBJECT_ID.test(subject.id)
+      && typeof subject.label === "string" && subject.label.length <= SUBJECT_LABEL_MAX
+      && Array.isArray(subject.credential_configuration_ids)
+      && subject.credential_configuration_ids.every((configuration) => typeof configuration === "string");
+  }
+
+  /** The subjects that apply to a credential configuration: an empty (or absent) list means every configuration. */
+  function subjectsFor(subjects, configurationId) {
+    return (Array.isArray(subjects) ? subjects : []).filter((subject) => subject && typeof subject.id === "string" && subject.id
+      && Array.isArray(subject.credential_configuration_ids)
+      && (subject.credential_configuration_ids.length === 0 || subject.credential_configuration_ids.indexOf(configurationId) >= 0));
+  }
+
+  /** "Other", or a deployment without a dropdown, is when the typed id (and so the claims) is what the offer uses. */
+  function usesTypedSubject() {
+    const choice = el("subjectChoice");
+    return choice.hidden || !choice.value; // the "Other" option's value is empty; a configured subject id never is
+  }
+
+  function syncSubjectInput() {
+    const typed = usesTypedSubject();
+    el("subjectLabel").hidden = !typed;
+    el("subject").hidden = !typed;
+    // a visitor who picks a listed subject and also pastes claims needs to know the claims only apply to "Other" with an
+    // empty subject; without the dropdown the label is the one the page always had
+    el("claimsLabel").textContent = el("subjectChoice").hidden ? CLAIMS_HINT : CLAIMS_HINT_WITH_CHOICE;
+  }
+
+  /**
+   * Offers the demo subjects that apply to the selected configuration. With none configured, or none for this
+   * configuration, the dropdown is hidden and the page works as it did before the dropdown existed. Re-run on a
+   * configuration change, keeping the current choice while it is still offered.
+   */
+  function refreshSubjectChoice() {
+    const choice = el("subjectChoice");
+    if (!demoSubjects.length) {
+      choice.hidden = true; el("subjectChoiceLabel").hidden = true; syncSubjectInput(); return;
+    }
+    const previous = choice.hidden ? null : choice.value;
+    const matching = subjectsFor(demoSubjects, el("configuration").value);
+    choice.textContent = ""; // clearing our own options only
+    if (!matching.length) {
+      choice.hidden = true; el("subjectChoiceLabel").hidden = true; syncSubjectInput(); return;
+    }
+    matching.forEach((subject) => {
+      const option = document.createElement("option");
+      option.value = subject.id;
+      // the label is operator-configured display text: it is never parsed as HTML, so it may contain < or "
+      option.textContent = subject.label ? subject.label + " (" + subject.id + ")" : subject.id;
+      choice.appendChild(option);
+    });
+    const other = document.createElement("option");
+    other.value = OTHER;
+    other.textContent = "Other (type a subject id)";
+    choice.appendChild(other);
+    // keep the current choice while it is still offered (the empty value is "Other", offered every time); otherwise the
+    // first matching subject is preselected
+    const keep = previous !== null && (previous === OTHER || matching.some((subject) => subject.id === previous));
+    choice.value = keep ? previous : matching[0].id;
+    choice.hidden = false; el("subjectChoiceLabel").hidden = false;
+    syncSubjectInput();
+  }
+
+  /** What the offer sends as request.subject: a chosen demo subject, else the typed id (empty: the claims path). */
+  function chosenSubject() {
+    return usesTypedSubject() ? el("subject").value.trim() : el("subjectChoice").value;
+  }
+
+  async function loadDemoSubjects() {
+    const answer = await api("GET", DEMO_SUBJECTS);
+    // anything but a list of well-formed subjects (404, malformed JSON, one bad entry, a deployment that configured none)
+    // leaves the page exactly as it was
+    if (answer.status !== 200 || !answer.body || !Array.isArray(answer.body.subjects) || !answer.body.subjects.length) return;
+    if (!answer.body.subjects.every(isDemoSubject)) return;
+    demoSubjects = answer.body.subjects;
+    refreshSubjectChoice();
+  }
+
+  el("configuration").addEventListener("change", () => { syncSurfaceDefault(); refreshSubjectChoice(); });
+  el("subjectChoice").addEventListener("change", syncSubjectInput);
 
   el("create").addEventListener("click", async () => {
     // what this click proposes; the page's wallet below redeems the offer that is actually active, so none of it becomes
@@ -164,7 +266,8 @@
       issuer: proposedSurface };
     if (el("byValue").checked) request.offer_by_value = true;
     if (el("txCode").value.trim()) request.tx_code = el("txCode").value.trim();
-    if (el("subject").value.trim()) request.subject = el("subject").value.trim();
+    const subject = chosenSubject();
+    if (subject) request.subject = subject;
     else if (el("claims").value.trim()) {
       try { request.claims = JSON.parse(el("claims").value); } catch (e) { status("offerStatus", "Claims are not valid JSON: " + e.message, false); return; }
     } else { status("offerStatus", "Give a subject or claims", false); return; }

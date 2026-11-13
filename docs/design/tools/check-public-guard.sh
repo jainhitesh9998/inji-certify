@@ -117,6 +117,7 @@ pass public GET  /v1/certify/offer/
 pass public GET  /v1/certify/offer?subject=mdl-demo-1
 pass public GET  /v1/certify/offer/qrcode.min.js
 pass public GET  /v1/certify/offer/cbor.js
+pass public GET  /v1/certify/offer/demo-subjects
 pass public GET  /v1/certify/credential-offer-data/0b9a6c1e-4c1d-4f1e-9d39-0d2d1b5b8c55
 pass public GET  /v1/certify/credentials/status-list/abc
 pass public GET  /v1/certify/credentials/token-status-list/abc
@@ -230,6 +231,9 @@ pass public POST /oid4vci/credential
 403  public GET  /v1/certify/offer/qrcode.min.js.map
 403  public GET  /v1/certify/offer/x/cbor.js
 403  public POST /v1/certify/offer/cbor.js
+403  public POST /v1/certify/offer/demo-subjects
+403  public GET  /v1/certify/offer/demo-subjects/x
+403  public GET  /v1/certify/offer/demo-subjects.json
 # --- evasions ---
 403  public POST /v1/certify/oid4vci/../sign
 403  public POST /v1/certify/oid4vci/%2e%2e/sign

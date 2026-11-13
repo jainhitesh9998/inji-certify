@@ -193,6 +193,18 @@ jobs:
           docs/design/tools/check-public-overlay.sh
         shell: bash
 
+      - uses: actions/setup-node@v4
+        # F-15: the offer page's behaviour check is plain Node with no npm install, so only the interpreter is set up
+        with:
+          node-version: '20'
+
+      - name: Offer page behaviour (node)
+        # F-15: the real certify-service/src/main/resources/static/offer/index.html is evaluated with a fake DOM and
+        # asserted by behaviour (the demo-subject dropdown, its "Other" option, text-only labels, the POST body), which
+        # is the regression test for the two defects review round 1 found in the page's script. No npm dependencies.
+        run: node docs/design/tools/check-offer-page.mjs
+        shell: bash
+
       - uses: actions/setup-python@v5
         # verify_mdoc.py and its pinned requirements are tested on this interpreter, not whatever the runner ships
         with:
