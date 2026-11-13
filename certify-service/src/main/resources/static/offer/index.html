@@ -223,7 +223,7 @@
       const option = document.createElement("option");
       option.value = subject.id;
       // the label is operator-configured display text: it is never parsed as HTML, so it may contain < or "
-      option.textContent = subject.label ? subject.label + " (" + subject.id + ")" : subject.id;
+      option.textContent = subject.label && subject.label !== subject.id ? subject.label + " (" + subject.id + ")" : subject.id;
       choice.appendChild(option);
     });
     const other = document.createElement("option");

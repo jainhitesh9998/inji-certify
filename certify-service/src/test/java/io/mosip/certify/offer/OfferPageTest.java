@@ -97,8 +97,8 @@ class OfferPageTest {
     @Test
     void subjectLabelsAreTextAndNeverMarkup() throws Exception {
         String html = mockMvc.perform(get("/offer/")).andReturn().getResponse().getContentAsString();
-        assertTrue(html.contains("option.textContent = subject.label ? subject.label + \" (\" + subject.id + \")\" : subject.id;"),
-                "a subject label is assigned with textContent, so a label containing < or \" stays text");
+        assertTrue(html.contains("option.textContent = subject.label && subject.label !== subject.id ? subject.label + \" (\" + subject.id + \")\" : subject.id;"),
+                "a subject label is assigned with textContent, so a label containing < or \" stays text; a label that only repeats the id (or is empty) is printed once (F-18)");
         assertTrue(html.contains("option.value = subject.id;"), "the id is an option value, never markup");
         // every innerHTML assignment in the page clears a container of the page's own making; none takes server data.
         // The count is deliberately not asserted: what matters is that no assignment carries a value.
