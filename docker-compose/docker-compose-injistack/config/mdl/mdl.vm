@@ -7,9 +7,12 @@
 ## also valid JSON string content, so a double quote, a backslash or a control character in holders.json stays inside
 ## its JSON string. "$!_esc.java($x)" renders a missing value as an empty string, which the mDoc formatter refuses for
 ## a mandatory element instead of signing it. Optional elements are written only when the record has them ("$!x" is
-## empty for a missing field, and keeps a false or 0 value, which #if($x) would drop). sex (uint) and age_over_18
-## (bool) are written bare only when they are an unsigned integer and true/false; anything else goes in as an escaped
-## string, which the formatter refuses as the wrong type rather than letting it change the JSON.
+## empty for a missing field, and keeps a false or 0 value, which #if($x) would drop). sex (uint) is written bare only
+## when holders.json has a JSON number (it answers longValue(); a string does not) whose text is a canonical JSON
+## integer (0|[1-9][0-9]*: no sign, no leading zero, no fraction or exponent), and age_over_18 (bool) only when it is a
+## JSON boolean (it answers booleanValue(); the string "true" does not). Anything else goes in as an escaped string,
+## which the formatter refuses as the wrong type rather than letting it change the JSON or its type. codes is written
+## only when it is a non-empty list (Velocity 1.7, which certify-service runs, treats an empty list as true).
 {
     "docType": "org.iso.18013.5.1.mDL",
     "nameSpaces": {
@@ -25,16 +28,17 @@
             {"elementIdentifier": "portrait", "elementValue": "$!_esc.java($portrait)"},
             {"elementIdentifier": "driving_privileges", "elementValue": [
 #foreach($privilege in $driving_privileges)
-                {"vehicle_category_code": "$!_esc.java($privilege.vehicle_category_code)"#if("$!privilege.issue_date" != ""), "issue_date": "$!_esc.java($privilege.issue_date)"#{end}#if("$!privilege.expiry_date" != ""), "expiry_date": "$!_esc.java($privilege.expiry_date)"#{end}#if($privilege.codes), "codes": [#foreach($code in $privilege.codes){"code": "$!_esc.java($code.code)"#if("$!code.sign" != ""), "sign": "$!_esc.java($code.sign)"#{end}#if("$!code.value" != ""), "value": "$!_esc.java($code.value)"#{end}}#if($foreach.hasNext), #{end}#{end}]#{end}}#if($foreach.hasNext),#{end}
+                {"vehicle_category_code": "$!_esc.java($privilege.vehicle_category_code)"#if("$!privilege.issue_date" != ""), "issue_date": "$!_esc.java($privilege.issue_date)"#{end}#if("$!privilege.expiry_date" != ""), "expiry_date": "$!_esc.java($privilege.expiry_date)"#{end}#if($privilege.codes && $privilege.codes.size() > 0), "codes": [#foreach($code in $privilege.codes){"code": "$!_esc.java($code.code)"#if("$!code.sign" != ""), "sign": "$!_esc.java($code.sign)"#{end}#if("$!code.value" != ""), "value": "$!_esc.java($code.value)"#{end}}#if($foreach.hasNext), #{end}#{end}]#{end}}#if($foreach.hasNext),#{end}
 #end
             ]},
 #set($sexText = "$!sex")
 #if($sexText != "")
-            {"elementIdentifier": "sex", "elementValue": #if($sexText.matches("[0-9]+"))$sexText#{else}"$!_esc.java($sex)"#end},
+            {"elementIdentifier": "sex", "elementValue": #if("$!sex.longValue()" != "" && $sexText.matches("0|[1-9][0-9]*"))$sexText#{else}"$!_esc.java($sex)"#end},
 #end
 #set($ageText = "$!age_over_18")
+#set($ageBoolean = "$!age_over_18.booleanValue()")
 #if($ageText != "")
-            {"elementIdentifier": "age_over_18", "elementValue": #if($ageText == "true" || $ageText == "false")$ageText#{else}"$!_esc.java($age_over_18)"#end},
+            {"elementIdentifier": "age_over_18", "elementValue": #if($ageBoolean == "true" || $ageBoolean == "false")$ageBoolean#{else}"$!_esc.java($age_over_18)"#end},
 #end
 #if("$!nationality" != "")
             {"elementIdentifier": "nationality", "elementValue": "$!_esc.java($nationality)"},

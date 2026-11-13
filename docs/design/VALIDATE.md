@@ -251,9 +251,12 @@ cd ../.. && python3.12 -m venv .venv && .venv/bin/pip install -r docs/design/too
 A public host (or any machine others can reach) runs `MDL_PKI_PROFILE=mdl-operator MDL_PKI_DIR=<dir>` with
 `docker-compose.public.yaml` as the last file: certify and certify-nginx on `127.0.0.1` only, no PostgreSQL port, and
 the PostgreSQL, keymanager and issuer keystore passwords from Compose secret files in `CERTIFY_SECRETS_DIR` (Compose
-2.24.4 or later; README "The public host"). Its smoke run passes the public URL and pins the offline IACA:
-`smoke.py --mdl "$CERTIFY_PUBLIC_URL" --iaca "$MDL_PKI_DIR/iaca.pem"`. Changing `CERTIFY_PUBLIC_URL` needs a fresh
-database (status lists keep the old `sub` until F-10) and, in `mdl-dev`, a fresh `data/MDL_PKI`.
+2.24.4 or later; README "The public host"). That overlay also leaves `CERTIFY_KEYSTORE_PASSWORD` out of the container's
+environment even when the shell has it, exposes only actuator `health`, and removes the mimoto and inji-web ports;
+certify-nginx refuses `/v1/certify/actuator` to public requests. Its smoke run passes the public URL and pins the
+offline IACA: `smoke.py --mdl "$CERTIFY_PUBLIC_URL" --iaca "$MDL_PKI_DIR/iaca.pem"`. Changing `CERTIFY_PUBLIC_URL`
+needs a fresh database and, in `mdl-dev`, a fresh `data/MDL_PKI`. With F-10 a status list's `sub` follows the current
+URL, so mDLs issued under the old one (whose MSO names the old list URI) must be reissued.
 
 The plugin jars of step 2 bundle BouncyCastle 1.69 unshaded. On `loader.path` they shadow the service's 1.78, and
 since M-04 that stops the service at startup (`certify-pki`, `NoSuchMethodError`). The mDL overlay therefore mounts
@@ -263,12 +266,18 @@ The smoke plays a wallet through certify-nginx: offers by reference and by value
 and a P-256 holder (Bearer) and an Ed25519 holder (DPoP) through the token, nonce and credential endpoints. It then
 runs `verify_mdoc.py` with the IACA downloaded from `/v1/certify/mdoc/iaca/<id>.pem`, `openssl crl -CAfile` over the
 CRL at the Document Signer's distribution point, and `openssl verify -x509_strict -crl_check` over the Document
-Signer. Last come the status list and three refusals. All 29 checks passed in both PKI modes on 2026-11-13. The
-review round after that added a 30th (the `holders.json` record exists) and, with `--iaca`, a 31st (the published IACA
-is the pinned one), and made the element and status checks strict: CBOR types (tag 1004 full-dates, uint, bool, the
-whole `driving_privileges`) and the list's `sub`, `iat` and `exp`. `test_smoke_mdl.py` covers those helpers; the
-stricter run has not been repeated against a stack yet, and its `exp` check fails on a list older than two ttl until
-F-10 re-signs stale lists.
+Signer. Last come the status list and three refusals. The checks are strict: every element against `holders.json`
+in value and CBOR type, each full-date checked as tag 1004 at its own path (decoded with the tags kept, so tag 100,
+which cbor2 also reads as a date, fails, even when another privilege carries the same date as tag 1004), and the list's
+`sub`, `iat` and `exp` (requiring `exp` is Certify policy; draft-ietf-oauth-status-list makes it RECOMMENDED).
+`test_smoke_mdl.py` covers those helpers. Strict runs:
+
+| Date | Mode | Stack | Result |
+| --- | --- | --- | --- |
+| 2026-11-13 | `mdl-dev` | throwaway project, fresh database, `docker-compose.public.yaml` with scratch secrets, `CERTIFY_PUBLIC_URL=http://localhost:28091`, image `inji-certify:rebuild` with F-10 | 30/30 PASS (`smoke.py --mdl http://localhost:28091`) |
+| 2026-11-13 | `mdl-operator` | the public demo, `https://credentials.loremipsum.co.in`, with `--iaca` (the offline IACA) | 31/31 PASS (owner's session) |
+
+Before these, the non-strict run passed all 29 checks in both PKI modes on 2026-11-13.
 
 ## 7. Verify the credential independently
 

@@ -18,8 +18,8 @@
 #                        in mdl-dev, a fresh ./data/MDL_PKI (config/mdl/README.md)
 #   MDL_PKI_DIR          mdl-operator: host directory with issuer.p12, iaca.pem, iaca.crl (certify-cli Recipe 1)
 #   CERTIFY_KEYSTORE_PASSWORD  mdl-operator without docker-compose.public.yaml: the password of issuer.p12, passed
-#                        through from the shell (visible to `docker inspect`; the public overlay reads it from a secret
-#                        file instead)
+#                        through from the shell (visible to `docker inspect`); the public overlay replaces the environment
+#                        without it and reads the password from a secret file instead
 #   MDL_DSC_ALIAS        mdl-operator: the Document Signer entry checked at startup (default mdl-dsc@2026-11)
 #   MDL_SEED_UPDATE      true: the seed replaces an existing mDL configuration (PUT) instead of leaving it
 # See config/mdl/README.md.
@@ -29,7 +29,8 @@ services:
       - active_profile_env=default, csvdp-farmer, rebuild, mdl, ${MDL_PKI_PROFILE:?set MDL_PKI_PROFILE to mdl-dev or mdl-operator}
       - mosip_certify_domain_url=${CERTIFY_PUBLIC_URL:-http://localhost:8091}
       # passed through from the shell only when set (mdl-operator); `docker inspect` shows it, so a shared or public host
-      # uses docker-compose.public.yaml, which reads it from a secret file and leaves this unset
+      # uses docker-compose.public.yaml, which drops it (its certify environment is the whole list, without this) and
+      # reads it from a secret file. A change to the certify environment here goes into docker-compose.public.yaml too.
       - CERTIFY_KEYSTORE_PASSWORD
       - MDL_DSC_ALIAS
     volumes:

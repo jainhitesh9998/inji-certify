@@ -77,6 +77,17 @@ class ElementProblems(unittest.TestCase):
         dropped = [{"vehicle_category_code": p["vehicle_category_code"]} for p in RECORD["driving_privileges"]]
         self.assertTrue(any(p.startswith("driving_privileges") for p in self.problems(driving_privileges=dropped)))
 
+    def test_a_privilege_date_as_tag_100_is_refused_when_another_privilege_shares_it(self):
+        # mdl-demo-1's privileges share issue_date and expiry_date: a byte search for the tag 1004 encoding of the date
+        # finds the other privilege's copy, so only a check at each path ([1].issue_date) catches this
+        self.assertEqual(RECORD["driving_privileges"][0]["issue_date"], RECORD["driving_privileges"][1]["issue_date"])
+        days = (date.fromisoformat(RECORD["driving_privileges"][1]["issue_date"]) - date(1970, 1, 1)).days
+        privileges = issued(RECORD)[0]["driving_privileges"]
+        tagged = [{k: full_date(v.isoformat()) if isinstance(v, date) else v for k, v in p.items()} for p in privileges]
+        tagged[1]["issue_date"] = cbor2.CBORTag(100, days)
+        self.assertEqual(["driving_privileges: not a tag 1004 full-date: [1] B.issue_date"],
+                         self.problems(driving_privileges=tagged))
+
     def test_privilege_dates_as_text_are_refused(self):
         as_text = [dict(p) for p in RECORD["driving_privileges"]]
         self.assertTrue(any(p.startswith("driving_privileges") for p in self.problems(driving_privileges=as_text)))
@@ -86,6 +97,30 @@ class ElementProblems(unittest.TestCase):
 
     def test_text_values_compare_exactly(self):
         self.assertTrue(any(p.startswith("family_name") for p in self.problems(family_name="demo")))
+
+
+class CborTagged(unittest.TestCase):
+
+    def test_tags_are_kept_where_cbor2_would_turn_them_into_dates(self):
+        data = cbor2.dumps({"a": [cbor2.CBORTag(1004, "2024-01-15"), cbor2.CBORTag(100, 19737)], "b": cbor2.CBORTag(24, b"x")})
+        self.assertEqual({"a": [cbor2.CBORTag(1004, "2024-01-15"), cbor2.CBORTag(100, 19737)], "b": cbor2.CBORTag(24, b"x")},
+                         s.cbor_tagged(data))
+        self.assertEqual(date(2024, 1, 15), cbor2.loads(data)["a"][1])  # why cbor2.loads cannot tell them apart
+
+    def test_untagged_values_decode_as_cbor2_does(self):
+        value = {"i": [0, 23, 24, 255, 65536, 2**40, -1, -500], "t": "Bengaluru ಬೆಂಗಳೂರು", "b": b"\x00\xff",
+                 "s": [True, False, None], "f": [1.5, 0.1], 1: {"nested": []}}
+        for canonical in (False, True):
+            self.assertEqual(cbor2.loads(cbor2.dumps(value, canonical=canonical)), s.cbor_tagged(cbor2.dumps(value, canonical=canonical)))
+
+    def test_indefinite_lengths(self):
+        # [_ "ab" "c"] as an indefinite text string, inside an indefinite array, inside an indefinite map
+        self.assertEqual({"k": ["abc", 1]}, s.cbor_tagged(bytes.fromhex("bf616b9f7f6261626163ff01ffff")))
+
+    def test_truncated_or_trailing_bytes_fail(self):
+        for bad in (bytes.fromhex("82 01"), bytes.fromhex("6461"), bytes.fromhex("01 02")):
+            with self.assertRaises((ValueError, IndexError)):
+                s.cbor_tagged(bad)
 
 
 class StatusListProblems(unittest.TestCase):

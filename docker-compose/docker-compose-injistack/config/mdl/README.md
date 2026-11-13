@@ -8,7 +8,7 @@ case of the same stack (`docs/design/20-mdl-issuer.md`, M-10). Everything here i
 | File | What it is |
 | --- | --- |
 | `../../docker-compose.mdl.yaml` | Overlay on `docker-compose.yaml` + `docker-compose.rebuild.yaml`: profile `mdl` plus `MDL_PKI_PROFILE` (`mdl-dev` or `mdl-operator`, required), the mounts, and the `mdl-seed` service |
-| `../../docker-compose.public.yaml` | Last overlay on a public host or shared machine: certify and certify-nginx on `127.0.0.1`, no PostgreSQL port, passwords from Compose secret files (Compose 2.24.4 or later) |
+| `../../docker-compose.public.yaml` | Last overlay on a public host or shared machine: certify and certify-nginx on `127.0.0.1`, no PostgreSQL, mimoto or inji-web port, passwords from Compose secret files and never from the shell, actuator limited to `health` (Compose 2.24.4 or later) |
 | `../certify-mdl.properties` | Profile `mdl`: issuer display, offers on `/oid4vci` (D5), anonymous pre-authorized grant advertised (D13), x509-file provider, IACA publication (M-08), MSO validity `P30D`, the file data source `mdldemo` |
 | `../certify-mdl-dev.properties` | Profile `mdl-dev` (local runs and demos): x509-file dev mode generates the IACA and the Document Signer `mdl-dsc` |
 | `../certify-mdl-operator.properties` | Profile `mdl-operator`: the operator's keystore, IACA and CRL, made offline with `certify-cli` (D3) |
@@ -33,15 +33,15 @@ missing a value`). That way a public host never falls back to dev keys. Each com
 relative to the repository root (`git rev-parse --show-toplevel`), so the blocks run in any order from anywhere in the
 checkout.
 
-1. Build the service image from this checkout (`docs/design/VALIDATE.md` step 1). The Dockerfile copies
-   `certify-service/target/certify-service-*.jar`, so only the application jar may match:
+1. Build the service image from this checkout (`docs/design/VALIDATE.md` step 1). The Dockerfile copies the executable
+   jar by its exact name, `certify-service/target/certify-service.jar` (the module's `finalName`, F-10); the `-javadoc`
+   and `-sources` jars beside it are never picked up:
 
    ```bash
    cd "$(git rev-parse --show-toplevel)"
    export JAVA_HOME=$(/usr/libexec/java_home -v 21)
    mvn -B -ntp -s .mvn/settings-local.xml -Dmaven.legacyLocalRepo=true -Dgpg.skip=true -Dmaven.gitcommitid.skip=true \
        -DskipTests package -pl certify-service -am
-   rm -f certify-service/target/certify-service-*-javadoc.jar certify-service/target/certify-service-*-sources.jar
    docker build -t inji-certify:rebuild --build-arg container_user=mosip --build-arg container_user_group=mosip certify-service
    ```
 
@@ -98,10 +98,12 @@ The seed leaves an existing configuration alone. After editing `mdl.vm` or `mdl-
 `CERTIFY_PUBLIC_URL` is baked into state that outlives a restart, so a stack moved to another URL starts fresh:
 
 - **The database** (`mdl_compose rm -sfv database`, then `up` again; the seed writes the configuration again). A Token
-  Status List JWT names its own URL as `sub` and was signed under the old URL, while new mDLs point at the list under
-  the new one; a verifier that checks `sub` against the MSO's `uri` (draft-ietf-oauth-status-list) then rejects the
-  status. F-10 (`wp/f-10-mdl-deploy-fixes`) makes the service sign a list again when it is served with a stale `sub`
-  or an `exp` closer than its ttl; until it is merged, a fresh database is the only fix.
+  Status List JWT names its own URL as `sub`. With F-10 the service signs a list again when it is served with a `sub`
+  that is not the current URL (or an `exp` closer than its ttl), so the list's `sub` follows the current
+  `CERTIFY_PUBLIC_URL`; before F-10 it kept the old one and a fresh database was the only fix. Either way, mDLs issued
+  before the change name the list under the **old** URL in their MSO (`status.status_list.uri`): they can be checked
+  only while the old host still routes to this stack, and a verifier that compares `sub` with `uri`
+  (draft-ietf-oauth-status-list) rejects even then, because `sub` is now the new URL. Reissue them.
 - **In `mdl-dev`, `data/MDL_PKI`** (`rm -f data/MDL_PKI/mdl-dev.p12*`): the IACA's issuerAltName and CRL distribution
   point name the URL. A new IACA is generated, and wallets and verifiers need it. In `mdl-operator` the IACA is made
   offline for one URL; a different URL needs a different IACA (`certify pki iaca create --issuer-alt-uri`/`--crl-uri`).
@@ -143,9 +145,10 @@ endpoint derive from it, and the first offer check fails with the URL to pass wh
 check passes. The credentials (`p-256.mdoc`, `ed25519.mdoc`), the holder keys, the IACA and the CRL stay in `--out` (a
 new temporary directory by default).
 
-Without F-10 a status list is signed only when a status changes, with `exp` two ttl (two hours by default) after
-that; once the newest list of the stack is older than that, the status check fails on `exp`. That is the defect F-10
-fixes, not a smoke problem; a fresh database passes until then.
+The status check requires `exp` present and not passed. The draft makes `exp` RECOMMENDED; requiring it is Certify
+policy (it always sets one). Without F-10 a status list is signed only when a status changes, with `exp` two ttl (two
+hours by default) after that, so on an older stack the check fails once the newest list is older than that; F-10 signs
+such a list again when it is served.
 
 ## Operator PKI (mdl-operator)
 
@@ -215,9 +218,10 @@ lines to swap are at the end of `certify-mdl-operator.properties`.
 
 The public host runs `mdl-operator` (never `mdl-dev`, whose keystore holds the IACA's private key) with
 `docker-compose.public.yaml` last in the file list. That overlay needs Docker Compose 2.24.4 or later
-(`docker compose version`; it uses `!override` and `!reset`) and does three things:
+(`docker compose version`; it uses `!override` and `!reset`) and does four things:
 
-- certify (8090) and certify-nginx (8091) listen on `127.0.0.1` only, and PostgreSQL is not published at all. The
+- certify (8090) and certify-nginx (8091) listen on `127.0.0.1` only, and PostgreSQL (and mimoto and inji-web, which
+  the mDL stack does not start) is not published at all. The
   tunnel connector runs on the host and forwards the public host to `http://127.0.0.1:8091` (M-12); a connector that
   runs as a container instead joins `mosip_network` and forwards to `http://certify-nginx:80`.
 - The PostgreSQL password, the keymanager keystore password and the `issuer.p12` password come from files in
@@ -232,37 +236,65 @@ The public host runs `mdl-operator` (never `mdl-dev`, whose keystore holds the I
   | `keymanager_keystore_password` | `mosip.kernel.keymanager.hsm.keystore-pass`, the PKCS#12 in `data/CERTIFY_PKCS12` | `local` (`certify-default.properties`) |
   | `keystore_password` | `CERTIFY_KEYSTORE_PASSWORD`, the `issuer.p12` password of `mdl-operator` | the environment variable |
 
+  Certify's environment is the overlay's own complete list (`environment: !override`), without the
+  `CERTIFY_KEYSTORE_PASSWORD` that `docker-compose.mdl.yaml` passes through from the shell: a value exported there
+  would otherwise reach the container (`docker inspect`) and, as an environment variable, outrank the secret file.
+- Actuator exposes only `health` and never shows environment values (`MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE=health`,
+  `MANAGEMENT_ENDPOINT_ENV_SHOW_VALUES=NEVER`), since the secrets are part of Certify's Environment.
 - Nothing else changes: the same profiles, mounts and seed.
 
-Make the secrets once, outside the checkout, readable by the deploying user alone (`printf '%s'` writes no trailing
-newline; Certify and PostgreSQL would drop one anyway):
+Make the secrets once, outside the checkout, readable by the deploying user alone. The subshell keeps `umask 077` (and
+the password variable) out of your shell; `printf '%s'` and `tr -d '\n'` write no trailing newline (Certify and
+PostgreSQL would drop one anyway):
 
 ```bash
-umask 077 && mkdir -p ~/certify-mdl-secrets
-openssl rand -base64 24 | tr -d '\n' > ~/certify-mdl-secrets/db_password
-openssl rand -base64 24 | tr -d '\n' > ~/certify-mdl-secrets/keymanager_keystore_password
-# the issuer.p12 password from certify-cli; bash; in zsh: read -rs 'p?issuer.p12 password: '
-read -rs -p 'issuer.p12 password: ' p; echo; printf '%s' "$p" > ~/certify-mdl-secrets/keystore_password; unset p
+(
+  umask 077
+  mkdir -p "$HOME/certify-mdl-secrets"
+  openssl rand -base64 24 | tr -d '\n' > "$HOME/certify-mdl-secrets/db_password"
+  openssl rand -base64 24 | tr -d '\n' > "$HOME/certify-mdl-secrets/keymanager_keystore_password"
+  # the issuer.p12 password from certify-cli; bash; in zsh: read -rs 'p?issuer.p12 password: '
+  read -rs -p 'issuer.p12 password: ' p; echo; printf '%s' "$p" > "$HOME/certify-mdl-secrets/keystore_password"
+)
 ```
 
-PostgreSQL applies `db_password` only when it initialises an empty data directory, and keymanager creates its keystore
-with the password of the first start. A stack that ran with the defaults therefore starts fresh: remove the database
-container with its volume and move the old keymanager keystore away (new keymanager keys, and with them new status list
-and JWKS keys):
+Start (or restart, or update) the public stack. The block is safe to paste again at any time: it changes nothing a
+running stack keeps (database, keystores). The compose project is named on every command (`-p certify-mdl`, the public
+demo's project), so a second checkout or a stray `COMPOSE_PROJECT_NAME` cannot address another stack:
 
 ```bash
 cd "$(git rev-parse --show-toplevel)/docker-compose/docker-compose-injistack"
 export MDL_PKI_PROFILE=mdl-operator MDL_PKI_DIR=/path/to/deploy
-export CERTIFY_PUBLIC_URL=https://credentials.loremipsum.co.in CERTIFY_SECRETS_DIR=~/certify-mdl-secrets
-mdl_compose() { docker compose -f docker-compose.yaml -f docker-compose.rebuild.yaml -f docker-compose.mdl.yaml \
-    -f docker-compose.public.yaml "$@"; }
-mdl_compose rm -sfv database && mv data/CERTIFY_PKCS12 "data/CERTIFY_PKCS12.$(date +%s)"   # only when moving off the defaults
-mdl_compose up -d --no-build database certify certify-nginx mdl-seed
+export CERTIFY_PUBLIC_URL=https://credentials.loremipsum.co.in CERTIFY_SECRETS_DIR="$HOME/certify-mdl-secrets"
+unset CERTIFY_KEYSTORE_PASSWORD   # must not be in the shell: the secret file provides it
+mdl_public() { docker compose -p certify-mdl -f docker-compose.yaml -f docker-compose.rebuild.yaml \
+    -f docker-compose.mdl.yaml -f docker-compose.public.yaml "$@"; }
+mdl_public up -d --no-build database certify certify-nginx mdl-seed
 cd "$(git rev-parse --show-toplevel)" && .venv/bin/python docs/design/tools/smoke.py --mdl "$CERTIFY_PUBLIC_URL" --iaca "$MDL_PKI_DIR/iaca.pem"
 ```
 
-`CERTIFY_KEYSTORE_PASSWORD` need not be in the shell here: the secret file provides it. `docker compose config` shows
-the secrets' file paths, not their contents.
+Name only these four services: `mimoto-service` and `inji-web` are not part of the mDL stack (the public overlay
+removes their ports, but nothing else of theirs is hardened). `CERTIFY_KEYSTORE_PASSWORD` must not be in the shell:
+the public overlay leaves it out of the container's environment (`mdl_public config` shows no such variable, and the
+secrets as file paths, not contents), and the `unset` keeps it from lingering where other processes inherit it.
+
+### One-time: move a stack off the default passwords
+
+PostgreSQL applies `db_password` only when it initialises an empty data directory, and keymanager creates its keystore
+with the password of the first start. A stack that ever ran with the defaults (`postgres`, `local`) therefore has to
+start fresh, **once**, before the start block above: this deletes the database (configuration, status lists, ledger)
+and moves the old keymanager keystore aside, so keymanager makes new keys, and with them new status list and JWKS keys.
+Credentials issued before it no longer check. Never paste it as part of a restart:
+
+```bash
+cd "$(git rev-parse --show-toplevel)/docker-compose/docker-compose-injistack"
+export MDL_PKI_PROFILE=mdl-operator MDL_PKI_DIR=/path/to/deploy CERTIFY_SECRETS_DIR="$HOME/certify-mdl-secrets"
+docker compose -p certify-mdl -f docker-compose.yaml -f docker-compose.rebuild.yaml -f docker-compose.mdl.yaml \
+    -f docker-compose.public.yaml down -v           # stops the project and deletes its database volume
+mv data/CERTIFY_PKCS12 "data/CERTIFY_PKCS12.$(date +%s)"
+```
+
+Then run the start block.
 
 `CERTIFY_PUBLIC_URL` becomes `mosip.certify.domain.url`, and with it the issuer identifiers:
 
@@ -276,10 +308,19 @@ the secrets' file paths, not their contents.
 Switching it later needs a fresh database (and in dev mode a fresh `data/MDL_PKI`): "Changing CERTIFY_PUBLIC_URL".
 
 certify-nginx refuses the admin APIs (`v2/credential-configurations`, `system-info`, `credentials/status`,
-`ledger-search`, `vc-api`) to requests that arrive through Cloudflare (`CF-Ray`, D12). `/pre-authorized-data`, the offer
-page and `/mdoc/iaca` (GET only) stay public. Public calls to `POST /v1/certify/pre-authorized-data` and
-`/v1/certify/oauth/token` are rate limited per client (`CF-Connecting-IP`): 30 a minute with a burst of 20, then `429`;
-local requests are never counted. The guard and the limit both trust `CF-Ray`, which is why 8091 must not be reachable
+`ledger-search`, `vc-api`) and Spring Boot actuator (`/v1/certify/actuator`, health included) to requests that arrive
+through Cloudflare (`CF-Ray`, D12). `/pre-authorized-data`, the offer page and `/mdoc/iaca` (GET only) stay public.
+The public overlay also exposes only `health` from actuator and never shows environment values
+(`certify-default.properties` exposes every endpoint, and `/actuator/env` or `/actuator/heapdump` would carry the
+secret-file passwords and the Document Signer key). Nothing in the stack calls actuator: the seed waits until
+`certify:8090/v1/certify/.well-known/openid-credential-issuer` answers with a `credential_issuer`. (`/actuator/health`
+is not a readiness signal here: `certify-default.properties` permits `**/actuator/**`, an Ant pattern that actuator's
+`PathPattern` handler mapping never matches, so health requires authentication, and Certify answers that refusal with
+`200` and an error body.) Public calls to `POST /v1/certify/pre-authorized-data` and `/v1/certify/oauth/token`
+are rate limited per client address (`CF-Connecting-IP`): 30 a minute with a burst of 20, then `429`; local requests
+are never counted. The key is the single address, so an IPv6 client, which usually holds a whole /64, can rotate
+addresses and is limited only by Cloudflare's own rules; add a Cloudflare rate-limiting rule keyed on the client if
+that matters. The guard and the limit both trust `CF-Ray`, which is why 8091 must not be reachable
 from anywhere but the host and the tunnel. The seed talks to `certify:8090` inside the network, so the guard does not
 apply to it. Access tokens are verified against Certify's own JWKS over loopback (`certify-mdl.properties`), so the
 container never has to reach its public URL.

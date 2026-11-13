@@ -12,7 +12,8 @@ metadata say:
   4. an Ed25519 holder: a DPoP-bound token, nonce, credential with an EdDSA jwt proof (ISO/IEC 18013-5 9.1.5.2);
   5. every mDL read back: each element equals the holders.json record in value and CBOR type (full-date as tag 1004,
      bool, uint, bstr, the whole driving_privileges), MSO docType, x5chain without the anchor, the Token Status List
-     entry served with its bit clear, sub equal to the MSO's uri, iat not in the future and exp not passed; then
+     entry served with its bit clear, sub equal to the MSO's uri, iat not in the future and exp not passed (exp is
+     RECOMMENDED by draft-ietf-oauth-status-list; requiring it is Certify policy); then
      docs/design/tools/verify_mdoc.py (pymdoccbor, a verifier Certify does not maintain) with --doctype, --holder (the
      proof key) and --iaca: the IACA named by the Document Signer's CRL distribution point, downloaded from
      /v1/certify/mdoc/iaca/<id>.pem, or with --iaca <file> the operator's offline IACA, which the published one must
@@ -74,7 +75,7 @@ PRE_AUTH = "urn:ietf:params:oauth:grant-type:pre-authorized_code"
 X5CHAIN = 33
 TX_CODE = "1234"
 # ISO/IEC 18013-5 Table 5 types of the elements holders.json carries; full-date is CBOR tag 1004 over "YYYY-MM-DD"
-# (RFC 8943), decoded by cbor2 to datetime.date
+# (RFC 8943), decoded by cbor2 to datetime.date (as is tag 100, so the tag itself is checked with cbor_tagged)
 FULL_DATES = ["birth_date", "issue_date", "expiry_date"]
 TEXTS = ["family_name", "given_name", "issuing_country", "issuing_authority", "document_number", "un_distinguishing_sign",
          "nationality", "resident_city"]
@@ -210,10 +211,88 @@ def same(actual, expected):
     return actual == expected
 
 
-def tagged_full_date(item, value):
-    """The IssuerSignedItem bytes hold this date as tag 1004 over its text (d9 03ec 6a "YYYY-MM-DD"), not as tag 100
-    (days since the epoch) or a bare string, both of which cbor2 would also hand back as a date or a str."""
-    return isinstance(value, date) and b"\xd9\x03\xec\x6a" + value.isoformat().encode() in item
+def cbor_tagged(data):
+    """The CBOR data item in `data` with every tag kept as a cbor2.CBORTag around its content, so the type of a value
+    can be checked at its own path: cbor2.loads turns tag 1004 (full-date) and tag 100 (days since the epoch) alike into
+    a datetime.date and offers no switch to keep them. Definite and indefinite lengths; maps become dicts (keys are the
+    text and integers an mDoc uses). Trailing bytes are an error."""
+    def length(info, pos):
+        if info < 24:
+            return info, pos
+        if info in (24, 25, 26, 27):
+            size = 1 << (info - 24)
+            return int.from_bytes(data[pos:pos + size], "big"), pos + size
+        if info == 31:
+            return None, pos
+        raise ValueError(f"reserved additional information {info} at byte {pos - 1}")
+
+    def item(pos):
+        if pos >= len(data):
+            raise ValueError("truncated CBOR")
+        major, info = data[pos] >> 5, data[pos] & 0x1F
+        pos += 1
+        if major == 7:
+            if info < 24:
+                return {20: False, 21: True, 22: None, 23: cbor2.undefined}.get(info, cbor2.CBORSimpleValue(info)), pos
+            if info == 24:
+                return cbor2.CBORSimpleValue(data[pos]), pos + 1
+            if info in (25, 26, 27):
+                size = 1 << (info - 24)
+                return cbor2.loads(data[pos - 1:pos + size]), pos + size
+            raise ValueError(f"unexpected break or reserved simple value at byte {pos - 1}")
+        n, pos = length(info, pos)
+        if major == 0:
+            return n, pos
+        if major == 1:
+            return -1 - n, pos
+        if major in (2, 3):
+            if n is None:
+                chunks = []
+                while data[pos] != 0xFF:
+                    chunk, pos = item(pos)
+                    chunks.append(chunk)
+                joined = b"".join(chunks) if major == 2 else "".join(chunks)
+                return joined, pos + 1
+            raw = data[pos:pos + n]
+            if len(raw) != n:
+                raise ValueError("truncated CBOR string")
+            return (raw if major == 2 else raw.decode("utf-8")), pos + n
+        if major == 4:
+            values = []
+            while (n is None and data[pos] != 0xFF) or (n is not None and len(values) < n):
+                value, pos = item(pos)
+                values.append(value)
+            return values, pos + (1 if n is None else 0)
+        if major == 5:
+            entries, count = {}, 0
+            while (n is None and data[pos] != 0xFF) or (n is not None and count < n):
+                key, pos = item(pos)
+                entries[key], pos = item(pos)
+                count += 1
+            return entries, pos + (1 if n is None else 0)
+        if n is None:
+            raise ValueError(f"indefinite length for major type {major}")
+        content, pos = item(pos)
+        return cbor2.CBORTag(n, content), pos
+
+    value, end = item(0)
+    if end != len(data):
+        raise ValueError(f"{len(data) - end} bytes after the data item")
+    return value
+
+
+def full_date_tag(node, value):
+    """`node` (from cbor_tagged) is `value` as tag 1004 over its "YYYY-MM-DD" text (RFC 8943, ISO/IEC 18013-5 full-date)."""
+    return isinstance(node, cbor2.CBORTag) and node.tag == 1004 and node.value == value.isoformat()
+
+
+def element_value_tagged(item):
+    """The elementValue of an IssuerSignedItem's bytes, tags kept; None when the bytes cannot be read."""
+    try:
+        decoded = cbor_tagged(item)
+    except (ValueError, IndexError, UnicodeDecodeError):
+        return None
+    return decoded.get("elementValue") if isinstance(decoded, dict) else None
 
 
 def element_problems(record, elements, items, portrait):
@@ -231,7 +310,7 @@ def element_problems(record, elements, items, portrait):
             continue
         if not same(elements.get(name), expected):
             problems.append(f"{name}: {elements.get(name)!r} != {expected!r}")
-        elif not tagged_full_date(items.get(name, b""), expected):
+        elif not full_date_tag(element_value_tagged(items.get(name, b"")), expected):
             problems.append(f"{name}: not a tag 1004 full-date")
     if "sex" in record and not same(elements.get("sex"), record["sex"]):
         problems.append(f"sex: {elements.get('sex')!r} != {record['sex']!r} (uint)")
@@ -252,17 +331,22 @@ def element_problems(record, elements, items, portrait):
     if not same(elements.get("driving_privileges"), expected_privileges):
         problems.append(f"driving_privileges: {elements.get('driving_privileges')!r} != {expected_privileges!r}")
     else:
-        item = items.get("driving_privileges", b"")
-        untagged = [f"{p['vehicle_category_code']}.{name}" for p in expected_privileges for name in PRIVILEGE_DATES
-                    if name in p and not tagged_full_date(item, p[name])]
+        # each date at its own path ([i].issue_date): two privileges sharing a date must each carry tag 1004
+        tagged = element_value_tagged(items.get("driving_privileges", b""))
+        tagged = tagged if isinstance(tagged, list) and len(tagged) == len(expected_privileges) else [{}] * len(expected_privileges)
+        untagged = [f"[{i}] {p['vehicle_category_code']}.{name}" for i, p in enumerate(expected_privileges)
+                    for name in PRIVILEGE_DATES
+                    if name in p and not (isinstance(tagged[i], dict) and full_date_tag(tagged[i].get(name), p[name]))]
         if untagged:
             problems.append("driving_privileges: not a tag 1004 full-date: " + ", ".join(untagged))
     return problems
 
 
 def status_list_problems(payload, uri, index, now):
-    """The Token Status List JWT claims (draft-ietf-oauth-status-list): sub is the uri the MSO names, iat not in the
-    future, exp not passed, and the credential's bit clear. [problem, ...]."""
+    """The Token Status List JWT claims (draft-ietf-oauth-status-list): sub is the uri the MSO names (REQUIRED), iat not
+    in the future (REQUIRED), and the credential's bit clear; and, as Certify policy rather than the draft (which makes
+    exp RECOMMENDED), exp present and not passed: Certify always sets it and re-signs a list before it lapses (F-10).
+    [problem, ...]."""
     problems = []
     if payload.get("sub") != uri:
         problems.append(f"sub {payload.get('sub')!r} is not the MSO's uri {uri!r}")
@@ -270,7 +354,7 @@ def status_list_problems(payload, uri, index, now):
     if not isinstance(iat, (int, float)) or isinstance(iat, bool) or iat > now + CLOCK_SKEW:
         problems.append(f"iat {iat!r} missing or in the future (now {int(now)})")
     if not isinstance(exp, (int, float)) or isinstance(exp, bool) or exp <= now:
-        problems.append(f"exp {exp!r} missing or passed (now {int(now)})")
+        problems.append(f"exp {exp!r} missing or passed (now {int(now)}; Certify policy, the draft makes exp RECOMMENDED)")
     try:
         bit = token_status_bit(payload["status_list"]["lst"], index)
     except Exception as e:  # noqa: BLE001 - reported as a problem
@@ -536,7 +620,8 @@ class Smoke:
         entry = mso.get("status", {}).get("status_list", {}) if isinstance(mso.get("status"), dict) else {}
         if not check("MSO status.status_list {idx, uri} (Token Status List)", isinstance(entry.get("idx"), int) and isinstance(entry.get("uri"), str), entry):
             return
-        name = "status list served as statuslist+jwt, signature verifies with its x5c, sub is the uri, iat/exp, bit clear"
+        name = ("status list served as statuslist+jwt, signature verifies with its x5c, sub is the uri, iat, "
+                "exp (Certify policy), bit clear")
         s, h, token = call("GET", entry["uri"])
         try:
             header = jwt.get_unverified_header(token)

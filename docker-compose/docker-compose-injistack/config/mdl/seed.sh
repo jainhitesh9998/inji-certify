@@ -1,8 +1,9 @@
 #!/bin/sh
 # One-shot seed of the mDL credential configuration (docs/design/20-mdl-issuer.md, M-10), run by the mdl-seed service of
-# docker-compose.mdl.yaml in curlimages/curl (POSIX sh, BusyBox sed and awk, no jq): waits until Certify is up, then
-# posts mdl-configuration.json with mdl.vm as its template to the v2 configuration API. It talks to certify:8090 inside
-# the compose network, not through certify-nginx, whose admin guard (M-12a) is for requests from the public host.
+# docker-compose.mdl.yaml in curlimages/curl (POSIX sh, BusyBox sed and awk, no jq): waits until Certify serves its
+# issuer metadata, then posts mdl-configuration.json with mdl.vm as its template to the v2 configuration API. It talks to
+# certify:8090 inside the compose network, not through certify-nginx, whose admin guard (M-12a) is for requests from the
+# public host.
 #
 #   POST 201                       seeded
 #   POST 409, GET <id> 200         a configuration with this id exists: left as it is (MDL_SEED_UPDATE=true replaces it
@@ -22,11 +23,12 @@ fail() {
   exit 1
 }
 
-# The top-level "id" of a JSON document, whatever its layout: a small scanner that skips strings (and their escapes)
-# and tracks the nesting depth, so an "id" inside a nested object or a string value is never taken for it. Prints
-# nothing when there is none. Ids with escapes are not supported (printed raw); the configuration id has none.
-json_top_level_id() {
-  tr -d '\r\n' < "$1" | awk '
+# json_top_level_string KEY FILE: the string value of the top-level member KEY of a JSON object, whatever its layout:
+# a small scanner that skips strings (and their escapes) and tracks the nesting depth, so a KEY inside a nested object
+# or a string value is never taken for it. Prints nothing when there is none or its value is not a string. Values with
+# escapes are printed raw; the configuration id and the issuer identifier have none.
+json_top_level_string() {
+  tr -d '\r\n' < "$2" | awk -v key="$1" '
     {
       depth = 0; in_string = 0; escaped = 0; token = ""; last = ""; want = 0
       n = length($0)
@@ -47,17 +49,16 @@ json_top_level_id() {
         if (c == "\"") { in_string = 1; token = ""; continue }
         if (c == "{" || c == "[") { depth++; want = 0; continue }
         if (c == "}" || c == "]") { depth--; want = 0; continue }
-        if (depth == 1 && c == ":") { want = (last == "id") ? 1 : 0; last = ""; continue }
+        if (depth == 1 && c == ":") { want = (last == key) ? 1 : 0; last = ""; continue }
         if (depth == 1 && c == ",") { want = 0; last = ""; continue }
         if (c != " " && c != "\t" && want == 1) want = 0
       }
     }'
 }
 
-# True when the JSON response names the configuration id as "id" (compared with all whitespace removed, which the
-# id itself never contains).
+# True when the JSON response's own top-level "id" is the configuration id (an "id" nested deeper never counts).
 response_has_id() {
-  tr -d ' \t\r\n' < "$RESPONSE" | grep -qF "\"id\":\"$id\""
+  [ "$(json_top_level_string id "$RESPONSE")" = "$id" ]
 }
 
 # The configuration with the template text inserted as a JSON string at the "@@mdl.vm@@" placeholder: backslashes and
@@ -73,17 +74,32 @@ case "$json" in
   *) fail "$DIR/mdl-configuration.json has no \"@@mdl.vm@@\" placeholder for the template" ;;
 esac
 printf '%s%s%s\n' "${json%%@@mdl.vm@@*}" "$template" "${json#*@@mdl.vm@@}" > "$BODY"
-id=$(json_top_level_id "$DIR/mdl-configuration.json")
+id=$(json_top_level_string id "$DIR/mdl-configuration.json")
 [ -n "$id" ] || fail "$DIR/mdl-configuration.json has no top-level \"id\""
 case "$id" in
   *[!A-Za-z0-9._-]*) fail "unexpected characters in the configuration id \"$id\"" ;;
 esac
 
-echo "mdl-seed: waiting for $CERTIFY_URL/actuator/health (up to ${WAIT_SECONDS}s)"
+# Ready: the issuer metadata answers 200 with a top-level "credential_issuer" string, which Certify serves only once
+# it has started. Not actuator/health: certify-default.properties permits `**/actuator/**`, an Ant pattern the MVC
+# controllers match (ANT_PATH_MATCHER) but actuator's own handler mapping (PathPattern) does not, so health requires
+# authentication there, and Certify answers that refusal with 200 and an error body, which a status-only check would
+# take for healthy. Until ready, including while Certify refuses the connection, wait and ask again.
+READY=/tmp/ready.json
+ready() {
+  : > "$READY"
+  ready_status=$(curl -s -o "$READY" -w '%{http_code}' "$CERTIFY_URL/.well-known/openid-credential-issuer" 2>/dev/null) \
+    || ready_status=none
+  [ "$ready_status" = "200" ] && [ -n "$(json_top_level_string credential_issuer "$READY")" ]
+}
+echo "mdl-seed: waiting for Certify to answer $CERTIFY_URL/.well-known/openid-credential-issuer (up to ${WAIT_SECONDS}s)"
 waited=0
-until curl -fsS -o /dev/null "$CERTIFY_URL/actuator/health"; do
+until ready; do
   if [ "$waited" -ge "$WAIT_SECONDS" ]; then
-    fail "Certify did not become healthy in ${WAIT_SECONDS}s"
+    echo "mdl-seed: the last metadata request answered $ready_status:" >&2
+    cat "$READY" >&2
+    echo >&2
+    fail "Certify did not answer with its issuer metadata in ${WAIT_SECONDS}s"
   fi
   sleep 5
   waited=$((waited + 5))
