@@ -7,8 +7,6 @@
 package io.mosip.certify.credential;
 
 import java.net.URI;
-import java.time.LocalDateTime;
-import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
@@ -34,6 +32,7 @@ import io.mosip.certify.signing.SignerByteSigner;
 import io.mosip.certify.signing.SigningKey;
 import io.mosip.certify.services.CertifyIssuanceServiceImpl;
 import io.mosip.certify.utils.DIDDocumentUtil;
+import io.mosip.certify.utils.LegacyW3cDateTimes;
 import io.mosip.certify.vcformatters.VCFormatter;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -113,11 +112,14 @@ public class W3CJsonLD extends Credential{
         }
         // TODO: VC Data Model spec doesn't specify a single date format or a
         //  timezone restriction, this will have to be supported timely.
-        Date createDate = Date
-                .from(LocalDateTime
-                        .parse(validFrom,
-                                DateTimeFormatter.ofPattern(Constants.UTC_DATETIME_PATTERN))
-                        .atZone(ZoneId.systemDefault()).toInstant());
+        //
+        // F-19: this used to be a strict LocalDateTime.parse of Constants.UTC_DATETIME_PATTERN, which requires the
+        // fraction of a second; StatusListUpdateBatchJob writes validFrom as Instant.toString(), which omits it when it
+        // is zero, so re-signing a Bitstring Status List threw DateTimeParseException at such an instant. The reader
+        // now accepts the XML Schema dateTimeStamp grammar LegacyW3cDateTimes documents (every form the writers
+        // produce among them), applies the value's zone designator, refuses anything else before signing, and keeps
+        // this path's reading of the resulting UTC wall clock in the JVM's default zone (G38).
+        Date createDate = LegacyW3cDateTimes.proofCreated(validFrom);
 
         CertificateResponseDTO certificateResponseDTO = didDocumentUtil.getCertificateDataResponseDto(appID, refID);
         String kid = certificateResponseDTO.getKeyId();

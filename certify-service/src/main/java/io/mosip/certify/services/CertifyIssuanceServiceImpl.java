@@ -29,6 +29,7 @@ import io.mosip.certify.proof.ProofValidatorFactory;
 import io.mosip.certify.utils.CredentialUtils;
 import io.mosip.certify.utils.DIDDocumentUtil;
 import io.mosip.certify.utils.LedgerUtils;
+import io.mosip.certify.utils.LegacyW3cDateTimes;
 import io.mosip.certify.utils.VCIssuanceUtil;
 import io.mosip.certify.vcformatters.VCFormatter;
 import io.mosip.pixelpass.PixelPass;
@@ -336,7 +337,11 @@ public class CertifyIssuanceServiceImpl implements VCIssuanceService {
                     credentialId = templateParams.get(VCDMConstants.CREDENTIAL_ID).toString();
                 }
                 CredentialStatusDetail credentialStatusDetail = ledgerUtils.extractCredentialStatusDetails(jsonObject);
-                LocalDateTime issuanceDate = LocalDateTime.parse(time, DateTimeFormatter.ofPattern(Constants.UTC_DATETIME_PATTERN));
+                // F-19: read through the same reader as W3CJsonLD.addProof, so the ledger's issuance instant and the
+                // proof's created can never disagree about which forms this path accepts. The ledger keeps the UTC
+                // wall clock (time is this method's own ...SSS'Z' value); unlike the proof's created, no JVM zone is
+                // applied here (G38).
+                LocalDateTime issuanceDate = LegacyW3cDateTimes.localDateTime(time);
                 credentialLedgerService.storeLedgerEntry(credentialId, didUrl, credentialType, credentialStatusDetail, indexedAttributes, issuanceDate);
                 log.info("Successfully stored the credential issuance data in ledger with credentialType: {}", credentialType);
             }
