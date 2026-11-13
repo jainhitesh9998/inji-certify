@@ -61,6 +61,8 @@ public class JcaKeyProvider implements KeyProvider {
     public static final String PURPOSE_MDOC_IACA = PublicKeyDescriptor.PURPOSE_MDOC_IACA;
     /** An ISO/IEC 18013-5 Annex B Document Signer (mDL extended key usage {@code 1.0.18013.5.1.2}). */
     public static final String PURPOSE_MDOC_DSC = "mdoc-dsc";
+    /** The alias of the P3-08 dev CA when none is configured ({@code certify.keyprovider.x509-file.ca-alias}). */
+    public static final String DEFAULT_DEV_CA_ALIAS = "dev-ca";
 
     static {
         if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) == null) {
@@ -94,10 +96,19 @@ public class JcaKeyProvider implements KeyProvider {
 
     /** As {@link #fromPkcs12(String, Path, char[])}, with the purpose a plain key gets ({@code vc-signing} unless configured). */
     public static JcaKeyProvider fromPkcs12(String id, Path path, char[] password, String plainPurpose) {
+        return fromPkcs12(id, path, password, plainPurpose, DEFAULT_DEV_CA_ALIAS, null);
+    }
+
+    /**
+     * As {@link #fromPkcs12(String, Path, char[], String)}, naming the configured dev CA and IACA aliases
+     * ({@link #purposeOf(String, X509Certificate, String, String, String)}); either may be null.
+     */
+    public static JcaKeyProvider fromPkcs12(String id, Path path, char[] password, String plainPurpose,
+                                            String devCaAlias, String iacaAlias) {
         try (InputStream in = Files.newInputStream(path)) {
             KeyStore keyStore = KeyStore.getInstance("PKCS12");
             keyStore.load(in, password);
-            return fromKeyStore(id, keyStore, password, plainPurpose);
+            return fromKeyStore(id, keyStore, password, plainPurpose, devCaAlias, iacaAlias);
         } catch (IOException | GeneralSecurityException e) {
             throw new SigningException("Cannot load PKCS#12 keystore " + path, e);
         }
@@ -117,6 +128,12 @@ public class JcaKeyProvider implements KeyProvider {
      * restart, and a plain key gets {@code plainPurpose} as before M-05.
      */
     public static JcaKeyProvider fromKeyStore(String id, KeyStore keyStore, char[] password, String plainPurpose) {
+        return fromKeyStore(id, keyStore, password, plainPurpose, DEFAULT_DEV_CA_ALIAS, null);
+    }
+
+    /** As {@link #fromKeyStore(String, KeyStore, char[], String)}, naming the configured dev CA and IACA aliases. */
+    public static JcaKeyProvider fromKeyStore(String id, KeyStore keyStore, char[] password, String plainPurpose,
+                                              String devCaAlias, String iacaAlias) {
         JcaKeyProvider provider = new JcaKeyProvider(id);
         try {
             Enumeration<String> aliases = keyStore.aliases();
@@ -136,7 +153,8 @@ public class JcaKeyProvider implements KeyProvider {
                 if (x509.isEmpty()) {
                     throw new SigningException("Keystore entry " + alias + " has no certificate");
                 }
-                provider.add(alias, privateKey, new CertificateChain(x509), null, purposeOf(x509.get(0), plainPurpose));
+                provider.add(alias, privateKey, new CertificateChain(x509), null,
+                        purposeOf(alias, x509.get(0), plainPurpose, devCaAlias, iacaAlias));
             }
         } catch (GeneralSecurityException e) {
             throw new SigningException("Cannot read keystore", e);
@@ -145,15 +163,28 @@ public class JcaKeyProvider implements KeyProvider {
     }
 
     /**
-     * The purpose a stored certificate implies (docs/design/20-mdl-issuer.md M-05): a CA certificate that is self-signed
-     * and passes {@link AnnexBValidator#validateIaca} is {@value #PURPOSE_MDOC_IACA}, any other CA certificate
-     * {@value #PURPOSE_DEV_CA}; a certificate with the mDL extended key usage is {@value #PURPOSE_MDOC_DSC}; anything
-     * else is a plain key and gets {@code plainPurpose}.
+     * The purpose a stored certificate implies (docs/design/20-mdl-issuer.md M-05). Only what M-05 itself generates or
+     * validates gets a purpose of its own: the configured IACA alias, or a self-signed CA certificate that passes
+     * {@link AnnexBValidator#validateIaca}, is {@value #PURPOSE_MDOC_IACA}; the configured dev CA alias (a CA
+     * certificate) is {@value #PURPOSE_DEV_CA}; a certificate with the mDL extended key usage is
+     * {@value #PURPOSE_MDOC_DSC}. Everything else, including any other CA certificate an operator keeps in the
+     * keystore, is a plain key and gets {@code plainPurpose}, as before M-05.
+     *
+     * @param devCaAlias the configured dev CA alias ({@value #DEFAULT_DEV_CA_ALIAS} by default), or null
+     * @param iacaAlias  the configured Annex B IACA alias, or null when no IACA is configured
      */
-    public static String purposeOf(X509Certificate certificate, String plainPurpose) {
-        if (certificate.getBasicConstraints() >= 0) {
-            boolean selfSigned = certificate.getSubjectX500Principal().equals(certificate.getIssuerX500Principal());
-            return selfSigned && AnnexBValidator.validateIaca(certificate).isEmpty() ? PURPOSE_MDOC_IACA : PURPOSE_DEV_CA;
+    public static String purposeOf(String alias, X509Certificate certificate, String plainPurpose, String devCaAlias,
+                                   String iacaAlias) {
+        boolean ca = certificate.getBasicConstraints() >= 0;
+        if (ca && alias != null && alias.equals(iacaAlias)) {
+            return PURPOSE_MDOC_IACA;
+        }
+        if (ca && alias != null && alias.equals(devCaAlias)) {
+            return PURPOSE_DEV_CA;
+        }
+        if (ca && certificate.getSubjectX500Principal().equals(certificate.getIssuerX500Principal())
+                && AnnexBValidator.validateIaca(certificate).isEmpty()) {
+            return PURPOSE_MDOC_IACA;
         }
         return hasMdlEku(certificate) ? PURPOSE_MDOC_DSC : plainPurpose;
     }

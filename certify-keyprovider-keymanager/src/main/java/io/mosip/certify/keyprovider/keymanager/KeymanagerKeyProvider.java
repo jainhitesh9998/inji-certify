@@ -47,7 +47,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * ECDSA with the signature transcoded to the JOSE concatenation, Ed25519) and returns the raw signature base64url
  * encoded; the key id is keymanager's certificate thumbprint. Certificates are read through
  * {@link KeymanagerService#getAllCertificates} and cached briefly, so a key rotated in keymanager is picked up
- * within {@code cacheTtl}.
+ * within {@code cacheTtl}. An alias without certificates (not provisioned yet) is cached for at most
+ * {@link #MAX_NEGATIVE_TTL}, so the JWKS and every resolve do not call keymanager on each request, while a key
+ * provisioned later is seen at once: {@link #ensureKeys} and {@link #evict} (called after the master keys) drop it.
  */
 public class KeymanagerKeyProvider implements KeyProvider {
 
@@ -58,12 +60,15 @@ public class KeymanagerKeyProvider implements KeyProvider {
     static final String OBJECT_TYPE_CERTIFICATE = "certificate";
     private static final Set<SignatureAlgorithm> SUPPORTED = EnumSet.of(SignatureAlgorithm.RS256, SignatureAlgorithm.PS256,
             SignatureAlgorithm.ES256, SignatureAlgorithm.ES256K, SignatureAlgorithm.EdDSA);
+    /** The longest an empty answer (an alias keymanager holds no certificate for) is cached. */
+    static final Duration MAX_NEGATIVE_TTL = Duration.ofSeconds(30);
 
     private final KeymanagerService keymanagerService;
     private final SignatureServicev2 signatureService;
     private final List<KeymanagerAlias> knownAliases;
     private final Clock clock;
     private final Duration cacheTtl;
+    private final Duration negativeTtl;
     private final Map<KeymanagerAlias, CachedCertificates> cache = new ConcurrentHashMap<>();
 
     public KeymanagerKeyProvider(KeymanagerService keymanagerService, SignatureServicev2 signatureService,
@@ -73,6 +78,7 @@ public class KeymanagerKeyProvider implements KeyProvider {
         this.knownAliases = List.copyOf(knownAliases);
         this.clock = clock;
         this.cacheTtl = cacheTtl;
+        this.negativeTtl = cacheTtl.compareTo(MAX_NEGATIVE_TTL) < 0 ? cacheTtl : MAX_NEGATIVE_TTL;
     }
 
     @Override
@@ -195,7 +201,7 @@ public class KeymanagerKeyProvider implements KeyProvider {
     private List<PublicKeyDescriptor> descriptors(KeymanagerAlias alias) {
         Instant now = clock.instant();
         CachedCertificates cached = cache.get(alias);
-        if (cached != null && cached.fetchedAt().plus(cacheTtl).isAfter(now)) {
+        if (cached != null && cached.fetchedAt().plus(cached.descriptors().isEmpty() ? negativeTtl : cacheTtl).isAfter(now)) {
             return cached.descriptors();
         }
         AllCertificatesDataResponseDto response = keymanagerService.getAllCertificates(alias.applicationId(),
@@ -207,12 +213,8 @@ public class KeymanagerKeyProvider implements KeyProvider {
                     .map(this::descriptor)
                     .forEach(descriptors::add);
         }
-        if (descriptors.isEmpty()) {
-            // a key not provisioned yet (a read before KeymanagerKeyInitializer ran) must not stay invisible for the
-            // TTL once it is: only answers that hold certificates are cached
-            cache.remove(alias);
-            return List.of();
-        }
+        // an empty answer (a key not provisioned yet) is cached for the short negative TTL only, and provisioning
+        // (ensureKeys, evict after the master keys) drops it, so the key is visible as soon as it exists
         cache.put(alias, new CachedCertificates(List.copyOf(descriptors), now));
         return descriptors;
     }

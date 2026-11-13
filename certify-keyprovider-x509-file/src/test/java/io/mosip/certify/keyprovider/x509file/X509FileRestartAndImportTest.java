@@ -229,6 +229,81 @@ class X509FileRestartAndImportTest {
                 "settings that are not given are not compared");
     }
 
+    // ---- round 3: the IACA clamp excuses a shorter Document Signer only when validity-days reaches the IACA's end
+
+    @Test
+    void aDscClampedToItsIacaMatchesOnlyAValidityThatReachesTheIacaEnd() throws Exception {
+        KeyPair iacaKeys = keyPair();
+        // an IACA with 100 days left: a Document Signer issued now for 457 days ends with it
+        X509Certificate iacaCertificate = IsoMdocProfiles.iaca(iacaKeys)
+                .notBefore(java.time.Instant.now().minus(java.time.Duration.ofDays(1)))
+                .validity(java.time.Duration.ofDays(101)).country("IN").commonName("Short IACA")
+                .issuerAltUri(ALT_URI).crlDistributionPoint(CRL_URI).build();
+        KeyPair dscKeys = keyPair();
+        X509Certificate dscCertificate = IsoMdocProfiles.ds(dscKeys, iacaCertificate, iacaKeys)
+                .commonName("Demo DSC").build();
+        assertEquals(iacaCertificate.getNotAfter(), dscCertificate.getNotAfter(), "clamped to the IACA");
+        JcaKeyProvider keystore = new JcaKeyProvider("x509-file");
+        keystore.add("iaca", iacaKeys.getPrivate(), io.mosip.certify.signing.CertificateChain.of(iacaCertificate), null,
+                "mdoc-iaca");
+        keystore.add("mdl-dsc", dscKeys.getPrivate(),
+                io.mosip.certify.signing.CertificateChain.of(dscCertificate, iacaCertificate), null, "mdoc-dsc");
+        Path file = dir.resolve("clamped.p12");
+        keystore.saveAsPkcs12(file, "pw".toCharArray());
+        X509FileProperties.IacaSpec byAlias = new X509FileProperties.IacaSpec("iaca", null, null, null, null, null,
+                null, null);
+
+        SigningException refused = assertThrows(SigningException.class, () -> X509FileKeyProviders.open(props(file,
+                false, List.of(dsc("mdl-dsc", null, "ES256", 30)), null, byAlias)));
+        assertTrue(refused.getMessage().contains("keys[].validity-days is 30")
+                && refused.getMessage().contains("ending with its IACA"), refused.getMessage());
+
+        for (int days : List.of(100, 200, 457)) {
+            assertDoesNotThrow(() -> X509FileKeyProviders.open(props(file, false,
+                    List.of(dsc("mdl-dsc", null, "ES256", days)), null, byAlias)), "validity-days " + days);
+        }
+        SigningException tooShort = assertThrows(SigningException.class, () -> X509FileKeyProviders.open(props(file,
+                false, List.of(dsc("mdl-dsc", null, "ES256", 99)), null, byAlias)));
+        assertTrue(tooShort.getMessage().contains("keys[].validity-days is 99"), tooShort.getMessage());
+    }
+
+    // ---- round 3: a configured keystore must exist; dev mode needs a path to write what it generates
+
+    @Test
+    void aMissingKeystoreRefusesStartupEvenNextToPemKeys() throws Exception {
+        PemDsc pem = pemDsc("missing");
+        Path missing = dir.resolve("absent.p12");
+        SigningException refused = assertThrows(SigningException.class, () -> X509FileKeyProviders.open(props(missing,
+                false, List.of(), List.of(new X509FileProperties.PemKeySpec("mdl-dsc", pem.key, null, pem.chain)),
+                null)));
+        assertTrue(refused.getMessage().contains(missing + " does not exist and dev mode is off"), refused.getMessage());
+    }
+
+    @Test
+    void devModeWithoutAPathRefusesToGenerateAndNamesTheSetting() throws Exception {
+        PemDsc pem = pemDsc("nopath");
+        List<X509FileProperties.PemKeySpec> pemKeys =
+                List.of(new X509FileProperties.PemKeySpec("mdl-dsc", pem.key, null, pem.chain));
+
+        SigningException iacaRefused = assertThrows(SigningException.class, () -> X509FileKeyProviders.open(props(null,
+                true, List.of(dsc("mdl-dsc@2026-11", "CN=Demo DSC", "ES256", 300)), pemKeys, iaca())));
+        assertTrue(iacaRefused.getMessage().contains("set certify.keyprovider.x509-file.path"), iacaRefused.getMessage());
+        SigningException plainRefused = assertThrows(SigningException.class, () -> X509FileKeyProviders.open(props(null,
+                true, List.of(new X509FileProperties.KeySpec("issuer-es256", "ES256", "CN=VC issuer")), pemKeys, null)));
+        assertTrue(plainRefused.getMessage().contains("set certify.keyprovider.x509-file.path"), plainRefused.getMessage());
+
+        SigningException production = assertThrows(SigningException.class, () -> X509FileKeyProviders.open(props(null,
+                false, List.of(new X509FileProperties.KeySpec("issuer-es256", "ES256", "CN=VC issuer")), pemKeys, null)));
+        assertTrue(production.getMessage().contains("PEM-only configuration"), production.getMessage());
+        assertFalse(production.getMessage().contains("null"), production.getMessage());
+
+        // nothing to generate: PEM keys alone start in dev mode without a path
+        assertDoesNotThrow(() -> X509FileKeyProviders.open(props(null, true, List.of(), pemKeys, null)));
+        SigningException clash = assertThrows(SigningException.class, () -> X509FileKeyProviders.open(props(null, false,
+                List.of(), List.of(pemKeys.get(0), pemKeys.get(0)), null)));
+        assertFalse(clash.getMessage().contains("null"), clash.getMessage());
+    }
+
     private static Map<String, String> purposes(JcaKeyProvider provider) {
         return provider.publicKeys(KeyFilter.ALL).stream()
                 .collect(Collectors.toMap(PublicKeyDescriptor::kid, PublicKeyDescriptor::purpose));

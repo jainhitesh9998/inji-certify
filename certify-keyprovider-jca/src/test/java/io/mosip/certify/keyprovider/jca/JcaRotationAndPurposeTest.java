@@ -135,6 +135,23 @@ class JcaRotationAndPurposeTest {
                 "an IACA is never published as a signing key");
     }
 
+    /** Round 3: only the configured dev CA alias is a dev CA; any other CA key an operator keeps stays vc-signing. */
+    @Test
+    void anOperatorCaKeyKeepsThePlainPurposeOnlyTheConfiguredDevCaIsOne(@TempDir Path dir) {
+        JcaKeyProvider provider = new JcaKeyProvider("x509-file");
+        provider.generateCa("dev-ca", SignatureAlgorithm.ES256, "CN=Inji Certify Dev CA", "dev-ca");
+        provider.generateCa("operator-ca", SignatureAlgorithm.ES256, "CN=Operator signing CA", "vc-signing");
+        provider.generateCa("my-dev-ca", SignatureAlgorithm.ES256, "CN=Renamed Dev CA", "dev-ca");
+        Path file = dir.resolve("operator.p12");
+        provider.saveAsPkcs12(file, "pw".toCharArray());
+
+        assertEquals(Map.of("dev-ca", "dev-ca", "operator-ca", "vc-signing", "my-dev-ca", "vc-signing"),
+                purposes(JcaKeyProvider.fromPkcs12("x509-file", file, "pw".toCharArray())), "default ca-alias dev-ca");
+        assertEquals(Map.of("dev-ca", "vc-signing", "operator-ca", "vc-signing", "my-dev-ca", "dev-ca"),
+                purposes(JcaKeyProvider.fromPkcs12("x509-file", file, "pw".toCharArray(), "vc-signing", "my-dev-ca",
+                        null)), "ca-alias: my-dev-ca");
+    }
+
     private static Map<String, String> purposes(JcaKeyProvider provider) {
         return provider.publicKeys(KeyFilter.ALL).stream()
                 .collect(Collectors.toMap(PublicKeyDescriptor::kid, PublicKeyDescriptor::purpose));

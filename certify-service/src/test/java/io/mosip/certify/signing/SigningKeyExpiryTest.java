@@ -132,6 +132,67 @@ class SigningKeyExpiryTest {
         assertTrue(gauge(registry, "x509-file:mdl-dsc").value() < -99, "expired 100 days ago, and visible as such");
     }
 
+    /** Round 3: a rotation gap (expired version + a successor not valid yet) is an expired key, not +460 days. */
+    @Test
+    void aRotationGapReportsTheExpiredVersionNotTheFutureOne() throws Exception {
+        KeyPair iacaKeys = ecKeyPair();
+        X509Certificate iaca = iaca(iacaKeys);
+        JcaKeyProvider provider = new JcaKeyProvider("x509-file");
+        addDsc(provider, "mdl-dsc@2025-04", iaca, iacaKeys, Instant.now().minus(410, ChronoUnit.DAYS), 400);
+        addDsc(provider, "mdl-dsc@2026-12", iaca, iacaKeys, Instant.now().plus(5, ChronoUnit.DAYS), 457);
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+
+        try (CapturedLog log = new CapturedLog()) {
+            assertEquals(List.of("x509-file:mdl-dsc@2025-04"),
+                    new SigningKeyExpiry(List.of(provider), registry, SigningKeyExpiryProperties.DEFAULTS).reconcile());
+            double days = gauge(registry, "x509-file:mdl-dsc@2025-04").value();
+            assertTrue(days < -9 && days > -11, "expired ten days ago: " + days);
+            assertEquals(1, registry.find(SigningKeyExpiry.METRIC).gauges().size(), "no gauge for the future version");
+            assertTrue(log.messages().stream().anyMatch(m -> m.contains("x509-file:mdl-dsc@2025-04 expired at")
+                    && m.contains("next version valid from")), log.messages().toString());
+        }
+    }
+
+    @Test
+    void anAliasWhoseOnlyVersionsAreInTheFutureReportsZeroAndWarnsAtEveryReconciliation() throws Exception {
+        KeyPair iacaKeys = ecKeyPair();
+        X509Certificate iaca = iaca(iacaKeys);
+        JcaKeyProvider provider = new JcaKeyProvider("x509-file");
+        Instant first = Instant.now().plus(3, ChronoUnit.DAYS);
+        addDsc(provider, "mdl-dsc@2026-12", iaca, iacaKeys, first, 300);
+        addDsc(provider, "mdl-dsc@2027-03", iaca, iacaKeys, first.plus(90, ChronoUnit.DAYS), 300);
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        SigningKeyExpiry expiry = new SigningKeyExpiry(List.of(provider), registry, SigningKeyExpiryProperties.DEFAULTS);
+
+        try (CapturedLog log = new CapturedLog()) {
+            assertEquals(List.of("x509-file:mdl-dsc@2026-12"), expiry.reconcile());
+            assertEquals(0.0, gauge(registry, "x509-file:mdl-dsc@2026-12").value(), "no key valid now: 0 days");
+            assertEquals(Set.of("x509-file:mdl-dsc@2026-12"), expiry.gauged(), "the earliest future version only");
+            expiry.reconcile();
+            List<String> warnings = log.messages().stream()
+                    .filter(m -> m.contains("alias x509-file:mdl-dsc has no key valid now; next version valid from "
+                            + first.truncatedTo(ChronoUnit.SECONDS)))
+                    .toList();
+            assertEquals(2, warnings.size(), "once per reconciliation: " + log.messages());
+        }
+    }
+
+    @Test
+    void aSingleDocumentSignerThatIsNotValidYetReportsZero() throws Exception {
+        KeyPair iacaKeys = ecKeyPair();
+        X509Certificate iaca = iaca(iacaKeys);
+        JcaKeyProvider provider = new JcaKeyProvider("x509-file");
+        addDsc(provider, "mdl-dsc", iaca, iacaKeys, Instant.now().plus(10, ChronoUnit.DAYS), 300);
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+
+        try (CapturedLog log = new CapturedLog()) {
+            assertEquals(List.of("x509-file:mdl-dsc"),
+                    new SigningKeyExpiry(List.of(provider), registry, SigningKeyExpiryProperties.DEFAULTS).reconcile());
+            assertEquals(0.0, gauge(registry, "x509-file:mdl-dsc").value(), "not +310 days: it cannot sign yet");
+            assertTrue(log.messages().stream().anyMatch(m -> m.contains("has no key valid now")), log.messages().toString());
+        }
+    }
+
     @Test
     void gaugesKeepTheirValueWhenAProviderReplacesItsDescriptorsAndFollowNewAndGoneKeys() {
         Instant now = Instant.now();
@@ -204,6 +265,42 @@ class SigningKeyExpiryTest {
         assertDoesNotThrow(() -> new SigningKeyExpiry(List.of(provider), registry, SigningKeyExpiryProperties.DEFAULTS)
                 .reconcile());
         assertTrue(registry.find(SigningKeyExpiry.METRIC).gauges().isEmpty());
+    }
+
+    private static X509Certificate iaca(KeyPair iacaKeys) throws Exception {
+        return IsoMdocProfiles.iaca(iacaKeys).notBefore(Instant.now().minus(900, ChronoUnit.DAYS))
+                .country("IN").commonName("Demo IACA").issuerAltUri("https://credentials.example.test/mdoc/iaca")
+                .crlDistributionPoint(CRL).build();
+    }
+
+    private static void addDsc(JcaKeyProvider provider, String alias, X509Certificate iaca, KeyPair iacaKeys,
+                               Instant notBefore, int days) throws Exception {
+        KeyPair keys = ecKeyPair();
+        X509Certificate dsc = IsoMdocProfiles.ds(keys, iaca, iacaKeys).commonName("Demo DSC").notBefore(notBefore)
+                .validity(Duration.ofDays(days)).build();
+        provider.add(alias, keys.getPrivate(), CertificateChain.of(dsc, iaca), SignatureAlgorithm.ES256, "mdoc-dsc");
+    }
+
+    /** The WARNs {@link SigningKeyExpiry} logs while open. */
+    private static final class CapturedLog implements AutoCloseable {
+        private final ch.qos.logback.classic.Logger logger =
+                (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(SigningKeyExpiry.class);
+        private final ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+                new ch.qos.logback.core.read.ListAppender<>();
+
+        CapturedLog() {
+            appender.start();
+            logger.addAppender(appender);
+        }
+
+        List<String> messages() {
+            return appender.list.stream().map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage).toList();
+        }
+
+        @Override
+        public void close() {
+            logger.detachAppender(appender);
+        }
     }
 
     private static Gauge gauge(MeterRegistry registry, String keyRef) {

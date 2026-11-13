@@ -83,7 +83,8 @@ when a key with `profile: mdoc-dsc` is configured without an `iaca` block.
 **Settings are compared with what the keystore holds.** A certificate cannot change in place, so every start compares
 the `iaca.*` settings that are given (country, state, common-name, issuer-alt-name, crl-uri, algorithm,
 validity-years) with the IACA in the keystore, and the `subject` CN, `algorithm` and `validity-days` of each `mdoc-dsc`
-key with its Document Signer (a DSC whose requested validity was clamped to its IACA's end matches). A difference
+key with its Document Signer. A DSC whose validity was clamped to its IACA's end matches only a `validity-days` that
+reaches that end: the expected end is `min(notBefore + validity-days - 1 s, IACA notAfter)`. A difference
 refuses startup and names each setting: restore the settings, or rotate. The IACA is never regenerated
 automatically, because verifiers already hold it as a trust anchor: to change it, set `iaca.alias` to a new alias
 (`iaca-2`), and dev mode generates a new IACA under it while the old entry stays in the keystore; Document Signers
@@ -92,9 +93,10 @@ one, and `iacaCertificates` lists both. To change a Document Signer, add a new v
 (`mdl-dsc@2027-02`). A setting left out is not compared, so a production IACA can be named by `iaca.alias` alone.
 
 **Purposes after a restart.** PKCS#12 stores no purpose, so each entry's purpose is derived from its certificate on
-every load: a self-signed CA that passes `AnnexBValidator.validateIaca` is `mdoc-iaca`, any other CA (the P3-08 dev CA)
-`dev-ca`, a certificate with the mDL EKU `1.0.18013.5.1.2` `mdoc-dsc`, and anything else is a plain key with the
-configured `purpose` (`vc-signing`). An `mdoc-iaca` entry is a trust anchor and is never listed as a signing key in the
+every load: the configured `iaca.alias`, or a self-signed CA that passes `AnnexBValidator.validateIaca`, is
+`mdoc-iaca`; the configured `ca-alias` (the P3-08 dev CA) is `dev-ca`; a certificate with the mDL EKU
+`1.0.18013.5.1.2` is `mdoc-dsc`; anything else, including any other CA key an operator keeps in the keystore, is a
+plain key with the configured `purpose` (`vc-signing`), as before M-05. An `mdoc-iaca` entry is a trust anchor and is never listed as a signing key in the
 JWKS or a DID document; nothing changes for a deployment without the M-05 properties, whose dev CA is published as
 before. Country, state, issuerAltName and CRL
 distribution point of a DSC come from the IACA; a DSC's chain is `[DSC, IACA]`, and `signing.x5c=without-anchor` (or the
@@ -122,7 +124,9 @@ warning for weak ones), and the chain is returned to the formatter as `[DSC, IAC
 - a PEM alias is already an alias in the keystore.
 
 PEM keys are read after the keystore has been written, so an operator's private key is never copied into the PKCS#12
-file; when all keys are PEM keys, `path` may be omitted.
+file; when all keys are PEM keys, `path` may be omitted. A `path` that is set must exist unless dev mode is on, PEM
+keys or not, and dev mode refuses to generate anything (the IACA, a Document Signer, a plain key) without a `path`
+to write it to, since it would generate new keys on every start.
 
 ## Rotation
 
@@ -156,10 +160,13 @@ included, because the metric belongs to the service, not to a key-provider modul
   expired. `keyRef` is the reference that pins the key and parses as a `KeyRef`: `x509-file:mdl-dsc@2027-02`,
   `x509-file:iaca`, `keymanager:CERTIFY_SERVICE@<kid>`, `keymanager:CERTIFY_VC_SIGN_ED25519/ED25519_SIGN@<kid>`;
 - one `WARN` when a current key enters the window of `certify.signing.key-expiry.warn-days` (30) days, and one when an
-  alias is left with no valid key.
+  alias is left with no valid key; an alias whose versions are all still in the future logs
+  `alias X has no key valid now; next version valid from <notBefore>` at every reconciliation.
 
-The current key is the one an unversioned reference resolves to; when no version is valid, the one that expired last,
-so the alias shows a negative number instead of disappearing. Rotated-out versions (an older DSC in its rotation
+The current key is the one an unversioned reference resolves to; when no version is valid, the one that expired last
+among the versions that have started (`notBefore <= now`), so the alias shows a negative number instead of
+disappearing, even while its successor waits for its `notBefore`; when every version is still in the future (a single
+DSC not valid yet), the earliest of them at `0`. Rotated-out versions (an older DSC in its rotation
 window, keymanager's expired certificates) are not reported. Nothing is read while beans are created: the first
 report runs once the application is ready, after keymanager has provisioned its keys, and the gauges are reconciled
 with the providers every `certify.signing.key-expiry.reconcile-interval` (`PT1H`; zero turns the periodic run off), so

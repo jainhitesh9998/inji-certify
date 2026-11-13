@@ -188,8 +188,10 @@ final class MdocKeys {
     static void importPemKeys(X509FileProperties properties, JcaKeyProvider provider) {
         for (PemKeySpec spec : properties.pemKeys() == null ? List.<PemKeySpec>of() : properties.pemKeys()) {
             if (provider.aliases().contains(spec.alias())) {
-                throw new SigningException("PEM key " + spec.alias() + " has the alias of a key already in the keystore"
-                        + " " + properties.path() + "; give one of them another alias");
+                String holder = properties.path() == null ? "another pem-keys entry"
+                        : "a key already in the keystore " + properties.path() + " or another pem-keys entry";
+                throw new SigningException("PEM key " + spec.alias() + " has the alias of " + holder
+                        + "; give one of them another alias");
             }
             char[] password = spec.keyPassword() == null ? null : spec.keyPassword().toCharArray();
             PrivateKey privateKey = Pem.readPrivateKey(read(spec.key(), spec.alias()), password);
@@ -216,7 +218,8 @@ final class MdocKeys {
             requireLinkedChain(spec.alias(), chain);
             requireMatchingKey(spec.alias(), privateKey, chain.get(0));
             provider.add(spec.alias(), privateKey, new CertificateChain(chain), null,
-                    JcaKeyProvider.purposeOf(chain.get(0), properties.purpose()));
+                    JcaKeyProvider.purposeOf(spec.alias(), chain.get(0), properties.purpose(), properties.caAlias(),
+                            properties.iaca() == null ? null : iacaAlias(properties.iaca())));
         }
     }
 
@@ -286,13 +289,20 @@ final class MdocKeys {
         }
         if (key.validityDays() != null) {
             long days = Math.round(days(dsc));
-            // a DSC whose requested validity would outlive its IACA ends with the IACA (certify-pki DsBuilder)
-            boolean clampedToIaca = dsc.getNotAfter().toInstant().truncatedTo(ChronoUnit.SECONDS)
-                    .equals(iaca.getNotAfter().toInstant().truncatedTo(ChronoUnit.SECONDS));
-            if (days != key.validityDays() && !clampedToIaca) {
+            // a DSC whose requested validity would outlive its IACA ends with the IACA (certify-pki DsBuilder): the
+            // expected end is min(notBefore + validity-days - 1 s, IACA notAfter), so the clamp excuses a shorter
+            // certificate only when the configured validity really reaches the IACA's end
+            Instant notBefore = dsc.getNotBefore().toInstant().truncatedTo(ChronoUnit.SECONDS);
+            Instant requestedEnd = notBefore.plus(Duration.ofDays(key.validityDays())).minusSeconds(1);
+            Instant iacaEnd = iaca.getNotAfter().toInstant().truncatedTo(ChronoUnit.SECONDS);
+            Instant expectedEnd = requestedEnd.isBefore(iacaEnd) ? requestedEnd : iacaEnd;
+            long expectedDays = Math.round(Duration.between(notBefore, expectedEnd.plusSeconds(1)).getSeconds()
+                    / 86_400.0);
+            if (days != expectedDays) {
                 differences.add("keys[].validity-days is " + key.validityDays() + ", the Document Signer is valid for "
                         + days + " days (" + dsc.getNotBefore().toInstant() + " to " + dsc.getNotAfter().toInstant()
-                        + ")");
+                        + (dsc.getNotAfter().toInstant().truncatedTo(ChronoUnit.SECONDS).equals(iacaEnd)
+                                ? ", ending with its IACA" : "") + ")");
             }
         }
         if (!differences.isEmpty()) {

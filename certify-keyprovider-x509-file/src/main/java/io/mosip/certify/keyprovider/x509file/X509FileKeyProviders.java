@@ -35,13 +35,15 @@ public final class X509FileKeyProviders {
         }
         char[] password = properties.password() == null ? new char[0] : properties.password().toCharArray();
         boolean exists = path != null && Files.exists(path);
-        if (!exists && !properties.devMode() && !pemOnly) {
+        if (path != null && !exists && !properties.devMode()) {
+            // a configured keystore that is missing is a mistake even next to pem-keys: its keys would silently vanish
             throw new SigningException("Keystore " + path + " does not exist and dev mode is off");
         }
         // purposes are derived from each certificate on load, so a generated IACA or DSC keeps its purpose on restart
         JcaKeyProvider provider = exists
                 ? JcaKeyProvider.fromPkcs12(properties.id(), path, password,
-                        properties.purpose() == null ? JcaKeyProvider.PURPOSE_VC_SIGNING : properties.purpose())
+                        properties.purpose() == null ? JcaKeyProvider.PURPOSE_VC_SIGNING : properties.purpose(),
+                        properties.caAlias(), properties.iaca() == null ? null : MdocKeys.iacaAlias(properties.iaca()))
                 : new JcaKeyProvider(properties.id());
         List<KeySpec> required = properties.keys() == null ? List.of() : properties.keys();
         for (KeySpec key : required) {
@@ -78,8 +80,9 @@ public final class X509FileKeyProviders {
             String alias = MdocKeys.iacaAlias(iacaSpec);
             if (!provider.aliases().contains(alias)) {
                 if (!properties.devMode()) {
-                    throw new SigningException("Keystore " + path + " lacks the IACA key '" + alias + "' and dev mode is off");
+                    throw new SigningException(keystore(path) + " lacks the IACA key '" + alias + "' and dev mode is off");
                 }
+                requirePathForGeneration(path, "the IACA '" + alias + "'");
                 provider.generateIaca(alias, MdocKeys.iacaSpec(iacaSpec));
                 generated = true;
             }
@@ -87,8 +90,11 @@ public final class X509FileKeyProviders {
         }
         List<KeySpec> missing = required.stream().filter(k -> !provider.aliases().contains(k.alias())).toList();
         if (!missing.isEmpty() && !properties.devMode()) {
-            throw new SigningException("Keystore " + path + " lacks the required keys "
+            throw new SigningException(keystore(path) + " lacks the required keys "
                     + missing.stream().map(KeySpec::alias).toList());
+        }
+        if (!missing.isEmpty()) {
+            requirePathForGeneration(path, "the keys " + missing.stream().map(KeySpec::alias).toList());
         }
         if (missing.stream().anyMatch(k -> !k.mdocDsc()) && !provider.aliases().contains(properties.caAlias())) {
             // HAIP forbids a self-signed signing certificate: generated keys chain to a dev CA held in the same keystore
@@ -112,6 +118,23 @@ public final class X509FileKeyProviders {
             generated = true;
         }
         return generated;
+    }
+
+    /** How messages name the keystore: its path, or the PEM-only configuration that has none. */
+    static String keystore(Path path) {
+        return path == null ? "The PEM-only configuration (no certify.keyprovider.x509-file.path)" : "Keystore " + path;
+    }
+
+    /**
+     * Dev mode writes what it generates into the keystore, so the keys survive a restart and a Document Signer keeps
+     * matching the mDLs it signed; without {@code path} it would generate new keys on every start.
+     */
+    private static void requirePathForGeneration(Path path, String what) {
+        if (path == null) {
+            throw new SigningException("Dev mode would generate " + what + " but has nowhere to keep it: set"
+                    + " certify.keyprovider.x509-file.path to the PKCS#12 keystore dev mode should write (for example"
+                    + " /var/lib/certify/x509-file.p12), or configure these keys as pem-keys");
+        }
     }
 
     /**

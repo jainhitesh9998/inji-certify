@@ -41,8 +41,10 @@ import java.util.concurrent.TimeUnit;
  * startup) gets its gauge and a key that is gone loses it.
  *
  * <p><b>What.</b> For each alias a provider holds ({@link KeyProvider#keyRefs()}), the current key: the one an
- * unversioned reference resolves to, or, when no version is valid now, the latest-expiring one, so an alias left
- * without a valid key shows a negative number instead of disappearing. Rotated-out versions (an expired keymanager
+ * unversioned reference resolves to. When no version is valid now, the latest-expiring version that has started
+ * ({@code notBefore <= now}), so an alias left without a valid key shows a negative number instead of disappearing,
+ * even while a successor waits for its {@code notBefore}; when every version is still in the future, the earliest of
+ * them at 0 days, with a WARN at every reconciliation naming when it becomes valid. Rotated-out versions (an expired keymanager
  * certificate, an older DSC in its rotation window) are not reported: they no longer sign. The tag is the reference
  * that pins the key, {@code provider:alias@version} ({@code keymanager:CERTIFY_SERVICE@<kid>},
  * {@code x509-file:mdl-dsc@2027-02}), which parses as a {@link KeyRef}. A provider that cannot enumerate its aliases is
@@ -59,8 +61,16 @@ public final class SigningKeyExpiry implements ApplicationListener<ApplicationRe
 
     private static final Logger LOG = LoggerFactory.getLogger(SigningKeyExpiry.class);
 
-    /** One reported key: which provider it belongs to, the pinned reference, and its expiry. */
-    record ReportedKey(String providerId, String keyRef, Instant notAfter) {}
+    /**
+     * One reported key: which provider it belongs to, the pinned reference, and its expiry. {@code notAfter} is null
+     * when the alias has no version valid now and none that has expired (gauge 0); {@code nextValidFrom} is the
+     * {@code notBefore} of the earliest version that is not valid yet, when there is one.
+     */
+    record ReportedKey(String providerId, String keyRef, Instant notAfter, String alias, Instant nextValidFrom) {
+        ReportedKey(String providerId, String keyRef, Instant notAfter) {
+            this(providerId, keyRef, notAfter, null, null);
+        }
+    }
 
     /** The strongly held state behind one gauge; Micrometer's own reference to it may be weak. */
     private static final class Tracked {
@@ -115,7 +125,8 @@ public final class SigningKeyExpiry implements ApplicationListener<ApplicationRe
         scheduler.scheduleWithFixedDelay(() -> {
             try {
                 reconcile();
-            } catch (RuntimeException e) {
+            } catch (Throwable e) {
+                // anything escaping here would cancel the schedule silently: log it and keep reconciling
                 LOG.warn("Signing key expiry reconciliation failed; retrying in {}", interval, e);
             }
         }, millis, millis, TimeUnit.MILLISECONDS);
@@ -173,6 +184,13 @@ public final class SigningKeyExpiry implements ApplicationListener<ApplicationRe
         List<String> expiring = new ArrayList<>();
         Set<String> inWindow = new HashSet<>();
         for (ReportedKey key : current) {
+            if (key.notAfter() == null) {
+                // nothing signs under this alias until its first version starts: worth repeating every reconciliation
+                expiring.add(key.keyRef());
+                LOG.warn("Signing key alias {} has no key valid now; next version valid from {} ({})", key.alias(),
+                        key.nextValidFrom(), key.keyRef());
+                continue;
+            }
             Duration left = Duration.between(now, key.notAfter());
             if (left.compareTo(window) > 0) {
                 continue;
@@ -183,8 +201,9 @@ public final class SigningKeyExpiry implements ApplicationListener<ApplicationRe
                 continue; // warned already; the gauge keeps counting down
             }
             if (left.isNegative() || left.isZero()) {
-                LOG.warn("Signing key {} expired at {} and no valid version of its alias replaces it; rotate it now",
-                        key.keyRef(), key.notAfter());
+                LOG.warn("Signing key {} expired at {} and no valid version of its alias replaces it; {}",
+                        key.keyRef(), key.notAfter(), key.nextValidFrom() == null ? "rotate it now"
+                                : "next version valid from " + key.nextValidFrom());
             } else {
                 LOG.warn("Signing key {} expires at {} ({} days left); rotate it before it does",
                         key.keyRef(), key.notAfter(), left.toDays());
@@ -222,17 +241,18 @@ public final class SigningKeyExpiry implements ApplicationListener<ApplicationRe
         }
         Map<String, ReportedKey> byRef = new LinkedHashMap<>();
         for (KeyRef alias : aliases) {
-            currentOf(provider, alias)
-                    .filter(descriptor -> descriptor.notAfter() != null)
-                    .ifPresent(descriptor -> byRef.putIfAbsent(pinned(alias, descriptor),
-                            new ReportedKey(provider.id(), pinned(alias, descriptor), descriptor.notAfter())));
+            currentOf(provider, alias).ifPresent(key -> byRef.putIfAbsent(key.keyRef(), key));
         }
         out.addAll(byRef.values());
         return out;
     }
 
-    /** What an unversioned reference resolves to; the latest-expiring version when none is valid now. */
-    private Optional<PublicKeyDescriptor> currentOf(KeyProvider provider, KeyRef alias) {
+    /**
+     * What an unversioned reference resolves to. When it resolves to nothing: the latest-expiring version that has
+     * started ({@code notBefore <= now}, so a successor that is not valid yet does not hide an expired key), else the
+     * earliest version that is not valid yet, reported with no expiry (0 days).
+     */
+    private Optional<ReportedKey> currentOf(KeyProvider provider, KeyRef alias) {
         List<PublicKeyDescriptor> versions = provider.publicKeys(alias);
         if (versions == null || versions.isEmpty()) {
             return Optional.empty();
@@ -241,14 +261,26 @@ public final class SigningKeyExpiry implements ApplicationListener<ApplicationRe
             String kid = provider.resolve(alias).descriptor().kid();
             Optional<PublicKeyDescriptor> resolved = versions.stream().filter(d -> d.kid().equals(kid)).findFirst();
             if (resolved.isPresent()) {
-                return resolved;
+                return resolved.filter(d -> d.notAfter() != null)
+                        .map(d -> new ReportedKey(provider.id(), pinned(alias, d), d.notAfter(), alias.toString(), null));
             }
         } catch (RuntimeException e) {
-            // no version is valid now: report the one that expired last, so the alias shows a negative number
+            // no version is valid now: report the last one that started, or the next one to start
         }
-        return versions.stream()
-                .filter(d -> d.notAfter() != null)
+        Instant now = clock.instant();
+        Optional<PublicKeyDescriptor> next = versions.stream()
+                .filter(d -> d.notBefore() != null && d.notBefore().isAfter(now))
+                .min(Comparator.comparing(PublicKeyDescriptor::notBefore));
+        Instant nextValidFrom = next.map(PublicKeyDescriptor::notBefore).orElse(null);
+        Optional<PublicKeyDescriptor> started = versions.stream()
+                .filter(d -> d.notAfter() != null && (d.notBefore() == null || !d.notBefore().isAfter(now)))
                 .max(Comparator.comparing(PublicKeyDescriptor::notAfter));
+        if (started.isPresent()) {
+            PublicKeyDescriptor d = started.get();
+            return Optional.of(new ReportedKey(provider.id(), pinned(alias, d), d.notAfter(), alias.toString(),
+                    nextValidFrom));
+        }
+        return next.map(d -> new ReportedKey(provider.id(), pinned(alias, d), null, alias.toString(), nextValidFrom));
     }
 
     /**
@@ -264,6 +296,9 @@ public final class SigningKeyExpiry implements ApplicationListener<ApplicationRe
     }
 
     private double daysUntil(Instant notAfter) {
+        if (notAfter == null) {
+            return 0; // no version valid yet
+        }
         return Duration.between(clock.instant(), notAfter).toMillis() / (double) Duration.ofDays(1).toMillis();
     }
 }

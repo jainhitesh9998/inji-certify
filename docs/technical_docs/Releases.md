@@ -99,6 +99,10 @@ OpenID4VCI 1.0 (section 12.2.2) forms the metadata URL of a Credential Issuer Id
 ## Proof `iss` in the pre-authorized code flow
 
 A `jwt` proof presented with a token from the anonymous pre-authorized code flow may carry `iss` equal to the holder's own DID (the `did:jwk` of the proof key, or its `kid` without the fragment), which Inji Wallet sends to issuers with a nonce endpoint; OpenID4VCI 1.0 asks wallets to omit `iss` there, and the value names nothing the signature does not prove. A client_id, when known, must still match `iss`; any other value is still refused. The compose stack's seeded `FarmerCredential` now advertises EdDSA next to RS256, PS256 and ES256, as the deployment default does, so Inji Wallet's Ed25519 proofs are accepted there.
+
+## Annex B keys in the `x509-file` provider
+
+The `x509-file` provider can generate an ISO/IEC 18013-5 Annex B IACA and Document Signers in dev mode (`certify.keyprovider.x509-file.iaca`, `keys[].profile: mdoc-dsc`), import a Document Signer key and `[DSC, IACA]` chain from PEM files (`pem-keys`), and rotate keys as `alias@version` entries; the gauge `certify.signing.key.expires_in_days{keyRef}` and a WARN 30 days ahead report every current signing certificate, keymanager's included (`docs/design/20-mdl-issuer.md` M-05). Configurations without these settings are unchanged, with one exception: a Document Signer (a certificate carrying the mDL extended key usage `1.0.18013.5.1.2`) held as a single unversioned entry in an existing keystore no longer resolves once it has expired or before it is valid, because every verifier rejects an mDL signed outside its Document Signer's validity; a plain key with a single entry still resolves whatever its dates, as before.
 # Changes in release 0.11.0
 
 ## Removal of  Artifactory dependency
