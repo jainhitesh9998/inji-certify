@@ -69,7 +69,7 @@ class OfferPageTest {
         // F-18: the in-page wallet is offered for every published offer, on either surface, and redeems it where the offer
         // issuer's own metadata says once that metadata's identity is checked (whether a compatibility-surface offer then
         // verifies depends on the deployment's identity configuration, gap G34); a replaced portrait releases its blob URL
-        assertTrue(html.contains("el(\"wallet\").disabled = !grant;"), "the wallet is offered for either surface");
+        assertTrue(html.contains("el(\"wallet\").disabled = redeeming || !grant;"), "the wallet is offered for either surface (after a run in progress ends)");
         assertTrue(html.contains("portraitObjectUrls.forEach((url) => URL.revokeObjectURL(url))"), "a replaced portrait's object URL is revoked");
         MvcResult script = mockMvc.perform(get("/offer/qrcode.min.js")).andReturn();
         assertEquals(200, script.getResponse().getStatus());

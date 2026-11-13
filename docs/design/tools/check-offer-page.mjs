@@ -37,6 +37,10 @@
  *     removing options leaves the first option that is not disabled selected when nothing is; an option without a
  *     `value` reads its text with whitespace collapsed, and a `textarea` reads its text until its value is set;
  *   - a disabled control dispatches no click;
+ *   - `fetch` follows the Fetch standard's redirect modes for a 3xx with a `Location`: "follow" (the default) re-sends
+ *     the request there (301/302 turn a POST, 303 anything but GET/HEAD, into a GET without a body; 307/308 keep the
+ *     method and the body; a cross-origin hop drops `Authorization`), "error" rejects with a TypeError and requests
+ *     nothing at `Location`, "manual" answers an opaque redirect (status 0);
  *   - the `QRCode` stub draws a child into the container it is handed, so the published QR can be located and a
  *     replaced one is seen to leave nothing behind;
  *   - the page's own wallet runs for real against the documents the live stack serves (issuer metadata and RFC 8414
@@ -52,14 +56,18 @@
  *   - computed CSS and layout. The `[hidden]` check below is a static assertion over the stylesheet's text, not a
  *     rendered cascade, so a later rule, a specificity question, a media query or anything geometric (positions, sizes,
  *     overflow, z-index, scroll) is out of reach; so is whether the page looks right;
- *   - the full HTML parser: only the tokenisation rules listed above are modelled (no foster parenting, no other implied
- *     end tags, no `<select>` content restrictions, a small set of named character references); a page that relies on
- *     anything else is not modelled faithfully;
+ *   - the full HTML parser: only the tokenisation rules listed above are modelled (plus newline normalisation and the
+ *     newline dropped right after `<textarea>`, `<pre>` and `<listing>`; no foster parenting, no other implied end tags,
+ *     no `<select>` content restrictions, a small set of named character references); a page that relies on anything
+ *     else is not modelled faithfully;
  *   - user interaction: a visitor cannot pick a disabled `<option>`, which the harness asserts as the option's
  *     `disabled` flag and the page's own refusal, not through a real picker; focus, keyboard, tab order, pointer and
  *     drag-and-drop behaviour, form submission and navigation;
  *   - real QR rendering or scanning, image decoding, `Blob` URLs and portrait rendering (the `Cbor` stub is a stub);
- *   - CSP, CORS, cookies, TLS, real network timing, retries, and the clipboard;
+ *   - CSP, CORS (no preflight, and a cross-origin answer is readable here where a browser would make it opaque),
+ *     cookies, TLS, real network timing, retries, and the clipboard. Of redirects, only the three modes above are
+ *     modelled: not the CORS checks a cross-origin hop of a non-simple request needs, `Location` parsing edge cases,
+ *     or more than 20 hops;
  *   - anything about the issuer: every `fetch` answer is a fixture, so server behaviour (status codes, bodies, headers)
  *     is only as faithful as the fixtures below (their shapes are the ones the live stack serves, read from
  *     `docs/design/tools/smoke_mdl.py` and the server's metadata builders).
@@ -396,13 +404,19 @@ function tagAttributes(attributes) {
  * document order, and the root.
  */
 function parseMarkup(markup) {
+    // HTML 13.2.3.5: the input stream's CR LF and lone CR become LF before tokenisation
+    markup = markup.replace(/\r\n?/g, "\n");
     const ids = new Map();
     const scripts = [];
     const root = new Element("#document");
     const stack = [root];
     const current = () => stack[stack.length - 1];
+    // HTML 13.2.6.4.7: a newline right after a `<pre>` or `<listing>` start tag is dropped
+    let dropNewline = null;
     const appendText = (raw) => {
-        if (raw) current().appendChild(new Text(decodeReferences(raw)));
+        const text = dropNewline !== null && dropNewline === current() && raw.startsWith("\n") ? raw.slice(1) : raw;
+        dropNewline = null;
+        if (text) current().appendChild(new Text(decodeReferences(text)));
     };
     // a comment (to `-->`, or to the end when unterminated), a doctype or other `<!` declaration, or a tag
     const token = /<!--[\s\S]*?(?:-->|$)|<![^>]*>|<(\/?)([a-zA-Z][^\t\n\f\r />]*)((?:"[^"]*"|'[^']*'|[^>"'])*)>/g;
@@ -448,7 +462,9 @@ function parseMarkup(markup) {
             end.lastIndex = cursor;
             const found = end.exec(markup);
             const stop = found ? found.index : markup.length;
-            const content = markup.slice(cursor, stop);
+            let content = markup.slice(cursor, stop);
+            // HTML 13.2.6.4.7: a newline right after a `<textarea>` start tag is dropped
+            if (tag === "textarea" && content.startsWith("\n")) content = content.slice(1);
             if (content) element.appendChild(new Text(RCDATA.has(tag) ? decodeReferences(content) : content));
             const close = found ? markup.indexOf(">", stop) : -1;
             cursor = close < 0 ? markup.length : close + 1;
@@ -458,6 +474,7 @@ function parseMarkup(markup) {
         }
         // a `/` before `>` does not close a non-void HTML element: it is parsed as an open tag
         if (!VOID.has(tag)) stack.push(element);
+        if (tag === "pre" || tag === "listing") dropNewline = element;
     }
     appendText(markup.slice(cursor));
     return { ids, scripts, root };
@@ -530,7 +547,8 @@ const TX_CODE = { length: 4, input_mode: "numeric", description: "Please enter t
 /** RFC 8414 section 3 / OpenID4VCI 1.0 section 12.2.2: the well-known segment goes between the host and the path. */
 function wellKnown(identifier, suffix) {
     const url = new URL(identifier);
-    return url.origin + "/.well-known/" + suffix + url.pathname.replace(/\/+$/, "");
+    // RFC 8414 section 3.1: the path's terminating "/" (one) is removed
+    return url.origin + "/.well-known/" + suffix + url.pathname.replace(/\/$/, "");
 }
 
 /** A deep link whose `credential_offer_uri` parameter names an offer document, as the page's POST answer carries it. */
@@ -572,7 +590,10 @@ const SUBJECTS = [
  *                (`asMetadata`), the answer to `POST /pre-authorized-data` (`offer`, or `offers` consumed one per
  *                click, the last one repeating) and a promise it waits for before answering (`offerGate`), the answers
  *                to the by-reference offer fetch (`offerFetches`, an entry of `"throw"` being a fetch that rejects),
- *                and the `token`, `nonce` and `credential` answers of the page's wallet
+ *                the `token`, `nonce` and `credential` answers of the page's wallet, a promise the issuer metadata
+ *                GET waits for (`metadataGate`), redirects by URL or by `"METHOD URL"` (`redirects`: `{ status,
+ *                location }`), the page's own URL (`pageUrl`) and the issuer identifier its own document names
+ *                (`ownIssuer`)
  */
 function openPage(demo, options = {}) {
     const source = options.html === undefined ? html : options.html;
@@ -603,7 +624,12 @@ function openPage(demo, options = {}) {
         text: async () => (typeof body === "string" ? body : JSON.stringify(body)),
     });
 
-    const ownMetadata = { credential_configurations_supported: options.configurations || CONFIGURATIONS };
+    const pageUrl = new URL(options.pageUrl || DOMAIN + "/v1/certify/offer/");
+    const ownMetadata = {
+        credential_issuer: options.ownIssuer || LEGACY_ISSUER,
+        credential_configurations_supported: options.configurations || CONFIGURATIONS,
+    };
+    const redirects = new Map(Object.entries(options.redirects || {}));
     const tokenAnswer = options.token || { status: 200, body: { access_token: "at-f18", token_type: "Bearer" } };
     const nonceAnswer = options.nonce || { status: 200, body: { c_nonce: "nonce-f18" } };
     const credentialAnswer = options.credential
@@ -630,20 +656,14 @@ function openPage(demo, options = {}) {
     const credentialEndpoints = new Set(Object.values(issuerMetadata).map((entry) => entry && entry.credential_endpoint).filter(Boolean));
     const tokenEndpoints = new Set(Object.values(asMetadata).map((entry) => entry && entry.token_endpoint).filter(Boolean));
 
-    const fetch = async (url, init = {}) => {
-        const target = String(url);
-        const method = (init.method || "GET").toUpperCase();
-        const form = init.body instanceof URLSearchParams ? init.body : undefined;
-        requests.push({
-            method,
-            url: target,
-            headers: Object.assign({}, init.headers || {}),
-            body: form ? form.toString() : init.body,
-            form: form ? Object.fromEntries(form.entries()) : undefined,
-        });
+    /** The answer the stack gives to one request (no redirect involved). */
+    const respond = async (method, target) => {
         // OpenID4VCI 1.0 section 12.2.2 and RFC 8414 section 3: the documents of the offer's issuer and of its
         // authorization server, each at its well-known location
-        if (method === "GET" && issuerDocuments.has(target)) return answer(200, issuerDocuments.get(target));
+        if (method === "GET" && issuerDocuments.has(target)) {
+            if (options.metadataGate) await options.metadataGate;
+            return answer(200, issuerDocuments.get(target));
+        }
         if (method === "GET" && asDocuments.has(target)) return answer(200, asDocuments.get(target));
         // the page's own configuration list, loaded from its own surface
         if (method === "GET" && target === "/v1/certify/.well-known/openid-credential-issuer") return answer(200, ownMetadata);
@@ -652,8 +672,9 @@ function openPage(demo, options = {}) {
             if (demo === false) return answer(404, "not found");
             return answer(200, demo);
         }
-        // the page fetches the document a by-reference offer names, at the absolute URL in the deep link
-        if (method === "GET" && target.startsWith(OFFER_DOCUMENT)) {
+        // the page fetches the document a by-reference offer names (an absolute URL, or a path on its own origin)
+        if (method === "GET" && /^https?:\/\/[^/]+\/v1\/certify\/credential-offer-data\//.test(target)
+            && [new URL(OFFER_DOCUMENT).origin, pageUrl.origin].includes(new URL(target).origin)) {
             const next = nextOfferFetch();
             if (next === "throw") throw new TypeError("fetch failed");
             return answer(next.status, next.body);
@@ -666,6 +687,54 @@ function openPage(demo, options = {}) {
         if (method === "POST" && nonceEndpoints.has(target)) return answer(nonceAnswer.status, nonceAnswer.body);
         if (method === "POST" && credentialEndpoints.has(target)) return answer(credentialAnswer.status, credentialAnswer.body);
         return answer(404, "not found");
+    };
+
+    /**
+     * A browser's fetch, as far as the page depends on it: every request is recorded, and a 3xx with a Location (from
+     * `options.redirects`) is handled by the request's redirect mode as the Fetch standard's HTTP-redirect fetch does.
+     */
+    const fetch = async (url, init = {}) => {
+        const mode = init.redirect === undefined ? "follow" : init.redirect;
+        let method = (init.method || "GET").toUpperCase();
+        let headers = Object.assign({}, init.headers || {});
+        let body = init.body;
+        let target = String(url);
+        let redirectedFrom;
+        for (let hop = 0; ; hop++) {
+            const form = body instanceof URLSearchParams ? body : undefined;
+            requests.push({
+                method,
+                url: target,
+                headers: Object.assign({}, headers),
+                body: form ? form.toString() : body,
+                form: form ? Object.fromEntries(form.entries()) : undefined,
+                redirect: mode,
+                redirectedFrom,
+            });
+            const redirect = redirects.get(method + " " + target) || redirects.get(target);
+            if (redirect === undefined) return respond(method, target);
+            // the answer is a redirect
+            if (mode === "error") throw new TypeError("Failed to fetch: the response redirected and the redirect mode is \"error\"");
+            if (mode === "manual") return { status: 0, type: "opaqueredirect", text: async () => "" };
+            if (hop >= 20) throw new TypeError("Failed to fetch: too many redirects");
+            const from = new URL(target, pageUrl);
+            const next = new URL(redirect.location, from);
+            // 301 and 302 turn a POST into a GET, 303 turns anything but GET and HEAD into one; the body goes with it
+            if (((redirect.status === 301 || redirect.status === 302) && method === "POST")
+                || (redirect.status === 303 && method !== "GET" && method !== "HEAD")) {
+                method = "GET";
+                body = undefined;
+                for (const name of Object.keys(headers)) {
+                    if (/^content-(type|encoding|language|location)$/i.test(name)) delete headers[name];
+                }
+            }
+            // a hop to another origin drops the Authorization header (HTTP-redirect fetch, step 13)
+            if (next.origin !== from.origin) {
+                for (const name of Object.keys(headers)) if (/^authorization$/i.test(name)) delete headers[name];
+            }
+            redirectedFrom = target;
+            target = next.href;
+        }
     };
 
     // the real library draws a QR into the container it is given; this stub appends a stand-in whose src names the
@@ -681,7 +750,7 @@ function openPage(demo, options = {}) {
     QRCode.CorrectLevel = { L: 1, M: 2, Q: 3, H: 4 };
 
     const context = vm.createContext({
-        location: { pathname: "/v1/certify/offer/" },
+        location: { href: pageUrl.href, origin: pageUrl.origin, protocol: pageUrl.protocol, pathname: pageUrl.pathname },
         document,
         fetch,
         QRCode,
@@ -716,6 +785,7 @@ function openPage(demo, options = {}) {
     const posts = () => requests.filter((request) => request.method === "POST");
     const page = {
         el: (id) => document.getElementById(id),
+        fetch,
         created,
         requests,
         missingIds,
@@ -881,9 +951,8 @@ async function unchanged(name, demo) {
  */
 async function refusedRedemption(label, setup) {
     const code = "code-secret-" + label.replace(/[^a-z0-9]+/gi, "-");
-    const page = openPage({ subjects: [] }, Object.assign({
-        offers: [offerByValue("refused", offerDocument(setup.offerIssuer || OID4VCI_ISSUER, "demo", code, TX_CODE))],
-    }, setup.options));
+    const document = setup.document ? setup.document(code) : offerDocument(setup.offerIssuer || OID4VCI_ISSUER, "demo", code, TX_CODE);
+    const page = openPage({ subjects: [] }, Object.assign({ offers: [offerByValue("refused", document)] }, setup.options));
     await page.settle();
     const el = page.el;
     el("subject").value = "refused-subject";
@@ -902,6 +971,7 @@ async function refusedRedemption(label, setup) {
     check(`${label}: the refusal is reported`, el("walletStatus").className.includes("bad")
         && el("walletStatus").textContent.includes(setup.reason), el("walletStatus").textContent);
     check(`${label}: the wallet can be pressed again`, el("wallet").disabled === false);
+    return { page, sent };
 }
 
 /* ---------------------------------------------------------------- checks */
@@ -1840,6 +1910,321 @@ await section("24b. mso_mdoc first", async () => {
     equal("mso_mdoc on load: the legacy option is disabled and /oid4vci selected",
         [el("configuration").value, el("surfaceLegacy").disabled, el("surface").value, el("surfaceHint").hidden],
         ["aamva", true, "oid4vci", false]);
+});
+
+// 25. F-18 round 3: a wallet run redeems the offer that was active when it was pressed. The reviewers' reproduction:
+//     offer A (code-A, transaction code 1111) is being redeemed and waits for the issuer metadata when offer B
+//     (farmer, transaction code 2222 or none) is created; the run must still send only A's code, transaction code and
+//     configuration. The page disables Create while the wallet runs, so the check presses it the way a script (or the
+//     round 2 page, which left it enabled) can, to exercise the snapshot itself
+for (const [label, txB] of [["B with a transaction code", "2222"], ["B without a transaction code", ""]]) {
+    await section(`25. concurrent replacement, ${label}`, async () => {
+        let release;
+        const gate = new Promise((done) => { release = done; });
+        const page = openPage({ subjects: [] }, {
+            offers: [offerByValue("race-a", offerDocument(OID4VCI_ISSUER, "mdoc", "code-A", TX_CODE)),
+                offerByValue("race-b", offerDocument(LEGACY_ISSUER, "farmer", "code-B", txB ? TX_CODE : undefined))],
+            metadataGate: gate,
+        });
+        await page.settle();
+        const el = page.el;
+        el("subject").value = "race-subject";
+        el("configuration").value = "mdoc";
+        await el("configuration").fire("change");
+        el("txCode").value = "1111";
+        const postedA = await page.createOffer();
+        equal(`${label}: offer A is created for mdoc with 1111`, [postedA.credential_configuration_id, postedA.tx_code], ["mdoc", "1111"]);
+        const running = el("wallet").fire("click");
+        await page.settle();
+        equal(`${label}: while the wallet waits for the issuer metadata, Create and the wallet are disabled`,
+            [el("create").disabled, el("wallet").disabled], [true, true]);
+
+        el("create").disabled = false; // pressed anyway
+        el("configuration").value = "farmer";
+        await el("configuration").fire("change");
+        el("txCode").value = txB;
+        const posted = await page.createOffer();
+        equal(`${label}: offer B was created and published while A was being redeemed`,
+            [posted.credential_configuration_id, posted.tx_code === undefined ? "" : posted.tx_code, el("offerUri").textContent],
+            ["farmer", txB, deepLink("race-b")]);
+        equal(`${label}: B's creation leaves Create and the wallet disabled while A's run goes on`,
+            [el("create").disabled, el("wallet").disabled], [true, true]);
+
+        release();
+        await running;
+        await page.settle();
+        equalFields(`${label}: the token form carries A's code and A's transaction code only`,
+            tokenRequest(page) && tokenRequest(page).form, { grant_type: GRANT, "pre-authorized_code": "code-A", tx_code: "1111" });
+        checkCredentialRequest(`${label}: the credential request`, credentialRequest(page),
+            { audience: OID4VCI_ISSUER, nonce: "nonce-f18", configurationId: "mdoc" });
+        equal(`${label}: B's code and transaction code are sent nowhere`,
+            carrying(page.requests.filter((request) => !/pre-authorized-data$/.test(request.url)), ["code-B", ...(txB ? [txB] : []), "null"])
+                .map((request) => request.method + " " + request.url), []);
+        equal(`${label}: the IssuerSigned view follows A's configuration (mso_mdoc), not B's`, el("mdocView").hidden, false);
+        equal(`${label}: when the run ends, Create and the wallet (for B) are usable again`,
+            [el("create").disabled, el("wallet").disabled], [false, false]);
+    });
+}
+
+// 26. F-18 round 3: the wallet's requests refuse redirects. fetch's default would re-send a 307 token POST (the
+//     pre-authorized code and transaction code) to another origin, and a same-origin 307 credential POST with its
+//     Authorization header to a path no metadata advertised
+await section("26a. the fetch stub's redirect modes", async () => {
+    const page = openPage({ subjects: [] }, {
+        redirects: {
+            "POST https://credentials.example/a": { status: 307, location: "/b" },
+            "POST https://credentials.example/c": { status: 302, location: "/d" },
+            "POST https://credentials.example/e": { status: 303, location: "/f" },
+            "POST https://credentials.example/g": { status: 307, location: ATTACKER + "/h" },
+        },
+    });
+    await page.settle();
+    const sent = (from) => page.requests.slice(from).map((request) => [request.method, request.url, request.body || null,
+        request.headers.Authorization || null]);
+    let from = page.requests.length;
+    await page.fetch("https://credentials.example/a", { method: "POST", body: "x=1", headers: { Authorization: "Bearer t" } });
+    equal("follow: a 307 re-sends the method, the body and (same origin) the Authorization header", sent(from), [
+        ["POST", "https://credentials.example/a", "x=1", "Bearer t"], ["POST", "https://credentials.example/b", "x=1", "Bearer t"]]);
+    from = page.requests.length;
+    await page.fetch("https://credentials.example/c", { method: "POST", body: "x=1" });
+    equal("follow: a 302 turns a POST into a GET without a body", sent(from).map((entry) => entry.slice(0, 3)), [
+        ["POST", "https://credentials.example/c", "x=1"], ["GET", "https://credentials.example/d", null]]);
+    from = page.requests.length;
+    await page.fetch("https://credentials.example/e", { method: "POST", body: "x=1" });
+    equal("follow: a 303 turns a POST into a GET without a body", sent(from).map((entry) => entry.slice(0, 3)), [
+        ["POST", "https://credentials.example/e", "x=1"], ["GET", "https://credentials.example/f", null]]);
+    from = page.requests.length;
+    await page.fetch("https://credentials.example/g", { method: "POST", body: "x=1", headers: { Authorization: "Bearer t" } });
+    equal("follow: a cross-origin 307 keeps the body and drops the Authorization header", sent(from), [
+        ["POST", "https://credentials.example/g", "x=1", "Bearer t"], ["POST", ATTACKER + "/h", "x=1", null]]);
+    from = page.requests.length;
+    let error = null;
+    try {
+        await page.fetch("https://credentials.example/g", { method: "POST", body: "x=1", redirect: "error" });
+    } catch (caught) {
+        error = caught;
+    }
+    equal("error: the redirect rejects with a TypeError and nothing is requested at Location",
+        [error instanceof TypeError, sent(from).map((entry) => entry[1])], [true, ["https://credentials.example/g"]]);
+    from = page.requests.length;
+    const manual = await page.fetch("https://credentials.example/g", { method: "POST", body: "x=1", redirect: "manual" });
+    equal("manual: an opaque redirect with status 0, and nothing requested at Location",
+        [manual.type, manual.status, sent(from).map((entry) => entry[1])], ["opaqueredirect", 0, ["https://credentials.example/g"]]);
+});
+
+/** Runs the wallet against a stack that answers one of its requests with a redirect; returns the page and what it sent. */
+async function redirectedRun(label, redirects) {
+    const code = "code-redirect-" + label.replace(/[^a-z0-9]+/gi, "-");
+    const page = openPage({ subjects: [] }, {
+        offers: [offerByValue("redirected", offerDocument(OID4VCI_ISSUER, "demo", code, TX_CODE))],
+        redirects,
+    });
+    await page.settle();
+    page.el("subject").value = "redirect-subject";
+    page.el("txCode").value = "8642";
+    await page.createOffer();
+    const from = page.requests.length;
+    await page.runWallet();
+    const sent = page.requests.slice(from);
+    check(`${label}: every wallet request refuses redirects`, sent.length > 0 && sent.every((request) => request.redirect === "error"),
+        JSON.stringify(sent.map((request) => [request.method, request.url, request.redirect])));
+    check(`${label}: the refusal is reported and the wallet can be pressed again`,
+        page.el("walletStatus").className.includes("bad") && page.el("wallet").disabled === false, page.el("walletStatus").textContent);
+    return { page, sent, code };
+}
+
+await section("26b. a cross-origin 307 on the token endpoint", async () => {
+    const { sent, code } = await redirectedRun("token endpoint 307 to another origin",
+        { ["POST " + TOKEN_ENDPOINT]: { status: 307, location: ATTACKER + "/token" } });
+    equal("token endpoint 307: nothing reaches the redirect target", sent.filter((request) => request.url.startsWith(ATTACKER))
+        .map((request) => request.method + " " + request.url), []);
+    equal("token endpoint 307: the code and the transaction code went to the advertised token endpoint only",
+        carrying(sent, [code, "8642"]).map((request) => request.method + " " + request.url), ["POST " + TOKEN_ENDPOINT]);
+    equal("token endpoint 307: no nonce or credential request follows", [nonceRequest({ requests: sent }), credentialRequest({ requests: sent })],
+        [undefined, undefined]);
+});
+
+await section("26c. a same-origin 307 on the credential endpoint", async () => {
+    const elsewhere = DOMAIN + "/v1/certify/elsewhere";
+    const { sent } = await redirectedRun("credential endpoint 307 on the same origin",
+        { ["POST " + OID4VCI_CREDENTIAL_ENDPOINT]: { status: 307, location: "/v1/certify/elsewhere" } });
+    equal("credential endpoint 307: nothing reaches the redirect target", sent.filter((request) => request.url === elsewhere)
+        .map((request) => request.method + " " + request.url), []);
+    equal("credential endpoint 307: the access token went to the advertised credential endpoint only",
+        carrying(sent, ["at-f18"]).map((request) => request.method + " " + request.url), ["POST " + OID4VCI_CREDENTIAL_ENDPOINT]);
+});
+
+await section("26d. redirected nonce endpoint and metadata", async () => {
+    const nonce = await redirectedRun("nonce endpoint 307",
+        { ["POST " + OID4VCI_NONCE_ENDPOINT]: { status: 307, location: ATTACKER + "/nonce" } });
+    equal("nonce endpoint 307: nothing reaches the redirect target, and no credential request follows",
+        [nonce.sent.filter((request) => request.url.startsWith(ATTACKER)).length, credentialRequest({ requests: nonce.sent })], [0, undefined]);
+    const metadata = await redirectedRun("issuer metadata 302",
+        { [wellKnown(OID4VCI_ISSUER, "openid-credential-issuer")]: { status: 302, location: ATTACKER + "/metadata" } });
+    equal("issuer metadata 302: no request after it, nothing to the redirect target",
+        metadata.sent.map((request) => request.method + " " + request.url), ["GET " + wellKnown(OID4VCI_ISSUER, "openid-credential-issuer")]);
+    const as = await redirectedRun("AS metadata 302",
+        { [wellKnown(AS, "oauth-authorization-server")]: { status: 302, location: ATTACKER + "/as" } });
+    equal("AS metadata 302: no POST, nothing to the redirect target",
+        as.sent.filter((request) => request.method !== "GET" || request.url.startsWith(ATTACKER)).length, 0);
+});
+
+// 27. F-18 round 3: a credential issuer or authorization server identifier with userinfo, a query or a fragment is
+//     not an identifier (OpenID4VCI 1.0 section 12.2.1, RFC 8414 section 2), and is refused before anything is sent
+for (const [label, issuer] of [
+    ["an issuer with userinfo", "https://credentials.example@attacker.example/v1/certify/oid4vci"],
+    ["an issuer with a query", OID4VCI_ISSUER + "?tenant=other"],
+    ["an issuer with an empty query", OID4VCI_ISSUER + "?"],
+    ["an issuer with a fragment", OID4VCI_ISSUER + "#other"],
+]) {
+    await section(`27. ${label}`, async () => {
+        const { sent } = await refusedRedemption(label, { reason: "nothing was sent", offerIssuer: issuer,
+            options: { issuerMetadata: Object.assign({}, DEFAULT_ISSUER_METADATA, { [issuer]: Object.assign({}, OID4VCI_DOCUMENT, { credential_issuer: issuer }) }) } });
+        equal(`${label}: not even its metadata is requested`, sent.map((request) => request.method + " " + request.url), []);
+    });
+}
+for (const [label, server] of [
+    ["an authorization server with userinfo", "https://credentials.example@attacker.example"],
+    ["an authorization server with a query", AS + "?realm=other"],
+    ["an authorization server with a fragment", AS + "#other"],
+]) {
+    await section(`27. ${label}`, async () => {
+        const { sent } = await refusedRedemption(label, { reason: "nothing was sent", options: {
+            issuerMetadata: { [OID4VCI_ISSUER]: Object.assign({}, OID4VCI_DOCUMENT, { authorization_servers: [server] }) },
+        } });
+        equal(`${label}: only the issuer metadata is requested`, sent.map((request) => request.method + " " + request.url),
+            ["GET " + wellKnown(OID4VCI_ISSUER, "openid-credential-issuer")]);
+    });
+}
+
+// 28. F-18 round 3, OpenID4VCI 1.0 section 4.1.1: a grant's authorization_server picks one of the issuer metadata's
+//     authorization_servers, and MUST be one of them
+const SECOND_AS = "https://login.credentials.example";
+const TWO_SERVERS = { [OID4VCI_ISSUER]: Object.assign({}, OID4VCI_DOCUMENT, { authorization_servers: [AS, SECOND_AS] }) };
+const BOTH_AS = { [AS]: AS_DOCUMENT, [SECOND_AS]: { issuer: SECOND_AS, token_endpoint: SECOND_AS + "/token" } };
+const hinted = (hint) => (code) => {
+    const document = offerDocument(OID4VCI_ISSUER, "demo", code, TX_CODE);
+    document.grants[GRANT].authorization_server = hint;
+    return document;
+};
+await section("28a. authorization_server listed by the issuer", async () => {
+    const page = openPage({ subjects: [] }, {
+        offers: [offerByValue("hint", hinted(SECOND_AS)("code-hint"))], issuerMetadata: TWO_SERVERS, asMetadata: BOTH_AS,
+    });
+    await page.settle();
+    page.el("subject").value = "hint-subject";
+    page.el("txCode").value = "1234";
+    await page.createOffer();
+    await page.runWallet();
+    equal("listed hint: its metadata is read", metadataRequest(page, "oauth-authorization-server") && metadataRequest(page, "oauth-authorization-server").url,
+        wellKnown(SECOND_AS, "oauth-authorization-server"));
+    equal("listed hint: the token request goes to its token endpoint, not the first server's",
+        tokenRequest(page) && tokenRequest(page).url, SECOND_AS + "/token");
+    check("listed hint: the credential is issued", page.el("walletStatus").textContent.includes("Credential issued"), page.el("walletStatus").textContent);
+});
+await section("28b. no authorization_server, two listed", async () => {
+    const page = openPage({ subjects: [] }, {
+        offers: [offerByValue("no-hint", offerDocument(OID4VCI_ISSUER, "demo", "code-no-hint"))], issuerMetadata: TWO_SERVERS, asMetadata: BOTH_AS,
+    });
+    await page.settle();
+    page.el("subject").value = "hint-subject";
+    await page.createOffer();
+    await page.runWallet();
+    equal("no hint: the first listed server is used", tokenRequest(page) && tokenRequest(page).url, TOKEN_ENDPOINT);
+});
+for (const [label, hint, issuerMetadata] of [
+    ["authorization_server not listed by the issuer", "https://other.example", TWO_SERVERS],
+    ["authorization_server and no authorization_servers", AS, { [OID4VCI_ISSUER]: (() => {
+        const document = Object.assign({}, OID4VCI_DOCUMENT);
+        delete document.authorization_servers;
+        return document;
+    })() }],
+    ["authorization_server that is not a string", 42, TWO_SERVERS],
+]) {
+    await section(`28. ${label}`, async () => {
+        const { sent } = await refusedRedemption(label, { reason: "does not list", document: hinted(hint),
+            options: { issuerMetadata, asMetadata: BOTH_AS } });
+        equal(`${label}: no authorization server metadata is requested`,
+            sent.filter((request) => request.url.includes("oauth-authorization-server")).length, 0);
+    });
+}
+
+// 29. F-18 round 3: a by-reference offer's credential_offer_uri is fetched only as a path on the page's own origin or
+//     an absolute https URL (http when the deployment's own issuer identifier is http)
+const linkTo = (value) => `openid-credential-offer://?credential_offer_uri=${encodeURIComponent(value)}`;
+for (const [label, value, fetchedAt, pageOptions] of [
+    ["a path on the page's origin", "/v1/certify/credential-offer-data/by-path", DOMAIN + "/v1/certify/credential-offer-data/by-path", {}],
+    ["an absolute https URL", OFFER_DOCUMENT + "absolute", OFFER_DOCUMENT + "absolute", {}],
+    ["an http URL on an http deployment", "http://127.0.0.1:28191/v1/certify/credential-offer-data/dev",
+        "http://127.0.0.1:28191/v1/certify/credential-offer-data/dev",
+        { pageUrl: "http://127.0.0.1:28191/v1/certify/offer/", ownIssuer: "http://127.0.0.1:28191" }],
+]) {
+    await section(`29. by reference: ${label}`, async () => {
+        const page = openPage({ subjects: [] }, Object.assign({
+            offers: [{ credential_offer_uri: linkTo(value) }], offerFetches: [{ status: 200, body: REFERRED_OFFER }],
+        }, pageOptions));
+        await page.settle();
+        page.el("subject").value = "reference-subject";
+        await page.createOffer();
+        equal(`${label}: the offer document is fetched there`, find(page, "GET", /credential-offer-data/) && find(page, "GET", /credential-offer-data/).url, fetchedAt);
+        equal(`${label}: and published`, [page.el("offerUri").hidden, page.el("wallet").disabled], [false, false]);
+    });
+}
+for (const [label, value] of [
+    ["a protocol-relative URL", "//attacker.example/v1/certify/credential-offer-data/x"],
+    ["a backslash path", "/\\attacker.example/v1/certify/credential-offer-data/x"],
+    ["an http URL on an https deployment", "http://credentials.example/v1/certify/credential-offer-data/x"],
+    ["another scheme", "ftp://credentials.example/v1/certify/credential-offer-data/x"],
+    ["a javascript: URL", "javascript:alert(1)"],
+    ["userinfo", "https://user@credentials.example/v1/certify/credential-offer-data/x"],
+    ["a relative path without a leading slash", "v1/certify/credential-offer-data/x"],
+]) {
+    await section(`29. by reference refused: ${label}`, async () => {
+        const page = openPage({ subjects: [] }, {
+            offers: [{ credential_offer_uri: linkTo(value) }], offerFetches: [{ status: 200, body: REFERRED_OFFER }],
+        });
+        await page.settle();
+        page.el("subject").value = "reference-subject";
+        await page.createOffer();
+        equal(`${label}: nothing but the offer POST is requested`, page.requests.filter((request) => request.method !== "GET"
+            || !/^\/v1\/certify\/(\.well-known|offer\/)/.test(request.url)).map((request) => request.method + " " + request.url),
+        ["POST /v1/certify/pre-authorized-data"]);
+        check(`${label}: the refusal is reported`, page.el("offerStatus").className.includes("bad")
+            && page.el("offerStatus").textContent.includes("not a URL this page fetches"), page.el("offerStatus").textContent);
+        equal(`${label}: nothing is published`, [page.el("offerUri").hidden, page.el("wallet").disabled], [true, true]);
+    });
+}
+
+// 30. RFC 8414 section 3.1: one terminating "/" of the identifier's path is removed before the well-known segment goes in
+for (const [label, server, location] of [
+    ["one trailing slash", "https://as.example/realm/", "https://as.example/.well-known/oauth-authorization-server/realm"],
+    ["two trailing slashes", "https://as.example/realm//", "https://as.example/.well-known/oauth-authorization-server/realm/"],
+]) {
+    await section(`30. AS identifier with ${label}`, async () => {
+        const page = openPage({ subjects: [] }, {
+            offers: [offerByValue("slash", offerDocument(OID4VCI_ISSUER, "demo", "code-slash"))],
+            issuerMetadata: { [OID4VCI_ISSUER]: Object.assign({}, OID4VCI_DOCUMENT, { authorization_servers: [server] }) },
+            asMetadata: { [server]: { issuer: server, token_endpoint: "https://as.example/token" } },
+        });
+        await page.settle();
+        page.el("subject").value = "slash-subject";
+        await page.createOffer();
+        await page.runWallet();
+        equal(`${label}: the metadata URL`, metadataRequest(page, "oauth-authorization-server") && metadataRequest(page, "oauth-authorization-server").url, location);
+        equal(`${label}: the token endpoint it names is used`, tokenRequest(page) && tokenRequest(page).url, "https://as.example/token");
+    });
+}
+
+// 31. the parser's newline rules: CR LF normalised, and the newline right after <textarea>, <pre> and <listing> dropped
+await section("31. parser newlines", async () => {
+    const { ids } = parseMarkup('<textarea id="a">\nfirst</textarea><textarea id="b">\n\nsecond</textarea>'
+        + '<textarea id="c">\r\nthird</textarea><pre id="p">\nx</pre><pre id="q"><b>y</b>\nz</pre><div id="d">\nkept</div>');
+    equal("a textarea drops the newline right after its start tag", ids.get("a") && ids.get("a").value, "first");
+    equal("only that one newline", ids.get("b") && ids.get("b").value, "\nsecond");
+    equal("CR LF is a newline", ids.get("c") && ids.get("c").value, "third");
+    equal("a pre drops the newline right after its start tag", ids.get("p") && ids.get("p").textContent, "x");
+    equal("a newline later in a pre is kept", ids.get("q") && ids.get("q").textContent, "y\nz");
+    equal("other elements keep a leading newline", ids.get("d") && ids.get("d").textContent, "\nkept");
 });
 
 } finally {

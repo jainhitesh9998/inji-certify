@@ -105,20 +105,41 @@
   const BASE = location.pathname.replace(/\/offer\/.*$/, "");
   const el = (id) => document.getElementById(id);
   const PRE_AUTHORIZED = "urn:ietf:params:oauth:grant-type:pre-authorized_code";
-  let metadata = null, offerDocument = null, offerConfigurationId = null, offerSurface = null, offerTxCode = null;
+  let metadata = null;
+  // the offer the page has published: replaced as a whole when another one is published, never mutated, so a wallet run
+  // that took it before its first await keeps redeeming exactly that offer
+  let activeOffer = null;
+  // an offer is being created / redeemed: each keeps the other's button disabled while it runs
+  let creating = false, redeeming = false;
   // the blob URL of the last portrait this page rendered, released when the next one replaces it
   let portraitObjectUrls = [];
 
-  async function api(method, path, body, headers, form) {
+  async function send(method, url, body, headers, form, redirect) {
     const h = Object.assign({}, headers || {});
     let data;
     if (form) { data = new URLSearchParams(form); h["Content-Type"] = "application/x-www-form-urlencoded"; }
     else if (body !== undefined) { data = JSON.stringify(body); h["Content-Type"] = "application/json"; }
-    const r = await fetch(path.startsWith("http") ? path : BASE + path, { method, headers: h, body: data });
+    const r = await fetch(url, { method, headers: h, body: data, redirect });
     const text = await r.text();
     let parsed = text;
     try { parsed = JSON.parse(text); } catch (e) { /* plain text */ }
     return { status: r.status, body: parsed };
+  }
+
+  /** A request to this page's own deployment: a path under its servlet path, fetch's default redirect handling. */
+  async function api(method, path, body, headers, form) {
+    return send(method, BASE + path, body, headers, form, "follow");
+  }
+
+  /**
+   * A request of the in-page wallet: always an absolute URL the checks below vetted, and a redirect is an error.
+   * fetch's default would follow it: a 307 re-sends the token POST's pre-authorized code and transaction code to
+   * wherever Location points, and a same-origin redirect carries the Authorization header to a path no metadata
+   * advertised. The metadata GETs refuse redirects too: certify-nginx proxies both well-known documents (and every
+   * endpoint) without one, and a compliant issuer serves its metadata at the well-known URL itself.
+   */
+  async function walletApi(method, url, body, headers, form) {
+    return send(method, url, body, headers, form, "error");
   }
 
   function status(id, message, ok) {
@@ -311,6 +332,7 @@
       try { request.claims = JSON.parse(el("claims").value); } catch (e) { status("offerStatus", "Claims are not valid JSON: " + e.message, false); return; }
     } else { status("offerStatus", "Give a subject or claims", false); return; }
     status("offerStatus", "Creating the offer…");
+    creating = true;
     el("create").disabled = true;
     try {
       const r = await api("POST", "/pre-authorized-data", request);
@@ -323,12 +345,15 @@
       if (offer.credential_offer !== undefined) {
         fetchedOffer = offer.credential_offer; // by value: the offer travelled in the answer, no fetch needed
       } else {
-        const offerUrl = new URL(deepLink.replace(/^[a-z-]+:\/\//, "https://x/")).searchParams.get("credential_offer_uri");
-        const fetched = offerUrl ? await api("GET", offerUrl) : null;
-        if (!fetched || fetched.status !== 200) {
+        const offerUrl = offerDocumentUrl(deepLink);
+        if (!offerUrl) {
+          status("offerStatus", "The offer was created, but its credential_offer_uri is not a URL this page fetches", false); return;
+        }
+        const fetched = await send("GET", offerUrl, undefined, undefined, undefined, "follow");
+        if (fetched.status !== 200) {
           // the previous offer stays active: nothing has been published yet
           status("offerStatus", "The offer was created but could not be fetched from credential_offer_uri ("
-            + (fetched ? fetched.status : "no URI") + ")", false); return;
+            + fetched.status + ")", false); return;
         }
         fetchedOffer = fetched.body;
       }
@@ -342,31 +367,41 @@
       const qr = document.createElement("div");
       new QRCode(qr, { text: deepLink, width: 256, height: 256, correctLevel: QRCode.CorrectLevel.M });
       const grant = fetchedOffer.grants[PRE_AUTHORIZED];
-      // created and validated: this is the active offer from here, published in one go
-      offerConfigurationId = proposedConfigurationId;
-      offerSurface = proposedSurface;
-      // OpenID4VCI 1.0 section 6.1: the transaction code an offer's grant names is the one the visitor typed for that
-      // offer, read when Create was pressed, so that editing the field afterwards (or while the issuer answered) cannot
-      // change what this offer is redeemed with
-      offerTxCode = asksTxCode(grant) ? proposedTxCode : null;
-      offerDocument = fetchedOffer;
+      // created and validated: this is the active offer from here, published in one go, as one record a wallet run
+      // takes whole. OpenID4VCI 1.0 section 6.1: the transaction code an offer's grant names is the one the visitor
+      // typed for that offer, read when Create was pressed, so that editing the field afterwards (or while the issuer
+      // answered) cannot change what this offer is redeemed with
+      activeOffer = Object.freeze({
+        document: fetchedOffer,
+        issuer: fetchedOffer.credential_issuer,
+        code: grant["pre-authorized_code"],
+        asksTxCode: asksTxCode(grant),
+        txCode: asksTxCode(grant) ? proposedTxCode : null,
+        // section 4.1.1: which of the issuer's authorization servers this grant is for, when it says
+        authorizationServer: grant.authorization_server,
+        credentialConfigurationId: fetchedOffer.credential_configuration_ids[0],
+        configurationId: proposedConfigurationId,
+        surface: proposedSurface,
+      });
       el("offerUri").textContent = deepLink; el("offerUri").hidden = false;
       el("qr").innerHTML = "";
       while (qr.firstChild) el("qr").appendChild(qr.firstChild);
       el("copy").disabled = false;
       el("open").href = deepLink; el("open").hidden = false;
-      el("offerDoc").textContent = JSON.stringify(offerDocument, null, 2); el("offerDoc").hidden = !offerDocument;
+      el("offerDoc").textContent = JSON.stringify(activeOffer.document, null, 2); el("offerDoc").hidden = false;
       // the surface this offer actually targets, not what the dropdown says now; the wallet redeems it where that
       // surface's own metadata says (an mso_mdoc offer is never on the compatibility surface, see syncSurface)
-      const surfaceNote = offerSurface === "oid4vci" ? " It targets the /oid4vci surface."
+      const surfaceNote = activeOffer.surface === "oid4vci" ? " It targets the /oid4vci surface."
         : " It targets the compatibility surface.";
       status("offerStatus", "Offer created; the pre-authorized code is in the offer document below." + surfaceNote, true);
-      el("wallet").disabled = !grant;
+      // a wallet run in progress keeps its button until it ends, and then offers this one
+      el("wallet").disabled = redeeming || !grant;
       el("credential").hidden = true; status("walletStatus", "");
     } catch (e) {
       status("offerStatus", "Request failed: " + e.message, false);
     } finally {
-      el("create").disabled = false;
+      creating = false;
+      el("create").disabled = redeeming;
     }
   });
 
@@ -406,13 +441,46 @@
     let url, base;
     try { url = new URL(value); base = new URL(identifier); } catch (e) { return null; } // no base: relative is refused
     if (base.protocol !== "https:" && base.protocol !== "http:") return null;
+    if (url.username || url.password) return null; // userinfo is never part of an endpoint, and fetch refuses it anyway
     return url.protocol === "https:" || (url.protocol === "http:" && base.protocol === "http:") ? url.href : null;
+  }
+
+  /**
+   * A credential issuer or authorization server identifier: trustedUrl's rules, and no userinfo, query or fragment
+   * (OpenID4VCI 1.0 section 12.2.1, RFC 8414 section 2). `https://issuer.example@attacker.example/` names
+   * attacker.example, and a query or fragment cannot be part of the well-known location. Returns the URL or null.
+   */
+  function identifierUrl(value, governing) {
+    const href = trustedUrl(value, governing);
+    if (href === null || /[?#]/.test(value)) return null;
+    const url = new URL(value);
+    return url.username || url.password || url.search || url.hash ? null : href;
+  }
+
+  /**
+   * The offer document a by-reference deep link names (its credential_offer_uri parameter), as a URL this page fetches:
+   * a path on this page's own origin, or an absolute URL under trustedUrl's rule for this deployment's issuer identifier
+   * (https, or http when that identifier is http, as on a local stack). Anything else is null: another scheme, a
+   * protocol-relative or backslash path, userinfo.
+   */
+  function offerDocumentUrl(deepLink) {
+    let value;
+    try { value = new URL(deepLink.replace(/^[a-z-]+:\/\//, "https://x/")).searchParams.get("credential_offer_uri"); } catch (e) { return null; }
+    if (typeof value !== "string" || !value) return null;
+    if (value.startsWith("/")) {
+      if (value.startsWith("//") || value.includes("\\")) return null;
+      const url = new URL(value, location.href);
+      return url.origin === location.origin ? url.href : null;
+    }
+    const deployment = metadata && typeof metadata.credential_issuer === "string" ? metadata.credential_issuer : location.origin;
+    return trustedUrl(value, deployment);
   }
 
   /** RFC 8414 section 3 / OpenID4VCI 1.0 section 12.2.2: the well-known segment goes between the host and the path. */
   function wellKnown(identifier, suffix) {
     const url = new URL(identifier);
-    return url.origin + "/.well-known/" + suffix + url.pathname.replace(/\/+$/, "");
+    // RFC 8414 section 3.1: the terminating "/" of the path is removed (one, not every trailing slash)
+    return url.origin + "/.well-known/" + suffix + url.pathname.replace(/\/$/, "");
   }
 
   /** OpenID4VCI 1.0 section 8.2: the credential identifiers the access token's authorization_details grant. */
@@ -427,23 +495,31 @@
   }
 
   el("wallet").addEventListener("click", async () => {
-    const grant = offerDocument.grants[PRE_AUTHORIZED];
+    // the offer this run redeems, taken whole before the first await: publishing another offer replaces activeOffer,
+    // never this run's record, so the pre-authorized code, the transaction code, the configuration and the issuer stay
+    // those of the offer that was on screen when the button was pressed, whatever happens while the run waits
+    const offer = activeOffer;
+    if (!offer) return;
+    redeeming = true;
     el("wallet").disabled = true;
+    // and no other offer is created while this one is redeemed (the button comes back when the run ends)
+    el("create").disabled = true;
     try {
       // OpenID4VCI 1.0 sections 4.1.1, 7, 8.2 and 12.2.2/12.2.4: the offer names its credential issuer, and everything
       // else comes from that issuer's metadata and its authorization server's metadata, each at its well-known
       // location. Nothing here is hard-coded to this deployment's own surface. Every check below runs before the
       // pre-authorized code, the transaction code or the access token leaves the page.
-      const credentialIssuer = offerDocument.credential_issuer;
-      if (!trustedUrl(credentialIssuer, credentialIssuer)) {
-        status("walletStatus", "The offer's credential_issuer is not an http(s) URL: " + credentialIssuer, false); return;
+      const credentialIssuer = offer.issuer;
+      if (!identifierUrl(credentialIssuer, credentialIssuer)) {
+        status("walletStatus", "The offer's credential_issuer is not an http(s) URL without userinfo, query or fragment: "
+          + JSON.stringify(credentialIssuer) + "; nothing was sent", false); return;
       }
       // section 6.1: an offer whose grant asks for a transaction code is never redeemed without one (the token endpoint
       // would spend the pre-authorized code on a request that cannot succeed)
-      if (asksTxCode(grant) && !offerTxCode) {
+      if (offer.asksTxCode && !offer.txCode) {
         status("walletStatus", "This offer asks for a transaction code, and none was entered when it was created", false); return;
       }
-      const issuerAnswer = await api("GET", wellKnown(credentialIssuer, "openid-credential-issuer"));
+      const issuerAnswer = await walletApi("GET", wellKnown(credentialIssuer, "openid-credential-issuer"));
       if (issuerAnswer.status !== 200 || !issuerAnswer.body || typeof issuerAnswer.body !== "object") {
         status("walletStatus", "The issuer metadata of " + credentialIssuer + " could not be fetched (" + issuerAnswer.status + ")", false); return;
       }
@@ -460,12 +536,24 @@
       if (!credentialEndpoint || (issuerMetadata.nonce_endpoint !== undefined && !nonceEndpoint)) {
         status("walletStatus", "The issuer metadata's credential_endpoint or nonce_endpoint is not an absolute URL this page may use; nothing was sent", false); return;
       }
-      const authorizationServer = Array.isArray(issuerMetadata.authorization_servers) && issuerMetadata.authorization_servers.length
-        ? issuerMetadata.authorization_servers[0] : credentialIssuer;
-      if (!trustedUrl(authorizationServer, credentialIssuer)) {
+      // section 4.1.1: a grant that names an authorization_server picks that one, which MUST be one of the issuer's
+      // authorization_servers; without it the first of them is used, and without those the issuer is its own
+      // authorization server (section 12.2.4)
+      const servers = Array.isArray(issuerMetadata.authorization_servers) ? issuerMetadata.authorization_servers : [];
+      let authorizationServer;
+      if (offer.authorizationServer !== undefined) {
+        if (typeof offer.authorizationServer !== "string" || servers.indexOf(offer.authorizationServer) < 0) {
+          status("walletStatus", "The offer's grant names the authorization server " + JSON.stringify(offer.authorizationServer)
+            + ", which the issuer metadata does not list; nothing was sent", false); return;
+        }
+        authorizationServer = offer.authorizationServer;
+      } else {
+        authorizationServer = servers.length ? servers[0] : credentialIssuer;
+      }
+      if (!identifierUrl(authorizationServer, credentialIssuer)) {
         status("walletStatus", "The authorization server " + JSON.stringify(authorizationServer) + " is not an absolute URL this page may use; nothing was sent", false); return;
       }
-      const asAnswer = await api("GET", wellKnown(authorizationServer, "oauth-authorization-server"));
+      const asAnswer = await walletApi("GET", wellKnown(authorizationServer, "oauth-authorization-server"));
       if (asAnswer.status !== 200 || !asAnswer.body || typeof asAnswer.body !== "object") {
         status("walletStatus", "The authorization server metadata of " + authorizationServer + " could not be fetched (" + asAnswer.status + ")", false); return;
       }
@@ -479,18 +567,18 @@
         status("walletStatus", "The authorization server's token_endpoint is not an absolute URL this page may use; nothing was sent", false); return;
       }
       status("walletStatus", "1/3 exchanging the pre-authorized code for a token…");
-      const form = { grant_type: PRE_AUTHORIZED, "pre-authorized_code": grant["pre-authorized_code"] };
+      const form = { grant_type: PRE_AUTHORIZED, "pre-authorized_code": offer.code };
       // OpenID4VCI 1.0 section 6.1: the transaction code asked for is the one this offer's grant names, with the value
       // entered for this offer when it was created; an offer whose grant names none never sends one
-      if (asksTxCode(grant)) form.tx_code = offerTxCode;
-      const token = await api("POST", tokenEndpoint, undefined, undefined, form);
+      if (offer.asksTxCode) form.tx_code = offer.txCode;
+      const token = await walletApi("POST", tokenEndpoint, undefined, undefined, form);
       if (token.status !== 200 || !token.body.access_token) { status("walletStatus", "Token request refused (" + token.status + "): " + JSON.stringify(token.body), false); return; }
       // OpenID4VCI 1.0 section 7: the nonce endpoint is optional, so a metadata document without one asks for no c_nonce
       // and the proof carries none (Appendix F.1)
       let nonce = null;
       if (nonceEndpoint) {
         status("walletStatus", "2/3 fetching a c_nonce…");
-        const answer = await api("POST", nonceEndpoint);
+        const answer = await walletApi("POST", nonceEndpoint);
         if (answer.status < 200 || answer.status >= 300 || !answer.body || !answer.body.c_nonce) {
           status("walletStatus", "Nonce request refused (" + answer.status + ")", false); return;
         }
@@ -501,10 +589,10 @@
       // with a configuration id; otherwise the configuration the offer names is what the request carries
       const identifiers = credentialIdentifiers(token.body);
       const request = identifiers.length ? { credential_identifier: identifiers[0] }
-        : { credential_configuration_id: offerDocument.credential_configuration_ids[0] };
+        : { credential_configuration_id: offer.credentialConfigurationId };
       // Appendix F.1: aud is the credential issuer the offer named, whatever surface that is
       request.proofs = { jwt: [await proofJwt(credentialIssuer, nonce)] };
-      const credential = await api("POST", credentialEndpoint, request,
+      const credential = await walletApi("POST", credentialEndpoint, request,
         { Authorization: (token.body.token_type || "Bearer") + " " + token.body.access_token });
       el("credential").textContent = JSON.stringify(credential.body, null, 2); el("credential").hidden = false;
       const issued = credential.status === 200 && credential.body.credentials && credential.body.credentials.length;
@@ -514,7 +602,7 @@
       if (issued) {
         // its own guard: a rendering fault must not turn a successful issuance into "the flow failed"
         try {
-          renderMdoc(credential.body.credentials[0].credential);
+          renderMdoc(credential.body.credentials[0].credential, offer.configurationId);
         } catch (e) {
           status("walletStatus", "Credential issued, but the IssuerSigned view could not be rendered: " + e.message, false);
         }
@@ -522,7 +610,9 @@
     } catch (e) {
       status("walletStatus", "The flow failed: " + e.message, false);
     } finally {
-      el("wallet").disabled = false;
+      redeeming = false;
+      el("wallet").disabled = !activeOffer;
+      el("create").disabled = creating;
     }
   });
 
@@ -544,13 +634,14 @@
     return null;
   }
 
-  function renderMdoc(credential) {
+  /** Renders an issued mso_mdoc; configurationId is the configuration of the offer the wallet run redeemed. */
+  function renderMdoc(credential, configurationId) {
     const view = el("mdocView"), table = el("mdocTable");
     // the previous credential's portrait image is dropped by the table reset below: release its blob URL first
     portraitObjectUrls.forEach((url) => URL.revokeObjectURL(url)); portraitObjectUrls = [];
     table.innerHTML = "";
-    // the format of the configuration this page offered, not of whatever the dropdown shows now
-    if (formatOf(offerConfigurationId) !== "mso_mdoc") { view.hidden = true; return; }
+    // the format of the configuration of the offer that was redeemed, not of whatever the dropdown or a newer offer shows
+    if (formatOf(configurationId) !== "mso_mdoc") { view.hidden = true; return; }
     let issuerSigned;
     try { issuerSigned = Cbor.decode(base64urlBytes(credential)); } catch (e) {
       view.hidden = false;
