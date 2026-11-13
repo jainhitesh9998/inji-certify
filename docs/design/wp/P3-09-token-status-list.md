@@ -18,6 +18,8 @@ Item 5 of docs/design/17-conformance-gaps.md and the decision of 2026-09-18 (Tok
 
 - Finding fixed on the way (CI red on the P3-08 merge): `DIDDocumentUtil` reads every `credential_config` row for the DID document and treated a provider-prefixed key (`x509-file:sdjwt-es256`, written by `PkiSdJwtIssuanceTest` into the H2 database every test context shares) as a keymanager alias, failing the whole document for every context that ran after it on Linux. It now resolves prefixed keys through the registry and leaves a key it cannot resolve out of the document with an error log.
 
+- Fixed later by F-10 (2026-11-13, decision log): a list was signed only on a status change, so it expired after two `ttl` and kept the `sub` of the domain at signing time; it is now signed again when served stale (`TokenStatusListFreshnessTest`, `StatusListPostgresTest.tokenStatusListIsSignedAgainWhenStaleOrUnderAnotherUri`).
+
 ## Outside scope
 
 The CWT form of the list for mDoc verifiers (`application/statuslist+cwt`), `/credentials/status` resolving an SD-JWT's list entry through the ledger (the ledger stores Bitstring entries today), status list aggregation, `status_list` referenced tokens with more than one bit.
