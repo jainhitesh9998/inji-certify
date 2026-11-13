@@ -206,6 +206,13 @@ class StatusListPostgresTest {
     @Autowired LedgerRepository ledgerRepository;
     @Autowired CredentialStatusTransactionRepository transactionRepository;
     @Autowired StatusListUpdateBatchJob batchJob;
+    @Autowired io.mosip.certify.status.TokenStatusListService tokenStatusLists;
+    @Autowired io.mosip.certify.status.TokenStatusListProperties tokenStatusListProperties;
+    @Autowired io.mosip.certify.repository.StatusListCredentialRepository statusListRepository;
+    @Autowired io.mosip.certify.services.StatusListCredentialService statusListCredentialService;
+    @Autowired io.mosip.certify.services.StatusListIndexProvider statusListIndexProvider;
+    @Autowired io.mosip.certify.issuance.KeyProviderRegistry keyProviders;
+    @Autowired org.springframework.core.env.Environment environment;
     @Autowired Flyway flyway;
     @Autowired DataSource dataSource;
     @MockBean DataProviderPlugin dataProviderPlugin;
@@ -411,6 +418,67 @@ class StatusListPostgresTest {
         Map<String, Object> after = updated.getJWTClaimsSet().getJSONObjectClaim("status_list");
         assertTrue(io.mosip.certify.status.TokenStatusListService.get(io.mosip.certify.status.TokenStatusListService.decode(after.get("lst").toString()), idx), "revoked");
         assertTrue(updated.verify(new com.nimbusds.jose.crypto.ECDSAVerifier((java.security.interfaces.ECPublicKey) leaf.getPublicKey())), "the re-signed list verifies");
+    }
+
+    /**
+     * Freshness of a served Token Status List (draft-ietf-oauth-status-list 5.1, 8.3) on PostgreSQL: a list signed long
+     * ago (exp less than ttl away) and a list signed under another domain (sub not the URI the tokens carry) are both
+     * signed again by GET, through the compare-and-set on vc_document, with the revoked bit kept.
+     */
+    @Test
+    void tokenStatusListIsSignedAgainWhenStaleOrUnderAnotherUri() throws Exception {
+        io.mosip.certify.status.TokenStatusListService.Entry entry = tokenStatusLists.allocate("revocation");
+        String listId = entry.uri().substring(entry.uri().lastIndexOf('/') + 1);
+        CredentialStatusTransaction revocation = new CredentialStatusTransaction();
+        revocation.setCredentialId("token-status-fresh-" + entry.idx());
+        revocation.setStatusPurpose("revocation");
+        revocation.setStatusValue(true);
+        revocation.setStatusListCredentialId(listId);
+        revocation.setStatusListIndex(entry.idx());
+        revocation.setCreatedDtimes(java.time.LocalDateTime.now());
+        revocation.setIsProcessed(false);
+        transactionRepository.save(revocation);
+        batchJob.updateStatusList(listId, List.of(revocation));
+        String fresh = mockMvc.perform(get("/credentials/token-status-list/" + listId)).andReturn().getResponse().getContentAsString();
+        assertEquals(fresh, mockMvc.perform(get("/credentials/token-status-list/" + listId)).andReturn().getResponse().getContentAsString(),
+                "a fresh list is served as stored");
+
+        java.time.Duration ttl = tokenStatusListProperties.ttl();
+        java.time.Instant longAgo = java.time.Instant.now().minus(ttl).minus(ttl).plusSeconds(120); // exp two minutes away
+        signAgain(listId, environment.getProperty("mosip.certify.domain.url"), java.time.Clock.fixed(longAgo, java.time.ZoneOffset.UTC));
+        assertServedFresh(listId, entry.idx(), ttl);
+
+        signAgain(listId, "https://old-host.example.org", java.time.Clock.systemUTC());
+        assertTrue(SignedJWT.parse(statusListRepository.findById(listId).orElseThrow().getVcDocument()).getJWTClaimsSet().getSubject()
+                .startsWith("https://old-host.example.org/"));
+        assertServedFresh(listId, entry.idx(), ttl);
+    }
+
+    /** Stores the list signed again (same bits) by a service with another domain or clock, as an older deployment left it. */
+    private void signAgain(String listId, String domain, java.time.Clock clock) {
+        org.springframework.mock.env.MockEnvironment elsewhere = new org.springframework.mock.env.MockEnvironment()
+                .withProperty("mosip.certify.domain.url", domain)
+                .withProperty("server.servlet.path", environment.getProperty("server.servlet.path", ""));
+        new io.mosip.certify.status.TokenStatusListService(statusListRepository, statusListCredentialService, statusListIndexProvider,
+                keyProviders, tokenStatusListProperties, objectMapper, elsewhere, clock)
+                .update(statusListRepository.findById(listId).orElseThrow(), Map.of());
+    }
+
+    private void assertServedFresh(String listId, long revokedIdx, java.time.Duration ttl) throws Exception {
+        MvcResult fetched = mockMvc.perform(get("/credentials/token-status-list/" + listId)).andReturn();
+        assertEquals(200, fetched.getResponse().getStatus());
+        String served = fetched.getResponse().getContentAsString();
+        SignedJWT list = SignedJWT.parse(served);
+        java.security.cert.X509Certificate leaf = (java.security.cert.X509Certificate) java.security.cert.CertificateFactory.getInstance("X.509")
+                .generateCertificate(new ByteArrayInputStream(list.getHeader().getX509CertChain().get(0).decode()));
+        assertTrue(list.verify(new com.nimbusds.jose.crypto.ECDSAVerifier((java.security.interfaces.ECPublicKey) leaf.getPublicKey())), "the re-signed list verifies");
+        assertEquals(tokenStatusLists.uri(listId), list.getJWTClaimsSet().getSubject(), "sub is the URI the referenced tokens carry");
+        assertTrue(list.getJWTClaimsSet().getSubject().startsWith(domainUrl + "/v1/certify/credentials/token-status-list/"));
+        assertTrue(list.getJWTClaimsSet().getExpirationTime().toInstant().isAfter(java.time.Instant.now().plus(ttl)), "at least ttl to go");
+        Map<String, Object> claim = list.getJWTClaimsSet().getJSONObjectClaim("status_list");
+        assertTrue(io.mosip.certify.status.TokenStatusListService.get(io.mosip.certify.status.TokenStatusListService.decode(claim.get("lst").toString()), revokedIdx),
+                "the revocation is kept");
+        assertEquals(served, statusListRepository.findById(listId).orElseThrow().getVcDocument(), "the re-signed list is stored");
     }
 
     private JsonNode issueOid4vci() throws Exception {

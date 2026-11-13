@@ -138,6 +138,10 @@ An issuer can name the ISO/IEC 18013-5 IACAs its mDoc Document Signers chain to 
 
 # Changes in release 0.11.0
 
+## Fixes found while deploying the mDL issuer (F-10)
+
+- Token Status List freshness. A list JWT carries `exp = iat + 2 ttl` and `sub` = its URI, but was signed only when a status changed, so a list nobody revoked anything on expired after two hours and every verifier refused it, and a list signed before `mosip.certify.domain.url` changed kept the old URI in `sub` (draft-ietf-oauth-status-list 5.1 and 8.3 require `sub` to equal the `uri` in the referenced token). `GET /credentials/token-status-list/{id}` now signs the list again before serving it when `exp` is less than `ttl` away, has passed, or `sub` is not the list's current URI: same bits, new `iat`/`exp`, current `sub`. The new JWT replaces the stored one only if that one is unchanged (compare-and-set on `vc_document`), so a re-sign never undoes a revocation the batch job wrote meanwhile; one request per list re-signs at a time and concurrent readers get the previous list while it is still valid. A list that is merely due for renewal is served as stored if signing fails; an expired one is answered `503` with `Retry-After` instead. Nothing to configure; no schema change. The Bitstring Status List path does not have the expiry problem (its credential carries `validFrom` and no `validUntil`), but its `id` still names the domain at creation time; re-signing it would change the 1.0.0-beta.1 bytes, so it is unchanged.
+
 ## Removal of  Artifactory dependency
 
 ```text
