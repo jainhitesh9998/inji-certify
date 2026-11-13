@@ -50,6 +50,17 @@ public class OAuthAuthorizationServerMetadataService {
     @Value("${mosip.certify.oauth.require-interactive-authorization-request:true}")
     private boolean requireInteractiveAuthorizationRequest;
 
+    /** The deployment's authorization server (the base `mosip.certify.oauth.token-endpoint` and issuer are built from). */
+    @Value("${mosip.certify.authorization.url:}")
+    private String authorizationUrl;
+
+    /** The deployment's own base URL, the other base its own token endpoint may be built from. */
+    @Value("${mosip.certify.domain.url:}")
+    private String domainUrl;
+
+    @Value("${server.servlet.path:}")
+    private String servletPath;
+
     /**
      * Builds and returns OAuth 2.0 Authorization Server Metadata
      * @return OAuthAuthorizationServerMetadataDTO containing the OAuth Authorization Server metadata
@@ -77,7 +88,13 @@ public class OAuthAuthorizationServerMetadataService {
         // Certify's own token endpoint serves the pre-authorized grant whether or not an authorization-code client is
         // registered, so the two features are advertised independently of each other.
         boolean ownTokenEndpoint = as != null && tokenEndpoint != null && tokenEndpoint.endsWith("/oauth/token");
-        if (ownTokenEndpoint) {
+        // The grant filtering below describes this server, so it runs only when the document actually is Certify's own:
+        // an exact match against the token URL built from the deployment's identity. The suffix test above cannot tell
+        // eSignet (`https://esignet.example/v1/esignet/oauth/token`) or any external AS at `.../oauth/token` from
+        // Certify's own endpoint, and such a document must stay exactly as configured (F-17 review round 1, M1). The
+        // pre-existing features keep their historical condition on purpose: changing when they appear would change
+        // documents existing deployments serve.
+        if (as != null && describesOwnTokenEndpoint()) {
             advertiseOnlyCompletableGrants(metadata, as);
         }
         if (ownTokenEndpoint && as.enabled()) {
@@ -108,14 +125,19 @@ public class OAuthAuthorizationServerMetadataService {
      * endpoint is supported. A document that lists {@code authorization_code} without any way to obtain a code is what
      * that clause forbids, and a wallet that follows the document refuses the issuer (gap G29).
      *
-     * <p>Only called for Certify's own token endpoint; an external authorization server (eSignet), whose metadata this
-     * service merely repeats, keeps whatever the deployment configured. The rules:
+     * <p>Certify's own Interactive Authorization Endpoint is not an OpenID4VCI 1.0 final feature: it implements an
+     * earlier revision of the OpenID4VCI 1.1 editor's draft (docs/design/16-iae-audit.md), and 1.0 final has no such
+     * endpoint. Keeping {@code authorization_code} when the IAE is configured is therefore the owner-approved
+     * compatibility interpretation - a code is obtainable there, so the grant is not advertised without a way to
+     * complete it - not strict RFC 8414 conformance: a strict wallet that requires {@code authorization_endpoint}
+     * whenever the grant is listed still refuses this document (Talao rejects it). G29 records that remaining gap.
+     *
+     * <p>Only called when the document describes Certify's own token endpoint; an external authorization server
+     * (eSignet), whose metadata this service merely repeats, keeps whatever the deployment configured. The rules:
      * <ul>
      *   <li>{@code authorization_code} stays only when a code can be obtained: Certify's own authorization endpoint is
-     *       served (a client is registered, {@code certify.as.clients}) or an Interactive Authorization Endpoint is
-     *       configured ({@code mosip.certify.oauth.interactive-authorization-endpoint}). With the IAE the code comes from
-     *       that endpoint - OpenID4VCI 1.0's presentation during issuance - not from an authorization endpoint, so RFC
-     *       8414 section 2's clause is satisfied without {@code authorization_endpoint};</li>
+     *       served (a client is registered, {@code certify.as.clients}) or the IAE is configured
+     *       ({@code mosip.certify.oauth.interactive-authorization-endpoint});</li>
      *   <li>{@code grant_types_supported} is never empty or absent: RFC 8414 section 2 gives an omitted list the default
      *       <code>["authorization_code", "implicit"]</code>, both grant types that use the authorization endpoint, and
      *       the DTO's {@code NON_EMPTY} include would drop an empty one. Certify's own token endpoint always serves the
@@ -124,12 +146,15 @@ public class OAuthAuthorizationServerMetadataService {
      *   <li>{@code interactive_authorization_endpoint} and {@code require_interactive_authorization_request} are written
      *       together, and only with the endpoint configured: the requirement means nothing without the endpoint.</li>
      * </ul>
+     *
+     * <p>The configured list is trimmed and blank entries are dropped here. The historical parser in
+     * {@link #parseCommaSeparatedValues} keeps its bytes for the external-AS path, which this method does not touch.
      */
     private void advertiseOnlyCompletableGrants(OAuthAuthorizationServerMetadataDTO metadata, io.mosip.certify.as.AsProperties as) {
         boolean interactiveAuthorization = interactiveAuthorizationEndpoint != null && !interactiveAuthorizationEndpoint.isBlank();
         boolean ownAuthorizationEndpoint = as.enabled();
 
-        List<String> grants = new java.util.ArrayList<>(parseCommaSeparatedValues(grantTypesSupported));
+        List<String> grants = configuredGrantsTrimmed();
         if (!ownAuthorizationEndpoint && !interactiveAuthorization) {
             grants.removeIf(io.mosip.certify.core.constants.IarConstants.GRANT_TYPE_AUTHORIZATION_CODE::equals);
         }
@@ -147,6 +172,62 @@ public class OAuthAuthorizationServerMetadataService {
             metadata.setInteractiveAuthorizationEndpoint(null);
             metadata.setRequireInteractiveAuthorizationRequest(null);
         }
+    }
+
+    /**
+     * {@code mosip.certify.oauth.grant-types-supported} trimmed, blank entries dropped. Only the own-endpoint filtering
+     * uses this: {@link #parseCommaSeparatedValues} keeps its historical (untrimmed) reading for the external-AS
+     * document, whose bytes must not change.
+     */
+    private List<String> configuredGrantsTrimmed() {
+        List<String> grants = new java.util.ArrayList<>();
+        if (grantTypesSupported == null) {
+            return grants;
+        }
+        for (String grant : grantTypesSupported.split(",")) {
+            if (!grant.isBlank()) {
+                grants.add(grant.trim());
+            }
+        }
+        return grants;
+    }
+
+    /**
+     * Whether {@code mosip.certify.oauth.token-endpoint} is the token URL of Certify's own authorization server: the
+     * configured value equals {@code <base><server.servlet.path>/oauth/token} for one of the deployment's own bases
+     * ({@code mosip.certify.authorization.url}, comma-separated as the metadata builder reads it, and
+     * {@code mosip.certify.domain.url}), compared exactly after normalising one trailing slash. A suffix test would
+     * mistake an external authorization server's {@code .../oauth/token} (eSignet's
+     * {@code https://esignet.example/v1/esignet/oauth/token}) for Certify's own, and the grant rules must never rewrite
+     * an external server's document (F-17 review round 1, M1).
+     */
+    private boolean describesOwnTokenEndpoint() {
+        String described = normaliseEndpoint(tokenEndpoint);
+        if (described == null) {
+            return false;
+        }
+        String path = servletPath == null ? "" : servletPath;
+        for (String bases : new String[]{authorizationUrl, domainUrl}) {
+            if (bases == null) {
+                continue;
+            }
+            for (String base : bases.split(",")) {
+                String own = normaliseEndpoint(base.trim());
+                if (own != null && described.equals(own + path + "/oauth/token")) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** A URL without surrounding whitespace and with one trailing slash removed; {@code null} when blank. */
+    private static String normaliseEndpoint(String url) {
+        if (url == null || url.isBlank()) {
+            return null;
+        }
+        String trimmed = url.trim();
+        return trimmed.endsWith("/") ? trimmed.substring(0, trimmed.length() - 1) : trimmed;
     }
 
     /** {@code true} when {@code certify.as.client-attestation.required} refuses unauthenticated token requests. */

@@ -1,0 +1,49 @@
+package io.mosip.certify.as;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.boot.context.properties.bind.Binder;
+
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+/**
+ * F-17 review round 1 (m6): the authorization server document develop's compose stack serves is byte-identical before and
+ * after the grant rules. Arguing it field by field is weaker than holding the whole document, so the expected JSON below
+ * was produced by the implementation as it was on {@code 4f67ee7c} ({@code OAuthAuthorizationServerMetadataService}
+ * before F-17) bound with these very properties - the files the compose stack activates
+ * ({@code default, csvdp-farmer, rebuild} for {@code docker-compose.yaml} + {@code docker-compose.rebuild.yaml}) and the
+ * environment it sets ({@code mosip_certify_domain_url=http://certify-nginx:80}):
+ *
+ * <pre>{@code
+ * new ObjectMapper().writeValueAsString(preChangeService.getOAuthAuthorizationServerMetadata())
+ * }</pre>
+ *
+ * <p>The deployment here is the one that keeps {@code authorization_code}: {@code certify-default.properties} configures
+ * the Interactive Authorization Endpoint, which is the owner-approved compatibility interpretation of RFC 8414's
+ * "no grant type uses the authorization endpoint" clause (docs/design/20-mdl-issuer.md G29).
+ */
+class DevelopAsMetadataDocumentTest {
+
+    /** Recorded from the {@code 4f67ee7c} implementation with the properties below (no golden file changed). */
+    static final String DEVELOP_DOCUMENT = "{\"issuer\":\"http://certify-nginx:80\","
+            + "\"token_endpoint\":\"http://certify-nginx:80/v1/certify/oauth/token\","
+            + "\"jwks_uri\":\"http://certify-nginx:80/v1/certify/.well-known/jwks.json\","
+            + "\"grant_types_supported\":[\"authorization_code\",\"urn:ietf:params:oauth:grant-type:pre-authorized_code\"],"
+            + "\"response_types_supported\":[\"code\"],"
+            + "\"code_challenge_methods_supported\":[\"S256\"],"
+            + "\"dpop_signing_alg_values_supported\":[\"ES256\",\"ES384\",\"ES512\",\"RS256\",\"PS256\",\"EdDSA\"],"
+            + "\"interactive_authorization_endpoint\":\"http://certify-nginx:80/v1/certify/oauth/iae\","
+            + "\"require_interactive_authorization_request\":true}";
+
+    @Test
+    void theDevelopComposeDocumentIsByteIdentical() throws Exception {
+        Binder binder = ComposeProperties.binder(ComposeProperties.sources(
+                Map.of("mosip.certify.domain.url", "http://certify-nginx:80"), "default", "csvdp-farmer", "rebuild"));
+
+        String document = ComposeProperties.document(ComposeProperties.documentService(binder));
+
+        assertEquals(DEVELOP_DOCUMENT, document,
+                "an unchanged deployment's authorization server metadata must not change (F-17 review round 1, m6)");
+    }
+}

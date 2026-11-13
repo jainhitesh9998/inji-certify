@@ -315,7 +315,18 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
         return credentialConfigKeyId;
     }
 
+    /**
+     * A read, and only a read: the compatibility metadata document is rebuilt from the rows without touching them.
+     * The class-level {@code @Transactional} made this a read-write transaction, so Hibernate's dirty check could flush
+     * an entity the read itself had "changed". On the H2 test schema, whose {@code TEXT[]} columns are plain
+     * {@code VARCHAR} (see {@code src/test/resources/schema.sql}), a {@code List<String>} attribute reads back as a
+     * one-element array holding the column's text, which Hibernate then wrote back one bracket level deeper - the first
+     * metadata response after a write differed from every later one (G32, found by F-17 review round 1). PostgreSQL's
+     * real {@code text[]} columns round-trip correctly, so the live stack never showed it. A read-only transaction also
+     * makes that impossible on H2.
+     */
     @Override
+    @Transactional(readOnly = true)
     public CredentialIssuerMetadataDTO fetchCredentialIssuerMetadata() {
         // the compatibility surface and the v1 config API are the default tenant's; other tenants' rows stay out of this document
         List<CredentialConfig> credentialConfigList = credentialConfigRepository.findAll()
