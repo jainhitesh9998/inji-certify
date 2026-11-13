@@ -31,7 +31,9 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-          cache: maven
+          # No `cache: maven` here: setup-java saves that cache only when the job succeeds, so a job that keeps
+          # failing before the tests (a snapshot repository answering 429) never saves it and never recovers. The
+          # repository is restored and saved by the two explicit actions/cache steps below instead.
 
       # Pin Maven 3.9 (CLAUDE.md): the runner image's newer Maven rejects POM issues that 3.9 only warns about.
       - name: Maven 3.9.9
@@ -44,13 +46,94 @@ jobs:
       - name: Maven version
         run: mvn -v
 
+      - name: Restore the Maven repository cache
+        # Keyed on the pom hashes with a `-v2` suffix so these keys cannot collide with the `setup-java` ones, and
+        # restored through the prefix so a pom change still starts from the previous run's repository instead of an
+        # empty ~/.m2 (a cold repository is what makes the snapshot fetches below fail on a 429).
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}-v2
+          restore-keys: |
+            maven-${{ runner.os }}-
+
       - name: Docker is available for Testcontainers
         run: docker version
+
+      - name: Resolve dependencies
+        # `https://central.sonatype.com/repository/maven-snapshots` answers 429 Too Many Requests under load for
+        # io.inji.verify:verify-core:1.0.0-beta.1-SNAPSHOT (pom, maven-metadata.xml), and Maven then caches the failure
+        # in ~/.m2 (`... will not be reattempted until the update interval ... has elapsed or updates are forced`), so a
+        # cold repository fails the job before a single test runs. Hence: up to 5 attempts with backoff, `-U` from the
+        # second attempt on (to force past the cached failure), and the repository saved below even when this fails.
+        #
+        # Goal: `test-compile`, not `install` and not `dependency:go-offline`.
+        #  - `test-compile` builds the whole reactor, so no module has to fetch a sibling snapshot from a remote
+        #    repository, and it resolves every compile and test-scope dependency plus the plugins bound up to that
+        #    phase, without running a test.
+        #  - `install` would write this build's own artifacts into ~/.m2/repository, i.e. publish the reactor
+        #    snapshots into the cache saved below, where a later run could resolve a stale sibling instead of building
+        #    it. (The cleanup at the top of this step also drops anything an older cache carried in.)
+        #  - `dependency:go-offline` alone is known to leave plugin and test-scope dependencies unresolved.
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          # Nothing of this build belongs in a dependency cache (see the `install` note above). `test-compile` does not
+          # install, so this only has to remove reactor artifacts an older cache restored.
+          rm -rf "$HOME/.m2/repository/io/inji/certify"
+
+          waits=(60 120 240 480)          # the wait before attempt 2, 3, 4 and 5
+          attempts=$(( ${#waits[@]} + 1 ))
+          log="$RUNNER_TEMP/resolve-dependencies.log"
+
+          for attempt in $(seq 1 "$attempts"); do
+            goal=(-B -ntp -Dgpg.skip=true -DskipTests test-compile)
+            if [ "$attempt" -gt 1 ]; then
+              goal=(-U "${goal[@]}")       # force the snapshot recheck the first attempt left cached as failed
+            fi
+            echo "dependency resolution attempt ${attempt}/${attempts}: mvn ${goal[*]}"
+            mvn "${goal[@]}" 2>&1 | tee "$log"
+            status=${PIPESTATUS[0]}
+            if [ "$status" -eq 0 ]; then
+              echo "dependency resolution succeeded on attempt ${attempt}/${attempts}"
+              exit 0
+            fi
+            # Only a transport problem is worth retrying. A compile error, a missing artifact or a bad pom would fail
+            # identically five times and five waits later, so it fails the step here and now.
+            if ! grep -Eq '429|Too Many Requests|Could not transfer|Connection reset|timed out' "$log"; then
+              echo "::error::mvn exited ${status} without a transport error in the log; not retrying"
+              exit "$status"
+            fi
+            if [ "$attempt" -eq "$attempts" ]; then
+              break
+            fi
+            wait="${waits[$(( attempt - 1 ))]}"
+            echo "transport error on attempt ${attempt}/${attempts}; waiting ${wait}s before attempt $(( attempt + 1 ))"
+            sleep "$wait"
+          done
+
+          echo "::error::dependency resolution failed after ${attempts} attempts (see the log above); the snapshot repository kept answering 429 or the network kept dropping"
+          exit 1
+
+      - name: Save the Maven repository cache
+        # Right after resolution and unconditionally: a repository that resolved on attempt 3 must be kept even if the
+        # build step below fails, and so must a partial one (both are far better than the cold start that caused the
+        # 429 in the first place). `continue-on-error` because the cache is best-effort: a re-run of the same commit
+        # restores this exact key, and reserving an existing key is an error in actions/cache/save — a build that
+        # resolved fine must not go red over it.
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}-v2
 
       - name: Build and verify
         # Runs unit tests today; golden replay, signature vectors, ArchUnit and
         # Testcontainers suites join this step as their work packages land.
-        run: mvn -B -ntp -U -Dgpg.skip=true verify
+        # No `-U`: snapshots were refreshed (and resolved) by the resolution step above.
+        run: mvn -B -ntp -Dgpg.skip=true verify
 
       - name: certify-service runtime classpath guard
         # A test-only verifier must never change what the product ships. certify-service/runtime-classpath.txt is the
