@@ -45,7 +45,7 @@ One namespace, `certify.*`, one typed record per module, validated at startup, d
 | `certify.credentials.defaults` | core | `validity` (`P730D`), `id-prefix`, `rendering-template-id`, `status.purposes[]`, `status.mechanism` — defaults that each credential configuration may override | `data-provider-plugin.vc-expiry-duration`, `id-field-prefix-uri`, `rendering-template-id`, `credential-status.allowed-status-purposes`, `statuslist.*` |
 | `certify.ledger` | listeners | `enabled`, `indexed-attributes.*` | `issuer.ledger-enabled`, `indexed-mappings.*` |
 | `certify.plugins` | core | `data-sources[]` (id, class or bean, config), `external-issuers[]`, `audit`, `scan-packages[]` | `plugin-mode`, `integration.*` |
-| `certify.pki` | service (`io.mosip.certify.trust`, M-06/M-08) | `trust-anchors.mdoc-iaca[].{id, certificate, crl}` (IACA trust anchors, PEM or DER; `id` optional), `trust-anchors.crl-refresh-interval` (`PT5M`), `trust-anchors.dev-crl-validity` (`P7D`), `publication.enabled` (false) | new |
+| `certify.pki` | service (`io.mosip.certify.trust`, M-06/M-08) | `trust-anchors.mdoc-iaca[].{id, certificate, crl}` (IACA trust anchors, PEM or DER; `id` optional), `trust-anchors.crl-refresh-interval` (`PT5M`; zero or negative turns CRL re-reading and dev-mode CRL renewal off), `trust-anchors.dev-crl-validity` (`P7D`), `stale-crl-grace` (`PT24H`), `publication.enabled` (false) | new |
 | `certify.datasource.file` | file data source | `sources.<id>.{path, key-claim, binary-fields}` — one JSON file per source, registered by the module itself | new |
 | `certify.as` | certify-as | `enabled`, `issuer`, `token.*`, `pre-authorized.*`, `pre-authorized-grant.advertise-anonymous-access`, `iae.*`, `verify.*`, `par.enabled`, `dpop-bound-tokens.enabled`, `client-attestation.*` | `oauth.*`, `pre-auth.*`, `iar.*`, `iae.*`, `verify.*`, `vp-request.*`, `authorization.*`, `credential-offer-url`, `credential-config.as-mapping` |
 | `certify.cache` | app | `type`, `redis.*`, and one map `entries.<name>.{size,ttl}` | `cache.names`, `cache.size`, `cache.expire-in-seconds`, `*-cache-expire-seconds` |
@@ -68,7 +68,10 @@ enabled. With at least one anchor the mDoc DSC policy is enforced on every surfa
 the service logs once that the policy is not enforced. Every certificate must pass the Annex B IACA profile and every CRL
 the CRL profile at startup, or the service does not start. An anchor's `id` names its downloads under `/mdoc/iaca`
 (M-08); unset, it is the `<id>` of the IACA's CRL distribution point `…/mdoc/iaca/<id>.crl`, else its subject key
-identifier in lower-case hex. In a list the entries bind as `certify.pki.trust-anchors.mdoc-iaca[0].certificate`, or
+identifier in lower-case hex; an IACA whose CRL distribution point is `…/mdoc/iaca/<x>.crl` with an `<x>` that is not
+its id, or not a valid id, refuses startup. `certify.pki.stale-crl-grace` is how long an anchor's CRL may be past its
+`nextUpdate` before mDoc signing under it is refused (`CRL_STALE`) and startup is refused; `PT0S` refuses as soon as it
+passes. In a list the entries bind as `certify.pki.trust-anchors.mdoc-iaca[0].certificate`, or
 `CERTIFY_PKI_TRUSTANCHORS_MDOCIACA_0_CERTIFICATE` from the environment.
 
 Rules:

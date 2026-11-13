@@ -2,6 +2,7 @@ package io.mosip.certify.signing;
 
 import java.security.cert.X509CRL;
 import java.security.cert.X509Certificate;
+import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -20,6 +21,9 @@ public interface TrustAnchorRegistry {
 
     /** ISO/IEC 18013-5 Issuing Authority CA certificates, the roots of mDoc Document Signer chains. */
     String MDOC_IACA = PublicKeyDescriptor.PURPOSE_MDOC_IACA;
+
+    /** The default of {@link #staleCrlGrace()}: {@code certify.pki.stale-crl-grace} unset. */
+    Duration DEFAULT_STALE_CRL_GRACE = Duration.ofHours(24);
 
     /** A registry without anchors: nothing is enforced against it and nothing is published. */
     TrustAnchorRegistry EMPTY = new TrustAnchorRegistry() {
@@ -48,6 +52,16 @@ public interface TrustAnchorRegistry {
 
     /** The current CRL the anchor publishes, when one is configured or generated. */
     Optional<X509CRL> crl(String anchorId);
+
+    /**
+     * How long an anchor's CRL may be past its {@code nextUpdate} before signing under that anchor is refused: a
+     * verifier rejects a credential whose issuing CA's CRL is stale (RFC 5280 6.3.3), so a credential signed later
+     * would only fail verification. Within the window signing continues and the revocations the CRL lists still apply.
+     * {@link Duration#ZERO} refuses as soon as {@code nextUpdate} has passed.
+     */
+    default Duration staleCrlGrace() {
+        return DEFAULT_STALE_CRL_GRACE;
+    }
 
     /** The anchor certificates trusted for {@code purpose}. */
     default List<X509Certificate> anchors(String purpose) {

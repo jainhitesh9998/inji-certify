@@ -58,7 +58,10 @@ import java.util.function.Supplier;
  * Signer key whose CSR an IACA signed and an operator uploaded, docs/design/20-mdl-issuer.md M-06/M-07), the chain is
  * completed to {@code [DSC, IACA]} so the mDoc DSC policy can check it and {@code without-anchor} still carries the DSC
  * alone; any other certificate (keymanager's own self-signed or master-signed ones) keeps its one-certificate chain,
- * so a deployment without trust anchors sees the same chains, headers and bytes as before.
+ * so a deployment without trust anchors sees the same chains, headers and bytes as before. What this provider publishes
+ * ({@link #publicKeys(KeyFilter)} for the JWKS, {@link #publicKeys(KeyRef)} for DID documents) leaves the IACA out,
+ * as before the completion: an IACA is a trust anchor, published at {@code /mdoc/iaca} (M-08) and never in a JWKS
+ * (M-05), so a completed key's {@code x5c} stays the DSC alone.
  */
 public class KeymanagerKeyProvider implements KeyProvider {
 
@@ -132,7 +135,7 @@ public class KeymanagerKeyProvider implements KeyProvider {
         KeyFilter f = filter == null ? KeyFilter.ALL : filter;
         List<PublicKeyDescriptor> out = new ArrayList<>();
         for (KeymanagerAlias alias : knownAliases) {
-            descriptors(alias).stream().filter(f::matches).forEach(out::add);
+            descriptors(alias).stream().filter(f::matches).map(KeymanagerKeyProvider::published).forEach(out::add);
         }
         return out;
     }
@@ -143,7 +146,14 @@ public class KeymanagerKeyProvider implements KeyProvider {
         if (!ID.equals(ref.provider())) {
             throw new SigningException("KeyRef " + ref + " is not for provider " + ID);
         }
-        return descriptors(KeymanagerAlias.of(ref));
+        return descriptors(KeymanagerAlias.of(ref)).stream().map(KeymanagerKeyProvider::published).toList();
+    }
+
+    /** A key as published: without the IACA a completed chain ends at (the trust anchor is not part of the key). */
+    private static PublicKeyDescriptor published(PublicKeyDescriptor descriptor) {
+        CertificateChain chain = descriptor.chain().withoutAnchor();
+        return chain == descriptor.chain() ? descriptor : new PublicKeyDescriptor(descriptor.kid(), descriptor.algorithm(),
+                descriptor.publicKey(), chain, descriptor.notBefore(), descriptor.notAfter(), descriptor.purpose());
     }
 
     /** The aliases this provider publishes (from configuration); any other alias can still be resolved on demand. */
@@ -254,7 +264,7 @@ public class KeymanagerKeyProvider implements KeyProvider {
      * certificate alone. Keymanager's self-signed and master-signed certificates are issued by no IACA and stay alone.
      */
     private CertificateChain chainOf(X509Certificate certificate) {
-        TrustAnchorRegistry registry = CertificateLinks.selfSigned(certificate) ? null : trustAnchors.get();
+        TrustAnchorRegistry registry = CertificateLinks.selfIssued(certificate) ? null : trustAnchors.get();
         if (registry == null) {
             return CertificateChain.of(certificate);
         }

@@ -1,6 +1,7 @@
 package io.mosip.certify.tools;
 
 import io.mosip.certify.datasource.file.FileDataSourceAutoConfiguration;
+import io.mosip.certify.trust.PkiAutoConfiguration;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 
@@ -20,11 +21,19 @@ class MigrateOnlyTest {
     }
 
     @Test
+    void theMigrationJobExcludesTheTrustAnchorRegistry() {
+        // it reads IACAs and CRLs, refuses a stale CRL and writes dev-mode CRL numbers: nothing a migration needs (M-06)
+        assertTrue(MigrateOnly.AUTOCONFIGURATION_EXCLUDES.contains(PkiAutoConfiguration.class.getName()),
+                "a stale CRL or a broken trust anchor must not block a migration");
+    }
+
+    @Test
     void theExclusionIsAPropertyNotAnAnnotationOnTheScannedConfigurationClass() {
         // MigrateOnly is a @SpringBootConfiguration under io.mosip.certify: an @EnableAutoConfiguration(exclude) here
         // would remove the file data source from every context that scans it, the service included.
         EnableAutoConfiguration enable = MigrateOnly.class.getAnnotation(EnableAutoConfiguration.class);
         assertNotNull(enable);
         assertFalse(List.of(enable.exclude()).contains(FileDataSourceAutoConfiguration.class));
+        assertFalse(List.of(enable.exclude()).contains(PkiAutoConfiguration.class));
     }
 }
