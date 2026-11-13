@@ -303,8 +303,9 @@ public class JcaKeyProvider implements KeyProvider {
 
     /**
      * Writes every key into a PKCS#12 keystore, e.g. to persist dev-mode keys between runs. The file holds private keys:
-     * a new keystore is created {@code rw-------} whatever the process umask, an existing one keeps its owner, group and
-     * permissions, and it is replaced atomically where it can be ({@link KeyStoreFiles#write}).
+     * a new keystore is created {@code rw-------} whatever the process umask and moved into place atomically; an existing
+     * one is rewritten in place, keeping every attribute (owner, group, permissions, native ACLs), after its previous
+     * content is saved as {@code <file>.bak} ({@code rw-------}) ({@link KeyStoreFiles#write}).
      */
     public void saveAsPkcs12(Path path, char[] password) {
         try {

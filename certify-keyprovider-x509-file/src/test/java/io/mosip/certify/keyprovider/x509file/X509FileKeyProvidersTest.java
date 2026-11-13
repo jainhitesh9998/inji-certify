@@ -53,7 +53,7 @@ class X509FileKeyProvidersTest {
      * F-10: the dev-mode keystore holds private keys, so it is created rw------- whatever the umask (the JVM cannot set
      * its own; the test first shows the umask in force would leave a plain file readable by group or others, as 022
      * does); an existing keystore keeps the permissions its operator gave it (review round 1, CLAUDE.md rule 3) when dev
-     * mode adds a key to it.
+     * mode adds a key to it, and its previous content is kept as an owner-only {@code issuer.p12.bak} (review round 2).
      */
     @Test
     void theDevModeKeystoreIsOwnerOnlyUnderAPermissiveUmask() throws Exception {
@@ -80,8 +80,10 @@ class X509FileKeyProvidersTest {
         assertTrue(X509FileKeyProviders.open(props(file, false, List.of(new X509FileProperties.KeySpec("b", "EdDSA", "CN=b")))).aliases().contains("b"),
                 "the replaced keystore loads");
         try (var listing = Files.list(keys)) {
-            assertEquals(List.of("issuer.p12", "plain.bin"), listing.map(p -> p.getFileName().toString()).sorted().toList(), "no temporary file left");
+            assertEquals(List.of("issuer.p12", "issuer.p12.bak", "plain.bin"), listing.map(p -> p.getFileName().toString()).sorted().toList(),
+                    "the previous keystore kept as a backup (review round 2), no temporary file left");
         }
+        assertEquals(ownerOnly, Files.getPosixFilePermissions(keys.resolve("issuer.p12.bak")), "the backup is owner-only");
     }
 
     @Test
