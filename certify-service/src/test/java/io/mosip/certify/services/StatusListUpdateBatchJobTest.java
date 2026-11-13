@@ -17,6 +17,7 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.Spy;
@@ -24,11 +25,15 @@ import org.mockito.junit.MockitoJUnitRunner;
 import org.springframework.data.domain.Pageable;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.time.Clock;
+import java.time.Instant;
 import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
@@ -172,5 +177,55 @@ public class StatusListUpdateBatchJobTest {
         list.setVcDocument("{invalid json");
         assertThrows(CertifyException.class, () ->
                 batchJob.updateStatusListCredential(list, "newEncodedList"));
+    }
+
+    /**
+     * F-19: the reader of {@code validFrom} must accept what this writer produces. {@code Instant.toString()} omits
+     * the fraction of a second when it is zero, so a re-sign on such an instant (about one in a thousand) wrote
+     * {@code 2026-11-13T15:00:23Z} and the legacy strict parse refused it. The clock is pinned here so the form is
+     * not a matter of luck; the value itself must not change (wire bytes of status list credentials).
+     */
+    @Test
+    public void should_writeValidFromAsInstantToString_when_theInstantHasNoFraction() {
+        JSONObject vc = new JSONObject().put("credentialSubject",
+                new JSONObject().put("encodedList", BitStringStatusListUtils.createEmptyEncodedList(1L)));
+        StatusListCredential list = new StatusListCredential();
+        list.setId("list-a");
+        list.setCapacityInKB(1L);
+        list.setVcDocument(vc.toString());
+        setClock(Instant.parse("2026-11-13T15:00:23Z"));
+
+        batchJob.updateStatusListCredential(list, "newEncodedList");
+
+        ArgumentCaptor<String> resigned = ArgumentCaptor.forClass(String.class);
+        verify(statusListCredentialService).resignStatusListCredential(resigned.capture());
+        assertEquals("2026-11-13T15:00:23Z", new JSONObject(resigned.getValue()).getString("validFrom"));
+    }
+
+    /**
+     * The writer's form, pinned: {@code new Date().toInstant()} was millisecond-truncated, so the fraction is three
+     * digits when it is not zero - not the nine a nanosecond {@code Instant} would print - and it is omitted entirely
+     * when the milliseconds are zero. A pinned clock must not change either, or the bytes of a re-signed status list
+     * would differ from one written by the released code.
+     */
+    @Test
+    public void should_writeValidFromWithTheFraction_when_theInstantHasOne() {
+        JSONObject vc = new JSONObject().put("credentialSubject",
+                new JSONObject().put("encodedList", BitStringStatusListUtils.createEmptyEncodedList(1L)));
+        StatusListCredential list = new StatusListCredential();
+        list.setId("list-a");
+        list.setCapacityInKB(1L);
+        list.setVcDocument(vc.toString());
+        setClock(Instant.parse("2026-11-13T15:00:23.123456789Z"));
+
+        batchJob.updateStatusListCredential(list, "newEncodedList");
+
+        ArgumentCaptor<String> resigned = ArgumentCaptor.forClass(String.class);
+        verify(statusListCredentialService).resignStatusListCredential(resigned.capture());
+        assertEquals("2026-11-13T15:00:23.123Z", new JSONObject(resigned.getValue()).getString("validFrom"));
+    }
+
+    private void setClock(Instant instant) {
+        ReflectionTestUtils.setField(batchJob, "clock", Clock.fixed(instant, ZoneOffset.UTC));
     }
 }

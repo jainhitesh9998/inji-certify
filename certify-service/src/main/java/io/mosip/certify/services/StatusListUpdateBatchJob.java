@@ -18,6 +18,8 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Clock;
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -47,6 +49,13 @@ public class StatusListUpdateBatchJob {
 
     @Value("${mosip.certify.batch.status-list-update.batch-size:1000}")
     private int batchSize;
+
+    /**
+     * The clock {@code validFrom} is written from. {@code Clock.systemUTC()} by default, the same instant
+     * {@code new Date().toInstant()} produced; a test pins it to a fixed instant to make a specific {@code
+     * Instant.toString()} form deterministic.
+     */
+    private Clock clock = Clock.systemUTC();
 
     /**
      * Scheduled method that runs periodically (schedule controlled by cron expression property)
@@ -209,7 +218,12 @@ public class StatusListUpdateBatchJob {
             log.info("Updated encodedList for StatusListCredential ID: {}", statusListCredential.getId());
 
             // Update timestamps
-            String newValidFrom = new Date().toInstant().toString();
+            // Was new Date().toInstant().toString(): the millisecond instant, so Instant.toString() writes three
+            // fraction digits, or none at all when they are zero (:23Z as well as :23.123Z). clock.instant() would keep
+            // this JVM's microsecond clock and write six digits, which is a different wire form; clock.millis() keeps
+            // the instant and the form exactly as they were. The reader of this field accepts both forms - see
+            // LegacyW3cDateTimes.
+            String newValidFrom = Instant.ofEpochMilli(clock.millis()).toString();
             vcDocument.put("validFrom", newValidFrom);
             log.info("Set new validFrom timestamp: {} for StatusListCredential ID: {}", newValidFrom, statusListCredential.getId());
 

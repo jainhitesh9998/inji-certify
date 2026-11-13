@@ -18,6 +18,7 @@ import foundation.identity.jsonld.JsonLDObject;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.MockedStatic;
@@ -27,6 +28,11 @@ import org.springframework.test.util.ReflectionTestUtils;
 import java.io.IOException;
 import java.net.URI;
 import java.security.GeneralSecurityException;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
 import java.util.*;
 
 import static org.junit.Assert.*;
@@ -301,5 +307,66 @@ public class W3CJsonLDTest {
             String vcJson = "{\"@context\":[],\"issuanceDate\":\"2023-01-01T00:00:00.000Z\"}";
             w3cJsonLd.addProof(vcJson, "EdDSA", "appID", "refID", "https://example.com/key", "eddsa-rdfc-2022");
         }
+    }
+
+    /**
+     * F-19, the reported failure: {@code StatusListUpdateBatchJob} writes {@code validFrom} as {@code
+     * Instant.toString()}, which omits the fraction of a second when it is zero, and the strict
+     * {@code ...SSS'Z'} pattern refused {@code 2026-11-13T15:00:23Z} at index 19. A status list re-signed on such an
+     * instant could not be re-signed at all (about one run in a thousand).
+     */
+    @Test
+    public void testAddProofAcceptsTheStatusListValidFromWithoutAFraction() throws Exception {
+        LdProof proof = proofFor("validFrom", "2026-11-13T15:00:23Z");
+
+        assertEquals(proofSecondOf("2026-11-13T15:00:23Z"), proof.getCreated());
+    }
+
+    /**
+     * F-19: every form {@code Instant.toString()} and the legacy {@code ...SSS'Z'} writer produce is read, and the
+     * same instant gives the same proof {@code created} whichever form the document carries. The proof's {@code created}
+     * is an XML Schema dateTime, i.e. seconds, so it is compared at that precision (a {@code Date} keeps milliseconds;
+     * {@code LegacyW3cDateTimesTest} covers those).
+     */
+    @Test
+    public void testAddProofReadsEveryInstantToStringFormAsTheSameProofCreated() throws Exception {
+        for (String form : List.of("2026-11-13T15:00:23Z", "2026-11-13T15:00:23.123Z",
+                "2026-11-13T15:00:23.123456Z", "2026-11-13T15:00:23.123456789Z")) {
+            assertEquals(form, proofSecondOf(form), proofFor("validFrom", form).getCreated());
+            assertEquals(form, proofSecondOf(form), proofFor("issuanceDate", form).getCreated());
+        }
+    }
+
+    /**
+     * The legacy reader's rule, asserted rather than restated: the wall clock of the value in the JVM's default zone,
+     * at the seconds precision the proof's {@code created} is written with. Applying the {@code Z}/offset instead would
+     * move {@code proof.created} on every deployment not on UTC, which is a wire change in the compatibility path (see
+     * {@code LegacyW3cDateTimes}).
+     */
+    private static Date proofSecondOf(String value) {
+        return Date.from(LocalDateTime.ofInstant(Instant.parse(value), ZoneOffset.UTC)
+                .atZone(ZoneId.systemDefault()).toInstant().truncatedTo(ChronoUnit.SECONDS));
+    }
+
+    /** Signs one document on the legacy (proof generator) path and returns the proof options it was given. */
+    private LdProof proofFor(String dateField, String value) throws Exception {
+        Canonicalizer canonicalizer = mock(Canonicalizer.class);
+        when(proofGenerator.getCanonicalizer()).thenReturn(canonicalizer);
+        when(proofGenerator.getName()).thenReturn("RsaSignature2018");
+        when(canonicalizer.canonicalize(any(LdProof.class), any(JsonLDObject.class)))
+                .thenReturn("canonicalized".getBytes());
+        when(proofGenerator.generateProof(any(LdProof.class), anyString(), anyMap()))
+                .thenReturn(LdProof.builder().type("RsaSignature2018").created(new Date())
+                        .proofPurpose("assertionMethod").verificationMethod(URI.create("https://example.com/key"))
+                        .build());
+        when(didDocumentUtil.getCertificateDataResponseDto(anyString(), anyString())).thenReturn(new CertificateResponseDTO());
+        clearInvocations(proofGenerator);
+
+        w3cJsonLd.addProof("{\"@context\":[],\"" + dateField + "\":\"" + value + "\"}", "RS256", "appID", "refID",
+                "https://example.com/key", "Ed25519Signature2020");
+
+        ArgumentCaptor<LdProof> proofOptions = ArgumentCaptor.forClass(LdProof.class);
+        verify(proofGenerator).generateProof(proofOptions.capture(), anyString(), anyMap());
+        return proofOptions.getValue();
     }
 }

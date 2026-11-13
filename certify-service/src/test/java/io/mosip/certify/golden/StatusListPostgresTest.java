@@ -50,6 +50,7 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.TestPropertySource;
+import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 import org.testcontainers.containers.PostgreSQLContainer;
@@ -65,6 +66,9 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Date;
@@ -301,8 +305,19 @@ class StatusListPostgresTest {
         List<CredentialStatusTransaction> pending = transactionRepository.findByIsProcessedFalseOrderByCreatedDtimesAsc(PageRequest.of(0, 100))
                 .stream().filter(t -> listId.equals(t.getStatusListCredentialId()) && Long.valueOf(index).equals(t.getStatusListIndex())).toList();
         assertEquals(1, pending.size(), "one transaction for the credential's own entry");
-        batchJob.updateStatusList(listId, pending);
-        assertTrue(bit(statusList(listUrl).get("credentialSubject").get("encodedList").asText(), index), "the revoked bit is set through VC-API");
+        // F-19: pin the re-sign instant to one whose Instant.toString() carries no fractional second - the one form
+        // in a thousand the strict reader refused ("could not be parsed at index 19") - so this scenario catches it
+        // every run instead of rarely.
+        pinBatchClock(Instant.parse("2026-11-13T15:00:23Z"));
+        try {
+            batchJob.updateStatusList(listId, pending);
+        } finally {
+            pinBatchClock(null);
+        }
+        JsonNode reSigned = statusList(listUrl);
+        assertEquals("2026-11-13T15:00:23Z", reSigned.get("validFrom").asText(), "validFrom keeps the writer's form");
+        assertTrue(bit(reSigned.get("credentialSubject").get("encodedList").asText(), index), "the revoked bit is set through VC-API");
+        verifyStatusList(reSigned); // the re-signed list verifies, i.e. proof.created was derived from :23Z
 
         MvcResult unknownPurpose = mockMvc.perform(post("/vc-api/credentials/status").header("Authorization", basic).contentType(MediaType.APPLICATION_JSON)
                 .content(objectMapper.writeValueAsString(Map.of("credentialId", credential.get("id").asText(),
@@ -514,6 +529,12 @@ class StatusListPostgresTest {
     private JsonNode statusList(String listUrl) throws Exception {
         assertTrue(listUrl.startsWith(domainUrl + STATUS_LIST_PATH), listUrl);
         return getJson("/credentials/status-list/" + listUrl.substring(listUrl.lastIndexOf('/') + 1));
+    }
+
+    /** The batch job writes {@code validFrom} from its clock; {@code null} restores the real one. */
+    private void pinBatchClock(Instant instant) {
+        ReflectionTestUtils.setField(batchJob, "clock",
+                instant == null ? Clock.systemUTC() : Clock.fixed(instant, ZoneOffset.UTC));
     }
 
     private JsonNode getJson(String path) throws Exception {
