@@ -6,6 +6,7 @@ import io.mosip.certify.spi.CredentialDataSource;
 import io.mosip.certify.spi.CredentialFormatter;
 import io.mosip.certify.spi.DataSourceException;
 import io.mosip.certify.spi.ExternalIssuer;
+import io.mosip.certify.spi.FormatException;
 import io.mosip.certify.spi.HolderBinding;
 import io.mosip.certify.spi.IssuanceContext;
 import io.mosip.certify.spi.IssuanceListener;
@@ -56,12 +57,30 @@ public class DefaultIssuanceService implements IssuanceService {
     private final AuthorizationPolicy authorizationPolicy;
     private final Clock clock;
     private final Duration defaultValidity;
+    private final String defaultDataSourceId;
 
     public DefaultIssuanceService(ConfigurationRegistry configurations, FormatterRegistry formatters, KeyProviderRegistry keyProviders,
                                   List<CredentialDataSource> dataSources, List<ExternalIssuer> externalIssuers,
                                   List<ProofValidator> proofValidators, List<TemplateEngine> templateEngines,
                                   List<StatusProvider> statusProviders, List<IssuanceListener> listeners,
                                   AuthorizationPolicy authorizationPolicy, Clock clock, Duration defaultValidity) {
+        this(configurations, formatters, keyProviders, dataSources, externalIssuers, proofValidators, templateEngines,
+                statusProviders, listeners, authorizationPolicy, clock, defaultValidity, null);
+    }
+
+    /**
+     * @param defaultDataSourceId the {@link CredentialDataSource#id()} a configuration that names none resolves to, or
+     *                            {@code null} to keep the historical behaviour (the only registered source). Deployments
+     *                            register more than one source (the data-provider plugin and a file source, say), and a
+     *                            configuration written before {@code dataSourceId} existed names none: it must keep
+     *                            resolving to the source it was written for rather than fail with "several registered".
+     */
+    public DefaultIssuanceService(ConfigurationRegistry configurations, FormatterRegistry formatters, KeyProviderRegistry keyProviders,
+                                  List<CredentialDataSource> dataSources, List<ExternalIssuer> externalIssuers,
+                                  List<ProofValidator> proofValidators, List<TemplateEngine> templateEngines,
+                                  List<StatusProvider> statusProviders, List<IssuanceListener> listeners,
+                                  AuthorizationPolicy authorizationPolicy, Clock clock, Duration defaultValidity,
+                                  String defaultDataSourceId) {
         this.configurations = configurations;
         this.formatters = formatters;
         this.keyProviders = keyProviders;
@@ -74,6 +93,7 @@ public class DefaultIssuanceService implements IssuanceService {
         this.authorizationPolicy = authorizationPolicy;
         this.clock = clock;
         this.defaultValidity = defaultValidity;
+        this.defaultDataSourceId = defaultDataSourceId;
     }
 
     @Override
@@ -172,7 +192,7 @@ public class DefaultIssuanceService implements IssuanceService {
                 claims = new ClaimSet(supplied, Map.of(PROVENANCE_SUPPLIED, Boolean.TRUE));
             }
             default -> {
-                CredentialDataSource source = required(dataSources, configuration.dataSourceId(), "data source");
+                CredentialDataSource source = dataSource(configuration.dataSourceId());
                 ClaimSet fetched;
                 try {
                     fetched = source.fetch(context, configuration);
@@ -182,7 +202,7 @@ public class DefaultIssuanceService implements IssuanceService {
                 claims = render(fetched, configuration, context, holder);
             }
         }
-        UnsignedCredential unsigned = formatter.build(claims, configuration, context, holder);
+        UnsignedCredential unsigned = build(formatter, claims, configuration, context, holder);
         if (configuration.status().isEnabled()) {
             StatusProvider status = statusProviders.stream()
                     .filter(p -> p.mechanism().equals(configuration.status().mechanism()) && p.supports(configuration.format()))
@@ -198,7 +218,32 @@ public class DefaultIssuanceService implements IssuanceService {
         SigningConfig signingConfig = tenantDid == null || tenantDid.isBlank() || tenantDid.equals(configuration.signing().issuerDid())
                 ? configuration.signing() : configuration.signing().withIssuerDid(tenantDid);
         SigningContext signing = keyProviders.signingContext(signingConfig);
-        return new Issued(formatter.sign(unsigned, signing, context), claims);
+        try {
+            return new Issued(formatter.sign(unsigned, signing, context), claims);
+        } catch (FormatException e) {
+            throw callerError(e);
+        }
+    }
+
+    private static UnsignedCredential build(CredentialFormatter formatter, ClaimSet claims, CredentialConfiguration configuration,
+                                            IssuanceContext context, HolderBinding holder) {
+        try {
+            return formatter.build(claims, configuration, context, holder);
+        } catch (FormatException e) {
+            throw callerError(e);
+        }
+    }
+
+    /**
+     * A formatter may find the caller's own input unusable — an mDoc device key it cannot encode, for instance. The
+     * format names that with OpenID4VCI's {@code invalid_proof}, and this is where it becomes a protocol error instead of
+     * a 500 (docs/design/20-mdl-issuer.md G6, OID4VCI 8.3.1).
+     */
+    private static RuntimeException callerError(FormatException e) {
+        if (IssuanceException.INVALID_PROOF.equals(e.getErrorCode())) {
+            return new IssuanceException(IssuanceException.INVALID_PROOF, e.getMessage(), e);
+        }
+        return e;
     }
 
     @Override
@@ -230,6 +275,38 @@ public class DefaultIssuanceService implements IssuanceService {
         Map<String, Object> provenance = new HashMap<>(model.provenance());
         provenance.put(PROVENANCE_TEMPLATE_MODE, template.mode().name());
         return new ClaimSet(rendered.document(), provenance);
+    }
+
+    /**
+     * The configuration's source: the id it names, else {@link #defaultDataSourceId}, else the only registered source.
+     * The default id is the data-provider plugin's source, which the service always registers
+     * ({@code DataProviderPluginDataSource} is a component and resolves the plugin lazily), so a default id no
+     * provider registered only happens outside the service, with a bare core; it falls through so a single-source
+     * deployment keeps issuing as it did before several sources could coexist.
+     *
+     * <p>The messages are the ones this method has always produced: they reach a client's
+     * {@code error_description} through the compatibility and draft-13 surfaces, so changing them would change bytes
+     * on the wire (CLAUDE.md rule 1).</p>
+     */
+    private CredentialDataSource dataSource(String configuredId) {
+        if (configuredId != null) {
+            CredentialDataSource found = dataSources.get(configuredId);
+            if (found == null) {
+                throw new IssuanceException(IssuanceException.ISSUANCE_FAILED, "No data source with id '" + configuredId + "'");
+            }
+            return found;
+        }
+        if (defaultDataSourceId != null) {
+            CredentialDataSource fallback = dataSources.get(defaultDataSourceId);
+            if (fallback != null) {
+                return fallback;
+            }
+        }
+        if (dataSources.size() == 1) {
+            return dataSources.values().iterator().next();
+        }
+        throw new IssuanceException(IssuanceException.ISSUANCE_FAILED,
+                dataSources.isEmpty() ? "No data source registered" : "Several data sources registered; the configuration must name one");
     }
 
     private static <T> T required(Map<String, T> byId, String id, String what) {

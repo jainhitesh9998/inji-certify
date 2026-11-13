@@ -35,6 +35,17 @@ public record PublicKeyDescriptor(String kid, SignatureAlgorithm algorithm, Publ
         chain = chain == null ? CertificateChain.EMPTY : chain;
     }
 
+    /**
+     * The purpose of an ISO/IEC 18013-5 Annex B Issuing Authority CA. An IACA is a trust anchor, published as such
+     * (docs/design/20-mdl-issuer.md M-06, M-08), and never listed as a signing key in a JWKS or a DID document.
+     */
+    public static final String PURPOSE_MDOC_IACA = "mdoc-iaca";
+
+    /** Whether this key may be published as a signing key: everything except an mDL trust anchor (IACA). */
+    public boolean isSigningKey() {
+        return !PURPOSE_MDOC_IACA.equals(purpose);
+    }
+
     public boolean isValidAt(Instant instant) {
         return (notBefore == null || !instant.isBefore(notBefore)) && (notAfter == null || instant.isBefore(notAfter));
     }

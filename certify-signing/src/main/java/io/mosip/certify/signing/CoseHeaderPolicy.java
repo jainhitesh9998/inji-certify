@@ -15,9 +15,13 @@ public record CoseHeaderPolicy(JwsHeaderPolicy.ChainInclusion x5chain, KidStrate
         this(x5chain, kid, tagged, false);
     }
 
-    /** ISO/IEC 18013-5 IssuerAuth: full chain in {@code x5chain}, no {@code kid}, untagged (the mdoc structure carries it). */
+    /**
+     * ISO/IEC 18013-5 IssuerAuth: the chain in {@code x5chain} (RFC 9360, label 33) without the trust anchor — a verifier
+     * supplies the IACA itself, and HAIP forbids carrying it (9.1.2.4, docs/design/20-mdl-issuer.md G9) — no {@code kid},
+     * untagged (the mdoc structure carries it).
+     */
     public static CoseHeaderPolicy mdocIssuerAuth() {
-        return new CoseHeaderPolicy(JwsHeaderPolicy.ChainInclusion.FULL, null, false);
+        return new CoseHeaderPolicy(JwsHeaderPolicy.ChainInclusion.WITHOUT_ANCHOR, null, false);
     }
 
     /**

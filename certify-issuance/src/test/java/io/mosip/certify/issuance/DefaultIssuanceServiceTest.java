@@ -18,6 +18,7 @@ import io.mosip.certify.spi.CredentialFormatter;
 import io.mosip.certify.spi.DataSourceException;
 import io.mosip.certify.spi.ExternalIssuer;
 import io.mosip.certify.spi.FormatConfig;
+import io.mosip.certify.spi.FormatException;
 import io.mosip.certify.spi.HolderBinding;
 import io.mosip.certify.spi.IssuanceContext;
 import io.mosip.certify.spi.IssuanceListener;
@@ -53,6 +54,7 @@ import java.util.Set;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -89,9 +91,15 @@ class DefaultIssuanceServiceTest {
                 .register(config("farmer-status", "farmer_vc", IssuanceStrategy.TEMPLATE, new StatusConfig("token-status-list", List.of("revocation"))))
                 .register(config("supplied", "any", IssuanceStrategy.SUPPLIED, StatusConfig.NONE))
                 .register(config("external", "farmer_vc", IssuanceStrategy.EXTERNAL, StatusConfig.NONE));
-        service = new DefaultIssuanceService(registry, new FormatterRegistry(List.of(formatter)), new KeyProviderRegistry(List.of(JCA)),
-                List.of(dataSource), List.of(new FakeExternalIssuer()), List.of(proofValidator), List.of(templateEngine),
-                List.of(statusProvider), List.of(listener), AuthorizationPolicy.SCOPE, Clock.fixed(NOW, ZoneOffset.UTC), Duration.ofDays(30));
+        service = service(List.of(dataSource), null);
+    }
+
+    /** The same service over a given list of data sources and the default source id a configuration naming none uses. */
+    private DefaultIssuanceService service(List<CredentialDataSource> dataSources, String defaultDataSourceId) {
+        return new DefaultIssuanceService(registry, new FormatterRegistry(List.of(formatter)), new KeyProviderRegistry(List.of(JCA)),
+                dataSources, List.of(new FakeExternalIssuer()), List.of(proofValidator), List.of(templateEngine),
+                List.of(statusProvider), List.of(listener), AuthorizationPolicy.SCOPE, Clock.fixed(NOW, ZoneOffset.UTC), Duration.ofDays(30),
+                defaultDataSourceId);
     }
 
     /** The draft-13 selector is the configuration id in upper camel case, so each configuration stays uniquely selectable. */
@@ -291,6 +299,68 @@ class DefaultIssuanceServiceTest {
     }
 
     @Test
+    void aConfigurationNamingNoSourceUsesTheDefaultSourceEvenWhenSeveralAreRegistered() {
+        FakeDataSource plugin = new FakeDataSource("data-provider-plugin");
+        FakeDataSource file = new FakeDataSource("mdl-demo");
+        registry.register(templated("mdl", "mdl-demo"));
+        DefaultIssuanceService multi = service(List.of(plugin, file), "data-provider-plugin");
+
+        multi.issue(command("farmer").build());
+        assertNotNull(plugin.context, "a configuration without dataSourceId is a pre-M-10 configuration: the plugin source");
+        assertNull(file.context);
+
+        multi.issue(command("mdl").build());
+        assertNotNull(file.context, "a configuration naming dataSourceId uses exactly that source");
+    }
+
+    @Test
+    void withoutADefaultSourceSeveralRegisteredSourcesAreStillARefusal() {
+        FakeDataSource file = new FakeDataSource("mdl-demo");
+        DefaultIssuanceService multi = service(List.of(new FakeDataSource("data-provider-plugin"), file), null);
+
+        IssuanceException e = assertThrows(IssuanceException.class, () -> multi.issue(command("farmer").build()));
+
+        assertEquals(IssuanceException.ISSUANCE_FAILED, e.getErrorCode());
+        // the message design/extensibility produced, byte for byte: it reaches error_description on two surfaces
+        assertEquals("Several data sources registered; the configuration must name one", e.getMessage());
+    }
+
+    @Test
+    void noRegisteredSourceKeepsTheHistoricalMessage() {
+        DefaultIssuanceService none = service(List.of(), null);
+
+        IssuanceException e = assertThrows(IssuanceException.class, () -> none.issue(command("farmer").build()));
+
+        assertEquals(IssuanceException.ISSUANCE_FAILED, e.getErrorCode());
+        assertEquals("No data source registered", e.getMessage(), "unchanged from design/extensibility");
+    }
+
+    @Test
+    void anUnregisteredSourceIdKeepsTheHistoricalMessage() {
+        registry.register(templated("mdl", "no-such-source"));
+
+        IssuanceException e = assertThrows(IssuanceException.class, () -> service.issue(command("mdl").build()));
+
+        assertEquals(IssuanceException.ISSUANCE_FAILED, e.getErrorCode());
+        assertEquals("No data source with id 'no-such-source'", e.getMessage(), "unchanged from design/extensibility");
+    }
+
+    @Test
+    void anUnregisteredDefaultSourceFallsBackToTheOnlyRegisteredOne() {
+        FakeDataSource file = new FakeDataSource("mdl-demo");
+        DefaultIssuanceService single = service(List.of(file), "data-provider-plugin");
+
+        single.issue(command("farmer").build());
+
+        assertNotNull(file.context, "a deployment without the plugin keeps issuing from its one source");
+    }
+
+    private static CredentialConfiguration templated(String id, String dataSourceId) {
+        return new CredentialConfiguration(null, id, "farmer_vc", "vc+jwt", new FormatConfig.Generic(Map.of(), id + "Credential"),
+                null, SigningConfig.of(KEY, SignatureAlgorithm.ES256), IssuanceStrategy.TEMPLATE, dataSourceId, null, null, null);
+    }
+
+    @Test
     void dataSourceErrorsKeepTheirCodeAndAreReported() {
         dataSource.failWith = new DataSourceException("record_not_found", "no such farmer");
 
@@ -310,6 +380,36 @@ class DefaultIssuanceServiceTest {
         assertEquals(IssuanceException.ISSUANCE_FAILED, e.getErrorCode());
         assertInstanceOf(IllegalStateException.class, e.getCause());
         assertEquals(IssuanceException.ISSUANCE_FAILED, listener.failures.get(0).errorCode());
+    }
+
+    /**
+     * A formatter that finds the holder's own key unusable names it {@code invalid_proof} (the mDoc device key, G6), and
+     * the core turns exactly that code into the protocol's {@code invalid_proof}, from build and from sign; any other
+     * format error stays a server-side {@code issuance_failed}.
+     */
+    @Test
+    void aFormatterInvalidProofBecomesInvalidProofAndNoOtherFormatErrorDoes() {
+        formatter.buildFailure = new FormatException(IssuanceException.INVALID_PROOF, "no device key in the proof");
+        IssuanceException fromBuild = assertThrows(IssuanceException.class, () -> service.issue(command("farmer").build()));
+        assertEquals(IssuanceException.INVALID_PROOF, fromBuild.getErrorCode());
+        assertInstanceOf(FormatException.class, fromBuild.getCause());
+        assertEquals(IssuanceException.INVALID_PROOF, listener.failures.get(0).errorCode());
+
+        formatter.buildFailure = null;
+        formatter.signFailure = new FormatException(IssuanceException.INVALID_PROOF, "the device key is not a point");
+        IssuanceException fromSign = assertThrows(IssuanceException.class, () -> service.issue(command("farmer").build()));
+        assertEquals(IssuanceException.INVALID_PROOF, fromSign.getErrorCode());
+
+        for (String code : List.of("mdoc_data_model_invalid", "certificate_chain_invalid", "mdoc_signing_failed")) {
+            formatter.signFailure = new FormatException(code, "not the caller's proof");
+            IssuanceException other = assertThrows(IssuanceException.class, () -> service.issue(command("farmer").build()), code);
+            assertEquals(IssuanceException.ISSUANCE_FAILED, other.getErrorCode(), code + " is not a proof error");
+            assertEquals(code, ((FormatException) other.getCause()).getErrorCode(), "the format's own code is kept as the cause");
+        }
+        formatter.signFailure = null;
+        formatter.buildFailure = new FormatException("mdoc_template_processing_failed", "template broken");
+        assertEquals(IssuanceException.ISSUANCE_FAILED,
+                assertThrows(IssuanceException.class, () -> service.issue(command("farmer").build())).getErrorCode());
     }
 
     @Test
@@ -357,10 +457,19 @@ class DefaultIssuanceServiceTest {
     void clearTrace() { Trace.STEPS.clear(); }
 
     static final class FakeDataSource implements CredentialDataSource {
+        final String id;
         IssuanceContext context;
         DataSourceException failWith;
 
-        public String id() { return "fake"; }
+        FakeDataSource() {
+            this("fake");
+        }
+
+        FakeDataSource(String id) {
+            this.id = id;
+        }
+
+        public String id() { return id; }
 
         public ClaimSet fetch(IssuanceContext context, CredentialConfiguration configuration) throws DataSourceException {
             Trace.step("fetch");
@@ -447,6 +556,8 @@ class DefaultIssuanceServiceTest {
         final List<HolderBinding> holders = new ArrayList<>();
         IssuedCredential signed;
         boolean explode;
+        FormatException buildFailure;
+        FormatException signFailure;
 
         public String formatId() { return "vc+jwt"; }
 
@@ -459,6 +570,7 @@ class DefaultIssuanceServiceTest {
         public UnsignedCredential build(ClaimSet claims, CredentialConfiguration configuration, IssuanceContext context, HolderBinding holder) {
             Trace.step("build");
             if (explode) throw new IllegalStateException("boom");
+            if (buildFailure != null) throw buildFailure;
             holders.add(holder);
             Map<String, Object> payload = new LinkedHashMap<>(claims.claims());
             payload.put("sub", holder.value());
@@ -468,6 +580,7 @@ class DefaultIssuanceServiceTest {
 
         public IssuedCredential sign(UnsignedCredential credential, SigningContext signing, IssuanceContext context) {
             Trace.step("sign");
+            if (signFailure != null) throw signFailure;
             String json = toJson(credential.asMap());
             String jws = JwsEnvelope.sign(json, JwsHeaderPolicy.compact("JWT"), signing.key(), signing.signer());
             signed = new IssuedCredential(formatId(), jws, null, credential.attributes());

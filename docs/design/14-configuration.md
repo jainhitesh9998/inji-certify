@@ -40,17 +40,26 @@ One namespace, `certify.*`, one typed record per module, validated at startup, d
 | `certify.offer-page` | offer page | `enabled` (false; P5-02) | new |
 | `certify.protocol.vc-api` | vc-api adapter | `enabled` (false), `clients.<id>.secret`, `clients.<id>.credential-configurations` (P5-01; bearer-token clients later) | new |
 | `certify.authz` | authz | `issuer-uri`, `jwk-set-uri`, `audiences[]`, `jws-algorithms[]`, `dpop.*` (allowed algorithms, max age, skew, jti ttl), `local-test-tokens.enabled` | `authn.*`, `dpop.*`, `security.*`, profile `local` |
-| `certify.signing` | signing | `default-provider`, `providers.keymanager.*` (alias table, kid strategy), `providers.jca.*` (path, password, `dev-mode`), `providers.x509-file.*`, `header-policy.<format>.*` | `signature-algo.key-alias-mapper`, `credential-config.credential-signing-alg-values-supported`, `credential-config.cryptographic-binding-methods-supported`, `credential-config.proof-types-supported`, `status-list.signature-*`, `status-list.key-manager-ref-id` |
+| `certify.signing` | signing | `default-provider`, `providers.keymanager.*` (alias table, kid strategy), `providers.jca.*` (path, password, `dev-mode`), `providers.x509-file.*`, `header-policy.<format>.*`, `key-expiry.*` (`warn-days`, `reconcile-interval`; M-05) | `signature-algo.key-alias-mapper`, `credential-config.credential-signing-alg-values-supported`, `credential-config.cryptographic-binding-methods-supported`, `credential-config.proof-types-supported`, `status-list.signature-*`, `status-list.key-manager-ref-id` |
 | `certify.templates` | templates | `default-engine`, `velocity.params.*`, `validation.enabled` | `data-provider-plugin.velocity-template.env-configs.*`, `vcformat.vc.expiry` |
 | `certify.credentials.defaults` | core | `validity` (`P730D`), `id-prefix`, `rendering-template-id`, `status.purposes[]`, `status.mechanism` — defaults that each credential configuration may override | `data-provider-plugin.vc-expiry-duration`, `id-field-prefix-uri`, `rendering-template-id`, `credential-status.allowed-status-purposes`, `statuslist.*` |
 | `certify.ledger` | listeners | `enabled`, `indexed-attributes.*` | `issuer.ledger-enabled`, `indexed-mappings.*` |
 | `certify.plugins` | core | `data-sources[]` (id, class or bean, config), `external-issuers[]`, `audit`, `scan-packages[]` | `plugin-mode`, `integration.*` |
+| `certify.datasource.file` | file data source | `sources.<id>.{path, key-claim, binary-fields}` — one JSON file per source, registered by the module itself | new |
 | `certify.as` | certify-as | `enabled`, `issuer`, `token.*`, `pre-authorized.*`, `pre-authorized-grant.advertise-anonymous-access`, `iae.*`, `verify.*`, `par.enabled`, `dpop-bound-tokens.enabled`, `client-attestation.*` | `oauth.*`, `pre-auth.*`, `iar.*`, `iae.*`, `verify.*`, `vp-request.*`, `authorization.*`, `credential-offer-url`, `credential-config.as-mapping` |
 | `certify.cache` | app | `type`, `redis.*`, and one map `entries.<name>.{size,ttl}` | `cache.names`, `cache.size`, `cache.expire-in-seconds`, `*-cache-expire-seconds` |
 | `certify.db` | persistence | `migrate-only`, `flyway.*` passthrough | new |
 | `certify.tenancy` | core | `enabled`, `resolver` (`fixed`/`host`/`path`), `tenants.<id>.*` overrides of `certify.issuer` and `certify.signing` | new |
 | `certify.deprecated.<name>.enabled` | app | kill switches | in place since P0-09 |
 | `mosip.kernel.*` | keymanager provider | unchanged; keymanager owns its keys | |
+
+`certify.datasource.file.sources.<id>` is the built-in file data source, a convenience over `certify.plugins.data-sources[]`: a
+plugin-provided source is named there with its class or bean, while a JSON file is declared with only its `path` (plus
+`key-claim`, `binary-fields`) and needs no code. Both share one id space — a credential configuration's `dataSourceId`
+selects either kind — so a file source may not take the reserved id `data-provider-plugin`. Ids containing `-` (such as
+the mDL's `mdl-demo`) are fine in properties and YAML files but cannot be set through environment variables
+(`CERTIFY_DATASOURCE_FILE_SOURCES_MDL_DEMO_PATH` binds `mdl.demo`); a deployment configured only through environment
+variables should use a dash-free id.
 
 Rules:
 

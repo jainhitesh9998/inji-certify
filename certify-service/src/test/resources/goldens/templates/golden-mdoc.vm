@@ -8,8 +8,20 @@
     "nameSpaces": {
         "org.iso.18013.5.1": [
             {"digestID": 0, "elementIdentifier": "family_name", "elementValue": "${fullName}"},
-            {"digestID": 1, "elementIdentifier": "birth_date", "elementValue": "${dateOfBirth}"},
-            {"digestID": 2, "elementIdentifier": "resident_city", "elementValue": "${city}"}
+            {"digestID": 1, "elementIdentifier": "given_name", "elementValue": "Jane"},
+            {"digestID": 2, "elementIdentifier": "birth_date", "elementValue": "${dateOfBirth}"},
+            {"digestID": 3, "elementIdentifier": "issue_date", "elementValue": "2024-01-01"},
+            {"digestID": 4, "elementIdentifier": "expiry_date", "elementValue": "2034-01-01"},
+            {"digestID": 5, "elementIdentifier": "issuing_country", "elementValue": "IN"},
+            {"digestID": 6, "elementIdentifier": "issuing_authority", "elementValue": "Lorem Ipsum Demo Issuing Authority"},
+            {"digestID": 7, "elementIdentifier": "document_number", "elementValue": "DL-0420110149646"},
+            {"digestID": 8, "elementIdentifier": "portrait", "elementValue": "/9j/4AAQSkZJRgABAgAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCABQAEADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD2qiiiuY1CiuT8T+LxpbtZWIV7sffc8rH/AImvP7vUr2/cvdXUspP95jgfQdBUSmkaRptntlFeJ2mpXtg4e1upYiP7rHB+o6GvQPDHi8ao62V8FS7P3HHCyf4GiM0wlTaOsoooqzMKzNf1P+ydGnuhjzANsYP948D/AB/CtOuK+IsxWzsYM8PIzn/gIA/9mpSdkVFXdjgHdpHZ3Ys7HJJPJNX7LQtU1FN9rZSuh6OflU/QnArZ8GeH49UuHvLtN1tAcBD0d+uD7D+orutI13StaE40u7juBbN5cgQEbT26jpwcEccVlGF1dmsp2dkeWXuhappyb7qylRB1cfMo+pGRVBHaN1dGKupyCDyDXsWr67pWiiAapdx24uW8uMOCdx79B05GSeOa4Xxn4fj0u4S8tE2205wUHRH64Hsf6GiULK6CNS+jO50DU/7W0aC6OPMI2yAf3hwf8fxrTrivh1MWs76DPCSK4/4ECP8A2Wu1rWLujKSs7BXFfEWEtZ2M+OEkZD/wIA/+y12tZmv6Z/a2jT2ox5hG6Mn+8OR/h+NEldBF2dyj4JRV8L25XqzuW+u4j+QFX9J0DS9D+0f2ZZx232h98uwn5j+J4HJ4HHNcz4D1QRCbR7g7JVcvGG4P+0v1GM/nXTpq8I1afTrjbbzLhoN7f69CoyV9w2QQM4wD3og7oJq0hNW0DS9c+z/2nZx3P2d98W8n5T+B5HA4PHFUPGyK3he4LdVdCv13AfyJrQvdXhtbq3s4ts95NIqiBX+ZUz8znrgKMnnqcDvXMePNUEoh0e3O+VnDyBeT/sr9TnP5UTfuhBXkP+HUJWzvp8cPIqD/AICCf/Zq7WszQNM/snRoLU48wDdIR/ePJ/w/CtOiKsgk7u4UUUUyTlfEnhM3839oac4hvRyRnAcjvns1Yk3iLU7WD7Hr+jR3iL/z3jxn3zgqfqBXotFTy9UWpaWZ5vb65fzRtbeHdBgsVk+8baEfzAAH1Nb3hvwmbCb+0NRcTXp5AzkIT3z3auqoo5dbsHLSyCiiiqICiiigAooooAKKKKACiiigD//Z"},
+            {"digestID": 9, "elementIdentifier": "driving_privileges", "elementValue": [
+                {"vehicle_category_code": "B", "issue_date": "2020-01-01", "expiry_date": "2030-01-01",
+                 "codes": [{"code": "01", "sign": "IN", "value": "B"}]}
+            ]},
+            {"digestID": 10, "elementIdentifier": "un_distinguishing_sign", "elementValue": "IND"},
+            {"digestID": 11, "elementIdentifier": "resident_city", "elementValue": "${city}"}
         ]
     }
 }

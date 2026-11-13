@@ -1,0 +1,32 @@
+# Python environment for docs/design/tools/verify_mdoc.py — the CI second opinion on issued mDocs
+# (docs/design/20-mdl-issuer.md M-01, decision D9).
+#
+# Exact pins for the whole transitive closure, not just pymdoccbor: the point of this tool is to be a check that
+# does not move under us. `pip install -r docs/design/tools/requirements-verify.txt` reproduces it; bump a pin only
+# together with a run over the recorded samples.
+#
+# Install (CI and locally):
+#   python3 -m venv .venv-verify
+#   .venv-verify/bin/pip install --quiet -r docs/design/tools/requirements-verify.txt
+#
+# Hashes are deliberately not pinned (pip runs without --require-hashes): `cryptography` and `cffi` ship per-platform
+# wheels, so a hash file would have to carry every platform's wheel hash and would fail on the one it does not list.
+# The versions are exact, which is what keeps the verification result reproducible.
+
+# the verifier itself
+pymdoccbor==1.4.0
+pycose==1.1.0
+cbor2==5.9.0
+cryptography==50.0.2
+
+# transitive closure of the above, pinned so a resolver change cannot move the check
+asn1crypto==1.5.1
+attrs==26.1.0
+cbor-diag==1.1.2
+certvalidator==0.11.1
+cffi==2.0.0
+ecdsa==0.19.2
+oscrypto==1.3.0
+pycparser==2.23
+six==1.17.0
+typing_extensions==4.16.0

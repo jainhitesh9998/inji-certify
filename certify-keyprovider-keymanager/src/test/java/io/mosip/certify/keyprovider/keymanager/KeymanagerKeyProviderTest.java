@@ -166,6 +166,51 @@ class KeymanagerKeyProviderTest {
         verify(keymanager.keymanagerService, times(3)).getAllCertificates(eq(ED.applicationId()), eq(Optional.of(ED.referenceId())));
     }
 
+    /**
+     * M-05 review: a read before keymanager provisioned a key (the service key, read for the JWKS or by a startup
+     * report) must not hide the key for the cache TTL once it exists, and must not call keymanager on every request
+     * either: an empty answer is cached for min(TTL, 30 s), and provisioning evicts it.
+     */
+    @Test
+    void anAliasWithoutCertificatesIsCachedBrieflyAndAKeyProvisionedLaterIsSeenAtOnce() {
+        KeymanagerAlias service = new KeymanagerAlias("CERTIFY_SERVICE", "");
+        KeymanagerKeyProvider withService = new KeymanagerKeyProvider(keymanager.keymanagerService,
+                keymanager.signatureService, List.of(service), clock, Duration.ofMinutes(10));
+        for (int i = 0; i < 100; i++) {
+            assertEquals(List.of(), withService.publicKeys(service.toKeyRef()), "not provisioned yet");
+        }
+        verify(keymanager.keymanagerService, times(1)).getAllCertificates(eq("CERTIFY_SERVICE"), eq(Optional.of("")));
+        clock.set(NOW.plus(Duration.ofSeconds(31)));
+        withService.publicKeys(service.toKeyRef());
+        verify(keymanager.keymanagerService, times(2)).getAllCertificates(eq("CERTIFY_SERVICE"), eq(Optional.of("")));
+
+        String kid = keymanager.addKey(service, SignatureAlgorithm.RS256, KeymanagerStandIn.at("2025-01-01T00:00:00Z"),
+                KeymanagerStandIn.at("2028-01-01T00:00:00Z"));
+        withService.evict(); // what KeymanagerKeyInitializer does once the master keys exist
+
+        assertEquals(List.of(kid), withService.publicKeys(KeyFilter.ALL).stream().map(PublicKeyDescriptor::kid).toList(),
+                "the key provisioned a moment later is published at once, not after the negative TTL");
+        assertEquals(List.of(service.toKeyRef()), withService.keyRefs());
+        clock.set(NOW.plus(Duration.ofMinutes(5)));
+        withService.publicKeys(KeyFilter.ALL);
+        verify(keymanager.keymanagerService, times(3)).getAllCertificates(eq("CERTIFY_SERVICE"), eq(Optional.of("")));
+    }
+
+    @Test
+    void ensureKeysEvictsTheEmptyAnswerOfTheAliasItProvisions() {
+        KeymanagerAlias ps = new KeymanagerAlias("CERTIFY_VC_SIGN_PS256", "");
+        KeymanagerKeyProvider fresh = new KeymanagerKeyProvider(keymanager.keymanagerService,
+                keymanager.signatureService, List.of(ps), clock, Duration.ofMinutes(10));
+        assertEquals(List.of(), fresh.publicKeys(ps.toKeyRef()), "not provisioned yet; the empty answer is cached");
+
+        // the stand-in's generateMasterKey is a no-op: the key keymanager would create is added by hand
+        keymanager.addKey(ps, SignatureAlgorithm.RS256, KeymanagerStandIn.at("2025-01-01T00:00:00Z"),
+                KeymanagerStandIn.at("2028-01-01T00:00:00Z"));
+        fresh.ensureKeys(List.of(new KeyRequirement("CERTIFY_VC_SIGN_PS256", SignatureAlgorithm.RS256, "vc-signing")));
+
+        assertEquals(1, fresh.publicKeys(ps.toKeyRef()).size(), "visible straight after provisioning");
+    }
+
     @Test
     void ensureKeysReproducesTheHistoricalInitKeysCalls() {
         provider.ensureKeys(List.of(

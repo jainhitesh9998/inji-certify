@@ -57,6 +57,8 @@ class KeymanagerKeyInitializerTest {
         assertEquals("CERTIFY_SERVICE", symmetric.getValue().getApplicationId());
         order.verify(keymanagerService, calls(1)).generateMasterKey(eq("CSR"), master.capture());
         assertEquals("CERTIFY_PARTNER", master.getValue().getApplicationId());
+        // whatever was read before the master keys existed is read again (M-05 review)
+        order.verify(provider, calls(1)).evict();
 
         @SuppressWarnings("unchecked") ArgumentCaptor<List<KeyRequirement>> required = ArgumentCaptor.forClass(List.class);
         order.verify(provider, calls(1)).ensureKeys(required.capture());

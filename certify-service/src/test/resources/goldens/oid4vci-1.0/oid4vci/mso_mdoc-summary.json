@@ -1,8 +1,11 @@
 {
-  "digests" : 3,
-  "docType" : "org.iso.18013.5.1.mDL",
-  "issuerSignedItems" : 3,
-  "protectedLabels" : "[1]",
-  "unprotectedLabels" : "[33]",
-  "validityInfoKeys" : "[\"signed\", \"validFrom\", \"validUntil\"]"
+  "digestIdCount": 12,
+  "digestIdsUnique": true,
+  "digests": 12,
+  "docType": "org.iso.18013.5.1.mDL",
+  "issuerSignedItems": 12,
+  "protectedLabels": "[1]",
+  "unprotectedLabels": "[33]",
+  "validityInfoKeys": "[\"signed\", \"validFrom\", \"validUntil\"]",
+  "validityInfoSignedLength": 20
 }

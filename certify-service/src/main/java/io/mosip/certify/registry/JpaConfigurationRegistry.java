@@ -132,6 +132,10 @@ public class JpaConfigurationRegistry implements ConfigurationRegistry {
             case VCFormats.MSO_MDOC -> {
                 raw.put("docType", model.get("doctype"));
                 raw.put("msoMdocClaims", model.get("mdocClaims") == null ? Map.of() : model.get("mdocClaims"));
+                if (model.get("elementTypes") != null) {
+                    // the optional Table 5 override of docs/design/20-mdl-issuer.md D6 (formatConfig.elementTypes)
+                    raw.put("elementTypes", model.get("elementTypes"));
+                }
                 selector = String.valueOf(model.get("doctype"));
             }
             default -> selector = row.getCredentialConfigKeyId();

@@ -18,6 +18,12 @@
             <version>${project.version}</version>
         </dependency>
         <dependency>
+            <!-- Annex B IACA and Document Signer profiles for the dev-mode mDL path (M-05); no Spring in that module -->
+            <groupId>io.inji.certify</groupId>
+            <artifactId>certify-pki</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
             <scope>test</scope>

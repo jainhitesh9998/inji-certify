@@ -45,6 +45,8 @@ public class Oid4vciIssuanceConfiguration {
         // the validity the legacy issuance applies to templated credentials (mosip.certify.data-provider-plugin.vc-expiry-duration)
         Duration validity = Duration.parse(environment.getProperty("mosip.certify.data-provider-plugin.vc-expiry-duration", "P730D").toUpperCase());
         return new DefaultIssuanceService(configurations, new FormatterRegistry(formatters), keyProviders, dataSources, externalIssuers,
-                proofValidators, templateEngines, statusProviders, listeners, AuthorizationPolicy.SCOPE, Clock.systemUTC(), validity);
+                proofValidators, templateEngines, statusProviders, listeners, AuthorizationPolicy.SCOPE, Clock.systemUTC(), validity,
+                // a configuration that names no dataSourceId is a pre-M-10 configuration: it was issued through the plugin
+                DataProviderPluginDataSource.ID);
     }
 }
