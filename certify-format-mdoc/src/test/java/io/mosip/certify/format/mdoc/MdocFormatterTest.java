@@ -117,6 +117,56 @@ class MdocFormatterTest {
     }
 
     @Test
+    void theBeta1MdocKeysAreAliasesBelowTheNewOnes() {
+        // CLAUDE.md rule 9: mso-validity > certify.format.mdoc.validity-period-years
+        //                   > mosip.certify.mdoc.validity-period-years > P90D; the same for the digest algorithm
+        Map<String, String> legacy = Map.of("mosip.certify.mdoc.validity-period-years", "3",
+                "mosip.certify.mdoc.digest-algorithm", "SHA-384");
+        MdocProperties unset = new MdocProperties(null, "1.0", null, null);
+        MdocProperties fromLegacy = MdocAutoConfiguration.resolve(unset, binder(legacy));
+        assertEquals(Duration.ofDays(365L * 3), fromLegacy.validity());
+        assertEquals("SHA-384", fromLegacy.digestAlgorithm());
+
+        MdocProperties newYears = MdocAutoConfiguration.resolve(new MdocProperties("SHA-512", "1.0", null, 1), binder(legacy));
+        assertEquals(Duration.ofDays(365), newYears.validity(), "certify.format.mdoc.validity-period-years wins over the alias");
+        assertEquals("SHA-512", newYears.digestAlgorithm(), "certify.format.mdoc.digest-algorithm wins over the alias");
+
+        MdocProperties explicit = MdocAutoConfiguration.resolve(new MdocProperties(null, "1.0", Duration.ofDays(30), 1), binder(legacy));
+        assertEquals(Duration.ofDays(30), explicit.validity(), "mso-validity wins over both year settings");
+        assertEquals("SHA-384", explicit.digestAlgorithm());
+
+        MdocProperties defaults = MdocAutoConfiguration.resolve(unset, binder(Map.of()));
+        assertEquals(Duration.ofDays(90), defaults.validity());
+        assertEquals("SHA-256", defaults.digestAlgorithm());
+
+        assertThrows(IllegalArgumentException.class, () -> MdocAutoConfiguration.resolve(unset,
+                binder(Map.of("mosip.certify.mdoc.validity-period-years", "0"))));
+    }
+
+    @Test
+    void theAutoConfigurationReadsTheAliasesFromTheEnvironment() throws Exception {
+        org.springframework.core.env.StandardEnvironment environment = new org.springframework.core.env.StandardEnvironment();
+        environment.getPropertySources().addFirst(new org.springframework.core.env.MapPropertySource("beta1", Map.of(
+                "mosip.certify.mdoc.validity-period-years", "2", "mosip.certify.mdoc.digest-algorithm", "SHA-512")));
+        MdocFormatter bean = new MdocAutoConfiguration().mdocFormatter(new ObjectMapper(),
+                new MdocProperties(null, "1.0", null, null), environment);
+        MdocProperties applied = (MdocProperties) readField(bean, "properties");
+        assertEquals(Duration.ofDays(730), applied.validity());
+        assertEquals("SHA-512", applied.digestAlgorithm());
+    }
+
+    private static org.springframework.boot.context.properties.bind.Binder binder(Map<String, String> values) {
+        return new org.springframework.boot.context.properties.bind.Binder(
+                new org.springframework.boot.context.properties.source.MapConfigurationPropertySource(values));
+    }
+
+    private static Object readField(Object target, String name) throws Exception {
+        java.lang.reflect.Field field = target.getClass().getDeclaredField(name);
+        field.setAccessible(true);
+        return field.get(target);
+    }
+
+    @Test
     void invalidMsoSettingsAreRefusedAtStartup() {
         // ISO/IEC 18013-5 9.1.2.4 defines only MSO version 1.0
         assertThrows(IllegalArgumentException.class, () -> new MdocProperties("SHA-256", "2.0", null, null));
@@ -145,6 +195,18 @@ class MdocFormatterTest {
         UnsignedCredential unsigned = formatter.build(ClaimSet.of(MdlFixtures.mdl()), configuration(), CONTEXT,
                 HolderBinding.did(HOLDER, "jwt"));
         FormatException refused = assertThrows(FormatException.class, () -> formatter.sign(unsigned, full, CONTEXT));
+        assertEquals("certificate_chain_invalid", refused.getErrorCode());
+        assertTrue(refused.getMessage().contains("self-signed"), refused.getMessage());
+    }
+
+    @Test
+    void aSelfSignedDocumentSignerIsRefused() {
+        // without-anchor keeps a lone self-signed certificate, so the formatter must refuse it itself: an Annex B
+        // document signer is issued by an IACA, never self-signed
+        SigningContext lone = MdlFixtures.signing(MdlFixtures.selfSignedSigner());
+        UnsignedCredential unsigned = formatter.build(ClaimSet.of(MdlFixtures.mdl()), configuration(), CONTEXT,
+                HolderBinding.did(HOLDER, "jwt"));
+        FormatException refused = assertThrows(FormatException.class, () -> formatter.sign(unsigned, lone, CONTEXT));
         assertEquals("certificate_chain_invalid", refused.getErrorCode());
         assertTrue(refused.getMessage().contains("self-signed"), refused.getMessage());
     }

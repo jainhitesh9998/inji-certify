@@ -164,11 +164,21 @@ public class MdocFormatter implements CredentialFormatter {
      * document signer certificate, and a verifier builds the path from it to the IACA it trusts. So the key must have a
      * chain, the configuration may not leave the chain out ({@code none}), may not cut it to the DSC alone ({@code leaf})
      * when intermediates stand between the DSC and the IACA, and may not carry the self-signed IACA ({@code full}; HAIP).
+     * The signer itself may not be self-signed: {@code without-anchor} keeps a lone self-signed certificate, which no
+     * Annex B Document Signer is.
      */
     static void requireX5chain(JwsHeaderPolicy.ChainInclusion inclusion, CertificateChain chain) {
         if (chain == null || chain.isEmpty()) {
             throw new FormatException(MdocConstants.ERROR_CHAIN, "the signing key has no certificate chain; ISO/IEC 18013-5"
                     + " 9.1.2.4 requires the IssuerAuth to carry the document signer certificate in x5chain (label 33)");
+        }
+        X509Certificate leaf = chain.leafFirst().get(0);
+        if (leaf.getSubjectX500Principal().equals(leaf.getIssuerX500Principal())) {
+            // a lone self-signed certificate survives without-anchor (nothing above it to drop), so the IssuerAuth would
+            // carry a self-signed signer; an ISO/IEC 18013-5 Annex B Document Signer is always issued by an IACA
+            throw new FormatException(MdocConstants.ERROR_CHAIN, "the signing certificate " + leaf.getSubjectX500Principal()
+                    + " is self-signed; an ISO/IEC 18013-5 Annex B document signer certificate is issued by an IACA,"
+                    + " so the key needs a DSC chain (docs/design/06a-x509-pki-and-mdoc.md)");
         }
         switch (inclusion) {
             case NONE -> throw new FormatException(MdocConstants.ERROR_CHAIN, "x5chain none would leave the IssuerAuth"

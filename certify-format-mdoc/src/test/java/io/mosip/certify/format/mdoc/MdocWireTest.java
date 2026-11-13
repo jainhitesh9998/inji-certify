@@ -528,6 +528,11 @@ class MdocWireTest {
                 HolderBinding.did("did:jwk:" + Base64.getUrlEncoder().withoutPadding().encodeToString(offCurve.getBytes()), "jwt")));
         assertEquals("invalid_proof", point.getErrorCode());
         assertTrue(point.getMessage().contains("not on"), point.getMessage());
+        // the same point as a raw JWK (a jwt proof's jwk header), not wrapped in a did:jwk
+        FormatException rawPoint = assertThrows(FormatException.class, () -> formatter().build(ClaimSet.of(MdlFixtures.mdl()),
+                MdlFixtures.configuration(formatter()), MdlFixtures.context(), HolderBinding.jwk(offCurve, null, "jwt")));
+        assertEquals("invalid_proof", rawPoint.getErrorCode());
+        assertTrue(rawPoint.getMessage().contains("not on"), rawPoint.getMessage());
 
         // an Ed25519 x that is not exactly 32 bytes is refused, never zero-padded into a different key
         String shortEd25519 = "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\""
@@ -705,6 +710,14 @@ class MdocWireTest {
         assertEquals("mdoc_data_model_invalid", expired.getErrorCode());
         assertTrue(expired.getMessage().contains("expiry_date"), expired.getMessage());
 
+        // expiry_date today: a full-date counts from 00:00:00Z, so the document is already expired at any issuance instant
+        String today = java.time.LocalDate.ofInstant(MdlFixtures.NOW, java.time.ZoneOffset.UTC).toString();
+        FormatException expiresToday = assertThrows(FormatException.class, () -> formatter().build(
+                ClaimSet.of(MdlFixtures.with("expiry_date", today)), MdlFixtures.configuration(formatter()),
+                MdlFixtures.context(), MdlFixtures.holder()));
+        assertEquals("mdoc_data_model_invalid", expiresToday.getErrorCode());
+        assertTrue(expiresToday.getMessage().contains("expiry_date"), expiresToday.getMessage());
+
         // expiry in ten days with P90D configured: validUntil is the start of the expiry day, not signed + 90 days
         java.time.LocalDate expiryDay = java.time.LocalDate.ofInstant(MdlFixtures.NOW, java.time.ZoneOffset.UTC).plusDays(10);
         CBORObject validityInfo = mso(issuerSigned(issue(MdlFixtures.with("expiry_date", expiryDay.toString())))).get("validityInfo");
@@ -714,6 +727,38 @@ class MdocWireTest {
         String expiryInstant = MdlFixtures.tdate(MdlFixtures.NOW.plus(Duration.ofDays(3)));
         CBORObject capped = mso(issuerSigned(issue(MdlFixtures.with("expiry_date", expiryInstant)))).get("validityInfo");
         assertEquals(expiryInstant, capped.get("validUntil").Untag().AsString());
+    }
+
+    @Test
+    void issueAndBirthDatesAreNotInTheFutureAndIssueIsBeforeExpiry() {
+        java.time.LocalDate today = java.time.LocalDate.ofInstant(MdlFixtures.NOW, java.time.ZoneOffset.UTC);
+        // the latest calendar date anywhere on earth (UTC+14) is accepted; the day after it is in the future everywhere
+        java.time.LocalDate latest = java.time.LocalDate.ofInstant(MdlFixtures.NOW, java.time.ZoneOffset.ofHours(14));
+        String future = latest.plusDays(1).toString();
+        for (String element : List.of("issue_date", "birth_date")) {
+            FormatException e = assertThrows(FormatException.class, () -> formatter().build(
+                    ClaimSet.of(MdlFixtures.with(element, future)), MdlFixtures.configuration(formatter()),
+                    MdlFixtures.context(), MdlFixtures.holder()), element);
+            assertEquals("mdoc_data_model_invalid", e.getErrorCode(), element);
+            assertTrue(e.getMessage().contains(element), e.getMessage());
+        }
+        // a tdate one hour ahead is in the future too
+        String laterToday = MdlFixtures.tdate(MdlFixtures.NOW.plus(Duration.ofHours(1)));
+        assertEquals("mdoc_data_model_invalid", assertThrows(FormatException.class, () -> formatter().build(
+                ClaimSet.of(MdlFixtures.with("issue_date", laterToday)), MdlFixtures.configuration(formatter()),
+                MdlFixtures.context(), MdlFixtures.holder())).getErrorCode());
+        // today's date is accepted whatever the issuer's zone (an issuer east of UTC may write tomorrow's UTC date)
+        issue(MdlFixtures.with("issue_date", today.toString()));
+        issue(MdlFixtures.with("issue_date", latest.toString()));
+        issue(MdlFixtures.with("birth_date", latest.toString()));
+
+        // issue_date must be strictly before expiry_date
+        Map<String, Object> inverted = MdlFixtures.with("expiry_date", today.plusDays(30).toString());
+        Map<String, Object> issuedAfterExpiry = withAlso(inverted, "issue_date", today.plusDays(31).toString());
+        FormatException order = assertThrows(FormatException.class, () -> formatter().build(ClaimSet.of(issuedAfterExpiry),
+                MdlFixtures.configuration(formatter()), MdlFixtures.context(), MdlFixtures.holder()));
+        assertEquals("mdoc_data_model_invalid", order.getErrorCode());
+        assertTrue(order.getMessage().contains("is not before expiry_date"), order.getMessage());
     }
 
     @Test
@@ -853,6 +898,16 @@ class MdocWireTest {
         FormatException shortCoordinate = assertThrows(FormatException.class, () -> MdocCoseKey.fromHolder(shortX, MAPPER));
         assertEquals("invalid_proof", shortCoordinate.getErrorCode());
         assertTrue(shortCoordinate.getMessage().contains("exactly 32"), shortCoordinate.getMessage());
+    }
+
+    /** Sets one more element of a document built by {@link MdlFixtures#with}. */
+    private static Map<String, Object> withAlso(Map<String, Object> document, String identifier, Object value) {
+        for (Map<String, Object> item : MdlFixtures.items(document, MdlFixtures.MDL_NAMESPACE)) {
+            if (identifier.equals(item.get("elementIdentifier"))) {
+                item.put("elementValue", value);
+            }
+        }
+        return document;
     }
 
     /** {@code elementIdentifier -> the encoded IssuerSignedItem} of a namespace, exactly as the digest covers it. */

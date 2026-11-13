@@ -75,16 +75,27 @@ final class MdlFixtures {
     private static JcaKeyProvider provider() {
         JcaKeyProvider provider = JcaKeyProvider.devMode();
         // Annex B document signer certificates carry the country; the check at signing time compares it with issuing_country
-        provider.generate("mdl-dsc", SignatureAlgorithm.ES256, "C=IN,CN=Lorem Ipsum Demo DSC,O=Lorem Ipsum Demo", "vc-signing");
-        provider.generate("mdl-dsc-us", SignatureAlgorithm.ES256, "C=US,CN=Lorem Ipsum Demo DSC,O=Lorem Ipsum Demo", "vc-signing");
+        // every document signer is issued by an IACA (Annex B): the formatter refuses a self-signed signer certificate
         provider.generateCa("mdl-iaca", SignatureAlgorithm.ES256, "C=IN,CN=Lorem Ipsum Demo IACA,O=Lorem Ipsum Demo", "vc-signing");
+        provider.generateCa("mdl-iaca-us", SignatureAlgorithm.ES256, "C=US,CN=Lorem Ipsum Demo IACA,O=Lorem Ipsum Demo", "vc-signing");
+        provider.generateSignedBy("mdl-dsc", SignatureAlgorithm.ES256, "C=IN,CN=Lorem Ipsum Demo DSC,O=Lorem Ipsum Demo",
+                "vc-signing", "mdl-iaca");
+        provider.generateSignedBy("mdl-dsc-us", SignatureAlgorithm.ES256, "C=US,CN=Lorem Ipsum Demo DSC,O=Lorem Ipsum Demo",
+                "vc-signing", "mdl-iaca-us");
         provider.generateSignedBy("mdl-dsc-chained", SignatureAlgorithm.ES256, "C=IN,CN=Lorem Ipsum Demo DSC,O=Lorem Ipsum Demo",
                 "vc-signing", "mdl-iaca");
+        // a plain self-signed dev key (G10/G11): what the formatter must refuse to sign with
+        provider.generate("mdl-self-signed", SignatureAlgorithm.ES256, "C=IN,CN=Lorem Ipsum Demo Self-Signed,O=Lorem Ipsum Demo",
+                "vc-signing");
         return provider;
     }
 
     static SigningKey dsc() {
         return KEYS.resolve(KeyRef.parse("jca:mdl-dsc"));
+    }
+
+    static SigningKey selfSignedSigner() {
+        return KEYS.resolve(KeyRef.parse("jca:mdl-self-signed"));
     }
 
     static SigningKey dscIssuedByAnotherCountry() {

@@ -37,7 +37,8 @@ import java.util.Set;
  * (this issuer accepts JPEG portraits only, a compliant subset of Table 5's JPEG or JPEG 2000; decision log
  * 2026-11-13); {@code issuing_country} is an ISO 3166-1 alpha-2 code in upper case; {@code un_distinguishing_sign} is
  * 1-3 upper-case Latin letters (the UN distinguishing sign, e.g. {@code IND}); {@code issuing_jurisdiction}, when
- * present, is an ISO 3166-2 subdivision of {@code issuing_country}; {@code expiry_date} lies after the issuance instant.
+ * present, is an ISO 3166-2 subdivision of {@code issuing_country}; {@code expiry_date} lies after the issuance instant
+ * and after {@code issue_date}; {@code issue_date} and {@code birth_date} do not lie after it.
  * At signing time the country is compared with the subject {@code C} of the document signer certificate: a document
  * whose issuer is not the country the DSC belongs to is not validly signed (7.2.1, Annex B).
  */
@@ -107,6 +108,17 @@ final class MdocDataModelValidator {
         if (now != null && !expiry.isAfter(now.truncatedTo(java.time.temporal.ChronoUnit.SECONDS))) {
             throw invalid("expiry_date " + mdl.get("expiry_date") + " is not after the issuance instant " + now
                     + "; an mDL that is already expired is not issued (ISO/IEC 18013-5 7.2.1)");
+        }
+        Instant issued = dateInstant("issue_date", mdl.get("issue_date"));
+        if (!issued.isBefore(expiry)) {
+            throw invalid("issue_date " + mdl.get("issue_date") + " is not before expiry_date " + mdl.get("expiry_date")
+                    + " (ISO/IEC 18013-5 7.2.1 Table 5)");
+        }
+        if (now != null) {
+            notInTheFuture("issue_date", mdl.get("issue_date"), now);
+            if (mdl.containsKey("birth_date")) {
+                notInTheFuture("birth_date", mdl.get("birth_date"), now);
+            }
         }
         if (mdl.containsKey("nationality")) {
             country("nationality", mdl.get("nationality"));
@@ -183,6 +195,24 @@ final class MdocDataModelValidator {
             return Instant.parse(text);
         }
         throw invalid(element + " must be a full-date or a tdate (ISO/IEC 18013-5 7.2.1 Table 5), was " + typeName(value));
+    }
+
+    /**
+     * A {@code full-date} or {@code tdate} element that may not lie after the issuance instant. A {@code full-date} is
+     * a calendar date in the issuer's zone, so it is compared with the latest date anywhere on earth (UTC+14): an issuer
+     * east of UTC that writes its own date is never refused, a date no zone has reached yet always is.
+     */
+    private static void notInTheFuture(String element, Object value, Instant now) {
+        boolean future;
+        if (value instanceof String text && isFullDate(text)) {
+            future = LocalDate.parse(text, FULL_DATE).isAfter(LocalDate.ofInstant(now, ZoneOffset.ofHours(14)));
+        } else {
+            future = dateInstant(element, value).isAfter(now);
+        }
+        if (future) {
+            throw invalid(element + " " + value + " lies after the issuance instant " + now
+                    + " (ISO/IEC 18013-5 7.2.1 Table 5)");
+        }
     }
 
     /**

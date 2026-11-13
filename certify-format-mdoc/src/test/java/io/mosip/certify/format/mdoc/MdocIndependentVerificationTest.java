@@ -196,8 +196,10 @@ class MdocIndependentVerificationTest {
     void g8SignedIsValidFromWhateverTheGapBetweenBuildAndSign() throws Exception {
         // the core path builds at the request instant and signs after the data source answered; the window is decided
         // in sign() as one instant, so a later signing clock moves signed and validFrom together (never signed > validFrom)
-        Instant buildAt = MdlFixtures.NOW;
-        Instant signAt = buildAt.plusMillis(1_500);
+        // build 1.5 s in the past and sign at NOW, so the verifier's own clock (later still) never sees a validFrom
+        // in the future, whatever sub-second NOW falls on
+        Instant signAt = MdlFixtures.NOW;
+        Instant buildAt = signAt.minusMillis(1_500);
         UnsignedCredential unsigned = formatter.build(ClaimSet.of(MdlFixtures.mdl()), MdlFixtures.configuration(formatter),
                 MdlFixtures.context(buildAt), MdlFixtures.holder());
         IssuedCredential issued = formatter.sign(unsigned, MdlFixtures.signing(DSC), MdlFixtures.context(signAt));
@@ -285,9 +287,12 @@ class MdocIndependentVerificationTest {
         assertTrue(report.check(IndependentMdocVerifier.CHECK_SIGNATURE_MULTIPAZ).passed(), report.toString());
         assertEquals(2, x5chain(withAnchor).size(), "the mutation must actually carry [DSC, IACA]");
 
-        // and a lone self-signed signer certificate (a plain dev key, G10/G11) is the same problem at index 0
-        VerificationReport lone = verify(issue(MdlFixtures.mdl(), MdlFixtures.holder(), MdlFixtures.dsc()), Optional.empty(),
-                Options.strict(DOCTYPE));
+        // and a lone self-signed signer certificate (a plain dev key, G10/G11) is the same problem at index 0; the
+        // formatter refuses to sign with one, so the mutation swaps it in
+        unprotected.put(new UnsignedInteger(33),
+                new ByteString(MdlFixtures.selfSignedSigner().chain().leaf().orElseThrow().getEncoded()));
+        root.put(new UnicodeString("issuerAuth"), array(coseSign1));
+        VerificationReport lone = verify(encode(root), Optional.empty(), Options.strict(DOCTYPE));
         assertEquals(List.of("selfSigned:0"), lone.check(IndependentMdocVerifier.CHECK_NO_SELF_SIGNED).codes(), lone.toString());
     }
 
