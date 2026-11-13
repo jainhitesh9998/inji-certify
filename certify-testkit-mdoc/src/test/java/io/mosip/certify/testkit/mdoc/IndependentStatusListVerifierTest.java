@@ -370,6 +370,100 @@ class IndependentStatusListVerifierTest {
     }
 
     /**
+     * Review round 5, 1: keys are compared as RFC 8949 5.6.1 data items, recursively, not as bytes. Claim 999 holds
+     * {@code { {1: 1, 2: 2}: 1, {2: 2, 1: 1}: 2 }}: two encodings of one map key ("Two maps are equal if they have the
+     * same set of pairs regardless of their order"), which byte comparison let through with every check passing,
+     * Multipaz's {@code fromCwt} included.
+     */
+    @Test
+    void aMapKeyRepeatedWithItsPairsInAnotherOrderIsADuplicate() {
+        Fixture fixture = new Fixture();
+        assertMalformedByDuplicateKey(verify(fixture, tokenWithExtraClaim(fixture, hex("a2a20101020201a20202010102")),
+                IndependentStatusListVerifier.StatusListOptions.strictMode()), "the CWT claims → 999 carries the key");
+    }
+
+    /**
+     * Floats compare by numeric value whatever their width, -0.0 equals 0.0 (RFC 8949 5.6.1), and every NaN is one key
+     * (stricter than 5.6.1's significand rule, documented on {@code DuplicateKeys.dataItem}).
+     */
+    @Test
+    void floatKeysOfOneNumericValueAreDuplicatesWhateverTheirWidth() {
+        Fixture fixture = new Fixture();
+        Map<String, String> maps = new LinkedHashMap<>();
+        maps.put("1.0 as f16 and f64", "a2f93c0001fb3ff000000000000002");
+        maps.put("1.0 as f32 and f16", "a2fa3f80000001f93c0002");
+        maps.put("0.0 and -0.0", "a2f9000001f9800002");
+        maps.put("NaN as f16 and f64", "a2f97e0001fb7ff800000000000002");
+        maps.forEach((name, map) -> assertMalformedByDuplicateKey(verify(fixture, tokenWithExtraClaim(fixture, hex(map)),
+                IndependentStatusListVerifier.StatusListOptions.strictMode()), "the CWT claims → 999 carries the key"));
+    }
+
+    /** Arrays compare element by element: {@code [1, 2]} and {@code [18 01, 19 0002]} are one key. */
+    @Test
+    void arrayKeysWithTheSameElementsInOtherIntegerWidthsAreDuplicates() {
+        Fixture fixture = new Fixture();
+        assertMalformedByDuplicateKey(verify(fixture, tokenWithExtraClaim(fixture, hex("a28201020182180119000202")),
+                IndependentStatusListVerifier.StatusListOptions.strictMode()), "the CWT claims → 999 carries the key");
+    }
+
+    /**
+     * What RFC 8949 5.6.1 keeps apart stays apart: an integer, the same integer tagged, a bignum, a float and a simple
+     * value of the same number; a text string and a byte string of the same bytes; an array and a map; 0 and 0.0.
+     * Such a claim is not a duplicate, and the token passes every check.
+     */
+    @Test
+    void distinctDataItemsStayDistinctKeys() {
+        Fixture fixture = new Fixture();
+        String map = "ab"
+                + "01" + "00"            // 1
+                + "c101" + "00"          // 1(1): tagged
+                + "c24101" + "00"        // 2(h'01'): bignum 1
+                + "f93c00" + "00"        // 1.0
+                + "e1" + "00"            // simple(1)
+                + "6161" + "00"          // "a"
+                + "4161" + "00"          // h'61'
+                + "820101" + "00"        // [1, 1]
+                + "a10101" + "00"        // {1: 1}
+                + "00" + "00"            // 0
+                + "f90000" + "00";       // 0.0
+        VerificationReport report = verify(fixture, tokenWithExtraClaim(fixture, hex(map)),
+                IndependentStatusListVerifier.StatusListOptions.strictMode());
+        assertEquals(List.of(), report.failures(), () -> "eleven distinct keys are not a duplicate: " + report);
+    }
+
+    /**
+     * Review round 5, 3: the branch where Authlete cannot decode what Multipaz decoded. A text string that is not
+     * UTF-8 — RFC 8949 5.3.1's other basic validity error — is decoded by Multipaz to U+FFFD (so two different
+     * malformed keys would be one key there) and refused by Authlete, so the token is unreadable.
+     */
+    @Test
+    void aTextStringThatIsNotUtf8MakesTheTokenUnreadable() {
+        Fixture fixture = new Fixture();
+        assertEquals("\uFFFD", Cbor.INSTANCE.decode(hex("61ff")).getAsTstr(), "Multipaz reads 61 ff as U+FFFD");
+        VerificationReport report = verify(fixture, tokenWithExtraClaim(fixture, hex("61ff")),
+                IndependentStatusListVerifier.StatusListOptions.strictMode());
+        assertOnlyEnvelopeFails(report, "notTagged18", "Authlete cannot decode the CWT claims");
+        assertTrue(report.check(IndependentStatusListVerifier.CHECK_ENVELOPE).message().contains("UTF-8"),
+                () -> "the reason is the malformed text: " + report.check(IndependentStatusListVerifier.CHECK_ENVELOPE));
+    }
+
+    /** The canonical claims, encoded byte for byte, with claim 999 = {@code value} appended; signed by the DSC. */
+    private static byte[] tokenWithExtraClaim(Fixture fixture, byte[] value) {
+        List<byte[]> entries = new ArrayList<>();
+        fixture.canonicalClaims().forEach((key, claimValue) -> {
+            entries.add(enc(key));
+            entries.add(enc(claimValue));
+        });
+        entries.add(enc(claim(999)));
+        entries.add(value);
+        return fixture.builder().rawPayload(rawMap(entries.toArray(byte[][]::new))).build();
+    }
+
+    private static byte[] hex(String hex) {
+        return java.util.HexFormat.of().parseHex(hex);
+    }
+
+    /**
      * The control for the hand-built tokens above: the same raw encoding and hand signing, without a repeated key,
      * passes every check — so the duplicate is the only defect those tokens carry.
      */
@@ -398,8 +492,13 @@ class IndependentStatusListVerifierTest {
 
     /** {@code duplicateKey} and nothing else but notRun: no check reads a map one decoder or another has chosen from. */
     private static void assertMalformedByDuplicateKey(VerificationReport report, String where) {
+        assertOnlyEnvelopeFails(report, "duplicateKey", where);
+    }
+
+    /** The envelope fails with {@code code} naming {@code where}, and every other token check is notRun. */
+    private static void assertOnlyEnvelopeFails(VerificationReport report, String code, String where) {
         Map<String, List<String>> expected = new LinkedHashMap<>();
-        expected.put(IndependentStatusListVerifier.CHECK_ENVELOPE, List.of("duplicateKey"));
+        expected.put(IndependentStatusListVerifier.CHECK_ENVELOPE, List.of(code));
         for (String check : List.of(IndependentStatusListVerifier.CHECK_TYP, IndependentStatusListVerifier.CHECK_X5CHAIN,
                 IndependentStatusListVerifier.CHECK_SIGNATURE, IndependentStatusListVerifier.CHECK_CHAIN,
                 IndependentStatusListVerifier.CHECK_ISSUANCE_CHAIN, IndependentStatusListVerifier.CHECK_CLAIMS,
@@ -694,6 +793,24 @@ class IndependentStatusListVerifierTest {
     }
 
     /**
+     * Review round 5, 2: without {@code exp}, validateCwt derives it as {@code iat + maxValidity} and refuses it as
+     * expired when that is before now. An iat 366 days old is that refusal, caused by the missing exp, so
+     * {@code expMissing} explains it and the chain passes.
+     */
+    @Test
+    void withoutAnExpAnIatOlderThanMaxValidityIsFromCwtsExpiryAndExpMissingExplainsIt() {
+        Fixture fixture = new Fixture();
+        VerificationReport report = verify(fixture, fixture.tokenWithClaims(claims -> {
+                    claims.remove(claim(4));
+                    claims.put(claim(6), DataItemExtensionsKt.toDataItem(NOW.minusSeconds(366L * 24 * 3600).getEpochSecond()));
+                }), IndependentStatusListVerifier.StatusListOptions.strictMode());
+        assertProblems(report, Map.of(IndependentStatusListVerifier.CHECK_CLAIMS, List.of("expMissing")));
+        VerificationReport.Check chain = report.check(IndependentStatusListVerifier.CHECK_CHAIN);
+        assertTrue(chain.message().contains("fromCwt refused") && chain.message().contains("expired"),
+                () -> "fromCwt refuses the derived exp as expired, which expMissing explains: " + chain);
+    }
+
+    /**
      * Review round 4, 3: validateCwt decides maxValidity right after reading exp, before typ, sub, the signature and
      * the list, so a token past it is refused for maxValidity whatever else is wrong with it, and the chain says so
      * next to the other check's code.
@@ -787,6 +904,12 @@ class IndependentStatusListVerifierTest {
             claims.remove(claim(4));
             claims.put(claim(6), DataItemExtensionsKt.toDataItem(NOW.plusSeconds(6).getEpochSecond()));
         });
+        for (long days : new long[] {364, 365, 366}) {
+            mutations.put("no exp, iat " + days + " days ago", claims -> {
+                claims.remove(claim(4));
+                claims.put(claim(6), DataItemExtensionsKt.toDataItem(NOW.minusSeconds(days * 24 * 3600).getEpochSecond()));
+            });
+        }
         mutations.put("no exp, text ttl", claims -> {
             claims.remove(claim(4));
             claims.put(claim(65534), new Tstr("3600"));
@@ -822,6 +945,10 @@ class IndependentStatusListVerifierTest {
                 mutations.get("exp at the evaluation instant")), URI, NOW), "Multipaz accepts exp == at");
         assertTrue(IndependentStatusListVerifier.fromCwtRefusesOnAReportedDefect(fixture.tokenWithClaims(
                 mutations.get("exp at the evaluation instant")), URI, NOW.plusMillis(500)), "and refuses it 500 ms later");
+        assertTrue(IndependentStatusListVerifier.fromCwtRefusesOnAReportedDefect(fixture.tokenWithClaims(
+                mutations.get("no exp, iat 366 days ago")), URI, NOW), "an exp derived from an old iat is expired");
+        assertTrue(!IndependentStatusListVerifier.fromCwtRefusesOnAReportedDefect(fixture.tokenWithClaims(
+                mutations.get("no exp, iat 365 days ago")), URI, NOW), "iat + 365 days == at is accepted");
     }
 
     private static VerificationReport multipazRefusal(Fixture fixture, X509Cert signer, long exp,
@@ -926,13 +1053,21 @@ class IndependentStatusListVerifierTest {
         assertProblems(atExp, Map.of(IndependentStatusListVerifier.CHECK_CLAIMS, List.of("expired")));
         assertTrue(atExp.check(IndependentStatusListVerifier.CHECK_CHAIN).message().startsWith(
                 "CompressedStatusList.fromCwt accepts"), () -> "Multipaz accepts exp == at: " + atExp);
+        assertTrue(atExp.check(IndependentStatusListVerifier.CHECK_CLAIMS).message().contains(ALONE_AT_EXP),
+                () -> "at exp the message says only this check refuses: " + atExp.check(IndependentStatusListVerifier.CHECK_CLAIMS));
 
         VerificationReport secondBefore = verify(fixture, tokenExpiringAt(fixture, NOW.plusSeconds(1)), NOW);
         assertEquals(List.of(), secondBefore.failures(), () -> "one second before exp the token is valid: " + secondBefore);
 
         VerificationReport secondAfter = verify(fixture, tokenExpiringAt(fixture, NOW.minusSeconds(1)), NOW);
         assertProblems(secondAfter, Map.of(IndependentStatusListVerifier.CHECK_CLAIMS, List.of("expired")));
+        assertTrue(!secondAfter.check(IndependentStatusListVerifier.CHECK_CLAIMS).message().contains(ALONE_AT_EXP),
+                () -> "past exp Multipaz refuses too, and the message does not say otherwise: "
+                        + secondAfter.check(IndependentStatusListVerifier.CHECK_CLAIMS));
     }
+
+    /** The sentence the expired message adds only when Multipaz, handed {@code at} in milliseconds, accepts exp. */
+    static final String ALONE_AT_EXP = "exactly at exp this check alone refuses";
 
     /**
      * A fractional evaluation instant is compared at full precision: expired when {@code at >= exp}, so half a second
@@ -942,10 +1077,14 @@ class IndependentStatusListVerifierTest {
     void aFractionalEvaluationInstantIsComparedWithExpAtFullPrecision() {
         Fixture fixture = new Fixture();
         byte[] token = tokenExpiringAt(fixture, NOW);
-        assertProblems(verify(fixture, token, NOW.plusMillis(500)),
-                Map.of(IndependentStatusListVerifier.CHECK_CLAIMS, List.of("expired")));
-        assertProblems(verify(fixture, token, NOW.plusNanos(1)),
-                Map.of(IndependentStatusListVerifier.CHECK_CLAIMS, List.of("expired")));
+        VerificationReport halfSecondAfter = verify(fixture, token, NOW.plusMillis(500));
+        assertProblems(halfSecondAfter, Map.of(IndependentStatusListVerifier.CHECK_CLAIMS, List.of("expired")));
+        assertTrue(!halfSecondAfter.check(IndependentStatusListVerifier.CHECK_CLAIMS).message().contains(ALONE_AT_EXP),
+                "500 ms after exp Multipaz refuses too");
+        VerificationReport nanoAfter = verify(fixture, token, NOW.plusNanos(1));
+        assertProblems(nanoAfter, Map.of(IndependentStatusListVerifier.CHECK_CLAIMS, List.of("expired")));
+        assertTrue(nanoAfter.check(IndependentStatusListVerifier.CHECK_CLAIMS).message().contains(ALONE_AT_EXP),
+                "1 ns after exp Multipaz, handed milliseconds, still accepts");
         VerificationReport before = verify(fixture, token, NOW.minusMillis(500));
         assertEquals(List.of(), before.failures(), () -> "half a second before exp the token is valid: " + before);
         VerificationReport nanoBefore = verify(fixture, token, NOW.minusNanos(1));

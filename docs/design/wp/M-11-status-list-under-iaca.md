@@ -564,7 +564,7 @@ days.
 | --- | --- | --- |
 | `statusList.mso` | `malformed` (the MSO's `status.status_list` is present but not `{uri: tstr, idx: uint}`: typed `uri`, negative/text `idx`, `status_list` not a map; a `status` that is not a map. A `status` map without `status_list` — an `identifier_list` only, or RFU keys — is valid and absent) | ISO2 12.3.6 |
 | `statusList.http` | `contentType` (not `application/statuslist+cwt`, parameters ignored) | TSL §8.2 |
-| `statusList.envelope` | `notTagged18` (untagged, a tag other than 17/18/61, or any tag stack other than exactly `[18]` — `18(18(…))` and the self-describe `55799(18(…))` included), `cwtTag61`, `mac0`, `detachedPayload`, `duplicateKey` (a map of the protected header, the unprotected header or the claims, or a map nested in them such as `status_list`, carries a key twice; read on the wire with Authlete's decoder, which keeps every pair, before any header or claim is read, keys compared as RFC 8949 §5.6.1 data items so `02` and `18 02` are one key; every other token check is then `notRun`, because a decoder keeps one value or the other — Multipaz the last) | TSL §5.2, RFC 9052 §4.2; RFC 8949 §3.4.6; `@owf/cose` 0.6.0; RFC 9052 §3 ("if a label appears multiple times, the message MUST be rejected as malformed"), RFC 8392 §7.2 steps 1 and 7, RFC 8949 §5.3.1 |
+| `statusList.envelope` | `notTagged18` (untagged, a tag other than 17/18/61, or any tag stack other than exactly `[18]` — `18(18(…))` and the self-describe `55799(18(…))` included), `cwtTag61`, `mac0`, `detachedPayload`, `duplicateKey` (a map of the protected header, the unprotected header or the claims, or a map nested in them such as `status_list`, carries a key twice; read on the wire with Authlete's decoder, which keeps every pair, before any header or claim is read; keys compared recursively as RFC 8949 §5.6.1 data items — integers by value at any width, strings by content, arrays element-wise, maps as unordered pair sets, tags by number and content, simple values by value, floats by numeric value at any width with `-0.0` = `0.0` and every NaN one key (stricter than §5.6.1's significand rule) — so `02` and `18 02`, or `{1: 1, 2: 2}` and `{2: 2, 1: 1}`, are one key; every other token check is then `notRun`, because a decoder keeps one value or the other — Multipaz the last. A part Authlete cannot decode though Multipaz did, such as a text string that is not UTF-8, makes the token `notTagged18`) | TSL §5.2, RFC 9052 §4.2; RFC 8949 §3.4.6; `@owf/cose` 0.6.0; RFC 9052 §3 ("if a label appears multiple times, the message MUST be rejected as malformed"), RFC 8392 §7.2 steps 1 and 7, RFC 8949 §5.3.1 |
 | `statusList.typ` | `missing`, `unprotected`, `notText`, `wrong` | TSL §5.2 |
 | `statusList.x5chain` | `missing`, `unprotectedOnly`, `carriesAnchor` (any self-signed certificate), `serialNumber` (≤ 0 or > 20 octets) | ISO2 12.3.6.3; HAIP §6.1 analogue; RFC 5280 §4.1.2.2 |
 | `statusList.signature` | `invalid:multipaz`, `invalid:authlete` | TSL §5.2 rule 2 |
@@ -646,6 +646,23 @@ maxValidity as the reason. (4) `bits` is mirrored as Multipaz reads it — `Uint
 present), and the exp-absent branch has its own tests (text `ttl`: `{claims:[expMissing, ttlInvalid]}`; future `iat`:
 `{claims:[iatFuture, expMissing]}`; no chain code).
 
+**Review round 5 (2026-11-13, Opus approved with one minor and three nits; GPT-6.1 Sol one major; fixed on
+`wp/m-11b-r5`).** (1) Keys were compared as Authlete's re-encoded bytes, which RFC 8949 §5.6.1 does not do for maps
+("the same set of pairs regardless of their order"): claim 999 = `{ {1: 1, 2: 2}: 1, {2: 2, 1: 1}: 2 }` passed every
+check, Multipaz `fromCwt` included. Keys are now compared by `DuplicateKeys.dataItem`, a recursive generic-data-model
+identity (integers by value, strings by content, arrays element-wise, maps as pair multisets, tags by number and
+content, simple values by value, floats by numeric value across widths with `-0.0` = `0.0`). NaN: §5.6.1 makes NaNs
+equivalent when their significands zero-extended to 64 bits are equal; every NaN is one key here, which is stricter,
+because Authlete decodes every half-precision NaN to one canonical NaN (the significand is gone) and JavaScript's
+SameValueZero `Map` and Java's `Double.equals` collapse NaN keys anyway. Without it the map-keyed and float-keyed tokens
+pass every check. (2) The `fromCwt` mirror now has the "expired" `validateCwt` derives without `exp`: `exp` = `iat` +
+maxValidity for an `iat` at or before now, refused when before now, which `expMissing` explains; without it an `iat` 366
+days old with no `exp` was `{claims:[expMissing], chain:[untrusted]}`. The differential test gained `iat` 364/365/366
+days ago. (3) The branch where Authlete cannot decode what Multipaz decoded is reached by a real token: a claim holding a
+text string that is not UTF-8 (`61 ff`), which Multipaz decodes to U+FFFD and Authlete refuses, is `notTagged18` with
+every other check `notRun`; ignoring the branch lets it pass. (4) The `expired` message says "exactly at exp this check
+alone refuses" only when Multipaz, handed `at` in milliseconds, accepts `exp`.
+
 **Open (unchanged):** an algorithm allow-list (isomdl accepts only ES256/ES384) —
 owner decision later.
 
@@ -670,7 +687,11 @@ owner decision later.
 - every malformed `status.status_list` shape (`statusList.mso:malformed`);
 - a correctly signed token whose claims (`sub`), nested `status_list` (`bits`), protected header (`typ`) or unprotected
   header (`kid`) carries a key twice, with the conflicting values in both orders, and a key repeated in a
-  non-preferred encoding (`statusList.envelope:duplicateKey`, every other token check `notRun`);
+  non-preferred encoding, a map key repeated with its pairs in another order, float keys of one value in two widths,
+  `0.0`/`-0.0`, two NaNs and array keys of other integer widths (`statusList.envelope:duplicateKey`, every other token
+  check `notRun`), while an integer, its tagged form, a bignum, a float and a simple value of one number stay distinct;
+- a claim holding a text string that is not UTF-8 (`statusList.envelope:notTagged18`: Multipaz reads U+FFFD, Authlete
+  refuses);
 - a token evaluated exactly at its `exp`, and a nanosecond after it (`statusList.claims:expired`, `fromCwt` accepting).
 
 ### M-11c CWT codec, signer pinning, signer policy (certify-service, certify-issuance)

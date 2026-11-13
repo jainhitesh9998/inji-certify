@@ -5,14 +5,22 @@
  */
 package io.mosip.certify.testkit.mdoc;
 
+import com.authlete.cbor.CBORBoolean;
 import com.authlete.cbor.CBORByteArray;
 import com.authlete.cbor.CBORDecoder;
 import com.authlete.cbor.CBORDecoderOptions;
+import com.authlete.cbor.CBORDouble;
+import com.authlete.cbor.CBORFloat;
 import com.authlete.cbor.CBORItem;
 import com.authlete.cbor.CBORItemList;
+import com.authlete.cbor.CBORNull;
+import com.authlete.cbor.CBORNumber;
 import com.authlete.cbor.CBORPair;
 import com.authlete.cbor.CBORPairList;
+import com.authlete.cbor.CBORSimpleValue;
+import com.authlete.cbor.CBORString;
 import com.authlete.cbor.CBORTaggedItem;
+import com.authlete.cbor.CBORUndefined;
 import com.authlete.cose.COSESign1;
 import com.authlete.cose.COSEVerifier;
 import kotlin.coroutines.Continuation;
@@ -49,6 +57,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -759,11 +768,13 @@ public final class IndependentStatusListVerifier {
                 // at >= exp at full precision: exp is whole seconds and getEpochSecond() floors, so for an exp of S
                 // the token is expired from S.000000000 on, and at S - 1 ns it is not
                 if (exp <= at.getEpochSecond()) {
+                    // Multipaz compares exp with the millisecond `at` it is handed and refuses only exp < now
+                    boolean multipazAccepts = compareSecondsWithMillis(exp, at.toEpochMilli()) == 0;
                     problems.add("expired", "exp is " + numericDate(exp) + ", and " + at + " is not before it; TSL 5.2 "
                             + "takes exp from RFC 8392 3.1.4, whose RFC 7519 4.1.4 rule is that \"the current date/time "
                             + "MUST be before the expiration date/time\" (the token is not accepted on or after exp), and "
-                            + "TSL 8.3 step 4c checks it. Multipaz 0.102.0's validateCwt refuses only exp < now, so exactly "
-                            + "at exp this check alone refuses");
+                            + "TSL 8.3 step 4c checks it" + (multipazAccepts ? ". Multipaz 0.102.0's validateCwt refuses "
+                            + "only exp < now, so exactly at exp this check alone refuses" : ""));
                 }
                 X509Certificate leaf = chain.isEmpty() ? null : chain.get(0);
                 if (leaf != null && exp > leaf.getNotAfter().toInstant().getEpochSecond()) {
@@ -859,7 +870,9 @@ public final class IndependentStatusListVerifier {
          *     when it is more than {@code maxValidity} (365 days) after now — no check of ours names that, so it is
          *     decided here, and a token past it is never explained by anything checked later; {@code exp} absent reads
          *     {@code iat} ({@code "either 'exp' or 'iat' is required"}, {@code "'iat' is in future"} beyond 5 s) and
-         *     derives {@code exp} from it, which cannot exceed maxValidity;</li>
+         *     derives {@code exp} from it ({@code iat + maxValidity}, or {@code now + maxValidity} for an {@code iat}
+         *     up to 5 s ahead), which cannot exceed maxValidity but is refused as expired when it is before now — an
+         *     {@code iat} more than 365 days old, explained by {@code expMissing};</li>
          *     <li>its {@code checks} map carries TYP and SUB, and it verifies the COSE signature — so any
          *     {@code statusList.typ}, {@code statusList.signature} or {@code subMismatch} failure explains one;</li>
          *     <li>{@code CompressedStatusList$Companion.fromCborMap} reads {@code ttl} only in its exp-absent branch
@@ -901,6 +914,14 @@ public final class IndependentStatusListVerifier {
                 DataItem iatItem = claims.getOrNull(CLAIM_IAT);
                 if (!isInteger(iatItem)
                         || compareSecondsWithMillis(iatItem.getAsNumber(), now + IAT_FUTURE_SKEW_SECONDS * 1000) > 0) {
+                    return true;
+                }
+                // validateCwt then derives exp — now + maxValidity for an iat up to 5 s ahead, iat + maxValidity for
+                // an iat at or before now — and refuses it as "expired" when it is before now: a refusal caused by
+                // the missing exp, which expMissing reports. iat <= now keeps iat + maxValidity from overflowing.
+                long iat = iatItem.getAsNumber();
+                if (compareSecondsWithMillis(iat, now) <= 0
+                        && compareSecondsWithMillis(iat + MAX_VALIDITY_SECONDS, now) < 0) {
                     return true;
                 }
             }
@@ -1175,10 +1196,15 @@ public final class IndependentStatusListVerifier {
      *
      * <p>The walk is Authlete's decoder, with no tag processor so the COSE structure arrives as plain items: a map
      * comes back as a {@code CBORPairList} holding every pair in wire order, never collapsed (Multipaz's decoder keeps
-     * the last value of a key instead). Two keys are the same key when Authlete encodes the decoded keys to the same
-     * bytes: that encoding is preferred serialization ({@code 18 02} and {@code 02} are both the integer 2; an
-     * indefinite-length text is re-encoded definite), which is RFC 8949 5.6.1's data-model equivalence for the
-     * integer and text labels COSE and CWT use. Nothing else is interpreted.
+     * the last value of a key instead). Two keys are the same key when they are equal data items of RFC 8949 5.6.1's
+     * generic data model, compared recursively by {@link #dataItem}, never as bytes: {@code 18 02} and {@code 02} are
+     * one integer, and the maps {@code {1: 1, 2: 2}} and {@code {2: 2, 1: 1}} are one map.
+     *
+     * <p>When Authlete cannot decode a part Multipaz decoded, {@link #find} throws and the token is unreadable
+     * ({@code statusList.envelope:notTagged18}): Multipaz decodes a text string that is not UTF-8 — RFC 8949 5.3.1's
+     * other basic validity error — to U+FFFD, so two different malformed keys would become one there, and Authlete
+     * refuses it; Authlete's recursive decoder also gives up on nesting a few thousand levels deep, which Multipaz
+     * still reads.
      */
     static final class DuplicateKeys {
 
@@ -1209,17 +1235,18 @@ public final class IndependentStatusListVerifier {
             try {
                 return new CBORDecoder(cbor, new CBORDecoderOptions()).next();
             } catch (Exception e) {
-                throw new IllegalStateException("Authlete cannot decode " + what + " to check its map keys (RFC 8949 "
-                        + "5.6): " + describe(e), e);
+                throw new IllegalStateException("Authlete cannot decode " + what + ", so its map keys cannot be "
+                        + "checked (RFC 8949 5.3.1: a key twice and a text string that is not UTF-8 both make CBOR "
+                        + "invalid): " + describe(e), e);
             }
         }
 
         private static void walk(CBORItem item, String where, List<String> found) {
             if (item instanceof CBORPairList map) {
-                Map<String, Integer> counts = new LinkedHashMap<>();
-                Map<String, CBORItem> keys = new HashMap<>();
+                Map<Object, Integer> counts = new LinkedHashMap<>();
+                Map<Object, CBORItem> keys = new HashMap<>();
                 for (CBORPair pair : map.getPairs()) {
-                    String key = pair.getKey().encodeToHex();
+                    Object key = dataItem(pair.getKey());
                     counts.merge(key, 1, Integer::sum);
                     keys.putIfAbsent(key, pair.getKey());
                 }
@@ -1239,6 +1266,99 @@ public final class IndependentStatusListVerifier {
                 }
             } else if (item instanceof CBORTaggedItem tagged) {
                 walk(tagged.getTagContent(), where, found);
+            }
+        }
+
+        /**
+         * The identity of a decoded item under RFC 8949 5.6.1's generic data model, for comparing map keys: two items
+         * are equivalent exactly when their identities are equal. Integers compare by value whatever their encoding
+         * width; byte strings and text strings by content (and never with each other); arrays element by element;
+         * maps as the unordered set of their (key, value) pairs; tags by tag number and content (so {@code 1} and
+         * {@code 1(1)}, and {@code 1} and the bignum {@code 2(h'01')}, stay distinct); simple values by value; floats
+         * by numeric value, whatever their half, single or double width, with {@code -0.0} equal to {@code 0.0}. An
+         * integer, a float and a simple value of the same number stay distinct.
+         *
+         * <p>NaN: RFC 8949 5.6.1 makes two NaNs equivalent when their significands, zero-extended at the right to 64
+         * bits, are equal. Here every NaN is the same key, which is stricter and can only refuse more: Authlete
+         * decodes every half-precision NaN to the one canonical NaN, so the significand the rule needs is gone, and the
+         * maps a wallet stack builds collapse NaN keys anyway (JavaScript's SameValueZero {@code Map}, Java's
+         * {@code Double.equals}), so a map with two NaN keys is ambiguous in practice.
+         */
+        static Object dataItem(CBORItem item) {
+            if (item instanceof CBORFloat value) {
+                return new FloatItem(value.getValue());
+            }
+            if (item instanceof CBORDouble value) {
+                return new FloatItem(value.getValue());
+            }
+            if (item instanceof CBORNumber<?> value) {
+                // CBORInteger, CBORLong, CBORBigInteger: major types 0 and 1 at every width (2^64 - 1, -2^64 included)
+                return new IntegerItem(new BigInteger(value.getValue().toString()));
+            }
+            if (item instanceof CBORString value) {
+                return new TextItem(value.getValue());
+            }
+            if (item instanceof CBORByteArray value) {
+                return new BytesItem(HexFormat.of().formatHex(value.getValue()));
+            }
+            if (item instanceof CBORBoolean value) {
+                return new SimpleItem(value.getValue() ? 21 : 20);
+            }
+            if (item instanceof CBORNull) {
+                return new SimpleItem(22);
+            }
+            if (item instanceof CBORUndefined) {
+                return new SimpleItem(23);
+            }
+            if (item instanceof CBORSimpleValue value) {
+                return new SimpleItem(value.getValue());
+            }
+            if (item instanceof CBORItemList list) {
+                return new ArrayItem(list.getItems().stream().map(DuplicateKeys::dataItem).toList());
+            }
+            if (item instanceof CBORPairList map) {
+                Map<List<Object>, Integer> pairs = new HashMap<>();
+                for (CBORPair pair : map.getPairs()) {
+                    pairs.merge(List.of(dataItem(pair.getKey()), dataItem(pair.getValue())), 1, Integer::sum);
+                }
+                return new MapItem(pairs);
+            }
+            if (item instanceof CBORTaggedItem tagged) {
+                return new TagItem(new BigInteger(tagged.getTagNumber().toString()), dataItem(tagged.getTagContent()));
+            }
+            // no other item comes out of a decoder without tag processors; compared as Authlete encodes it if one did
+            return new OtherItem(item.getClass().getName(), item.encodeToHex());
+        }
+
+        private record IntegerItem(BigInteger value) {}
+
+        private record TextItem(String value) {}
+
+        private record BytesItem(String hex) {}
+
+        private record SimpleItem(int value) {}
+
+        private record ArrayItem(List<Object> elements) {}
+
+        /** The pairs as a multiset: equal maps hold the same pairs in any order. */
+        private record MapItem(Map<List<Object>, Integer> pairs) {}
+
+        private record TagItem(BigInteger number, Object content) {}
+
+        private record OtherItem(String type, String hex) {}
+
+        /** A float of any width, by numeric value: {@code -0.0} equals {@code 0.0}, and every NaN is one value. */
+        private record FloatItem(double value) {
+
+            @Override
+            public boolean equals(Object other) {
+                return other instanceof FloatItem that
+                        && (Double.isNaN(value) ? Double.isNaN(that.value) : value == that.value);
+            }
+
+            @Override
+            public int hashCode() {
+                return Double.isNaN(value) ? 1 : value == 0 ? 0 : Double.hashCode(value);
             }
         }
     }
