@@ -75,6 +75,13 @@
             <artifactId>jackson-databind</artifactId>
         </dependency>
         <dependency>
+            <!-- a second, independent COSE decoder and signature verifier for the tests (RFC 9052) -->
+            <groupId>com.authlete</groupId>
+            <artifactId>cbor</artifactId>
+            <version>${authlete.cbor.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
             <scope>test</scope>
