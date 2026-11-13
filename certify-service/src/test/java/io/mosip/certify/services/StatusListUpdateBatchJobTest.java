@@ -226,6 +226,6 @@ public class StatusListUpdateBatchJobTest {
     }
 
     private void setClock(Instant instant) {
-        ReflectionTestUtils.setField(batchJob, "clock", Clock.fixed(instant, ZoneOffset.UTC));
+        batchJob.setClock(Clock.fixed(instant, ZoneOffset.UTC));
     }
 }

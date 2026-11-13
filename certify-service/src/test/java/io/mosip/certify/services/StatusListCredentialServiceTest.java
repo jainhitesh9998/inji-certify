@@ -14,6 +14,7 @@ import io.mosip.certify.core.dto.CredentialStatusDetail;
 import io.mosip.certify.repository.LedgerRepository;
 import io.mosip.certify.repository.StatusListAvailableIndicesRepository;
 import io.mosip.certify.repository.StatusListCredentialRepository;
+import io.mosip.certify.utils.LegacyW3cDateTimes;
 import org.json.JSONObject;
 import org.junit.*;
 import org.junit.runner.RunWith;
@@ -24,6 +25,11 @@ import org.springframework.test.util.ReflectionTestUtils;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.Query;
 
+import java.time.Clock;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.*;
 
 import static org.junit.Assert.*;
@@ -323,5 +329,40 @@ public class StatusListCredentialServiceTest {
         } catch (CertifyException ex) {
             // expected
         }
+    }
+
+    /**
+     * F-19 for the first-sign writer: a new list's {@code validFrom} is {@code Instant.toString()} of a millisecond
+     * instant, so it has three fraction digits or none at all, and the document it writes must be readable by the
+     * proof's own reader. The clock is pinned to an instant with no fraction so the form is not a matter of luck; the
+     * value is then read back through the same reader {@code W3CJsonLD.addProof} uses.
+     */
+    @Test
+    public void generateStatusListCredential_WritesAValidFromTheProofReaderAccepts() {
+        W3CJsonLD w3CJsonLD = mock(W3CJsonLD.class);
+        when(credentialFactory.getCredential(VCFormats.LDP_VC)).thenReturn(Optional.of(w3CJsonLD));
+        VCResult mockVcResultLdp = new VCResult<JsonLDObject>();
+        mockVcResultLdp.setCredential(JsonLDObject.fromJson("{\"signed\":\"credential\", \"proof\":{}}"));
+        when(w3CJsonLD.addProof(anyString(), anyString(), anyString(), anyString(), anyString(), anyString()))
+                .thenReturn(mockVcResultLdp);
+        when(statusListCredentialRepository.saveAndFlush(any())).thenAnswer(i -> i.getArgument(0));
+        Query mockQuery = mock(Query.class);
+        when(entityManager.createNativeQuery(anyString())).thenReturn(mockQuery);
+        when(mockQuery.setParameter(anyInt(), any())).thenReturn(mockQuery);
+        when(mockQuery.getSingleResult()).thenReturn(1L);
+        when(mockQuery.executeUpdate()).thenReturn(2);
+
+        Instant pinned = Instant.parse("2026-11-13T15:00:23Z");
+        service.setClock(Clock.fixed(pinned, ZoneOffset.UTC));
+        service.generateStatusListCredential("revocation");
+
+        ArgumentCaptor<String> unsigned = ArgumentCaptor.forClass(String.class);
+        verify(w3CJsonLD).addProof(unsigned.capture(), anyString(), anyString(), anyString(), anyString(), anyString());
+        String validFrom = new JSONObject(unsigned.getValue()).getString("validFrom");
+        assertEquals("the writer's form is unchanged: millisecond instant, no fraction when zero",
+                "2026-11-13T15:00:23Z", validFrom);
+        assertEquals("the proof's reader accepts exactly this value",
+                Date.from(LocalDateTime.of(2026, 11, 13, 15, 0, 23).atZone(ZoneId.systemDefault()).toInstant()),
+                LegacyW3cDateTimes.proofCreated(validFrom));
     }
 }

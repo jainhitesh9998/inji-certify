@@ -74,16 +74,31 @@ class LegacyW3cDateTimesTest {
     }
 
     /**
-     * A template or a plugin may supply an RFC 3339 value with an offset. It is accepted; the designator is validated
-     * and then not applied, because this path has always read the wall clock and applying it would move
-     * {@code proof.created} on every deployment not on UTC (see the class note).
+     * A template or a plugin may supply an RFC 3339 value with an offset instead of {@code Z}. The same instant must
+     * read the same whichever designator wrote it, because the value is normalised to UTC before the compatibility
+     * rule is applied.
      */
     @Test
-    void acceptsAnOffsetDesignatorAndReadsTheWallClock() {
-        LocalDateTime wallClock = LocalDateTime.of(2026, 11, 13, 15, 0, 23, 123_000_000);
-        for (String value : List.of("2026-11-13T15:00:23.123Z", "2026-11-13T15:00:23.123+05:30",
-                "2026-11-13T15:00:23.123-08:00", "2026-11-13T15:00:23.123")) {
-            assertEquals(wallClock, LegacyW3cDateTimes.localDateTime(value), value);
+    void readsTheSameInstantTheSameWhicheverZoneDesignatorWroteIt() {
+        LocalDateTime utcWallClock = LocalDateTime.of(2026, 11, 13, 15, 0, 23, 123_000_000);
+        for (String value : List.of("2026-11-13T15:00:23.123Z", "2026-11-13T15:00:23.123+00:00",
+                "2026-11-13T20:30:23.123+05:30", "2026-11-13T07:00:23.123-08:00",
+                "2026-11-13T15:00:23.123-00:00")) {
+            assertEquals(utcWallClock, LegacyW3cDateTimes.localDateTime(value), value);
+            // ...and therefore the same proof created, on whatever zone this JVM runs in
+            assertEquals(LegacyW3cDateTimes.proofCreated("2026-11-13T15:00:23.123Z"),
+                    LegacyW3cDateTimes.proofCreated(value), value);
+        }
+    }
+
+    /**
+     * The zone designator is required: VC 1.1 is RFC 3339 (an offset is mandatory) and VC 2.0's {@code validFrom} is a
+     * {@code dateTimeStamp}, so a zone-less value is refused before signing rather than read in some assumed zone.
+     */
+    @Test
+    void refusesAValueWithoutAZoneDesignator() {
+        for (String value : List.of("2026-11-13T15:00:23.123", "2026-11-13T15:00:23", "1970-01-01T00:00:00.001")) {
+            assertThrows(DateTimeParseException.class, () -> LegacyW3cDateTimes.localDateTime(value), value);
         }
     }
 
@@ -91,8 +106,11 @@ class LegacyW3cDateTimesTest {
     @Test
     void refusesWhatIsNotARfc3339DateTime() {
         for (String value : List.of("not-a-date", "2026-11-13", "2026-11-13T15:00", "2026-13-01T00:00:00Z",
-                "2026-11-13T25:00:23Z", "2026-11-13T15:00:23.1234567890Z", "2026-11-13 15:00:23Z",
-                "2026-11-13T15:00:23+0530", "")) {
+                "2026-11-13T25:00:23Z", "2026-11-13T15:00:23.1234567890Z", "2026-11-13T15:00:23.Z",
+                "2026-11-13 15:00:23Z", "2026-11-13T15:00:23+0530", "2026-11-13T15:00:23+05:30:15",
+                "2026-11-13T15:00:23+05", "2026-11-13T15:00:23z", "",
+                // an impossible date or time is refused, not moved to the nearest valid one (ResolverStyle.STRICT)
+                "2026-02-30T00:00:00Z", "2026-02-31T00:00:00Z", "2026-04-31T00:00:00Z", "2026-11-13T24:00:00Z")) {
             assertThrows(DateTimeParseException.class, () -> LegacyW3cDateTimes.localDateTime(value), value);
         }
         assertThrows(DateTimeParseException.class, () -> LegacyW3cDateTimes.localDateTime(null));

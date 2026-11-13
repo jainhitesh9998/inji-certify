@@ -51,11 +51,16 @@ public class StatusListUpdateBatchJob {
     private int batchSize;
 
     /**
-     * The clock {@code validFrom} is written from. {@code Clock.systemUTC()} by default, the same instant
-     * {@code new Date().toInstant()} produced; a test pins it to a fixed instant to make a specific {@code
-     * Instant.toString()} form deterministic.
+     * The clock {@code validFrom} is written from: {@code Clock.systemUTC()} unless a deployment, or a test, injects
+     * another through {@link #setClock(Clock)}.
      */
     private Clock clock = Clock.systemUTC();
+
+    /** Optional injection point for the writer clock; the default is the system clock. */
+    @Autowired(required = false)
+    public void setClock(Clock clock) {
+        this.clock = clock;
+    }
 
     /**
      * Scheduled method that runs periodically (schedule controlled by cron expression property)

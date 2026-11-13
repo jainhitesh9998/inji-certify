@@ -324,24 +324,35 @@ public class W3CJsonLDTest {
 
     /**
      * F-19: every form {@code Instant.toString()} and the legacy {@code ...SSS'Z'} writer produce is read, and the
-     * same instant gives the same proof {@code created} whichever form the document carries. The proof's {@code created}
-     * is an XML Schema dateTime, i.e. seconds, so it is compared at that precision (a {@code Date} keeps milliseconds;
-     * {@code LegacyW3cDateTimesTest} covers those).
+     * same instant gives the same proof {@code created} whichever form — or zone designator — the document carries.
+     * The proof's {@code created} is an XML Schema dateTime, i.e. seconds, so it is compared at that precision (a
+     * {@code Date} keeps milliseconds; {@code LegacyW3cDateTimesTest} covers those).
      */
     @Test
     public void testAddProofReadsEveryInstantToStringFormAsTheSameProofCreated() throws Exception {
         for (String form : List.of("2026-11-13T15:00:23Z", "2026-11-13T15:00:23.123Z",
-                "2026-11-13T15:00:23.123456Z", "2026-11-13T15:00:23.123456789Z")) {
+                "2026-11-13T15:00:23.123456Z", "2026-11-13T15:00:23.123456789Z",
+                "2026-11-13T20:30:23.123+05:30", // the same instant as the previous one, written with an offset
+                "2026-11-13T07:00:23.123-08:00")) {
             assertEquals(form, proofSecondOf(form), proofFor("validFrom", form).getCreated());
             assertEquals(form, proofSecondOf(form), proofFor("issuanceDate", form).getCreated());
         }
     }
 
+    /** A validity field without a zone designator is refused before signing, not read in an assumed zone. */
+    @Test
+    public void testAddProofRefusesAValidityFieldWithoutAZone() throws Exception {
+        for (String field : List.of("validFrom", "issuanceDate")) {
+            assertThrows(java.time.format.DateTimeParseException.class,
+                    () -> proofFor(field, "2026-11-13T15:00:23.123"));
+        }
+    }
+
     /**
-     * The legacy reader's rule, asserted rather than restated: the wall clock of the value in the JVM's default zone,
-     * at the seconds precision the proof's {@code created} is written with. Applying the {@code Z}/offset instead would
-     * move {@code proof.created} on every deployment not on UTC, which is a wire change in the compatibility path (see
-     * {@code LegacyW3cDateTimes}).
+     * The compatibility reader's rule, asserted rather than restated: the value's UTC wall clock (the same for every
+     * zone designator) read in the JVM's default zone, at the seconds precision the proof's {@code created} is written
+     * with. Applying the {@code Z}/offset instead would move {@code proof.created} on every deployment not on UTC, which
+     * is a wire change in the compatibility path (see {@code LegacyW3cDateTimes} and gap G33).
      */
     private static Date proofSecondOf(String value) {
         return Date.from(LocalDateTime.ofInstant(Instant.parse(value), ZoneOffset.UTC)

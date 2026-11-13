@@ -24,6 +24,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Clock;
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.util.*;
 
@@ -76,6 +78,18 @@ public class StatusListCredentialService {
 
     @Value("${mosip.certify.status-list.key-manager-ref-id:ED25519_SIGN}")
     private String statusListKeyManagerRefId;
+
+    /**
+     * The clock a new list's {@code validFrom} is written from: {@code Clock.systemUTC()} unless a deployment, or a
+     * test, injects another through {@link #setClock(Clock)}.
+     */
+    private Clock clock = Clock.systemUTC();
+
+    /** Optional injection point for the writer clock; the default is the system clock. */
+    @Autowired(required = false)
+    public void setClock(Clock clock) {
+        this.clock = clock;
+    }
 
     public String getStatusListCredential(String id) throws CertifyException {
         log.info("Processing status list credential request for ID: {}", id);
@@ -159,7 +173,9 @@ public class StatusListCredentialService {
 
             statusListData.put("id", statusListId);
             statusListData.put("issuer", didUrl);
-            statusListData.put("validFrom", new Date().toInstant().toString());
+            // The millisecond instant new Date() produced, so Instant.toString() writes three fraction digits or none
+            // when they are zero (:23Z as well as :23.123Z). Both forms must be readable: see LegacyW3cDateTimes.
+            statusListData.put("validFrom", Instant.ofEpochMilli(clock.millis()).toString());
 
             JSONObject credentialSubject = new JSONObject();
             credentialSubject.put("id", statusListId);

@@ -50,7 +50,6 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.TestPropertySource;
-import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 import org.testcontainers.containers.PostgreSQLContainer;
@@ -533,8 +532,7 @@ class StatusListPostgresTest {
 
     /** The batch job writes {@code validFrom} from its clock; {@code null} restores the real one. */
     private void pinBatchClock(Instant instant) {
-        ReflectionTestUtils.setField(batchJob, "clock",
-                instant == null ? Clock.systemUTC() : Clock.fixed(instant, ZoneOffset.UTC));
+        batchJob.setClock(instant == null ? Clock.systemUTC() : Clock.fixed(instant, ZoneOffset.UTC));
     }
 
     private JsonNode getJson(String path) throws Exception {
