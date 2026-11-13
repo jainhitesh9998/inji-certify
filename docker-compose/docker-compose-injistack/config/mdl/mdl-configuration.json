@@ -47,7 +47,10 @@
         "background_color": "#1B3A5C",
         "text_color": "#FFFFFF"
       }
-    ]
+    ],
+    "order": ["portrait", "family_name", "given_name", "birth_date", "document_number", "driving_privileges",
+              "issue_date", "expiry_date", "issuing_authority", "issuing_country", "un_distinguishing_sign",
+              "sex", "age_over_18", "nationality", "resident_city"]
   },
   "protocol": {
     "cryptographicBindingMethodsSupported": ["cose_key"],

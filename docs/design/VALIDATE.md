@@ -230,6 +230,34 @@ driver pins IPv4 and sets a user agent because Cloudflare stalls Python's defaul
 `attester.pem` is the private key of the JWK in the two `attesters` properties. The run of 2026-09-19 found four
 defects that the unit suite could not see (F-02 to F-05 in `docs/design/wp/PROGRESS.md`); all are fixed.
 
+## 6f. The mDL issuer
+
+The ISO/IEC 18013-5 mDL of `docs/design/20-mdl-issuer.md` (M-10) runs on the same stack through a third overlay,
+`docker-compose.mdl.yaml`. It adds profile `mdl` plus `mdl-dev` (a generated dev IACA, the default) or `mdl-operator`
+(the offline `certify-cli` PKI), the demo holders, and the `mdl-seed` service that writes the configuration
+`org.iso.18013.5.1.mDL` through the v2 API. `docker-compose/docker-compose-injistack/config/mdl/README.md` is the
+runbook. In short:
+
+```bash
+cd docker-compose/docker-compose-injistack
+mkdir -p loader_path/certify-mdl && cp loader_path/certify/mock-certify-plugin.jar loader_path/certify-mdl/
+zip -q -d loader_path/certify-mdl/mock-certify-plugin.jar 'org/bouncycastle/*' 'META-INF/versions/*/org/bouncycastle/*'
+docker compose -f docker-compose.yaml -f docker-compose.rebuild.yaml -f docker-compose.mdl.yaml \
+    up -d --no-build database certify certify-nginx mdl-seed
+cd ../.. && python3.12 -m venv .venv && .venv/bin/pip install -r docs/design/tools/requirements-verify.txt pyjwt
+.venv/bin/python docs/design/tools/smoke.py --mdl http://localhost:8091
+```
+
+The plugin jars of step 2 bundle BouncyCastle 1.69 unshaded. On `loader.path` they shadow the service's 1.78, and
+since M-04 that stops the service at startup (`certify-pki`, `NoSuchMethodError`). The mDL overlay therefore mounts
+only the CSV plugin with BouncyCastle removed.
+
+The smoke plays a wallet through certify-nginx: offers by reference and by value, metadata at the 12.2.2 location,
+and a P-256 holder (Bearer) and an Ed25519 holder (DPoP) through the token, nonce and credential endpoints. It then
+runs `verify_mdoc.py` with the IACA downloaded from `/v1/certify/mdoc/iaca/<id>.pem`, `openssl crl -CAfile` over the
+CRL at the Document Signer's distribution point, and `openssl verify -x509_strict -crl_check` over the Document
+Signer. Last come the status list and three refusals. All 29 checks passed in both PKI modes on 2026-11-13.
+
 ## 7. Verify the credential independently
 
 The wallet shows the credential; to check it with a third-party verifier, paste the `ldp_vc` JSON into any

@@ -389,13 +389,19 @@ class Smoke:
         self.iaca_path.write_bytes(pem)
         dsc_path = self.out / "dsc.pem"
         dsc_path.write_bytes(self.dsc.public_bytes(serialization.Encoding.PEM))
-        s, h, crl = call("GET", dp, binary=True)
+        # An operator IACA names the public host in its CRL distribution point; a run against another URL (a local stack
+        # before it goes public) fetches the same path from that URL, and says so.
+        url = dp
+        dp_url, base_url = urllib.parse.urlparse(dp), urllib.parse.urlparse(self.base)
+        if (dp_url.scheme, dp_url.netloc) != (base_url.scheme, base_url.netloc):
+            url = self.base + dp_url.path
+        s, h, crl = call("GET", url, binary=True)
         crl_path = self.out / "iaca.crl"
         crl_path.write_bytes(crl if s == 200 else b"")
         code, output = run_openssl("crl", "-inform", "DER", "-in", str(crl_path), "-CAfile", str(self.iaca_path), "-noout")
         check("CRL at the Document Signer's distribution point: openssl crl -CAfile <IACA> verifies it",
               s == 200 and h.get("content-type", "").startswith("application/pkix-crl") and code == 0 and "verify OK" in output,
-              {"url": dp, "status": s, "openssl": output})
+              {"url": url} | ({"distribution point": dp} if url != dp else {}) | {"status": s, "openssl": output})
         crl_pem = self.out / "iaca.crl.pem"
         run_openssl("crl", "-inform", "DER", "-in", str(crl_path), "-out", str(crl_pem))
         code, output = run_openssl("verify", "-x509_strict", "-crl_check", "-CAfile", str(self.iaca_path),

@@ -15,6 +15,7 @@ public URL instead and needs the verifier's environment too:
 import json, sys, time, urllib.request, urllib.parse, urllib.error
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--mdl":
+    sys.dont_write_bytecode = True  # no __pycache__ in the repository
     import smoke_mdl  # this script's directory is first on sys.path
     sys.exit(smoke_mdl.main(sys.argv[2:]))
 

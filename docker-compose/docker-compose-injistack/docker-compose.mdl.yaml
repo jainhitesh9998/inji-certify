@@ -3,14 +3,18 @@
 # configuration through the v2 API. On top of the base file and the rebuild overlay:
 #
 #   docker compose -f docker-compose.yaml -f docker-compose.rebuild.yaml -f docker-compose.mdl.yaml \
-#       up -d database certify certify-nginx mdl-seed
+#       up -d --no-build database certify certify-nginx mdl-seed
+#
+# with inji-certify:rebuild built first and loader_path/certify-mdl/ prepared (config/mdl/README.md, steps 1 and 2).
 #
 # Environment (all optional):
 #   CERTIFY_PUBLIC_URL   the URL wallets reach certify-nginx at: identifiers, offers, metadata, the IACA's
 #                        issuerAltName and CRL distribution point (default http://localhost:8091; the public demo uses
 #                        https://credentials.loremipsum.co.in)
 #   MDL_PKI_PROFILE      mdl-dev (default: dev-mode IACA and DSC kept in ./data/MDL_PKI) or mdl-operator
-#   MDL_PKI_DIR          mdl-operator only: host directory with mdl-dsc.key.pem, dsc-chain.pem, iaca.pem, iaca.crl
+#   MDL_PKI_DIR          mdl-operator: host directory with issuer.p12, iaca.pem, iaca.crl (certify-cli Recipe 1)
+#   CERTIFY_KEYSTORE_PASSWORD  mdl-operator: the password of issuer.p12, passed through, never written to a file
+#   MDL_DSC_ALIAS        mdl-operator: the Document Signer entry checked at startup (default mdl-dsc@2026-11)
 #   MDL_SEED_UPDATE      true: the seed replaces an existing mDL configuration (PUT) instead of leaving it
 # See config/mdl/README.md.
 services:
@@ -18,15 +22,24 @@ services:
     environment:
       - active_profile_env=default, csvdp-farmer, rebuild, mdl, ${MDL_PKI_PROFILE:-mdl-dev}
       - mosip_certify_domain_url=${CERTIFY_PUBLIC_URL:-http://localhost:8091}
+      # passed through from the shell only when set (mdl-operator)
+      - CERTIFY_KEYSTORE_PASSWORD
+      - MDL_DSC_ALIAS
     volumes:
+      # Replaces the rebuild overlay's ./loader_path/certify/: the plugin jars of the published with-plugins image bundle
+      # BouncyCastle 1.69 unshaded, which shadows the service's 1.78 and breaks certify-pki (NoSuchMethodError at
+      # startup). This directory holds only the jar the farmer profile scans, mock-certify-plugin.jar, with
+      # org/bouncycastle removed (config/mdl/README.md, "Plugin jars").
+      - ./loader_path/certify-mdl/:/home/mosip/additional_jars/
       - ./config/certify-mdl.properties:/home/mosip/config/certify-mdl.properties:ro
       - ./config/certify-mdl-dev.properties:/home/mosip/config/certify-mdl-dev.properties:ro
       - ./config/certify-mdl-operator.properties:/home/mosip/config/certify-mdl-operator.properties:ro
       # holders.json and the portraits it names (the file data source "mdldemo"); read-only, see config/mdl/README.md
       - ./config/mdl:/home/mosip/config/mdl:ro
-      # mdl-dev: the generated IACA and Document Signer, kept across restarts
+      # mdl-dev: the generated IACA and Document Signer, and the dev CRL numbers (<keystore>.crl-numbers), kept across
+      # restarts; must be writable
       - ./data/MDL_PKI:/home/mosip/mdl-pki
-      # mdl-operator: the DSC key, [DSC, IACA] chain, IACA and CRL produced offline with certify-cli
+      # mdl-operator: the issuer keystore, IACA and CRL produced offline with certify-cli; read-only
       - ${MDL_PKI_DIR:-./data/MDL_PKI_OPERATOR}:/pki:ro
 
   mdl-seed:
