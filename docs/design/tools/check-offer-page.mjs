@@ -2141,6 +2141,8 @@ for (const status of [307, 308]) {
             .map((request) => request.method + " " + request.url), []);
         equal(`Create ${status}: the transaction code went to /pre-authorized-data only`,
             carrying(sent, ["1234"]).map((request) => request.method + " " + request.url), ["POST /v1/certify/pre-authorized-data"]);
+        equal(`Create ${status}: every request of the page, the load included, refuses redirects`,
+            page.requests.filter((request) => request.redirect !== "error").map((request) => request.method + " " + request.url), []);
         check(`Create ${status}: nothing is published and Create can be pressed again`,
             page.el("create").disabled === false && page.el("wallet").disabled === true, page.el("offerStatus").textContent);
     });
