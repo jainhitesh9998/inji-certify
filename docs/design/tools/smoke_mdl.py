@@ -5,8 +5,12 @@ Plays a wallet against the public URL (certify-nginx, CERTIFY_PUBLIC_URL), only 
 metadata say:
 
   1. pre-authorized offers for the mDL configuration with "issuer": "oid4vci", by reference and by value;
-  2. issuer metadata at the OpenID4VCI 1.0 section 12.2.2 location derived from the offer's credential_issuer, and the
-     authorization server metadata (RFC 8414) of its authorization server;
+  2. issuer metadata at the OpenID4VCI 1.0 section 12.2.2 location derived from the offer's credential_issuer - also
+     GET and HEAD with no Accept, application/jwt, text/html, application/json and */*, each of which must answer 200
+     application/json, every GET with the same bytes (12.2.2; G30) - and the authorization
+     server metadata (RFC 8414) of its authorization server: a present, non-empty grant_types_supported, and every
+     authorization_code it lists completable through authorization_endpoint or interactive_authorization_endpoint (gap
+     G29: the demo listed the grant without either and Talao's wallet aborted);
   3. a P-256 holder: token (anonymous pre-authorized grant, Bearer), nonce, credential with an ES256 jwt proof,
      notification, nonce replay refused;
   4. an Ed25519 holder: a DPoP-bound token, nonce, credential with an EdDSA jwt proof (ISO/IEC 18013-5 9.1.5.2);
@@ -476,10 +480,44 @@ class Smoke:
         s, _, as_metadata = call("GET", as_url)
         self.as_metadata = as_metadata if isinstance(as_metadata, dict) else {}
         check("authorization server metadata: anonymous pre-authorized grant advertised",
-              s == 200 and self.as_metadata.get("issuer") == servers[0] and self.as_metadata.get("token_endpoint")
+              s == 200 and self.as_metadata.get("issuer") == servers[0]
+              and isinstance(self.as_metadata.get("token_endpoint"), str) and self.as_metadata.get("token_endpoint").strip()
               and PRE_AUTH in self.as_metadata.get("grant_types_supported", [])
               and self.as_metadata.get("pre-authorized_grant_anonymous_access_supported") is True,
               {"url": as_url, "status": s} | {k: self.as_metadata.get(k) for k in ("issuer", "token_endpoint", "pre-authorized_grant_anonymous_access_supported")})
+        # RFC 8414 section 2: the document advertises only grants it can complete. grant_types_supported must be present
+        # and non-empty (an absent list defaults to authorization_code and implicit), and authorization_code needs
+        # authorization_endpoint - or the interactive authorization endpoint of the OpenID4VCI 1.1 editor's draft, which
+        # is the owner-approved compatibility interpretation (1.0 final has no such endpoint; G29). A blank string is as
+        # absent as a missing member. The demo listed authorization_code with neither and a wallet that follows
+        # authorization_servers[0] aborted (G29).
+        def present(value):
+            return isinstance(value, str) and value.strip() != ""
+
+        grants = self.as_metadata.get("grant_types_supported") or []
+        authorization_code_completable = (present(self.as_metadata.get("authorization_endpoint"))
+                                         or present(self.as_metadata.get("interactive_authorization_endpoint")))
+        check("authorization server metadata: non-empty grant_types_supported, authorization_code completable (RFC 8414 s2)",
+              bool(grants) and all(present(g) for g in grants)
+              and ("authorization_code" not in grants or authorization_code_completable),
+              {"grant_types_supported": grants,
+               "authorization_endpoint": self.as_metadata.get("authorization_endpoint"),
+               "interactive_authorization_endpoint": self.as_metadata.get("interactive_authorization_endpoint")})
+        # OpenID4VCI 1.0 section 12.2.2: the unsigned form is the one this issuer serves and its Content-Type must say
+        # so. A wallet that prefers the signed form (Accept: application/jwt) or a browser (text/html) must still get the
+        # document, not a 406, at the root-mapped location the proxy serves; HEAD answers the same way (G30).
+        _, _, reference = call("GET", url, headers={"Accept": "application/json"}, binary=True)
+        answers = []
+        for method in ("GET", "HEAD"):
+            for accept in (None, "application/jwt", "text/html", "application/json", "*/*"):
+                status, headers, body = call(method, url, headers={"Accept": accept} if accept else None, binary=True)
+                content_type = (headers.get("content-type") or "").lower()
+                same_bytes = method == "HEAD" or body == reference
+                if status != 200 or not content_type.startswith("application/json") or not same_bytes:
+                    answers.append({"method": method, "accept": accept, "status": status, "content-type": content_type,
+                                    "same bytes as Accept: application/json": same_bytes})
+        check("issuer metadata at the 12.2.2 location: GET and HEAD answer 200 application/json for every Accept, one document",
+              not answers and isinstance(reference, bytes) and b'"credential_issuer"' in reference, answers)
         return bool(self.metadata.get("credential_endpoint") and self.as_metadata.get("token_endpoint"))
 
     # ---------------------------------------------------------------------------------------------- the flow

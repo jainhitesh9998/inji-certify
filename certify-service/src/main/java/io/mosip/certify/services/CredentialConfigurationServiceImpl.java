@@ -72,6 +72,7 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
 
 
     /** The deployment-wide values the v1 API applies to every configuration; the v2 API applies them when a body omits them. */
+    @Transactional(readOnly = true) // reads configuration only; joins the caller's transaction when there is one
     public ProtocolDefaults protocolDefaults(String format) {
         return new ProtocolDefaults(cryptographicBindingMethodsSupportedMap == null ? null : cryptographicBindingMethodsSupportedMap.get(format),
                 proofTypesSupported, allowedCredentialStatusPurposes);
@@ -249,7 +250,13 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
         }
     }
 
+    /**
+     * A pure read, like {@link #fetchCredentialIssuerMetadata()}: read-only, so loading the row can never write it. With
+     * {@code spring.jpa.open-in-view} on (the default), the entity loaded here stays read-only for the rest of the
+     * request; do not modify and save it later in the same request.
+     */
     @Override
+    @Transactional(readOnly = true)
     public CredentialConfigurationDTO getCredentialConfigurationById(String credentialConfigKeyId) {
         CredentialConfig credentialConfig = getActiveCredentialConfig(credentialConfigKeyId);
 
@@ -315,7 +322,25 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
         return credentialConfigKeyId;
     }
 
+    /**
+     * A read, and only a read: the compatibility metadata document is rebuilt from the rows without touching them, in a
+     * read-only transaction, so Hibernate takes no snapshot and never flushes what it loaded.
+     *
+     * <p>Before F-17 this ran in the class-level read-write {@code @Transactional}, and every read of an
+     * {@code mso_mdoc} row rewrote the row: the {@code msoMdocClaims} attribute was falsely dirty on every load (the
+     * JSON type's snapshot copy turned each nested {@code Claims} into a {@code LinkedHashMap}; fixed at the root by
+     * {@link io.mosip.certify.entity.TypedJsonBinaryType}), so Hibernate flushed one whole-row {@code UPDATE} per mDoc
+     * row and read. On PostgreSQL the rewritten values were the ones just read, so nothing visible changed, but a read
+     * wrote, and its stale copy could silently revert an admin update committed in between. On the H2 test schema,
+     * whose {@code TEXT[]} columns are {@code VARCHAR}, the rewrite also nested the array columns one bracket level
+     * deeper per read (G32, F-17 review rounds 1 and 2). Both the root fix and this read-only transaction hold;
+     * {@code LegacyMetadataPostgresTest} checks the rows' {@code xmin} and Hibernate's update count.
+     *
+     * <p>With {@code spring.jpa.open-in-view} on (the default), the entities loaded here stay read-only for the rest of
+     * the request; do not modify and save them later in the same request.
+     */
     @Override
+    @Transactional(readOnly = true)
     public CredentialIssuerMetadataDTO fetchCredentialIssuerMetadata() {
         // the compatibility surface and the v1 config API are the default tenant's; other tenants' rows stay out of this document
         List<CredentialConfig> credentialConfigList = credentialConfigRepository.findAll()

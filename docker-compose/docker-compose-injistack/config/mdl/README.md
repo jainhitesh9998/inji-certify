@@ -9,7 +9,7 @@ case of the same stack (`docs/design/20-mdl-issuer.md`, M-10). Everything here i
 | --- | --- |
 | `../../docker-compose.mdl.yaml` | Overlay on `docker-compose.yaml` + `docker-compose.rebuild.yaml`: profile `mdl` plus `MDL_PKI_PROFILE` (`mdl-dev` or `mdl-operator`, required), the mounts, and the `mdl-seed` service |
 | `../../docker-compose.public.yaml` | Last overlay on a public host or shared machine: certify and certify-nginx on `127.0.0.1`, no PostgreSQL, mimoto or inji-web port, passwords from Compose secret files and never from the shell, actuator limited to `health` (Compose 2.24.4 or later) |
-| `../certify-mdl.properties` | Profile `mdl`: issuer display, offers on `/oid4vci` (D5), anonymous pre-authorized grant advertised (D13), x509-file provider, IACA publication (M-08), MSO validity `P30D`, the file data source `mdldemo`, the offer page's demo subjects (F-15) |
+| `../certify-mdl.properties` | Profile `mdl`: issuer display, offers on `/oid4vci` (D5), anonymous pre-authorized grant advertised (D13), pre-authorized only - one grant in the AS metadata, no own-AS client, no Interactive Authorization Endpoint (G29) - x509-file provider, IACA publication (M-08), MSO validity `P30D`, the file data source `mdldemo`, the offer page's demo subjects (F-15) |
 | `../certify-mdl-dev.properties` | Profile `mdl-dev` (local runs and demos): x509-file dev mode generates the IACA and the Document Signer `mdl-dsc` |
 | `../certify-mdl-operator.properties` | Profile `mdl-operator`: the operator's keystore, IACA and CRL, made offline with `certify-cli` (D3) |
 | `mdl-configuration.json` | The v2 configuration body (`/v2/credential-configurations`); `"@@mdl.vm@@"` is replaced by `mdl.vm` |
@@ -143,7 +143,10 @@ metadata say. It covers:
 
 - `holders.json` has the record it asks for (`--subject`, default `mdl-demo-1`; `--holders` for another file);
 - offers by reference and by value (`"issuer": "oid4vci"`), with `credential_issuer` under the base URL given;
-- the issuer metadata at its OpenID4VCI 1.0 section 12.2.2 location and the authorization server metadata;
+- the issuer metadata at its OpenID4VCI 1.0 section 12.2.2 location, also with `Accept: application/jwt` (200 and
+  `application/json`, never a 406 or 500), and the authorization server metadata: `grant_types_supported` present and
+  non-empty, and every `authorization_code` it lists completable through `authorization_endpoint` or
+  `interactive_authorization_endpoint` (RFC 8414 section 2, G29);
 - a P-256 holder (Bearer) and an Ed25519 holder (DPoP-bound token): each gets a nonce and a credential;
 - every element against `holders.json` in value and CBOR type: `birth_date`, `issue_date`, `expiry_date` and the
   privilege dates as tag 1004 full-dates, `sex` an unsigned integer (never `true`), `age_over_18` a boolean, the

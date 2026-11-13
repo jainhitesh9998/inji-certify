@@ -4,6 +4,7 @@ import io.mosip.certify.core.dto.CredentialIssuerMetadataDTO;
 import io.mosip.certify.core.dto.NonceResponse;
 import io.mosip.certify.core.spi.CredentialRegistry;
 import io.mosip.certify.core.spi.NonceService;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -48,16 +49,22 @@ public class Oid4vciDiscoveryController {
      * The default tenant's document is develop's configurations plus this surface's identity; another tenant's is built
      * from the core under its own identifier. Both are finished by {@link Oid4vciMetadataDocument}: no null members,
      * claims in display order (OpenID4VCI 1.0 section 12.2.4); the compatibility documents keep their bytes.
+     *
+     * <p>The document is always the unsigned {@code application/json} form, whatever the request's {@code Accept}
+     * header says. OpenID4VCI 1.0 section 12.2.2 permits that form and a signed {@code application/jwt}, and requires the
+     * response's {@code Content-Type} to name what is returned; it does not let a wallet that prefers the signed form
+     * (Talao asks for it) turn the metadata into a refusal. The {@code Content-Type} is therefore set explicitly rather
+     * than declared with {@code produces = application/json}, which answered 406 to any other {@code Accept}.
      */
-    @GetMapping(value = "/.well-known/openid-credential-issuer", produces = "application/json")
-    public Object issuerMetadata() {
+    @GetMapping("/.well-known/openid-credential-issuer")
+    public ResponseEntity<Object> issuerMetadata() {
         CredentialIssuerMetadataDTO legacy = registry.issuerMetadata();
         String tenantId = authorizationContext.getTenantId();
         if (tenantId != null && !io.mosip.certify.spi.TenantContext.DEFAULT_TENANT_ID.equals(tenantId)) {
             io.mosip.certify.spi.TenantContext tenant = tenants.forRequest(tenantId, issuer.identifier(), null);
             java.util.List<io.mosip.certify.spi.CredentialConfiguration> configurations = tenantMetadata.configurations(tenantId);
-            return Oid4vciMetadataDocument.finish(objectMapper.valueToTree(tenantMetadata.document(tenant, issuers.forTenant(tenantId), legacy, configurations)),
-                    TenantIssuerMetadata.claimOrders(configurations));
+            return asJson(Oid4vciMetadataDocument.finish(objectMapper.valueToTree(tenantMetadata.document(tenant, issuers.forTenant(tenantId), legacy, configurations)),
+                    TenantIssuerMetadata.claimOrders(configurations)));
         }
         CredentialIssuerMetadataDTO metadata = new CredentialIssuerMetadataDTO();
         metadata.setCredentialIssuer(issuer.identifier());
@@ -72,7 +79,12 @@ public class Oid4vciDiscoveryController {
         // as-is. This surface has no display of its own, so there is nothing to prefer over it.
         metadata.setDisplay(legacy.getDisplay());
         metadata.setCredentialConfigurationSupportedDTO(legacy.getCredentialConfigurationSupportedDTO());
-        return Oid4vciMetadataDocument.finish(objectMapper.valueToTree(metadata), tenantMetadata.defaultClaimOrders());
+        return asJson(Oid4vciMetadataDocument.finish(objectMapper.valueToTree(metadata), tenantMetadata.defaultClaimOrders()));
+    }
+
+    /** The one media type this surface publishes (section 12.2.2): set on the response, so no {@code Accept} negotiates it away. */
+    private static ResponseEntity<Object> asJson(Object document) {
+        return ResponseEntity.ok().contentType(MediaType.APPLICATION_JSON).body(document);
     }
 
     @PostMapping(value = "/nonce", produces = "application/json")

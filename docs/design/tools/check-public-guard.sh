@@ -11,6 +11,10 @@
 #         `%2e%2e`, `;`, a trailing slash, an extra segment) are refused for a public request;
 #   local the same keymanager and admin paths still reach the upstream without CF-Ray (the operator on the host), which
 #         is why 8091 must only listen on loopback (docker-compose.public.yaml).
+#   fwd   the OpenID4VCI 1.0 metadata, root-mapped (section 12.2.2) and under the servlet path, reaches the 1.0 handler's
+#         path for GET and HEAD with the request's Accept unchanged (absent, application/jwt, text/html,
+#         application/json, */*): the stub echoes what it received in X-Stub-* headers, which HEAD carries too. The
+#         handler's answer to each of them is held by Oid4vciMetadataAcceptRootMappedTest (F-17 review round 2, m4).
 #
 # Nothing here touches another compose project or network: the containers and the network are named
 # check-public-guard-<pid> and removed on exit, and nginx is published on a random 127.0.0.1 port.
@@ -37,6 +41,9 @@ server {
     listen 8090;
     location / {
         default_type text/plain;
+        add_header X-Stub-Method $request_method always;
+        add_header X-Stub-Uri $request_uri always;
+        add_header X-Stub-Accept $http_accept always;
         return 200 "stub $request_method $request_uri\n";
     }
 }
@@ -254,6 +261,44 @@ pass local  GET  /v1/certify/v3/api-docs
 pass local  POST /v1/certify/v2/credential-configurations
 pass local  POST /v1/certify/oid4vci/credential
 EOF
+
+# forward <method> <path> <upstream path> <accept, - for none>
+#   public request; expects 200 from the stub, which saw exactly this method, the upstream path and the Accept value
+forward() {
+    local method="$1" path="$2" upstream="$3" accept="$4"
+    local args=(-s --path-as-is -D "$WORK/headers" -o "$WORK/body" -w '%{http_code}'
+        -H 'CF-Ray: 8f00000000000000-BLR' -H "CF-Connecting-IP: 198.51.100.$(( total % 200 + 1 ))")
+    if [ "$accept" = - ]; then args+=(-H 'Accept:'); else args+=(-H "Accept: $accept"); fi
+    if [ "$method" = HEAD ]; then args+=(--head); fi
+    local code
+    code="$(curl "${args[@]}" "$BASE$path")" || code="curl-error"
+    total=$((total + 1))
+    local got_method got_uri got_accept want_accept
+    got_method="$({ grep -i '^x-stub-method:' "$WORK/headers" || true; } | head -n1 | cut -d' ' -f2- | tr -d '\r')"
+    got_uri="$({ grep -i '^x-stub-uri:' "$WORK/headers" || true; } | head -n1 | cut -d' ' -f2- | tr -d '\r')"
+    got_accept="$({ grep -i '^x-stub-accept:' "$WORK/headers" || true; } | head -n1 | cut -d' ' -f2- | tr -d '\r')"
+    want_accept="$accept"
+    if [ "$accept" = - ]; then want_accept=""; fi  # nginx emits no X-Stub-Accept for an absent header
+    if [ "$code" = 200 ] && [ "$got_method" = "$method" ] && [ "$got_uri" = "$upstream" ] && [ "$got_accept" = "$want_accept" ]; then
+        printf 'ok    fwd   public %-7s %s [Accept %s] -> %s %s\n' "$method" "$path" "$accept" "$got_method" "$got_uri"
+    else
+        printf 'FAIL  fwd   public %-7s %s [Accept %s] -> %s %s %s [Accept %s]\n' "$method" "$path" "$accept" "$code" "$got_method" "$got_uri" "$got_accept"
+        failures=$((failures + 1))
+    fi
+}
+
+ONE_ZERO=/v1/certify/oid4vci/.well-known/openid-credential-issuer
+for mapping in "/.well-known/openid-credential-issuer/v1/certify/oid4vci $ONE_ZERO" \
+               "/.well-known/openid-credential-issuer/v1/certify/t/acme/oid4vci /v1/certify/t/acme/oid4vci/.well-known/openid-credential-issuer" \
+               "/oid4vci/.well-known/openid-credential-issuer $ONE_ZERO" \
+               "$ONE_ZERO $ONE_ZERO"; do
+    read -r path upstream <<<"$mapping"
+    for method in GET HEAD; do
+        for accept in - application/jwt text/html application/json '*/*'; do
+            forward "$method" "$path" "$upstream" "$accept"
+        done
+    done
+done
 
 echo
 if [ "$failures" -ne 0 ]; then

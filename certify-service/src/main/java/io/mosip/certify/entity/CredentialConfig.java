@@ -94,7 +94,8 @@ public class CredentialConfig {
     @Column(name = "claims", columnDefinition = "jsonb")
     private Map<String, Claims> claims;
 
-    @Type(JsonBinaryType.class)
+    // typed snapshot copy: with JsonBinaryType every load looked dirty and rewrote the row (TypedJsonBinaryType, G32)
+    @Type(TypedJsonBinaryType.class)
     @JdbcTypeCode(SqlTypes.JSON)
     @Column(name = "mso_mdoc_claims", columnDefinition = "jsonb")
     private Map<String, Map<String, Claims>> msoMdocClaims;
