@@ -169,7 +169,7 @@ public class TokenStatusListService {
                 return Optional.of(servedAsStored(listId, latest(listId, stored.get()), properties.renewBackoff(), e));
             }
             failures.remove(listId);
-            return Optional.of(renewed);
+            return Optional.of(usableRenewal(listId, renewed));
         } finally {
             lock.unlock();
         }
@@ -215,6 +215,22 @@ public class TokenStatusListService {
                 + " is expired or under another URI and could not be signed again", retryAfter, cause);
     }
 
+    /**
+     * The renewed document, judged against the clock when it is returned: {@code exp} is stamped before the signer runs,
+     * so a signer that answers after it has passed (an HSM or keymanager stall longer than two {@code ttl}) yields a list
+     * that is already expired. Such a renewal counts as a failure (back-off, logged once); the list as stored now is
+     * served if another writer left a usable one, otherwise 503 with {@code Retry-After}.
+     */
+    private String usableRenewal(String listId, String renewed) {
+        if (freshness(listId, renewed) != Freshness.UNUSABLE) {
+            return renewed;
+        }
+        IllegalStateException stale = new IllegalStateException("Token status list " + listId
+                + " was signed again but had expired by the time the signer answered");
+        failed(listId, stale);
+        return servedAsStored(listId, latest(listId, renewed), properties.renewBackoff(), stale);
+    }
+
     /** The list as stored now (a status update may have replaced it while this request waited or signed), else {@code fallback}. */
     private String latest(String listId, String fallback) {
         try {
@@ -231,9 +247,15 @@ public class TokenStatusListService {
         if (failure == null) {
             return Optional.empty();
         }
-        Duration left = Duration.between(clock.instant(), failure.plus(properties.renewBackoff()));
+        Instant now = clock.instant();
+        Duration left = Duration.between(now, failure.plus(properties.renewBackoff()));
         if (left.isNegative() || left.isZero()) {
             return Optional.empty();
+        }
+        if (left.compareTo(properties.renewBackoff()) > 0) {
+            // the clock moved backwards since the failure: the window ends one renew-backoff from now, as Retry-After says
+            failures.replace(listId, failure, now);
+            left = properties.renewBackoff();
         }
         log.debug("Token status list {} failed to be signed again at {}; not signing it again for {}", listId, failure, left);
         return Optional.of(left);

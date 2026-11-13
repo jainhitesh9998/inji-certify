@@ -324,6 +324,65 @@ class TokenStatusListFreshnessTest {
         assertEquals(TokenStatusListService.Freshness.FRESH, lists.freshness(LIST_ID, renewed));
     }
 
+    /**
+     * Review round 2, item 2: {@code exp} is stamped before the signer runs, so a signer that succeeds only after
+     * {@code 2 ttl} has passed yields a list that is already expired. It is not served with 200: 503 with
+     * {@code Retry-After}, the failure backs off, and the next renewal once the signer is quick again serves a fresh list.
+     */
+    @Test
+    void aSlowSignerThatSucceedsAfterExpNeverGetsAnExpiredListServed() throws Exception {
+        documents.put(LIST_ID, service(DOMAIN, T0).sign(LIST_ID, revokedAt(10)));
+        MutableClock clock = new MutableClock(T0.plus(Duration.ofDays(1))); // the stored list expired long ago
+        AtomicBoolean slow = new AtomicBoolean(true);
+        AtomicInteger attempts = new AtomicInteger();
+        TokenStatusListService lists = service(DOMAIN, clock, properties("keymanager:status-es256", RENEW_WAIT, BACKOFF), signerThat(() -> {
+            attempts.incrementAndGet();
+            if (slow.get()) {
+                clock.advance(TTL.multipliedBy(2).plusSeconds(1)); // the signer answers, successfully, after exp
+            }
+        }));
+
+        TokenStatusListUnavailableException refused = assertThrows(TokenStatusListUnavailableException.class, () -> lists.jwt(LIST_ID));
+        assertEquals(BACKOFF.getSeconds(), refused.retryAfterSeconds());
+        assertTrue(refused.getCause().getMessage().contains("expired by the time the signer answered"), refused.getCause().getMessage());
+        assertEquals(1, attempts.get());
+        assertEquals(TokenStatusListService.Freshness.UNUSABLE, lists.freshness(LIST_ID, documents.get(LIST_ID)),
+                "what the slow signer stored is expired too; it is never served");
+
+        assertThrows(TokenStatusListUnavailableException.class, () -> lists.jwt(LIST_ID));
+        assertEquals(1, attempts.get(), "within the back-off: 503 at once, not signed again");
+
+        slow.set(false);
+        clock.advance(BACKOFF);
+        String renewed = lists.jwt(LIST_ID).orElseThrow();
+        assertEquals(2, attempts.get());
+        assertEquals(TokenStatusListService.Freshness.FRESH, lists.freshness(LIST_ID, renewed));
+        assertArrayEquals(revokedAt(10), TokenStatusListService.bits(renewed));
+        assertEquals(renewed, documents.get(LIST_ID));
+    }
+
+    /** Review round 2, item 6: a clock that moves backwards after a failure never makes Retry-After exceed renew-backoff. */
+    @Test
+    void aClockMovingBackwardsNeverStretchesTheBackoff() {
+        documents.put(LIST_ID, service(DOMAIN, T0).sign(LIST_ID, revokedAt(11)));
+        MutableClock clock = new MutableClock(T0.plus(Duration.ofDays(1)));
+        AtomicBoolean broken = new AtomicBoolean(true);
+        TokenStatusListService lists = service(DOMAIN, clock, properties("keymanager:status-es256", RENEW_WAIT, BACKOFF), signerThat(() -> {
+            if (broken.get()) {
+                throw new IllegalStateException("signer down");
+            }
+        }));
+        assertThrows(TokenStatusListUnavailableException.class, () -> lists.jwt(LIST_ID));
+
+        clock.advance(Duration.ofHours(-1)); // NTP steps the clock back an hour
+        TokenStatusListUnavailableException refused = assertThrows(TokenStatusListUnavailableException.class, () -> lists.jwt(LIST_ID));
+        assertEquals(BACKOFF.getSeconds(), refused.retryAfterSeconds(), "capped at renew-backoff, not an hour and thirty seconds");
+
+        broken.set(false);
+        clock.advance(BACKOFF); // the window ends when Retry-After said it would
+        assertEquals(TokenStatusListService.Freshness.FRESH, lists.freshness(LIST_ID, lists.jwt(LIST_ID).orElseThrow()));
+    }
+
     /** Review round 1, item 7: the endpoint answers an expired list whose signer throws with 503 and Retry-After, no body. */
     @Test
     void theEndpointAnswers503WithRetryAfterForAnExpiredListThatCannotBeSigned() throws Exception {
