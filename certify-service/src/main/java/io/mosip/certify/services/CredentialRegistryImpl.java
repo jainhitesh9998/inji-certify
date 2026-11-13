@@ -23,7 +23,7 @@ import java.util.Optional;
 @Service
 public class CredentialRegistryImpl implements CredentialRegistry {
 
-    static final String KEY = "issuer-metadata";
+    public static final String KEY = "issuer-metadata";
 
     private final CredentialConfigurationService credentialConfigurationService;
     private final CacheManager cacheManager;

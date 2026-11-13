@@ -28,7 +28,7 @@ import java.util.Map;
 public class TenantIssuerMetadata {
 
     /** The default tenant's claim display orders, kept beside the issuer metadata they finish and cleared with it. */
-    static final String DEFAULT_CLAIM_ORDERS_KEY = "oid4vci-claim-orders";
+    public static final String DEFAULT_CLAIM_ORDERS_KEY = "oid4vci-claim-orders";
 
     private final ConfigurationRegistry configurations;
     private final List<CredentialFormatter> formatters;
