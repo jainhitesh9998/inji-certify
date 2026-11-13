@@ -70,8 +70,8 @@ the CRL profile at startup, or the service does not start. An anchor's `id` name
 (M-08); unset, it is the `<id>` of the IACA's CRL distribution point `…/mdoc/iaca/<id>.crl`, else its subject key
 identifier in lower-case hex; an IACA whose CRL distribution point is `…/mdoc/iaca/<x>.crl` with an `<x>` that is not
 its id, or not a valid id, refuses startup. `certify.pki.stale-crl-grace` is how long an anchor's CRL may be past its
-`nextUpdate` before mDoc signing under it is refused (`CRL_STALE`) and startup is refused; `PT0S` refuses as soon as it
-passes. In a list the entries bind as `certify.pki.trust-anchors.mdoc-iaca[0].certificate`, or
+`nextUpdate` before mDoc signing under it is refused (`CRL_STALE`); past it at startup the service logs an ERROR and starts, since
+only mDoc signing under that IACA is affected; `PT0S` refuses as soon as it passes. In a list the entries bind as `certify.pki.trust-anchors.mdoc-iaca[0].certificate`, or
 `CERTIFY_PKI_TRUSTANCHORS_MDOCIACA_0_CERTIFICATE` from the environment.
 
 Rules:

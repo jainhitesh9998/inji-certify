@@ -34,6 +34,11 @@ public interface CrlNumberStore {
     /** Records {@code number} as the last one issued for {@code iaca}, durably before it returns. */
     void record(X509Certificate iaca, BigInteger number) throws IOException;
 
+    /** The file the numbers are kept in; empty for a store held in memory. */
+    default java.util.Optional<Path> location() {
+        return java.util.Optional.empty();
+    }
+
     /** Numbers kept for this process only: for tests, and an x509-file keystore without a file. */
     static CrlNumberStore inMemory() {
         Map<String, BigInteger> numbers = new ConcurrentHashMap<>();
@@ -133,6 +138,11 @@ public interface CrlNumberStore {
 
         Path path() {
             return path;
+        }
+
+        @Override
+        public java.util.Optional<Path> location() {
+            return java.util.Optional.of(path);
         }
     }
 }

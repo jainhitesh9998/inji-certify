@@ -249,6 +249,14 @@ class MdocDscPolicyTest {
         }, MdlFixtures.configuration(enforced), MdlFixtures.context()));
     }
 
+    /** Round 2, item 1: a caller that knows anchors are configured but cannot obtain the policy refuses (fail closed). */
+    @Test
+    void anUnavailablePolicyOverConfiguredAnchorsRefuses() {
+        refused(MdocDscPolicy.TRUST_ANCHORS_UNAVAILABLE, () -> {
+            throw MdocDscPolicy.unavailable("2 TrustAnchorRegistry beans hold mdoc-iaca anchors and none is primary");
+        });
+    }
+
     @Test
     @Order(Integer.MAX_VALUE)
     void everyNamedRuleHasANegativeTest() {

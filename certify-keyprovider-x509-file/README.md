@@ -192,7 +192,8 @@ refuses to start, since the URL every Document Signer copies would answer 404. T
 `certify-cli pki iaca create --crl-uri` of a production IACA (M-07). In dev mode the provider holds the IACA's key,
 so `JcaKeyProvider.issueEmptyCrl` signs that CRL (empty, re-issued by the registry half way through
 `certify.pki.trust-anchors.dev-crl-validity`, numbered after the last number kept in `<path>.crl-numbers` next to the
-keystore, so numbers keep increasing across restarts); with `certify.pki.trust-anchors.crl-refresh-interval` zero or
+keystore, so numbers keep increasing across restarts; the keystore's directory must be writable in dev mode, or the
+service does not start); with `certify.pki.trust-anchors.crl-refresh-interval` zero or
 negative it is never re-issued, goes stale after `dev-crl-validity`, and mDoc signing stops `certify.pki.stale-crl-grace`
 later (`CRL_STALE`) until a restart. In production the IACA key stays offline (D3) and the operator configures the CRL
 file it signed as `certify.pki.trust-anchors.mdoc-iaca[].crl` next to the same IACA certificate, and replaces it with

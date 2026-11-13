@@ -291,7 +291,7 @@ class FileTrustAnchorRegistryTest {
         touch(crlFile, 15);
         logged(events, () -> { registry.refresh(); return null; });
         assertSame(loaded, registry.crl("rollback").orElseThrow(), "a larger number with an earlier thisUpdate is refused too");
-        assertTrue(has(events, Level.ERROR, "is earlier than the current"), events.toString());
+        assertTrue(has(events, Level.ERROR, "earlier than the current"), events.toString());
 
         events.clear();
         Files.write(crlFile, current.getEncoded()); // the current CRL written again (a redeploy, a touch)
@@ -304,6 +304,46 @@ class FileTrustAnchorRegistryTest {
         touch(crlFile, 25);
         registry.refresh();
         assertEquals(BigInteger.valueOf(6), FileTrustAnchorRegistry.crlNumber(registry.crl("rollback").orElseThrow()), "renewal taken");
+    }
+
+    /**
+     * Round 2, item 3: RFC 5280 5.2.3 orders CRLs by cRLNumber, so a renewal with a larger number is taken when its
+     * thisUpdate lies up to AnnexBValidator.CLOCK_SKEW before the current one's (the current CRL was signed on a clock
+     * running fast); lower numbers and the same number with other content stay refused.
+     */
+    @Test
+    void aRenewalWithALargerNumberIsTakenWhenItsThisUpdateIsWithinTheClockSkewBeforeTheCurrent() throws Exception {
+        Iaca iaca = iaca("Skewed IACA", "https://credentials.example.test/v1/certify/mdoc/iaca/skewed.crl",
+                Instant.now().minus(30, ChronoUnit.DAYS));
+        Instant now = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+        X509CRL fast = crl(iaca, 11, now.plus(4, ChronoUnit.MINUTES), now.plus(7, ChronoUnit.DAYS));
+        Path crlFile = Files.write(dir.resolve("skewed.crl"), fast.getEncoded());
+        FileTrustAnchorRegistry registry = new FileTrustAnchorRegistry(properties(new PkiProperties.AnchorSpec(null,
+                write("skewed.pem", Pem.writeCertificate(iaca.certificate())), crlFile)), List.of(), null, Clock.systemUTC());
+        assertEquals(BigInteger.valueOf(11), FileTrustAnchorRegistry.crlNumber(registry.crl("skewed").orElseThrow()));
+
+        List<ILoggingEvent> events = new java.util.ArrayList<>();
+        Files.write(crlFile, crl(iaca, 10, now.plus(4, ChronoUnit.MINUTES), now.plus(8, ChronoUnit.DAYS)).getEncoded());
+        touch(crlFile, 5);
+        logged(events, () -> { registry.refresh(); return null; });
+        assertEquals(BigInteger.valueOf(11), FileTrustAnchorRegistry.crlNumber(registry.crl("skewed").orElseThrow()),
+                "a lower number stays refused, whatever its thisUpdate");
+        assertTrue(has(events, Level.ERROR, "cRLNumber 10 is lower than the current 11"), events.toString());
+
+        Files.write(crlFile, crl(iaca, 13, now.plus(2, ChronoUnit.MINUTES), now.plus(7, ChronoUnit.DAYS)).getEncoded());
+        touch(crlFile, 10);
+        registry.refresh();
+        assertEquals(BigInteger.valueOf(13), FileTrustAnchorRegistry.crlNumber(registry.crl("skewed").orElseThrow()),
+                "#13 two minutes before #11's fast thisUpdate is the renewal");
+
+        events.clear();
+        Files.write(crlFile, crl(iaca, 14, now.plus(2, ChronoUnit.MINUTES).minus(AnnexBValidator.CLOCK_SKEW).minusSeconds(1),
+                now.plus(7, ChronoUnit.DAYS)).getEncoded());
+        touch(crlFile, 15);
+        logged(events, () -> { registry.refresh(); return null; });
+        assertEquals(BigInteger.valueOf(13), FileTrustAnchorRegistry.crlNumber(registry.crl("skewed").orElseThrow()),
+                "a thisUpdate more than the clock skew earlier is still refused");
+        assertTrue(has(events, Level.ERROR, "earlier than the current"), events.toString());
     }
 
     /**
@@ -361,11 +401,21 @@ class FileTrustAnchorRegistryTest {
         assertDoesNotThrow(() -> new MdocDscPolicy(strict).check(chain, renewedNext));
         FormatException immediately = assertThrows(FormatException.class, () -> new MdocDscPolicy(strict).check(chain, renewedNext.plusSeconds(1)));
         assertTrue(immediately.getMessage().startsWith(MdocDscPolicy.CRL_STALE + ": "), immediately.getMessage());
-        // startup past the grace is refused
+        // round 2, item 2: a CRL past the grace at startup does not refuse startup (other formats keep issuing); it is
+        // logged at ERROR, the gauge shows it, and mDoc signing under the IACA fails closed with CRL_STALE
         clock.set(renewedNext.plus(24, ChronoUnit.HOURS).plusSeconds(1));
-        IllegalStateException startup = assertThrows(IllegalStateException.class, () -> new FileTrustAnchorRegistry(
+        events.clear();
+        FileTrustAnchorRegistry staleAtStartup = logged(events, () -> new FileTrustAnchorRegistry(
                 properties(Duration.ofHours(24), spec), List.of(), null, clock));
-        assertTrue(startup.getMessage().contains("certify.pki.stale-crl-grace"), startup.getMessage());
+        assertTrue(has(events, Level.ERROR, "is refused (CRL_STALE)") && has(events, Level.ERROR, "certify.pki.stale-crl-grace"),
+                events.toString());
+        SimpleMeterRegistry startupMeters = new SimpleMeterRegistry();
+        staleAtStartup.bindMetrics(startupMeters);
+        assertTrue(startupMeters.get(FileTrustAnchorRegistry.METRIC).tag("anchor", "stale").gauge().value()
+                < -Duration.ofHours(24).toSeconds(), "the gauge shows the stale CRL from startup");
+        FormatException staleSigning = assertThrows(FormatException.class,
+                () -> new MdocDscPolicy(staleAtStartup).check(chain, clock.instant()));
+        assertTrue(staleSigning.getMessage().startsWith(MdocDscPolicy.CRL_STALE + ": "), staleSigning.getMessage());
         assertThrows(IllegalArgumentException.class, () -> properties(Duration.ofSeconds(-1)));
         assertEquals(Duration.ofHours(24), properties().staleCrlGrace(), "PT24H by default");
     }
@@ -515,6 +565,29 @@ class FileTrustAnchorRegistryTest {
         @Override
         public Instant instant() {
             return now;
+        }
+    }
+
+    /**
+     * Round 2, item 5: in dev mode the keystore's directory holds {@code <keystore>.crl-numbers}; when it is read-only the
+     * startup error names that file and says the directory must be writable.
+     */
+    @Test
+    void aReadOnlyKeystoreDirectoryInDevModeNamesTheCrlNumbersFile() throws Exception {
+        Iaca numbered = iaca("Read Only IACA", "https://credentials.example.test/v1/certify/mdoc/iaca/read-only.crl");
+        FileTrustAnchorRegistry.DevCrlIssuer devMode = (certificate, number, thisUpdate, nextUpdate) -> Optional.of(
+                CrlBuilder.forIaca(certificate, numbered.keys()).crlNumber(number).thisUpdate(thisUpdate).nextUpdate(nextUpdate).build());
+        Path keys = Files.createDirectories(dir.resolve("read-only-keys"));
+        Path store = CrlNumberStore.nextTo(keys.resolve("x509-file.p12"));
+        Files.setPosixFilePermissions(keys, java.nio.file.attribute.PosixFilePermissions.fromString("r-xr-xr-x"));
+        try {
+            org.junit.jupiter.api.Assumptions.assumeFalse(Files.isWritable(keys), "running as a user that ignores permissions");
+            IllegalStateException refused = assertThrows(IllegalStateException.class, () -> new FileTrustAnchorRegistry(
+                    properties(), List.of(numbered.certificate()), devMode, CrlNumberStore.file(store), Clock.systemUTC()));
+            assertTrue(refused.getMessage().contains(store.toString()) && refused.getMessage().contains("must be writable")
+                    && refused.getMessage().contains("dev mode"), refused.getMessage());
+        } finally {
+            Files.setPosixFilePermissions(keys, java.nio.file.attribute.PosixFilePermissions.fromString("rwxr-xr-x"));
         }
     }
 }
