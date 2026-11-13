@@ -77,7 +77,8 @@ RUN chmod +x configure_start.sh
 
 RUN chmod a-w /home/${container_user}/configure_start.sh
 
-COPY ./target/certify-service-*.jar certify-service.jar
+# the executable jar only (finalName in pom.xml); the -javadoc and -sources jars beside it never match
+COPY ./target/certify-service.jar certify-service.jar
 
 # change permissions of file inside working dir
 RUN chown -R ${container_user}:${container_user} /home/${container_user}

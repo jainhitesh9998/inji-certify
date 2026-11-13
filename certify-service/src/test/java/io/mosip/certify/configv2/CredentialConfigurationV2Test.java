@@ -314,6 +314,84 @@ class CredentialConfigurationV2Test {
         return objectMapper.readTree(result.getResponse().getContentAsString()).get("error").asText();
     }
 
+    /** F-10: a missing required field is a 400 naming it, decided before the database, and nothing is stored. */
+    @Test
+    void requiredFieldsAreRefusedUpFrontWithTheFieldNamed() throws Exception {
+        String id = "V2RequiredFields";
+        Map<String, Map<String, Object>> cases = new LinkedHashMap<>();
+        Map<String, Object> noOrder = body(id, template(id));
+        noOrder.put("display", Map.of("display", List.of(Map.of("name", id, "locale", "en"))));
+        cases.put("display.order", noOrder);
+        Map<String, Object> noScope = body(id, template(id));
+        noScope.remove("scope");
+        cases.put("scope", noScope);
+        Map<String, Object> noDisplay = body(id, template(id));
+        noDisplay.remove("display");
+        cases.put("display is required", noDisplay);
+        Map<String, Object> noDisplayEntries = body(id, template(id));
+        noDisplayEntries.put("display", Map.of("order", List.of("fullName")));
+        cases.put("display.display", noDisplayEntries);
+        for (Map.Entry<String, Map<String, Object>> c : cases.entrySet()) {
+            MvcResult refused = call(post(PATH), c.getValue());
+            JsonNode error = objectMapper.readTree(refused.getResponse().getContentAsString());
+            assertEquals(400, refused.getResponse().getStatus(), c.getKey() + ": " + error);
+            assertEquals("invalid_configuration", error.get("error").asText(), c.getKey());
+            assertTrue(error.get("error_description").asText().contains(c.getKey()), c.getKey() + ": " + error);
+            assertTrue(configurations.findByTenantIdAndCredentialConfigKeyId("default", id).isEmpty(), c.getKey() + ": nothing stored");
+        }
+        // the same rule on update
+        assertEquals(201, call(post(PATH), body(id, template(id))).getResponse().getStatus());
+        try {
+            MvcResult update = call(put(PATH + "/" + id), noOrder);
+            assertEquals(400, update.getResponse().getStatus(), update.getResponse().getContentAsString());
+            assertTrue(objectMapper.readTree(update.getResponse().getContentAsString()).get("error_description").asText().contains("display.order"));
+        } finally {
+            configurations.findByTenantIdAndCredentialConfigKeyId("default", id).ifPresent(configurations::delete);
+        }
+    }
+
+    /** F-10: what only the database refuses (here a scope longer than its column) is a 400 without SQL, never a 200. */
+    @Test
+    void aDatabaseConstraintIsA400WithoutSqlText() throws Exception {
+        String id = "V2TooLongScope";
+        Map<String, Object> body = body(id, template(id));
+        body.put("scope", "s".repeat(300));
+        MvcResult refused = call(post(PATH), body);
+        String text = refused.getResponse().getContentAsString();
+        assertEquals(400, refused.getResponse().getStatus(), text);
+        JsonNode error = objectMapper.readTree(text);
+        assertEquals("invalid_configuration", error.get("error").asText(), text);
+        for (String leak : List.of("SQL", "sql", "insert", "INSERT", "credential_config", "VARCHAR", "jdbc", "Exception")) {
+            assertFalse(text.contains(leak), "no database internals in the answer: " + text);
+        }
+        assertTrue(configurations.findByTenantIdAndCredentialConfigKeyId("default", id).isEmpty());
+    }
+
+    /** F-10: the v2 surface never answers 200 to an error, whatever fails. */
+    @Test
+    void malformedBodiesAndUnexpectedErrorsAreNeverA200() throws Exception {
+        MvcResult notJson = mockMvc.perform(post(PATH).contentType(MediaType.APPLICATION_JSON).content("{\"id\": ")).andReturn();
+        assertEquals(400, notJson.getResponse().getStatus(), notJson.getResponse().getContentAsString());
+        assertEquals("invalid_configuration", objectMapper.readTree(notJson.getResponse().getContentAsString()).get("error").asText());
+
+        Map<String, Object> wrongShape = body("V2WrongShape", template("V2WrongShape"));
+        wrongShape.put("display", Map.of("display", List.of("not an object"), "order", List.of("fullName")));
+        MvcResult shape = call(post(PATH), wrongShape);
+        assertEquals(400, shape.getResponse().getStatus(), shape.getResponse().getContentAsString());
+
+        CredentialConfigurationV2Controller controller = new CredentialConfigurationV2Controller(null);
+        var duplicate = controller.constraint(new org.springframework.dao.DataIntegrityViolationException("could not execute statement",
+                new java.sql.SQLException("duplicate key value violates unique constraint \"credential_config_pkey\"", "23505")));
+        assertEquals(409, duplicate.getStatusCode().value());
+        assertEquals("configuration_exists", duplicate.getBody().get("error"));
+        assertFalse(duplicate.getBody().get("error_description").contains("credential_config_pkey"));
+        var notNull = controller.constraint(new org.springframework.dao.DataIntegrityViolationException("could not execute statement",
+                new java.sql.SQLException("null value in column \"display_order\" violates not-null constraint", "23502")));
+        assertEquals(400, notNull.getStatusCode().value());
+        assertFalse(notNull.getBody().get("error_description").contains("display_order"));
+        assertEquals(500, controller.unexpected(new IllegalStateException("boom")).getStatusCode().value());
+    }
+
     private MvcResult call(org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder request, Object body) throws Exception {
         return mockMvc.perform(request.contentType(MediaType.APPLICATION_JSON).content(objectMapper.writeValueAsString(body))).andReturn();
     }

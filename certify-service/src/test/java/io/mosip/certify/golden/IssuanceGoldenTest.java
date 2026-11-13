@@ -663,6 +663,15 @@ class IssuanceGoldenTest {
         assertEquals(issuerIdentifier + "/oid4vci/nonce", metadata.get("nonce_endpoint").asText());
         assertTrue(metadata.get("credential_configurations_supported").has(LDP_ID));
         assertTrue(metadata.get("credential_configurations_supported").has(MDOC_ID));
+        // OpenID4VCI 1.0 12.2.4 (F-10): optional members are absent, not null, and claims follow the display order;
+        // the compatibility document keeps develop's bytes (its golden, and the explicit nulls checked here)
+        assertFalse(onlyGoldenConfigurations(metadata).toString().contains(":null"), metadata.toString());
+        List<String> claimNames = new java.util.ArrayList<>();
+        metadata.at("/credential_configurations_supported/" + LDP_ID + "/credential_metadata/claims").forEach(c -> claimNames.add(c.get("path").get(0).asText()));
+        assertEquals(List.of("fullName", "dateOfBirth", "city"), claimNames, "the configuration's display order");
+        JsonNode compatibilityDisplay = getJson("/.well-known/openid-credential-issuer")
+                .at("/credential_configurations_supported/" + LDP_ID + "/credential_metadata/display/0");
+        assertTrue(compatibilityDisplay.has("logo") && compatibilityDisplay.get("logo").isNull(), "the compatibility document is unchanged");
         Goldens.assertGolden("oid4vci-1.0/oid4vci/openid-credential-issuer", onlyGoldenConfigurations(metadata));
     }
 

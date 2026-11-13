@@ -295,6 +295,7 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
         credentialConfigResponse.setId(savedConfig.getCredentialConfigKeyId());
         credentialConfigResponse.setStatus(savedConfig.getStatus());
 
+        issuerMetadataCache.evict(); // the compatibility metadata and the /oid4vci claim orders (lost in W-01, F-10 review round 2)
         return credentialConfigResponse;
     }
 

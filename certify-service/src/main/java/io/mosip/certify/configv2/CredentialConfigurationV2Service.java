@@ -115,7 +115,7 @@ public class CredentialConfigurationV2Service {
         row.setCreatedTimes(LocalDateTime.now());
         row.setTenantId(tenant);
         row.setCredentialConfigKeyId(body.getId());
-        mapper.apply(body, row, legacyService.protocolDefaults(body.getFormat()));
+        apply(body, row);
         storeTemplate(body.getTemplate(), row);
         row = configurations.save(row);
         dryRun(row, body.getSampleClaims());
@@ -143,7 +143,7 @@ public class CredentialConfigurationV2Service {
         }
         body.setId(id);
         validate(body, tenant, row);
-        mapper.apply(body, row, legacyService.protocolDefaults(body.getFormat()));
+        apply(body, row);
         storeTemplate(body.getTemplate(), row);
         row.setUpdatedTimes(LocalDateTime.now());
         row = configurations.save(row);
@@ -171,11 +171,54 @@ public class CredentialConfigurationV2Service {
         return new CredentialConfigurationV2.PreviewResponse(unsigned.format(), unsigned.document(), unsigned.attributes());
     }
 
+    /** The body onto the row; a value of the wrong shape (a display entry that is not an object, say) is a 400, not a 500. */
+    private void apply(CredentialConfigurationV2 body, CredentialConfig row) {
+        try {
+            mapper.apply(body, row, legacyService.protocolDefaults(body.getFormat()));
+        } catch (IllegalArgumentException e) {
+            throw ConfigV2Exception.invalid("The body does not match the v2 configuration model: " + rootMessage(e));
+        }
+    }
+
+    private static String rootMessage(Throwable e) {
+        Throwable root = e;
+        while (root.getCause() != null && root.getCause() != root) {
+            root = root.getCause();
+        }
+        String message = root.getMessage() == null ? root.getClass().getSimpleName() : root.getMessage();
+        int newline = message.indexOf('\n');
+        return newline < 0 ? message : message.substring(0, newline);
+    }
+
+    /**
+     * The fields every row must carry (the {@code credential_config} NOT NULL columns {@code scope}, {@code display},
+     * {@code display_order}), refused up front with the field named instead of reaching the database.
+     */
+    private static void requireStoredFields(CredentialConfigurationV2 body) {
+        if (body.getScope() == null || body.getScope().isBlank()) {
+            throw ConfigV2Exception.invalid("scope is required (the OAuth scope that authorises this configuration)");
+        }
+        CredentialConfigurationV2.Display display = body.getDisplay();
+        if (display == null) {
+            throw ConfigV2Exception.invalid("display is required: {\"display\": [{\"name\": ..., \"locale\": ...}], \"order\": [claim names]}");
+        }
+        if (display.getDisplay() == null) {
+            throw ConfigV2Exception.invalid("display.display is required (the credential's display entries; [] for none)");
+        }
+        if (display.getOrder() == null) {
+            throw ConfigV2Exception.invalid("display.order is required (the claim names in display order; [] for none)");
+        }
+        if (display.getOrder().stream().anyMatch(name -> name == null || name.isBlank())) {
+            throw ConfigV2Exception.invalid("display.order must not contain an empty claim name");
+        }
+    }
+
     private static HolderBinding previewHolder(CredentialConfiguration configuration) {
         return FORMAT_MSO_MDOC.equals(configuration.format()) ? PREVIEW_MDOC_HOLDER : PREVIEW_HOLDER;
     }
 
     private void validate(CredentialConfigurationV2 body, String tenant, CredentialConfig existing) {
+        requireStoredFields(body);
         String format = body.getFormat();
         if (format == null || format.isBlank() || formatters.forFormat(format).isEmpty()) {
             throw new ConfigV2Exception(400, ConfigV2Exception.UNSUPPORTED_FORMAT, "No formatter for format " + format);

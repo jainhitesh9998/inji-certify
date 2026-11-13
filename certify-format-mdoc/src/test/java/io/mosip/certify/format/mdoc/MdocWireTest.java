@@ -214,6 +214,29 @@ class MdocWireTest {
         assertEquals(1004, values.get("driving_privileges").get(0).get("issue_date").getMostOuterTag().ToInt32Checked());
     }
 
+    /**
+     * F-10: a mandatory Table 5 text element whose value is empty, or is the reference Velocity prints when the data
+     * source lacks the value, is refused before signing with the element named; ordinary text with a dollar sign is not.
+     */
+    @Test
+    void aMandatoryTextElementThatIsEmptyOrAnUnrenderedReferenceIsRefused() {
+        for (String[] element : new String[][] {{"family_name", ""}, {"given_name", "   "},
+                {"issuing_authority", "${issuing_authority}"}, {"document_number", "$document_number"},
+                {"family_name", "$!{holder.familyName}"}, {"given_name", " $!given_name "}, {"document_number", "${dl-number}"}}) {
+            FormatException e = assertThrows(FormatException.class, () -> formatter().build(
+                    ClaimSet.of(MdlFixtures.with(element[0], element[1])), MdlFixtures.configuration(formatter()),
+                    MdlFixtures.context(), MdlFixtures.holder()), element[0] + " '" + element[1] + "'");
+            assertEquals("mdoc_data_model_invalid", e.getErrorCode(), element[0] + " '" + element[1] + "'");
+            assertTrue(e.getMessage().startsWith(element[0] + " is "), e.getMessage());
+            assertTrue(e.getMessage().contains("Table 5"), e.getMessage());
+        }
+        for (String[] element : new String[][] {{"issuing_authority", "Lorem Ipsum $ Demo Authority"}, {"document_number", "DL-$5"},
+                {"given_name", "Jane ${not the whole value}"}}) {
+            Map<String, CBORObject> values = valuesByIdentifier(issuerSigned(issue(MdlFixtures.with(element[0], element[1]))), MdlFixtures.MDL_NAMESPACE);
+            assertEquals(element[1], values.get(element[0]).AsString(), "text that is not a bare reference is issued as given");
+        }
+    }
+
     @Test
     void impossibleDatesAreRefused() {
         for (String[] element : new String[][] {{"birth_date", "2023-02-31"}, {"expiry_date", "2024-13-01"},

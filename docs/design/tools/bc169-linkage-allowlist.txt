@@ -1,0 +1,20 @@
+# BouncyCastle 1.69 linkage allowlist for check-bc169-linkage.sh (decision log 2026-11-13, F-10 review round 1).
+#
+# An unresolved reference is allowed only when its failure cannot stop the service or a Certify code path. Columns,
+# separated by blanks: <jar file name or classes directory regex> <using class regex> <reference regex> <reason>.
+# A line that matches nothing is reported as UNUSED; remove it then.
+
+# OkHttp's BouncyCastle JSSE platform: okhttp3.internal.platform.Platform builds BouncyCastlePlatform only when its
+# isSupported check finds org.bouncycastle.jsse.provider.BouncyCastleJsseProvider (bctls) by name, and the Android
+# socket adapter only on Android; Certify ships no bctls and the 1.69 plugin jars bring none, so neither is used.
+# (Netty reaches org.bouncycastle.jsse through reflection only, so it has no reference to allow.)
+okhttp-.*\.jar  okhttp3/internal/platform/(BouncyCastlePlatform|android/BouncyCastleSocketAdapter.*)  org/bouncycastle/jsse/.*  optional BCJSSE platform, loaded only when bctls is installed (never in Certify)
+
+# kernel-keymanager's COSE service calls DERSequenceGenerator.addObject(ASN1Primitive), added in 1.70, in
+# convertRawECSignatureToDER, which only its verification of EC signatures uses (coseVerify1, cwtVerify). Certify never
+# calls keymanager COSE or CWT signing or verification: it uses KeymanagerService, SignatureServicev2.signv2 and
+# PartnerCertificateManagerService only (grep of certify-*/src/main for io.mosip.kernel, 2026-11-13), and signs COSE with
+# its own certify-signing CoseEnvelope. The method is reached only through keymanager's own CoseSignController
+# (POST /coseVerify1, /cwtVerify), which keymanager's component scan maps behind authentication and its @PreAuthorize
+# roles; with 1.69 on loader.path such a call with an EC key fails with NoSuchMethodError (HTTP 500) and nothing else.
+kernel-keymanager-service-.*\.jar  io/mosip/kernel/signature/service/impl/CoseSignatureServiceImpl  org/bouncycastle/asn1/DERSequenceGenerator\.addObject:\(Lorg/bouncycastle/asn1/ASN1Primitive;\)V  keymanager COSE verification of EC signatures, never called by Certify (only via keymanager's own /coseVerify1 and /cwtVerify endpoints)

@@ -27,11 +27,13 @@ public class Oid4vciDiscoveryController {
     private final TenantIssuerMetadata tenantMetadata;
     private final Oid4vciProperties properties;
     private final Oid4vciIssuerResolver issuers;
+    private final com.fasterxml.jackson.databind.ObjectMapper objectMapper;
 
     public Oid4vciDiscoveryController(CredentialRegistry registry, NonceService nonceService, Oid4vciIssuer issuer,
                                       io.mosip.certify.core.dto.AuthorizationContext authorizationContext,
                                       io.mosip.certify.tenancy.TenantContexts tenants, TenantIssuerMetadata tenantMetadata, Oid4vciProperties properties,
-                                      Oid4vciIssuerResolver issuers) {
+                                      Oid4vciIssuerResolver issuers, com.fasterxml.jackson.databind.ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
         this.registry = registry;
         this.nonceService = nonceService;
         this.issuer = issuer;
@@ -42,14 +44,20 @@ public class Oid4vciDiscoveryController {
         this.issuers = issuers;
     }
 
-    /** The default tenant's document is develop's (goldens) plus this surface's identity; another tenant's is built from the core under its own identifier. */
+    /**
+     * The default tenant's document is develop's configurations plus this surface's identity; another tenant's is built
+     * from the core under its own identifier. Both are finished by {@link Oid4vciMetadataDocument}: no null members,
+     * claims in display order (OpenID4VCI 1.0 section 12.2.4); the compatibility documents keep their bytes.
+     */
     @GetMapping(value = "/.well-known/openid-credential-issuer", produces = "application/json")
     public Object issuerMetadata() {
         CredentialIssuerMetadataDTO legacy = registry.issuerMetadata();
         String tenantId = authorizationContext.getTenantId();
         if (tenantId != null && !io.mosip.certify.spi.TenantContext.DEFAULT_TENANT_ID.equals(tenantId)) {
             io.mosip.certify.spi.TenantContext tenant = tenants.forRequest(tenantId, issuer.identifier(), null);
-            return tenantMetadata.document(tenant, issuers.forTenant(tenantId), legacy);
+            java.util.List<io.mosip.certify.spi.CredentialConfiguration> configurations = tenantMetadata.configurations(tenantId);
+            return Oid4vciMetadataDocument.finish(objectMapper.valueToTree(tenantMetadata.document(tenant, issuers.forTenant(tenantId), legacy, configurations)),
+                    TenantIssuerMetadata.claimOrders(configurations));
         }
         CredentialIssuerMetadataDTO metadata = new CredentialIssuerMetadataDTO();
         metadata.setCredentialIssuer(issuer.identifier());
@@ -64,7 +72,7 @@ public class Oid4vciDiscoveryController {
         // as-is. This surface has no display of its own, so there is nothing to prefer over it.
         metadata.setDisplay(legacy.getDisplay());
         metadata.setCredentialConfigurationSupportedDTO(legacy.getCredentialConfigurationSupportedDTO());
-        return metadata;
+        return Oid4vciMetadataDocument.finish(objectMapper.valueToTree(metadata), tenantMetadata.defaultClaimOrders());
     }
 
     @PostMapping(value = "/nonce", produces = "application/json")

@@ -259,6 +259,55 @@
 			</build>
 		</profile>
 
+		<!--
+			BouncyCastle 1.69 at runtime (decision log 2026-11-13, F-10). Published plugin jars (mock-certify-plugin,
+			mosip-identity-certify-plugin in injistackdev/inji-certify-with-plugins) bundle unshaded BouncyCastle 1.69,
+			and on loader.path they shadow the 1.78 classes the service ships. The code is compiled against 1.78 as
+			shipped; this profile only swaps the test runtime classpath to 1.69 (jdk15on: there is no jdk18on 1.69), so
+			a method whose descriptor differs between the two releases fails here as NoSuchMethodError, exactly as it
+			would at startup. CI: mvn -Pbc169 -pl certify-pki,certify-signing,certify-keyprovider-jca,
+			certify-keyprovider-x509-file,certify-format-mdoc test.
+		-->
+		<profile>
+			<id>bc169</id>
+			<build>
+				<plugins>
+					<plugin>
+						<groupId>org.apache.maven.plugins</groupId>
+						<artifactId>maven-surefire-plugin</artifactId>
+						<configuration>
+							<classpathDependencyExcludes>
+								<classpathDependencyExclude>org.bouncycastle:bcprov-jdk18on</classpathDependencyExclude>
+								<classpathDependencyExclude>org.bouncycastle:bcpkix-jdk18on</classpathDependencyExclude>
+								<classpathDependencyExclude>org.bouncycastle:bcutil-jdk18on</classpathDependencyExclude>
+								<classpathDependencyExclude>org.bouncycastle:bcprov-jdk15on</classpathDependencyExclude>
+								<classpathDependencyExclude>org.bouncycastle:bcpkix-jdk15on</classpathDependencyExclude>
+								<classpathDependencyExclude>org.bouncycastle:bcutil-jdk15on</classpathDependencyExclude>
+								<classpathDependencyExclude>org.bouncycastle:bcprov-jdk15to18</classpathDependencyExclude>
+							</classpathDependencyExcludes>
+							<additionalClasspathDependencies>
+								<additionalClasspathDependency>
+									<groupId>org.bouncycastle</groupId>
+									<artifactId>bcprov-jdk15on</artifactId>
+									<version>1.69</version>
+								</additionalClasspathDependency>
+								<additionalClasspathDependency>
+									<groupId>org.bouncycastle</groupId>
+									<artifactId>bcpkix-jdk15on</artifactId>
+									<version>1.69</version>
+								</additionalClasspathDependency>
+								<additionalClasspathDependency>
+									<groupId>org.bouncycastle</groupId>
+									<artifactId>bcutil-jdk15on</artifactId>
+									<version>1.69</version>
+								</additionalClasspathDependency>
+							</additionalClasspathDependencies>
+						</configuration>
+					</plugin>
+				</plugins>
+			</build>
+		</profile>
+
 		<profile>
 			<id>openapi-doc-generate-profile</id>
 			<build>

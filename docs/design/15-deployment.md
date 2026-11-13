@@ -34,6 +34,8 @@ Security lists (`mosip.certify.security.ignore-auth-urls`, `ignore-csrf-urls`, `
 
 The issuer identity is unchanged: `mosip.certify.identifier` and `mosip.certify.domain.url` for the legacy document, the derived `/oid4vci` identifier for the new one, `mosip.certify.data-provider-plugin.did-url` for the DID. Set them to the URL wallets reach (behind nginx: the public host name; the compose default `http://certify-nginx:80` is internal).
 
+Changing `mosip.certify.domain.url` after credentials were issued: the status-list URIs inside those credentials keep the old domain, so keep the old host routed to Certify for as long as they are valid, or reissue them. For Token Status Lists routing alone is not enough: a list is signed with `sub` under the current domain and a verifier compares it with the token's `uri` (draft-ietf-oauth-status-list 8.3), so SD-JWT VC and mDoc credentials issued under the old domain need reissuing.
+
 Keys: keymanager stays the default provider with the same `key_policy_def`, keystore (`CERTIFY_PKCS12` mount or the HSM client that `configure_start.sh` installs when `install_hsm_client=true`), aliases and rotation; `kid` values and signature bytes are unchanged. The `x509-file` provider is opt-in for deployments with their own PKI.
 
 ### Well-known documents and the proxy

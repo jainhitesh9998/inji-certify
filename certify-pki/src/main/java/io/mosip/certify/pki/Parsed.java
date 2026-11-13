@@ -138,7 +138,7 @@ final class Parsed {
             Certificate structure = Certificate.getInstance(strict(der));
             requireDer(der, structure.getEncoded(ASN1Encoding.DER));
             TBSCertificate tbs = structure.getTBSCertificate();
-            return new Cert(firstElement(der), signature(structure.getSignature()), tbs.getVersionNumber(),
+            return new Cert(firstElement(der), signature(BcCompat.signatureValue(structure)), tbs.getVersionNumber(),
                     tbs.getSerialNumber().getValue(), name(tbs.getIssuer()), name(tbs.getSubject()),
                     instant(tbs.getStartDate()), instant(tbs.getEndDate()),
                     tbs.getSubjectPublicKeyInfo(), tbs.getExtensions(), structure.getSignatureAlgorithm(),
@@ -166,7 +166,7 @@ final class Parsed {
                         extensions != null));
             }
             Time nextUpdate = tbs.getNextUpdate();
-            return new Crl(firstElement(der), signature(structure.getSignature()), tbs.getVersionNumber(),
+            return new Crl(firstElement(der), signature(BcCompat.signatureValue(structure)), tbs.getVersionNumber(),
                     name(tbs.getIssuer()), instant(tbs.getThisUpdate()),
                     nextUpdate == null ? null : instant(nextUpdate), List.copyOf(entries), tbs.getExtensions(),
                     structure.getSignatureAlgorithm(), tbs.getSignature());

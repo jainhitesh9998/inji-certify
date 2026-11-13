@@ -14,6 +14,7 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -68,7 +69,8 @@ class JcaKeyProviderTest {
         for (String alias : loaded.aliases()) {
             SigningKey a = generated.resolve(new KeyRef("jca", alias));
             SigningKey b = loaded.resolve(new KeyRef("jca", alias));
-            assertEquals(a.descriptor().publicKey(), b.descriptor().publicKey());
+            // compared by encoding: BouncyCastle 1.69 keys equal only BouncyCastle keys, and the keystore loads JDK keys (bc169 profile)
+            assertArrayEquals(a.descriptor().publicKey().getEncoded(), b.descriptor().publicKey().getEncoded());
             assertEquals(a.chain().leafFirst(), b.chain().leafFirst());
         }
         // PS256 and RS256 share a key type; the loaded algorithm is derived from the key, so PS256 becomes RS256

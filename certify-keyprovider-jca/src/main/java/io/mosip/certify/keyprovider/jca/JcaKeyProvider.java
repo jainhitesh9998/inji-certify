@@ -17,7 +17,6 @@ import org.bouncycastle.jce.provider.BouncyCastleProvider;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.math.BigInteger;
@@ -302,7 +301,12 @@ public class JcaKeyProvider implements KeyProvider {
         entries.put(alias, new Entry(alias, privateKey, descriptor));
     }
 
-    /** Writes every key into a PKCS#12 keystore, e.g. to persist dev-mode keys between runs. */
+    /**
+     * Writes every key into a PKCS#12 keystore, e.g. to persist dev-mode keys between runs. The file holds private keys:
+     * a new keystore is created {@code rw-------} whatever the process umask and moved into place atomically; an existing
+     * one is rewritten in place, keeping every attribute (owner, group, permissions, native ACLs), after its previous
+     * content is saved as {@code <file>.bak} ({@code rw-------}) ({@link KeyStoreFiles#write}).
+     */
     public void saveAsPkcs12(Path path, char[] password) {
         try {
             KeyStore keyStore = KeyStore.getInstance("PKCS12");
@@ -311,9 +315,7 @@ public class JcaKeyProvider implements KeyProvider {
                 keyStore.setKeyEntry(entry.alias(), entry.privateKey(), password,
                         entry.descriptor().chain().leafFirst().toArray(new Certificate[0]));
             }
-            try (OutputStream out = Files.newOutputStream(path)) {
-                keyStore.store(out, password);
-            }
+            KeyStoreFiles.write(path, out -> keyStore.store(out, password));
         } catch (IOException | GeneralSecurityException e) {
             throw new SigningException("Cannot write PKCS#12 keystore " + path, e);
         }

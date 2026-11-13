@@ -104,6 +104,19 @@ jobs:
           done
         shell: bash
 
+      - name: BouncyCastle 1.69 compatibility (published plugin jars)
+        # Published plugin jars (mock-certify-plugin, mosip-identity-certify-plugin) bundle unshaded BouncyCastle 1.69
+        # and shadow the service's 1.78 on loader.path (decision log 2026-11-13, F-10). The bc169 profile keeps the
+        # 1.78 compile and runs these modules' tests with only the 1.69 jars on the test classpath; the linkage guard
+        # resolves against 1.69 every BouncyCastle reference in certify-service, the Certify modules and the
+        # third-party jars on its runtime classpath, with the exceptions in docs/design/tools/bc169-linkage-allowlist.txt.
+        # After the mDoc verifier step on purpose: the format tests rewrite their samples.
+        run: |
+          mvn -B -ntp -Dgpg.skip=true -Pbc169 \
+            -pl certify-pki,certify-signing,certify-keyprovider-jca,certify-keyprovider-x509-file,certify-format-mdoc -am test
+          docs/design/tools/check-bc169-linkage.sh
+        shell: bash
+
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@v4
