@@ -295,7 +295,9 @@ class TokenStatusListCwtTest {
                 () -> encode(SUB, IAT, EXP, null, BITS, SIGNING), "no ttl");
         // whole seconds: a fractional exp that truncates onto iat is refused rather than signed as a zero-length token
         assertThrows(IllegalArgumentException.class,
-                () -> encode(SUB, IAT, IAT.plusMillis(500), TTL, BITS, SIGNING));
+                () -> encode(SUB, IAT, IAT.plusMillis(500), TTL, BITS, SIGNING));        // an empty status list answers every index as out of range (review round 3 nit)
+        assertThrows(IllegalArgumentException.class,
+                () -> encode(SUB, IAT, EXP, TTL, new byte[0], SIGNING), "an empty bit array");
     }
 
     @Test
@@ -493,7 +495,16 @@ class TokenStatusListCwtTest {
                 // iat is a uint64 above Long.MAX_VALUE
                 mutate(encode(BITS), (protectedHeader, unprotectedHeader, payload) ->
                         payload.set(CBORObject.FromObject(TokenStatusListCwt.CLAIM_IAT),
-                                CBORObject.DecodeFromBytes(HexFormat.of().parseHex("1bffffffffffffffff")))));
+                                CBORObject.DecodeFromBytes(HexFormat.of().parseHex("1bffffffffffffffff")))),
+                // iat and exp at Long.MAX_VALUE: integers, but outside Instant's range (review round 3 minor)
+                mutate(encode(BITS), (protectedHeader, unprotectedHeader, payload) ->
+                        payload.set(CBORObject.FromObject(TokenStatusListCwt.CLAIM_IAT), CBORObject.FromObject(Long.MAX_VALUE))),
+                mutate(encode(BITS), (protectedHeader, unprotectedHeader, payload) ->
+                        payload.set(CBORObject.FromObject(TokenStatusListCwt.CLAIM_EXP), CBORObject.FromObject(Long.MAX_VALUE))),
+                // lst is a valid zlib stream of an empty bit array (review round 3 nit)
+                mutate(encode(BITS), (protectedHeader, unprotectedHeader, payload) ->
+                        payload.get(CBORObject.FromObject(TokenStatusListCwt.CLAIM_STATUS_LIST))
+                                .set(CBORObject.FromObject("lst"), CBORObject.FromObject(TokenStatusListService.zlib(new byte[0])))));
         for (byte[] candidate : refused) {
             IllegalStateException failure = assertThrows(IllegalStateException.class,
                     () -> TokenStatusListCwt.decode(candidate), HexFormat.of().formatHex(candidate));

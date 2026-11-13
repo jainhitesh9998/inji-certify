@@ -138,6 +138,10 @@ public final class TokenStatusListCwt {
                     + ": TSL section 5.2 makes the time to live a positive unsigned integer");
         }
         Objects.requireNonNull(bits, "bits");
+        if (bits.length == 0) {
+            throw new IllegalArgumentException("A status list holds at least one status: an empty bit array would answer"
+                    + " every index as out of range (TSL section 4.1)");
+        }
 
         try {
             // mandatory, before anything is encoded or signed: no public path signs a status-list CWT without it
@@ -339,6 +343,9 @@ public final class TokenStatusListCwt {
             throw refuse("claim 65533 (status_list) has no lst");
         }
         byte[] bitArray = inflate(bytes(lst, "status_list.lst"), maxBits / 8);
+        if (bitArray.length == 0) {
+            throw refuse("status_list.lst inflates to an empty bit array: a status list holds at least one status");
+        }
         return new Decoded(sub.AsString(), iat, exp, ttl, BITS, bitArray, x5chain);
     }
 
@@ -414,7 +421,13 @@ public final class TokenStatusListCwt {
     }
 
     private static Instant instant(CBORObject value, String name) {
-        return Instant.ofEpochSecond(integer(value, name));
+        long seconds = integer(value, name);
+        try {
+            return Instant.ofEpochSecond(seconds);
+        } catch (java.time.DateTimeException e) {
+            // e.g. Long.MAX_VALUE: outside Instant's range; refused like every other claim, never a DateTimeException
+            throw refuse(name + " " + seconds + " is outside the representable time range", e);
+        }
     }
 
     /**
