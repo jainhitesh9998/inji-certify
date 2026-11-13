@@ -11,7 +11,6 @@ import com.upokecenter.cbor.CBORObject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import picocli.CommandLine;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -45,7 +44,7 @@ class CertifyCliTest {
         PrintStream original = System.out;
         System.setOut(new PrintStream(out, true));
         try {
-            return new CommandLine(new CertifyCli()).execute(args);
+            return CertifyCli.commandLine().execute(args);
         } finally {
             System.setOut(original);
         }
