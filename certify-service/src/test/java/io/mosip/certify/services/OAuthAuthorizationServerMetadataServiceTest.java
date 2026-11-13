@@ -183,6 +183,8 @@ public class OAuthAuthorizationServerMetadataServiceTest {
         assertTrue("a deployment with no authorization-code clients still serves the pre-authorized grant",
                 Boolean.TRUE.equals(result.getPreAuthorizedGrantAnonymousAccessSupported()));
         assertNull("the authorization code flow is still not advertised without a client", result.getAuthorizationEndpoint());
+        assertNull(result.getPushedAuthorizationRequestEndpoint());
+        assertNull(result.getRequirePushedAuthorizationRequests());
     }
 
     @Test
@@ -218,6 +220,149 @@ public class OAuthAuthorizationServerMetadataServiceTest {
 
         assertTrue(Boolean.TRUE.equals(result.getPreAuthorizedGrantAnonymousAccessSupported()));
         assertEquals("http://localhost:8090/v1/certify/oauth/authorize", result.getAuthorizationEndpoint());
+    }
+
+    /**
+     * Gap G29 (RFC 8414 section 2): the document advertises only what this server can complete. With Certify's own
+     * token endpoint, {@code authorization_code} stays only when a code can be obtained - the own authorization endpoint
+     * (a registered client) or an Interactive Authorization Endpoint - and is removed otherwise, and the pre-authorized
+     * code grant takes its place rather than leaving an empty list (RFC 8414 gives an absent list the default
+     * {@code authorization_code, implicit}).
+     */
+    @Test
+    public void getOAuthAuthorizationServerMetadata_ExternalAuthorizationServerIsUnchanged() {
+        // eSignet's document is repeated, not composed: no endpoint ends in /oauth/token, so none of the rules apply
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "tokenEndpoint", "https://as.example/token");
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "grantTypesSupported",
+                "authorization_code,urn:ietf:params:oauth:grant-type:pre-authorized_code");
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "interactiveAuthorizationEndpoint", "");
+        asProperties(as(Map.of(), false, false));
+
+        OAuthAuthorizationServerMetadataDTO result = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+
+        assertEquals("an external AS's grants are the deployment's, not ours to trim",
+                Arrays.asList("authorization_code", "urn:ietf:params:oauth:grant-type:pre-authorized_code"),
+                result.getGrantTypesSupported());
+        assertEquals(Arrays.asList("S256"), result.getCodeChallengeMethodsSupported());
+        assertNull(result.getAuthorizationEndpoint());
+    }
+
+    /** IAE-only deployments keep authorization_code: the code is obtained at the IAE, so RFC 8414 section 2 holds. */
+    @Test
+    public void getOAuthAuthorizationServerMetadata_InteractiveAuthorizationEndpointKeepsAuthorizationCode() {
+        asProperties(as(Map.of(), false, false));
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "grantTypesSupported",
+                "authorization_code,urn:ietf:params:oauth:grant-type:pre-authorized_code");
+
+        OAuthAuthorizationServerMetadataDTO result = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+
+        assertEquals(Arrays.asList("authorization_code", "urn:ietf:params:oauth:grant-type:pre-authorized_code"),
+                result.getGrantTypesSupported());
+        assertNull("the code comes from the IAE, not from an authorization endpoint", result.getAuthorizationEndpoint());
+        assertEquals(TEST_INTERACTIVE_AUTHORIZATION_ENDPOINT, result.getInteractiveAuthorizationEndpoint());
+        assertEquals(Boolean.TRUE, result.getRequireInteractiveAuthorizationRequest());
+        assertEquals(Arrays.asList("S256"), result.getCodeChallengeMethodsSupported());
+    }
+
+    /** A registered client is the own authorization endpoint; authorization_code stays and is completable. */
+    @Test
+    public void getOAuthAuthorizationServerMetadata_OwnClientKeepsAuthorizationCodeWithItsEndpoint() {
+        asProperties(as(Map.of("wallet", new AsProperties.Client(List.of("https://wallet.example/cb"))), false, false));
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "grantTypesSupported",
+                "authorization_code,urn:ietf:params:oauth:grant-type:pre-authorized_code");
+
+        OAuthAuthorizationServerMetadataDTO result = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+
+        assertEquals(Arrays.asList("authorization_code", "urn:ietf:params:oauth:grant-type:pre-authorized_code"),
+                result.getGrantTypesSupported());
+        assertEquals("http://localhost:8090/v1/certify/oauth/authorize", result.getAuthorizationEndpoint());
+        assertEquals(Arrays.asList("S256"), result.getCodeChallengeMethodsSupported());
+    }
+
+    /** Nothing can issue an authorization code: the grant is removed, and the pre-authorized grant stays. */
+    @Test
+    public void getOAuthAuthorizationServerMetadata_UncompletableAuthorizationCodeIsRemoved() {
+        asProperties(as(Map.of(), false, false));
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "interactiveAuthorizationEndpoint", "");
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "grantTypesSupported",
+                "authorization_code,urn:ietf:params:oauth:grant-type:pre-authorized_code");
+
+        OAuthAuthorizationServerMetadataDTO result = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+
+        assertEquals(List.of("urn:ietf:params:oauth:grant-type:pre-authorized_code"), result.getGrantTypesSupported());
+        assertNull("PKCE is only about the authorization code grant", result.getCodeChallengeMethodsSupported());
+        assertNull(result.getAuthorizationEndpoint());
+        assertNull(result.getInteractiveAuthorizationEndpoint());
+    }
+
+    /** Removing the only configured grant must not leave the list empty: an absent list means authorization_code+implicit. */
+    @Test
+    public void getOAuthAuthorizationServerMetadata_NeverEmitsAnEmptyGrantList() {
+        asProperties(as(Map.of(), false, false));
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "interactiveAuthorizationEndpoint", "");
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "grantTypesSupported", "authorization_code");
+
+        OAuthAuthorizationServerMetadataDTO result = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+
+        assertEquals(List.of("urn:ietf:params:oauth:grant-type:pre-authorized_code"), result.getGrantTypesSupported());
+
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "grantTypesSupported", "");
+        assertEquals("an own token endpoint never publishes an empty (and therefore omitted) list",
+                List.of("urn:ietf:params:oauth:grant-type:pre-authorized_code"),
+                oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata().getGrantTypesSupported());
+    }
+
+    /** The requirement means nothing without the endpoint, so the two members are written together. */
+    @Test
+    public void getOAuthAuthorizationServerMetadata_InteractiveAuthorizationMembersArePaired() {
+        asProperties(as(Map.of(), false, false));
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "interactiveAuthorizationEndpoint", "");
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "requireInteractiveAuthorizationRequest", true);
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "grantTypesSupported",
+                "urn:ietf:params:oauth:grant-type:pre-authorized_code");
+
+        OAuthAuthorizationServerMetadataDTO withoutEndpoint = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+        assertNull(withoutEndpoint.getInteractiveAuthorizationEndpoint());
+        assertNull("a requirement naming no endpoint is not published", withoutEndpoint.getRequireInteractiveAuthorizationRequest());
+
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "interactiveAuthorizationEndpoint", TEST_INTERACTIVE_AUTHORIZATION_ENDPOINT);
+        OAuthAuthorizationServerMetadataDTO withEndpoint = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+        assertEquals(TEST_INTERACTIVE_AUTHORIZATION_ENDPOINT, withEndpoint.getInteractiveAuthorizationEndpoint());
+        assertEquals(Boolean.TRUE, withEndpoint.getRequireInteractiveAuthorizationRequest());
+    }
+
+    /**
+     * The mDL demo stack ({@code certify-mdl.properties}): pre-authorized only, no registered client, no IAE. Its live
+     * document is the issuer, token and JWKS endpoints, one grant, the response types, the DPoP algorithms and the
+     * anonymous pre-authorized grant - and nothing that names a flow it does not serve.
+     */
+    @Test
+    public void getOAuthAuthorizationServerMetadata_MdlDemoIsPreAuthorizedOnly() throws Exception {
+        asProperties(as(Map.of(), false, true));
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "grantTypesSupported",
+                "urn:ietf:params:oauth:grant-type:pre-authorized_code");
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "interactiveAuthorizationEndpoint", "");
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "requireInteractiveAuthorizationRequest", false);
+
+        OAuthAuthorizationServerMetadataDTO result = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+
+        assertEquals(List.of("urn:ietf:params:oauth:grant-type:pre-authorized_code"), result.getGrantTypesSupported());
+        assertNull(result.getAuthorizationEndpoint());
+        assertNull(result.getPushedAuthorizationRequestEndpoint());
+        assertNull(result.getRequirePushedAuthorizationRequests());
+        assertNull(result.getInteractiveAuthorizationEndpoint());
+        assertNull(result.getRequireInteractiveAuthorizationRequest());
+        assertNull(result.getCodeChallengeMethodsSupported());
+        assertEquals(Boolean.TRUE, result.getPreAuthorizedGrantAnonymousAccessSupported());
+        assertEquals("RFC 8414 section 2: REQUIRED", Arrays.asList("code"), result.getResponseTypesSupported());
+
+        com.fasterxml.jackson.databind.JsonNode document = new com.fasterxml.jackson.databind.ObjectMapper().valueToTree(result);
+        java.util.Set<String> members = new java.util.TreeSet<>();
+        document.fieldNames().forEachRemaining(members::add);
+        assertEquals("nothing advertises a flow this stack does not serve: " + document,
+                new java.util.TreeSet<>(List.of("issuer", "token_endpoint", "jwks_uri", "grant_types_supported",
+                        "response_types_supported", "pre-authorized_grant_anonymous_access_supported")),
+                members);
     }
 
     private void asProperties(AsProperties properties) {

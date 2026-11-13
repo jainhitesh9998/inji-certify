@@ -5,8 +5,11 @@ Plays a wallet against the public URL (certify-nginx, CERTIFY_PUBLIC_URL), only 
 metadata say:
 
   1. pre-authorized offers for the mDL configuration with "issuer": "oid4vci", by reference and by value;
-  2. issuer metadata at the OpenID4VCI 1.0 section 12.2.2 location derived from the offer's credential_issuer, and the
-     authorization server metadata (RFC 8414) of its authorization server;
+  2. issuer metadata at the OpenID4VCI 1.0 section 12.2.2 location derived from the offer's credential_issuer - also
+     with Accept: application/jwt, which must still answer 200 application/json (12.2.2) - and the authorization
+     server metadata (RFC 8414) of its authorization server: a present, non-empty grant_types_supported, and every
+     authorization_code it lists completable through authorization_endpoint or interactive_authorization_endpoint (gap
+     G29: the demo listed the grant without either and Talao's wallet aborted);
   3. a P-256 holder: token (anonymous pre-authorized grant, Bearer), nonce, credential with an ES256 jwt proof,
      notification, nonce replay refused;
   4. an Ed25519 holder: a DPoP-bound token, nonce, credential with an EdDSA jwt proof (ISO/IEC 18013-5 9.1.5.2);
@@ -480,6 +483,26 @@ class Smoke:
               and PRE_AUTH in self.as_metadata.get("grant_types_supported", [])
               and self.as_metadata.get("pre-authorized_grant_anonymous_access_supported") is True,
               {"url": as_url, "status": s} | {k: self.as_metadata.get(k) for k in ("issuer", "token_endpoint", "pre-authorized_grant_anonymous_access_supported")})
+        # RFC 8414 section 2: the document advertises only grants it can complete. grant_types_supported must be present
+        # and non-empty (an absent list defaults to authorization_code and implicit), and authorization_code needs
+        # authorization_endpoint - or, for presentation during issuance, a configured interactive_authorization_endpoint.
+        # The demo listed authorization_code with neither and a wallet that follows authorization_servers[0] aborted (G29).
+        grants = self.as_metadata.get("grant_types_supported") or []
+        authorization_code_completable = (self.as_metadata.get("authorization_endpoint") is not None
+                                         or self.as_metadata.get("interactive_authorization_endpoint") is not None)
+        check("authorization server metadata: non-empty grant_types_supported, authorization_code completable (RFC 8414 s2)",
+              bool(grants) and ("authorization_code" not in grants or authorization_code_completable),
+              {"grant_types_supported": grants,
+               "authorization_endpoint": self.as_metadata.get("authorization_endpoint"),
+               "interactive_authorization_endpoint": self.as_metadata.get("interactive_authorization_endpoint")})
+        # OpenID4VCI 1.0 section 12.2.2: the unsigned form is the one this issuer serves and its Content-Type must say
+        # so. A wallet that prefers the signed form (Accept: application/jwt) must still get the document, not a 406.
+        jwt_status, jwt_headers, jwt_metadata = call("GET", url, headers={"Accept": "application/jwt"})
+        content_type = (jwt_headers.get("content-type") or "").lower()
+        check("issuer metadata with Accept: application/jwt: 200 and application/json (OID4VCI 1.0 12.2.2)",
+              jwt_status == 200 and content_type.startswith("application/json") and isinstance(jwt_metadata, dict)
+              and jwt_metadata.get("credential_issuer") == self.issuer,
+              {"status": jwt_status, "content-type": content_type})
         return bool(self.metadata.get("credential_endpoint") and self.as_metadata.get("token_endpoint"))
 
     # ---------------------------------------------------------------------------------------------- the flow

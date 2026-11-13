@@ -3,6 +3,8 @@ package io.mosip.certify.oid4vci.d13;
 import io.mosip.certify.core.spi.VCIssuanceService;
 import io.mosip.certify.deprecation.DeprecatedEndpoint;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -30,20 +32,31 @@ public class D13DiscoveryController {
     }
 
     @DeprecatedEndpoint(name = DEPRECATION_NAME, since = D13CredentialController.SINCE, replacement = REPLACEMENT)
-    @GetMapping(value = "/.well-known/openid-credential-issuer", params = "version", produces = "application/json")
-    public Map<String, Object> versionedMetadata(@RequestParam("version") String version) {
-        return metadata.metadata(version);
+    @GetMapping(value = "/.well-known/openid-credential-issuer", params = "version")
+    public ResponseEntity<Map<String, Object>> versionedMetadata(@RequestParam("version") String version) {
+        return asJson(metadata.metadata(version));
     }
 
     @DeprecatedEndpoint(name = DEPRECATION_NAME, since = D13CredentialController.SINCE, replacement = REPLACEMENT)
-    @GetMapping(value = "/issuance/.well-known/openid-credential-issuer", produces = "application/json")
-    public Map<String, Object> issuanceMetadata(@RequestParam(name = "version", required = false, defaultValue = D13MetadataService.VERSION_LATEST) String version) {
-        return metadata.metadata(version);
+    @GetMapping("/issuance/.well-known/openid-credential-issuer")
+    public ResponseEntity<Map<String, Object>> issuanceMetadata(@RequestParam(name = "version", required = false, defaultValue = D13MetadataService.VERSION_LATEST) String version) {
+        return asJson(metadata.metadata(version));
     }
 
     @DeprecatedEndpoint(name = DEPRECATION_NAME, since = D13CredentialController.SINCE, replacement = "/.well-known/did.json")
-    @GetMapping(value = "/issuance/.well-known/did.json", produces = "application/json")
-    public Map<String, Object> issuanceDidDocument() {
-        return vcIssuanceService.getDIDDocument();
+    @GetMapping("/issuance/.well-known/did.json")
+    public ResponseEntity<Map<String, Object>> issuanceDidDocument() {
+        return asJson(vcIssuanceService.getDIDDocument());
+    }
+
+    /**
+     * The 0.14.0 document is JSON only, and the {@code Content-Type} is set on the response rather than declared with
+     * {@code produces}: a client that sends {@code Accept: application/jwt} or {@code text/html} gets the document
+     * (OpenID4VCI 1.0 section 12.2.2 requires the media type to be named, and these deprecated aliases serve the same
+     * unsigned form as the current path) instead of a 406, or a 500 from the {@code /issuance/} error advice as
+     * {@code /issuance/.well-known/openid-credential-issuer} did. Bodies are unchanged, so the goldens replay.
+     */
+    private static ResponseEntity<Map<String, Object>> asJson(Map<String, Object> document) {
+        return ResponseEntity.ok().contentType(MediaType.APPLICATION_JSON).body(document);
     }
 }
