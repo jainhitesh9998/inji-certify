@@ -2,6 +2,7 @@ package io.mosip.certify.keyprovider.keymanager;
 
 import com.nimbusds.jose.jwk.Curve;
 import io.mosip.certify.signing.CertificateChain;
+import io.mosip.certify.signing.CertificateLinks;
 import io.mosip.certify.signing.KeyFilter;
 import io.mosip.certify.signing.KeyProvider;
 import io.mosip.certify.signing.KeyRef;
@@ -10,6 +11,7 @@ import io.mosip.certify.signing.PublicKeyDescriptor;
 import io.mosip.certify.signing.SignatureAlgorithm;
 import io.mosip.certify.signing.SigningException;
 import io.mosip.certify.signing.SigningKey;
+import io.mosip.certify.signing.TrustAnchorRegistry;
 import io.mosip.kernel.keymanagerservice.dto.AllCertificatesDataResponseDto;
 import io.mosip.kernel.keymanagerservice.dto.CertificateDataResponseDto;
 import io.mosip.kernel.keymanagerservice.dto.KeyPairGenerateRequestDto;
@@ -40,6 +42,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Supplier;
 
 /**
  * {@link KeyProvider} over the embedded MOSIP kernel-keymanager. Signing goes through
@@ -50,6 +53,15 @@ import java.util.concurrent.ConcurrentHashMap;
  * within {@code cacheTtl}. An alias without certificates (not provisioned yet) is cached for at most
  * {@link #MAX_NEGATIVE_TTL}, so the JWKS and every resolve do not call keymanager on each request, while a key
  * provisioned later is seen at once: {@link #ensureKeys} and {@link #evict} (called after the master keys) drop it.
+ *
+ * <p>Keymanager returns a certificate alone. When a configured {@link TrustAnchorRegistry} IACA issued it (a Document
+ * Signer key whose CSR an IACA signed and an operator uploaded, docs/design/20-mdl-issuer.md M-06/M-07), the chain is
+ * completed to {@code [DSC, IACA]} so the mDoc DSC policy can check it and {@code without-anchor} still carries the DSC
+ * alone; any other certificate (keymanager's own self-signed or master-signed ones) keeps its one-certificate chain,
+ * so a deployment without trust anchors sees the same chains, headers and bytes as before. What this provider publishes
+ * ({@link #publicKeys(KeyFilter)} for the JWKS, {@link #publicKeys(KeyRef)} for DID documents) leaves the IACA out,
+ * as before the completion: an IACA is a trust anchor, published at {@code /mdoc/iaca} (M-08) and never in a JWKS
+ * (M-05), so a completed key's {@code x5c} stays the DSC alone.
  */
 public class KeymanagerKeyProvider implements KeyProvider {
 
@@ -70,9 +82,21 @@ public class KeymanagerKeyProvider implements KeyProvider {
     private final Duration cacheTtl;
     private final Duration negativeTtl;
     private final Map<KeymanagerAlias, CachedCertificates> cache = new ConcurrentHashMap<>();
+    private final Supplier<TrustAnchorRegistry> trustAnchors;
 
     public KeymanagerKeyProvider(KeymanagerService keymanagerService, SignatureServicev2 signatureService,
                                  List<KeymanagerAlias> knownAliases, Clock clock, Duration cacheTtl) {
+        this(keymanagerService, signatureService, knownAliases, clock, cacheTtl, () -> null);
+    }
+
+    /**
+     * @param trustAnchors the registry leaf-only chains are completed from, read when certificates are (re)loaded; it may
+     *                     supply {@code null} when the application registers none
+     */
+    public KeymanagerKeyProvider(KeymanagerService keymanagerService, SignatureServicev2 signatureService,
+                                 List<KeymanagerAlias> knownAliases, Clock clock, Duration cacheTtl,
+                                 Supplier<TrustAnchorRegistry> trustAnchors) {
+        this.trustAnchors = trustAnchors == null ? () -> null : trustAnchors;
         this.keymanagerService = keymanagerService;
         this.signatureService = signatureService;
         this.knownAliases = List.copyOf(knownAliases);
@@ -111,7 +135,7 @@ public class KeymanagerKeyProvider implements KeyProvider {
         KeyFilter f = filter == null ? KeyFilter.ALL : filter;
         List<PublicKeyDescriptor> out = new ArrayList<>();
         for (KeymanagerAlias alias : knownAliases) {
-            descriptors(alias).stream().filter(f::matches).forEach(out::add);
+            descriptors(alias).stream().filter(f::matches).map(KeymanagerKeyProvider::published).forEach(out::add);
         }
         return out;
     }
@@ -122,7 +146,14 @@ public class KeymanagerKeyProvider implements KeyProvider {
         if (!ID.equals(ref.provider())) {
             throw new SigningException("KeyRef " + ref + " is not for provider " + ID);
         }
-        return descriptors(KeymanagerAlias.of(ref));
+        return descriptors(KeymanagerAlias.of(ref)).stream().map(KeymanagerKeyProvider::published).toList();
+    }
+
+    /** A key as published: without the IACA a completed chain ends at (the trust anchor is not part of the key). */
+    private static PublicKeyDescriptor published(PublicKeyDescriptor descriptor) {
+        CertificateChain chain = descriptor.chain().withoutAnchor();
+        return chain == descriptor.chain() ? descriptor : new PublicKeyDescriptor(descriptor.kid(), descriptor.algorithm(),
+                descriptor.publicKey(), chain, descriptor.notBefore(), descriptor.notAfter(), descriptor.purpose());
     }
 
     /** The aliases this provider publishes (from configuration); any other alias can still be resolved on demand. */
@@ -222,9 +253,24 @@ public class KeymanagerKeyProvider implements KeyProvider {
     private PublicKeyDescriptor descriptor(CertificateDataResponseDto dto) {
         X509Certificate certificate = parseCertificate(dto.getCertificateData());
         PublicKey publicKey = certificate.getPublicKey();
-        return new PublicKeyDescriptor(dto.getKeyId(), algorithmFor(publicKey), publicKey, CertificateChain.of(certificate),
+        return new PublicKeyDescriptor(dto.getKeyId(), algorithmFor(publicKey), publicKey, chainOf(certificate),
                 toInstant(dto.getIssuedAt(), certificate.getNotBefore().toInstant()),
                 toInstant(dto.getExpiryAt(), certificate.getNotAfter().toInstant()), PURPOSE_VC_SIGNING);
+    }
+
+    /**
+     * The certificate with the configured IACA that issued it ({@link CertificateLinks#issuedBy}: authority key
+     * identifier equal to the IACA's subject key identifier, else the issuer name, and the signature verifies), or the
+     * certificate alone. Keymanager's self-signed and master-signed certificates are issued by no IACA and stay alone.
+     */
+    private CertificateChain chainOf(X509Certificate certificate) {
+        TrustAnchorRegistry registry = CertificateLinks.selfIssued(certificate) ? null : trustAnchors.get();
+        if (registry == null) {
+            return CertificateChain.of(certificate);
+        }
+        return CertificateLinks.issuerAmong(certificate, registry.anchors(TrustAnchorRegistry.MDOC_IACA))
+                .map(iaca -> CertificateChain.of(certificate, iaca))
+                .orElseGet(() -> CertificateChain.of(certificate));
     }
 
     private static Instant toInstant(LocalDateTime keymanagerTime, Instant fallback) {

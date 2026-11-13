@@ -34,6 +34,12 @@
             <version>${project.version}</version>
         </dependency>
         <dependency>
+            <!-- ISO/IEC 18013-5 Annex B rules the DSC policy names (M-06); BouncyCastle only, no Spring -->
+            <groupId>io.inji.certify</groupId>
+            <artifactId>certify-pki</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
             <groupId>co.nstant.in</groupId>
             <artifactId>cbor</artifactId>
             <version>0.9</version>

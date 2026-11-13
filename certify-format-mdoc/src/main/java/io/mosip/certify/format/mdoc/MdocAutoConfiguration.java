@@ -1,8 +1,10 @@
 package io.mosip.certify.format.mdoc;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.mosip.certify.signing.TrustAnchorRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -10,7 +12,10 @@ import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.context.annotation.Bean;
 import org.springframework.core.env.Environment;
 
-/** Registers the mDoc formatter wherever this module is on the classpath (CLAUDE.md rule 10). */
+/**
+ * Registers the mDoc formatter wherever this module is on the classpath (CLAUDE.md rule 10), with the DSC policy over
+ * the application's {@link TrustAnchorRegistry} when one is registered (M-06).
+ */
 @AutoConfiguration
 @EnableConfigurationProperties(MdocProperties.class)
 public class MdocAutoConfiguration {
@@ -23,8 +28,28 @@ public class MdocAutoConfiguration {
 
     @Bean
     @ConditionalOnMissingBean(MdocFormatter.class)
-    public MdocFormatter mdocFormatter(ObjectMapper objectMapper, MdocProperties properties, Environment environment) {
-        return new MdocFormatter(objectMapper, resolve(properties, Binder.get(environment)));
+    public MdocFormatter mdocFormatter(ObjectMapper objectMapper, MdocProperties properties, Environment environment,
+                                       ObjectProvider<TrustAnchorRegistry> trustAnchors) {
+        return new MdocFormatter(objectMapper, resolve(properties, Binder.get(environment)),
+                dscPolicy(trustAnchors.getIfAvailable()));
+    }
+
+    /**
+     * The DSC policy, and the one startup line that says whether its trust-anchor rules apply (decision log
+     * 2026-11-13, refining D16): with no {@code mdoc-iaca} anchor configured, mDocs keep signing as they did before M-06.
+     */
+    static MdocDscPolicy dscPolicy(TrustAnchorRegistry registry) {
+        MdocDscPolicy policy = new MdocDscPolicy(registry);
+        if (policy.enforced()) {
+            log.info("mso_mdoc DSC policy enforced on every surface: Document Signers must be issued by one of the IACAs {}",
+                    registry.entries(TrustAnchorRegistry.MDOC_IACA).stream().map(TrustAnchorRegistry.Anchor::id).toList());
+        } else {
+            // INFO, not WARN: most deployments issue no mso_mdoc at all, and for them this is the expected state
+            log.info("mso_mdoc DSC policy is not enforced: no IACA trust anchor is configured"
+                    + " (certify.pki.trust-anchors.mdoc-iaca, or an x509-file iaca); mDocs are signed without checking"
+                    + " the Document Signer against an IACA");
+        }
+        return policy;
     }
 
     /**

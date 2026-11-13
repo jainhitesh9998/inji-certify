@@ -72,6 +72,28 @@ final class KeymanagerStandIn {
         return kid;
     }
 
+    /** Generates an Annex B IACA in the stand-in's own key store (the operator's offline IACA, outside keymanager). */
+    X509Certificate addIaca(String jcaAlias, String commonName) {
+        return jca.generateIaca(jcaAlias, new io.mosip.certify.keyprovider.jca.MdocIacaSpec(SignatureAlgorithm.ES256, "IN", null,
+                commonName, "https://credentials.example.test", null,
+                "https://credentials.example.test/v1/certify/mdoc/iaca/" + jcaAlias + ".crl", null)).chain().leaf().orElseThrow();
+    }
+
+    /**
+     * A keymanager key whose certificate the IACA under {@code iacaAlias} issued: the CSR flow (generate-csr, the IACA
+     * signs it, uploadCertificate), after which keymanager returns the DSC alone. Returns its key id.
+     */
+    String addIssuedKey(KeymanagerAlias alias, String iacaAlias, LocalDateTime issuedAt, LocalDateTime expiryAt) {
+        String jcaAlias = alias + "#" + certificates.getOrDefault(alias, List.of()).size();
+        X509Certificate certificate = jca.generateMdocDsc(jcaAlias, SignatureAlgorithm.ES256, "Lorem Ipsum Demo DSC", 400, iacaAlias)
+                .chain().leaf().orElseThrow();
+        String kid = thumbprint(certificate);
+        kidToJcaAlias.put(kid, jcaAlias);
+        certificates.computeIfAbsent(alias, k -> new ArrayList<>())
+                .add(new CertificateDataResponseDto(pem(certificate), issuedAt, expiryAt, kid));
+        return kid;
+    }
+
     static String thumbprint(X509Certificate certificate) {
         try {
             return Hex.toHexString(MessageDigest.getInstance("SHA-256").digest(certificate.getEncoded())).toUpperCase();

@@ -17,6 +17,7 @@ import io.mosip.certify.core.constants.Constants;
 import io.mosip.certify.core.constants.ErrorConstants;
 import io.mosip.certify.core.constants.VCDM2Constants;
 import io.mosip.certify.core.exception.CertifyException;
+import io.mosip.certify.format.mdoc.MdocDscPolicy;
 import io.mosip.certify.issuance.KeyProviderRegistry;
 import io.mosip.certify.signing.CoseEnvelope;
 import io.mosip.certify.signing.CoseHeaderPolicy;
@@ -26,6 +27,8 @@ import io.mosip.certify.signing.LegacyKeyRefs;
 import io.mosip.certify.signing.SignatureAlgorithm;
 import io.mosip.certify.signing.SigningException;
 import io.mosip.certify.signing.SigningKey;
+import io.mosip.certify.signing.TrustAnchorRegistry;
+import io.mosip.certify.spi.FormatException;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
@@ -41,6 +44,8 @@ import java.util.Map;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.beans.BeansException;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
@@ -60,6 +65,18 @@ public class MDocProcessor {
 
     @Autowired
     private KeyProviderRegistry keyProviders;
+
+    /**
+     * The trust anchors the DSC policy checks against (M-06): the same registry the refactored formatter's policy uses,
+     * taken directly rather than through an {@code MdocFormatter} bean, so a second formatter bean cannot switch the
+     * policy off on this path.
+     */
+    @Autowired
+    private ObjectProvider<TrustAnchorRegistry> trustAnchors;
+
+    /** The policy over {@link #policyRegistry}, kept so its profile cache survives between signatures. */
+    private volatile MdocDscPolicy dscPolicy;
+    private volatile TrustAnchorRegistry policyRegistry;
 
     /**
      * Process templated JSON to create final mDoc structure
@@ -509,6 +526,7 @@ public class MDocProcessor {
             SignatureAlgorithm algorithm = SignatureAlgorithm.fromJose(signAlgorithm)
                     .orElseThrow(() -> new CertifyException(ErrorConstants.VC_SIGNING_ERROR, "Unsupported signature algorithm " + signAlgorithm));
             SigningKey key = provider.resolve(ref).withAlgorithm(algorithm);
+            requireTrustedDocumentSigner(key);
             // ISO/IEC 18013-5 IssuerAuth: alg in the protected header, x5chain unprotected, untagged COSE_Sign1
             return CoseEnvelope.sign1(msoCbor, CoseHeaderPolicy.mdocIssuerAuth(), key, provider);
         } catch (CertifyException e) {
@@ -517,7 +535,54 @@ public class MDocProcessor {
         } catch (SigningException e) {
             log.error("Error during COSE signing: {}", e.getMessage(), e);
             throw new CertifyException(ErrorConstants.VC_SIGNING_ERROR, "COSE signing failed: " + e.getMessage());
+        } catch (FormatException e) {
+            log.error("mDoc DSC policy refused the signing key: {} {}", e.getErrorCode(), e.getMessage());
+            throw new CertifyException(ErrorConstants.VC_SIGNING_ERROR, "COSE signing failed: " + e.getErrorCode() + ": " + e.getMessage());
         }
+    }
+
+    /**
+     * The DSC policy's trust-anchor rules (docs/design/20-mdl-issuer.md M-06, D16 as refined in the decision log) hold on
+     * this legacy path too once IACAs are configured; without them nothing is checked here, so the bytes this path signs
+     * stay those of the {@code legacy-develop} golden (CLAUDE.md rule 1).
+     */
+    private void requireTrustedDocumentSigner(SigningKey key) {
+        MdocDscPolicy policy = dscPolicy();
+        if (!policy.enforced()) {
+            return;
+        }
+        MdocDscPolicy.requireX5chain(CoseHeaderPolicy.mdocIssuerAuth().x5chain(), key.chain());
+        policy.check(key.chain(), java.time.Instant.now());
+    }
+
+    /**
+     * The policy over the application's {@link TrustAnchorRegistry} (the {@code @Primary} one when several exist). When
+     * no single registry can be chosen while one of them holds {@code mdoc-iaca} anchors, the policy cannot be applied
+     * and signing fails closed ({@link MdocDscPolicy#TRUST_ANCHORS_UNAVAILABLE}): configured anchors must never be
+     * skipped silently. No registry, or several without anchors, means not enforced, as before M-06.
+     */
+    MdocDscPolicy dscPolicy() {
+        TrustAnchorRegistry registry;
+        try {
+            registry = trustAnchors == null ? null : trustAnchors.getIfAvailable();
+        } catch (BeansException e) {
+            List<TrustAnchorRegistry> registries = trustAnchors.orderedStream().toList();
+            if (registries.stream().anyMatch(candidate -> !candidate.entries(TrustAnchorRegistry.MDOC_IACA).isEmpty())) {
+                throw MdocDscPolicy.unavailable(registries.size() + " TrustAnchorRegistry beans hold mdoc-iaca anchors"
+                        + " and none is primary (" + e.getMessage() + ")");
+            }
+            registry = null;
+        }
+        if (registry == null) {
+            return MdocDscPolicy.notEnforced();
+        }
+        MdocDscPolicy policy = dscPolicy;
+        if (policy == null || policyRegistry != registry) {
+            policy = new MdocDscPolicy(registry);
+            policyRegistry = registry;
+            dscPolicy = policy;
+        }
+        return policy;
     }
 
     /**

@@ -2,6 +2,7 @@ package io.mosip.certify.keyprovider.jca;
 
 import com.nimbusds.jose.crypto.impl.ECDSA;
 import io.mosip.certify.pki.AnnexBValidator;
+import io.mosip.certify.pki.CrlBuilder;
 import io.mosip.certify.pki.IsoMdocProfiles;
 import io.mosip.certify.signing.CertificateChain;
 import io.mosip.certify.signing.KeyFilter;
@@ -19,13 +20,16 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.math.BigInteger;
 import java.security.GeneralSecurityException;
+import java.security.KeyPair;
 import java.security.KeyStore;
 import java.security.PrivateKey;
 import java.security.Security;
 import java.security.Signature;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateParsingException;
+import java.security.cert.X509CRL;
 import java.security.cert.X509Certificate;
 import java.security.interfaces.ECPublicKey;
 import java.security.interfaces.RSAPublicKey;
@@ -269,6 +273,20 @@ public class JcaKeyProvider implements KeyProvider {
         add(alias, generated.privateKey(), CertificateChain.of(generated.certificate(), iacaCertificate), algorithm,
                 PURPOSE_MDOC_DSC);
         return resolve(new KeyRef(id, alias));
+    }
+
+    /**
+     * An empty CRL signed by an IACA this provider holds the private key of (dev mode only: in production the IACA key
+     * stays offline, D3, and the operator publishes the CRL it signed). Empty when no entry holds {@code iaca} with its
+     * key. The caller keeps the CRL number increasing (RFC 5280 5.2.3).
+     */
+    public Optional<X509CRL> issueEmptyCrl(X509Certificate iaca, BigInteger crlNumber, Instant thisUpdate, Instant nextUpdate) {
+        Optional<Entry> holder = entries.values().stream()
+                .filter(entry -> PURPOSE_MDOC_IACA.equals(entry.descriptor().purpose()) && entry.privateKey() != null)
+                .filter(entry -> entry.descriptor().chain().leaf().map(iaca::equals).orElse(false))
+                .findFirst();
+        return holder.map(entry -> CrlBuilder.forIaca(iaca, new KeyPair(iaca.getPublicKey(), entry.privateKey()))
+                .crlNumber(crlNumber).thisUpdate(thisUpdate).nextUpdate(nextUpdate).build());
     }
 
     /**

@@ -213,16 +213,19 @@ public class DefaultIssuanceService implements IssuanceService {
         for (IssuanceListener listener : listeners) {
             unsigned = listener.beforeSign(unsigned, configuration, context);
         }
-        // a tenant with its own DID issues under it: the proof's verification method and the issuer must resolve together
-        String tenantDid = context.tenant() == null ? null : context.tenant().issuerDid();
-        SigningConfig signingConfig = tenantDid == null || tenantDid.isBlank() || tenantDid.equals(configuration.signing().issuerDid())
-                ? configuration.signing() : configuration.signing().withIssuerDid(tenantDid);
-        SigningContext signing = keyProviders.signingContext(signingConfig);
+        SigningContext signing = keyProviders.signingContext(signingConfig(configuration, context));
         try {
             return new Issued(formatter.sign(unsigned, signing, context), claims);
         } catch (FormatException e) {
             throw callerError(e);
         }
+    }
+
+    /** A tenant with its own DID issues under it: the proof's verification method and the issuer must resolve together. */
+    private static SigningConfig signingConfig(CredentialConfiguration configuration, IssuanceContext context) {
+        String tenantDid = context.tenant() == null ? null : context.tenant().issuerDid();
+        return tenantDid == null || tenantDid.isBlank() || tenantDid.equals(configuration.signing().issuerDid())
+                ? configuration.signing() : configuration.signing().withIssuerDid(tenantDid);
     }
 
     private static UnsignedCredential build(CredentialFormatter formatter, ClaimSet claims, CredentialConfiguration configuration,
@@ -251,7 +254,10 @@ public class DefaultIssuanceService implements IssuanceService {
         CredentialFormatter formatter = formatters.require(configuration.format());
         ClaimSet rendered = configuration.strategy() == io.mosip.certify.spi.IssuanceStrategy.TEMPLATE
                 ? render(claims, configuration, context, holder) : claims;
-        return formatter.build(rendered, configuration, context, holder);
+        UnsignedCredential unsigned = formatter.build(rendered, configuration, context, holder);
+        // the key checks sign() would run (the mDoc DSC policy, M-06): the key is resolved only if the format asks for it
+        formatter.checkSigningKey(() -> keyProviders.signingContext(signingConfig(configuration, context)), configuration, context);
+        return unsigned;
     }
 
     private ClaimSet render(ClaimSet fetched, CredentialConfiguration configuration, IssuanceContext context, HolderBinding holder) {

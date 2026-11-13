@@ -1,7 +1,9 @@
 package io.mosip.certify.keyprovider.keymanager;
 
+import io.mosip.certify.signing.TrustAnchorRegistry;
 import io.mosip.kernel.keymanagerservice.service.KeymanagerService;
 import io.mosip.kernel.signature.service.SignatureServicev2;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.data.jpa.JpaRepositoriesAutoConfiguration;
@@ -64,7 +66,8 @@ public class KeymanagerKeyProviderConfiguration {
     @Bean
     public KeymanagerKeyProvider keymanagerKeyProvider(KeymanagerService keymanagerService, SignatureServicev2 signatureService,
                                                        KeymanagerProviderProperties properties,
-                                                       @Value("#{${mosip.certify.signature-algo.key-alias-mapper:{}}}") Map<String, List<List<String>>> keyAliasMapper) {
+                                                       @Value("#{${mosip.certify.signature-algo.key-alias-mapper:{}}}") Map<String, List<List<String>>> keyAliasMapper,
+                                                       ObjectProvider<TrustAnchorRegistry> trustAnchors) {
         List<KeymanagerAlias> known = new ArrayList<>();
         known.add(new KeymanagerAlias(KeymanagerKeyInitializer.CERTIFY_SERVICE_APP_ID, ""));
         if (keyAliasMapper != null) {
@@ -75,7 +78,9 @@ public class KeymanagerKeyProviderConfiguration {
                 }
             }));
         }
-        return new KeymanagerKeyProvider(keymanagerService, signatureService, known, Clock.systemUTC(), properties.certificateCacheTtl());
+        // M-06: a DSC certificate an IACA issued through the CSR flow is completed to [DSC, IACA] from the registry
+        return new KeymanagerKeyProvider(keymanagerService, signatureService, known, Clock.systemUTC(), properties.certificateCacheTtl(),
+                trustAnchors::getIfAvailable);
     }
 
     @Bean

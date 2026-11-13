@@ -173,12 +173,31 @@ with the providers every `certify.signing.key-expiry.reconcile-interval` (`PT1H`
 a key that appears later gets a gauge, a key that is gone loses it, and a provider unavailable at startup is picked up
 when it answers. A provider that fails to answer is logged and keeps its previous gauges.
 
-## Publishing the IACA (M-06)
+## Trust anchors and publishing the IACA (M-06, M-08)
 
 `X509FileKeyProviders.iacaCertificates(provider)` returns the IACA certificates this provider can publish: the dev-mode
 IACA entry and the anchor each Document Signer chain ends at (production), deduplicated by encoding. A self-signed
 certificate counts only when it passes `AnnexBValidator.validateIaca`, so the P3-08 dev CA and a plain self-signed dev
-key are excluded. The method serves nothing over HTTP; M-06's trust-anchor registry reads it.
+key are excluded. The method serves nothing over HTTP: `certify-service`'s `FileTrustAnchorRegistry` adds these IACAs to
+`certify.pki.trust-anchors.mdoc-iaca` automatically when this provider is enabled, which **enforces the mDoc DSC policy**
+on every surface (docs/design/20-mdl-issuer.md M-06): a dev IACA in the keystore means mDocs must be signed by a
+Document Signer one of the configured IACAs issued.
+
+An IACA is named by the `<id>` of its CRL distribution point when that is `…/mdoc/iaca/<id>.crl`, so set `iaca.crl-uri`
+to `https://<host>/v1/certify/mdoc/iaca/<id>.crl` and, with `certify.pki.publication.enabled=true`, `GET
+/mdoc/iaca/<id>.crl` serves the CRL the Document Signers point at (M-08). `<id>` must be lower-case letters, digits,
+`.`, `_` and `-`, starting with a letter or digit, at most 64 characters (`[a-z0-9][a-z0-9._-]{0,63}`), and the same as
+`certify.pki.trust-anchors.mdoc-iaca[].id` when the IACA is also configured there with an id; otherwise the service
+refuses to start, since the URL every Document Signer copies would answer 404. The same rule holds for the
+`certify-cli pki iaca create --crl-uri` of a production IACA (M-07). In dev mode the provider holds the IACA's key,
+so `JcaKeyProvider.issueEmptyCrl` signs that CRL (empty, re-issued by the registry half way through
+`certify.pki.trust-anchors.dev-crl-validity`, numbered after the last number kept in `<path>.crl-numbers` next to the
+keystore, so numbers keep increasing across restarts; the keystore's directory must be writable in dev mode, or the
+service does not start); with `certify.pki.trust-anchors.crl-refresh-interval` zero or
+negative it is never re-issued, goes stale after `dev-crl-validity`, and mDoc signing stops `certify.pki.stale-crl-grace`
+later (`CRL_STALE`) until a restart. In production the IACA key stays offline (D3) and the operator configures the CRL
+file it signed as `certify.pki.trust-anchors.mdoc-iaca[].crl` next to the same IACA certificate, and replaces it with
+a CRL of a larger cRLNumber before its `nextUpdate`.
 
 ## Tests
 

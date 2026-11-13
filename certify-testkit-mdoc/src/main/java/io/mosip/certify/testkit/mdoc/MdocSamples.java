@@ -42,7 +42,8 @@ import java.util.stream.Stream;
  *     <li>{@code <name>.doctype} — the docType the credential configuration asked for;</li>
  *     <li>{@code <name>.gaps} — the problems this sample is known to have, one {@code <check>:<code>} each
  *     ({@link AcceptedGaps});</li>
- *     <li>{@code <name>.iaca.pem} — the IACA, present only when the chain carries one (M-06 completes this).</li>
+ *     <li>{@code <name>.iaca.pem} — the IACA the verifier anchors to: the one the chain carries, or the configured
+ *     trust anchor the producer hands over (M-06; HAIP keeps it out of the x5chain).</li>
  * </ul>
  *
  * <p>Raw CBOR plus sidecars keep the samples free of any Java-only knowledge: the Python verifier reads the same
@@ -83,6 +84,16 @@ public final class MdocSamples {
      */
     public static Path write(Path directory, Class<?> producer, String surface, byte[] credential, JWK holder,
                              String docType, AcceptedGaps gaps) {
+        return write(directory, producer, surface, credential, holder, docType, gaps, null);
+    }
+
+    /**
+     * As {@link #write(Path, Class, String, byte[], JWK, String, AcceptedGaps)}, with the IACA the verifier is given:
+     * the issuer's configured trust anchor (M-06), which an x5chain without its anchor does not carry. {@code null}
+     * writes the IACA only when the chain carries one.
+     */
+    public static Path write(Path directory, Class<?> producer, String surface, byte[] credential, JWK holder,
+                             String docType, AcceptedGaps gaps, X509Certificate trustAnchor) {
         String name = name(producer, surface);
         try {
             Files.createDirectories(directory);
@@ -98,7 +109,7 @@ public final class MdocSamples {
             Files.writeString(directory.resolve(name + HOLDER_JWK), holder.toPublicJWK().toJSONString(), StandardCharsets.UTF_8);
             Files.writeString(directory.resolve(name + DOCTYPE), docType, StandardCharsets.UTF_8);
             Files.writeString(directory.resolve(name + GAPS), gaps.format(name), StandardCharsets.UTF_8);
-            Optional<X509Certificate> iaca = iacaOf(issuerSignedOf(credential));
+            Optional<X509Certificate> iaca = trustAnchor != null ? Optional.of(trustAnchor) : iacaOf(issuerSignedOf(credential));
             if (iaca.isPresent()) {
                 Files.writeString(directory.resolve(name + IACA_PEM), pem(iaca.get()), StandardCharsets.UTF_8);
             }

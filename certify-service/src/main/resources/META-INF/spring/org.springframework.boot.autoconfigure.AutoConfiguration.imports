@@ -1,1 +1,2 @@
 io.mosip.certify.datasource.file.FileDataSourceAutoConfiguration
+io.mosip.certify.trust.PkiAutoConfiguration

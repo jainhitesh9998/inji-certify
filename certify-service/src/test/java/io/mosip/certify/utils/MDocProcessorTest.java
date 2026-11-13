@@ -770,6 +770,153 @@ public class MDocProcessorTest {
         assertTrue("IssuerAuth must verify with JCA", verifier.verify(com.nimbusds.jose.crypto.impl.ECDSA.transcodeSignatureToDER(sign1.get(3).GetByteString())));
     }
 
+    /** An Annex B IACA (valid since 30 days) with its key, so a test can issue a DSC and a CRL with chosen dates. */
+    private record TestIaca(java.security.KeyPair keys, java.security.cert.X509Certificate certificate) {}
+
+    private static java.security.KeyPair p256() throws Exception {
+        java.security.KeyPairGenerator generator = java.security.KeyPairGenerator.getInstance("EC");
+        generator.initialize(new java.security.spec.ECGenParameterSpec("secp256r1"));
+        return generator.generateKeyPair();
+    }
+
+    private static TestIaca testIaca(String commonName) throws Exception {
+        java.security.KeyPair keys = p256();
+        return new TestIaca(keys, io.mosip.certify.pki.IsoMdocProfiles.iaca(keys).country("IN").commonName(commonName)
+                .issuerAltUri("https://credentials.example.test")
+                .crlDistributionPoint("https://credentials.example.test/v1/certify/mdoc/iaca/legacy-test.crl")
+                .notBefore(java.time.Instant.now().minus(30, java.time.temporal.ChronoUnit.DAYS)).build());
+    }
+
+    /** A registry with one {@code mdoc-iaca} anchor and, when given, its CRL. */
+    private static io.mosip.certify.signing.TrustAnchorRegistry registry(java.security.cert.X509Certificate iaca,
+                                                                          java.security.cert.X509CRL crl) {
+        return new io.mosip.certify.signing.TrustAnchorRegistry() {
+            @Override
+            public List<Anchor> entries(String purpose) {
+                return MDOC_IACA.equals(purpose) ? List.of(new Anchor("legacy-test", MDOC_IACA, iaca)) : List.of();
+            }
+
+            @Override
+            public Optional<java.security.cert.X509CRL> crl(String anchorId) {
+                return Optional.ofNullable(crl);
+            }
+        };
+    }
+
+    private static org.springframework.beans.factory.ObjectProvider<io.mosip.certify.signing.TrustAnchorRegistry> provider(
+            io.mosip.certify.signing.TrustAnchorRegistry registry) {
+        return new org.springframework.beans.factory.support.StaticListableBeanFactory(Map.of("trustAnchorRegistry", registry))
+                .getBeanProvider(io.mosip.certify.signing.TrustAnchorRegistry.class);
+    }
+
+    /** The "app/ref" key a DSC of {@code iaca}, chained [DSC, IACA] as the CSR flow resolves it. */
+    private void signWithDscOf(TestIaca iaca) throws Exception {
+        java.security.KeyPair dscKeys = p256();
+        java.security.cert.X509Certificate dsc = io.mosip.certify.pki.IsoMdocProfiles.ds(dscKeys, iaca.certificate(), iaca.keys())
+                .commonName("Legacy Path Test DSC").notBefore(java.time.Instant.now().minus(30, java.time.temporal.ChronoUnit.DAYS)).build();
+        io.mosip.certify.keyprovider.jca.JcaKeyProvider keys = new io.mosip.certify.keyprovider.jca.JcaKeyProvider("keymanager");
+        keys.add("app/ref", dscKeys.getPrivate(), io.mosip.certify.signing.CertificateChain.of(dsc, iaca.certificate()),
+                io.mosip.certify.signing.SignatureAlgorithm.ES256, "vc-signing");
+        ReflectionTestUtils.setField(mDocProcessor, "keyProviders", new io.mosip.certify.issuance.KeyProviderRegistry(List.of(keys)));
+    }
+
+    private static java.security.cert.X509CRL crl(TestIaca iaca, java.time.Instant nextUpdate) {
+        return io.mosip.certify.pki.CrlBuilder.forIaca(iaca.certificate(), iaca.keys()).crlNumber(java.math.BigInteger.ONE)
+                .thisUpdate(nextUpdate.minus(7, java.time.temporal.ChronoUnit.DAYS)).nextUpdate(nextUpdate).build();
+    }
+
+    private String refusal() throws Exception {
+        try {
+            mDocProcessor.signMSO(Map.of("version", "1.0"), "app", "ref", "ES256");
+        } catch (CertifyException e) {
+            return e.getMessage();
+        }
+        fail("the DSC policy must refuse this key");
+        return null;
+    }
+
+    /**
+     * M-06: once IACAs are configured the DSC policy holds on this legacy path too (fail closed on every surface); a key
+     * no configured IACA issued is refused before anything is signed. Without IACAs the path signs as before (above).
+     */
+    @Test
+    public void should_refuseSigning_when_dscPolicyIsEnforcedAndNoIacaIssuedTheKey() throws Exception {
+        ReflectionTestUtils.setField(mDocProcessor, "keyProviders", io.mosip.certify.signing.TestKeyProviders.registry("app/ref", io.mosip.certify.signing.SignatureAlgorithm.ES256));
+        ReflectionTestUtils.setField(mDocProcessor, "trustAnchors", provider(registry(testIaca("Legacy Path Test IACA").certificate(), null)));
+        String message = refusal();
+        assertTrue(message, message.contains("certificate_chain_invalid"));
+    }
+
+    /**
+     * M-06/M-08 round 2, item 4: an IACA's CRL more than certify.pki.stale-crl-grace past its nextUpdate refuses this
+     * legacy path too (CRL_STALE); within the grace the same DSC signs.
+     */
+    @Test
+    public void should_refuseSigning_when_theIacaCrlIsStalePastTheGrace() throws Exception {
+        TestIaca iaca = testIaca("Legacy Path Stale IACA");
+        signWithDscOf(iaca);
+        java.time.Instant now = java.time.Instant.now();
+        ReflectionTestUtils.setField(mDocProcessor, "trustAnchors",
+                provider(registry(iaca.certificate(), crl(iaca, now.minus(1, java.time.temporal.ChronoUnit.HOURS)))));
+        assertNotNull("within the grace (PT24H) the DSC signs", mDocProcessor.signMSO(Map.of("version", "1.0"), "app", "ref", "ES256"));
+
+        ReflectionTestUtils.setField(mDocProcessor, "trustAnchors",
+                provider(registry(iaca.certificate(), crl(iaca, now.minus(25, java.time.temporal.ChronoUnit.HOURS)))));
+        String message = refusal();
+        assertTrue(message, message.contains("certificate_chain_invalid") && message.contains(io.mosip.certify.format.mdoc.MdocDscPolicy.CRL_STALE));
+    }
+
+    /**
+     * M-06/M-08 round 2, item 1: the policy comes from the registry, not from a unique MdocFormatter bean, so an
+     * application with two formatter beans still refuses an untrusted key and a stale CRL on this path (before, the
+     * policy was skipped: fail open). Two registries holding anchors with none primary fail closed.
+     */
+    @Test
+    public void should_enforceTheDscPolicy_when_severalMdocFormatterBeansExist() throws Exception {
+        TestIaca iaca = testIaca("Two Formatters IACA");
+        signWithDscOf(iaca);
+        io.mosip.certify.issuance.KeyProviderRegistry trusted = (io.mosip.certify.issuance.KeyProviderRegistry)
+                ReflectionTestUtils.getField(mDocProcessor, "keyProviders");
+        io.mosip.certify.signing.TrustAnchorRegistry stale = registry(iaca.certificate(),
+                crl(iaca, java.time.Instant.now().minus(25, java.time.temporal.ChronoUnit.HOURS)));
+        io.mosip.certify.format.mdoc.MdocProperties properties = new io.mosip.certify.format.mdoc.MdocProperties("SHA-256", "1.0",
+                java.time.Duration.ofDays(90), null);
+        new org.springframework.boot.test.context.runner.ApplicationContextRunner()
+                .withBean(ObjectMapper.class, ObjectMapper::new)
+                .withBean(MDocConfig.class, MDocConfig::new)
+                .withBean("mdocFormatter", io.mosip.certify.format.mdoc.MdocFormatter.class,
+                        () -> new io.mosip.certify.format.mdoc.MdocFormatter(new ObjectMapper(), properties))
+                .withBean("customMdocFormatter", io.mosip.certify.format.mdoc.MdocFormatter.class,
+                        () -> new io.mosip.certify.format.mdoc.MdocFormatter(new ObjectMapper(), properties))
+                .withBean(io.mosip.certify.signing.TrustAnchorRegistry.class, () -> stale)
+                .withBean("untrustedKeys", io.mosip.certify.issuance.KeyProviderRegistry.class,
+                        () -> io.mosip.certify.signing.TestKeyProviders.registry("app/ref", io.mosip.certify.signing.SignatureAlgorithm.ES256))
+                .withBean(MDocProcessor.class)
+                .run(context -> {
+                    assertEquals(2, context.getBeansOfType(io.mosip.certify.format.mdoc.MdocFormatter.class).size());
+                    MDocProcessor processor = context.getBean(MDocProcessor.class);
+                    MDocProcessor before = mDocProcessor;
+                    mDocProcessor = processor;
+                    try {
+                        String untrusted = refusal();
+                        assertTrue(untrusted, untrusted.contains("certificate_chain_invalid"));
+                        ReflectionTestUtils.setField(processor, "keyProviders", trusted);
+                        String staleCrl = refusal();
+                        assertTrue(staleCrl, staleCrl.contains(io.mosip.certify.format.mdoc.MdocDscPolicy.CRL_STALE));
+                    } finally {
+                        mDocProcessor = before;
+                    }
+                });
+
+        io.mosip.certify.signing.TrustAnchorRegistry fresh = registry(iaca.certificate(), null);
+        ReflectionTestUtils.setField(mDocProcessor, "trustAnchors",
+                new org.springframework.beans.factory.support.StaticListableBeanFactory(Map.of("a", fresh, "b", stale))
+                        .getBeanProvider(io.mosip.certify.signing.TrustAnchorRegistry.class));
+        String ambiguous = refusal();
+        assertTrue(ambiguous, ambiguous.contains("certificate_chain_invalid")
+                && ambiguous.contains(io.mosip.certify.format.mdoc.MdocDscPolicy.TRUST_ANCHORS_UNAVAILABLE));
+    }
+
     @Test(expected = CertifyException.class)
     public void should_throwException_when_signingKeyIsMissing() throws Exception {
         ReflectionTestUtils.setField(mDocProcessor, "keyProviders", io.mosip.certify.signing.TestKeyProviders.registry("other/key", io.mosip.certify.signing.SignatureAlgorithm.ES256));
