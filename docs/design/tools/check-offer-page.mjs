@@ -2069,6 +2069,100 @@ await section("26d. redirected nonce endpoint and metadata", async () => {
         as.sent.filter((request) => request.method !== "GET" || request.url.startsWith(ATTACKER)).length, 0);
 });
 
+// 25b. F-18 round 4 (review): the other order of the race. Create is pressed for offer B while A is published, the
+//      wallet is pressed for A while B is pending, and B is published mid-run: the run redeems A with A's values
+//      only, both buttons stay disabled until it ends, and the next run redeems B.
+for (const [label, txB] of [["Create pressed first, B with a transaction code", "2222"], ["Create pressed first, B without one", ""]]) {
+    await section(`25b. ${label}`, async () => {
+        const options = {
+            offers: [offerByValue("race-a", offerDocument(OID4VCI_ISSUER, "mdoc", "code-A", TX_CODE)),
+                offerByValue("race-b", offerDocument(LEGACY_ISSUER, "farmer", "code-B", txB ? TX_CODE : undefined))],
+        };
+        const page = openPage({ subjects: [] }, options);
+        await page.settle();
+        const el = page.el;
+        el("subject").value = "race-subject";
+        el("configuration").value = "mdoc";
+        await el("configuration").fire("change");
+        el("txCode").value = "1111";
+        await page.createOffer();
+        let releaseOffer, releaseMeta;
+        options.offerGate = new Promise((d) => { releaseOffer = d; });
+        options.metadataGate = new Promise((d) => { releaseMeta = d; });
+        el("configuration").value = "farmer";
+        await el("configuration").fire("change");
+        el("txCode").value = txB;
+        const creating = el("create").fire("click");
+        await page.settle();
+        equal(`${label}: wallet still enabled for A while B is pending`, el("wallet").disabled, false);
+        const running = el("wallet").fire("click");
+        await page.settle();
+        releaseOffer();
+        await creating;
+        await page.settle();
+        equal(`${label}: B published`, el("offerUri").textContent, deepLink("race-b"));
+        equal(`${label}: create+wallet disabled while A runs`, [el("create").disabled, el("wallet").disabled], [true, true]);
+        releaseMeta();
+        await running;
+        await page.settle();
+        equalFields(`${label}: token form is A's`, tokenRequest(page) && tokenRequest(page).form,
+            { grant_type: GRANT, "pre-authorized_code": "code-A", tx_code: "1111" });
+        checkCredentialRequest(`${label}: credential request`, credentialRequest(page),
+            { audience: OID4VCI_ISSUER, nonce: "nonce-f18", configurationId: "mdoc" });
+        equal(`${label}: B secrets nowhere`, carrying(page.requests.filter((r) => !/pre-authorized-data$/.test(r.url)), ["code-B", ...(txB ? [txB] : [])])
+            .map((r) => r.method + " " + r.url), []);
+        equal(`${label}: re-enabled after`, [el("create").disabled, el("wallet").disabled], [false, false]);
+        // then B is redeemable with B's values
+        await page.runWallet();
+        await page.settle();
+        const forms = page.requests.filter((r) => r.method === "POST" && r.form && r.form.grant_type).map((r) => r.form);
+        equalFields(`${label}: next run redeems B`, forms[forms.length - 1],
+            Object.assign({ grant_type: GRANT, "pre-authorized_code": "code-B" }, txB ? { tx_code: "2222" } : {}));
+    });
+}
+// 26e. F-18 round 4: the page's own requests refuse redirects too. The Create POST carries the transaction code, and
+//      fetch's default would re-send a 307/308 POST, body and all, to wherever Location points.
+for (const status of [307, 308]) {
+    await section(`26e. a ${status} on the Create POST`, async () => {
+        const page = openPage({ subjects: [] }, {
+            offers: [offerByValue("create-redirect", offerDocument(OID4VCI_ISSUER, "demo", "code-create-redirect", TX_CODE))],
+            redirects: { "POST /v1/certify/pre-authorized-data": { status, location: ATTACKER + "/capture" } },
+        });
+        await page.settle();
+        page.el("subject").value = "redirect-subject";
+        page.el("txCode").value = "1234";
+        const from = page.requests.length;
+        page.el("create").fire("click");
+        await page.settle();
+        const sent = page.requests.slice(from);
+        equal(`Create ${status}: the POST refuses redirects`, sent.filter((request) => /pre-authorized-data$/.test(request.url))
+            .map((request) => request.redirect), ["error"]);
+        equal(`Create ${status}: nothing reaches the redirect target`, sent.filter((request) => request.url.startsWith(ATTACKER))
+            .map((request) => request.method + " " + request.url), []);
+        equal(`Create ${status}: the transaction code went to /pre-authorized-data only`,
+            carrying(sent, ["1234"]).map((request) => request.method + " " + request.url), ["POST /v1/certify/pre-authorized-data"]);
+        check(`Create ${status}: nothing is published and Create can be pressed again`,
+            page.el("create").disabled === false && page.el("wallet").disabled === true, page.el("offerStatus").textContent);
+    });
+}
+
+await section("26f. a redirect on the by-reference offer fetch", async () => {
+    const page = openPage({ subjects: [] }, {
+        offers: [offerByReference("by-ref-redirect")],
+        redirects: { [OFFER_DOCUMENT + "by-ref-redirect"]: { status: 302, location: ATTACKER + "/offer" } },
+    });
+    await page.settle();
+    page.el("subject").value = "redirect-subject";
+    const from = page.requests.length;
+    page.el("create").fire("click");
+    await page.settle();
+    const sent = page.requests.slice(from);
+    equal("by-reference 302: the offer GET refuses redirects", sent.filter((request) => request.url === OFFER_DOCUMENT + "by-ref-redirect")
+        .map((request) => request.redirect), ["error"]);
+    equal("by-reference 302: nothing reaches the redirect target", sent.filter((request) => request.url.startsWith(ATTACKER)).length, 0);
+    check("by-reference 302: nothing is published", page.el("wallet").disabled === true, page.el("offerStatus").textContent);
+});
+
 // 27. F-18 round 3: a credential issuer or authorization server identifier with userinfo, a query or a fragment is
 //     not an identifier (OpenID4VCI 1.0 section 12.2.1, RFC 8414 section 2), and is refused before anything is sent
 for (const [label, issuer] of [

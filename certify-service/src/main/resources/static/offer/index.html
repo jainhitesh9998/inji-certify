@@ -126,9 +126,13 @@
     return { status: r.status, body: parsed };
   }
 
-  /** A request to this page's own deployment: a path under its servlet path, fetch's default redirect handling. */
+  /**
+   * A request to this page's own deployment: a path under its servlet path. A redirect is an error here as well: the
+   * Create POST carries the transaction code, and fetch's default would re-send a 307/308 POST, body and all, to
+   * wherever Location points. certify-nginx answers none of these paths with a redirect.
+   */
   async function api(method, path, body, headers, form) {
-    return send(method, BASE + path, body, headers, form, "follow");
+    return send(method, BASE + path, body, headers, form, "error");
   }
 
   /**
@@ -349,7 +353,7 @@
         if (!offerUrl) {
           status("offerStatus", "The offer was created, but its credential_offer_uri is not a URL this page fetches", false); return;
         }
-        const fetched = await send("GET", offerUrl, undefined, undefined, undefined, "follow");
+        const fetched = await send("GET", offerUrl, undefined, undefined, undefined, "error");
         if (fetched.status !== 200) {
           // the previous offer stays active: nothing has been published yet
           status("offerStatus", "The offer was created but could not be fetched from credential_offer_uri ("
