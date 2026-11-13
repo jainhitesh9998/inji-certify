@@ -13,7 +13,10 @@ import io.mosip.certify.signing.SignatureAlgorithm;
 import io.mosip.certify.signing.TestKeyProviders;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.http.HttpHeaders;
 import org.springframework.mock.env.MockEnvironment;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
 import java.io.ByteArrayInputStream;
 import java.security.cert.CertificateFactory;
@@ -22,6 +25,7 @@ import java.security.interfaces.ECPublicKey;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
@@ -35,6 +39,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -42,14 +47,21 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
  * Token Status List freshness (draft-ietf-oauth-status-list 5.1, 8.3): a list JWT that is about to expire, has expired,
  * or names another URI in {@code sub} is signed again when it is served, with the same bits and a signature that
- * verifies; a concurrent status change is never overwritten; one re-sign per list at a time.
+ * verifies; a concurrent status change is never overwritten; one re-sign per list at a time; a stalled or failing signer
+ * never gets an expired list served, never parks request threads beyond {@code renew-wait}, and is not retried within
+ * {@code renew-backoff}.
  */
 class TokenStatusListFreshnessTest {
 
@@ -58,6 +70,8 @@ class TokenStatusListFreshnessTest {
     static final String DOMAIN = "https://credentials.example.org";
     static final String SERVLET_PATH = "/v1/certify";
     static final String LIST_ID = "4b4a7c5e-5d9a-4b3a-9b0e-2f0b8f6a1c11";
+    static final Duration RENEW_WAIT = Duration.ofSeconds(5);
+    static final Duration BACKOFF = Duration.ofSeconds(30);
 
     final Map<String, String> documents = new ConcurrentHashMap<>();
     final AtomicInteger replaced = new AtomicInteger();
@@ -189,7 +203,7 @@ class TokenStatusListFreshnessTest {
     void aListThatCannotBeSignedIsServedUntilItExpiresAndRefusedAfter() {
         String stored = service(DOMAIN, T0).sign(LIST_ID, revokedAt(4));
         documents.put(LIST_ID, stored);
-        TokenStatusListProperties broken = new TokenStatusListProperties("keymanager:no-such-key", "ES256", "leaf", 1024, TTL);
+        TokenStatusListProperties broken = properties("keymanager:no-such-key", RENEW_WAIT, BACKOFF);
         TokenStatusListService dueForRenewal = service(DOMAIN, T0.plus(TTL).plusSeconds(60), broken);
         assertEquals(stored, dueForRenewal.jwt(LIST_ID).orElseThrow(), "still valid: served as stored");
 
@@ -207,18 +221,187 @@ class TokenStatusListFreshnessTest {
         assertFalse(service(DOMAIN, T0).jwt(LIST_ID).isPresent());
     }
 
+    /**
+     * Review round 1, item 1: a signer that hangs (HSM or keymanager stall) holds the one request that re-signs the list;
+     * a request for the same expired list waits at most {@code renew-wait} and is answered 503, instead of waiting
+     * without limit (every Tomcat thread would end up parked on the lock).
+     */
+    @Test
+    void aRequestForAnExpiredListWaitsAtMostRenewWaitForAHungSigner() throws Exception {
+        documents.put(LIST_ID, service(DOMAIN, T0).sign(LIST_ID, revokedAt(6)));
+        CountDownLatch signing = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        KeyProviderRegistry hung = signerThat(() -> {
+            signing.countDown();
+            try {
+                release.await(30, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        Duration renewWait = Duration.ofMillis(300);
+        TokenStatusListService lists = service(DOMAIN, Clock.fixed(T0.plus(Duration.ofDays(1)), ZoneOffset.UTC),
+                properties("keymanager:status-es256", renewWait, BACKOFF), hung);
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<Optional<String>> first = pool.submit(() -> lists.jwt(LIST_ID));
+            assertTrue(signing.await(10, TimeUnit.SECONDS), "the first request is signing");
+
+            long started = System.nanoTime();
+            TokenStatusListUnavailableException refused = assertThrows(TokenStatusListUnavailableException.class, () -> lists.jwt(LIST_ID));
+            Duration waited = Duration.ofNanos(System.nanoTime() - started);
+            assertTrue(waited.compareTo(renewWait) >= 0 && waited.compareTo(Duration.ofSeconds(5)) < 0, "waited " + waited);
+            assertEquals(1, refused.retryAfterSeconds());
+
+            release.countDown();
+            String renewed = first.get(10, TimeUnit.SECONDS).orElseThrow();
+            assertEquals(renewed, documents.get(LIST_ID), "the hung request finishes the re-sign once the signer answers");
+            assertEquals(renewed, lists.jwt(LIST_ID).orElseThrow());
+        } finally {
+            release.countDown();
+            pool.shutdownNow();
+        }
+    }
+
+    /**
+     * Review round 1, item 2: the stored list was due (one second left) when the request began, the signer took two seconds
+     * and failed; by then the stored list has expired, so it is not served with 200.
+     */
+    @Test
+    void aListThatExpiresWhileTheSignerFailsIsNotServed() {
+        Instant start = T0.plus(TTL).plus(TTL).minusSeconds(1); // exp one second away: due, still valid
+        documents.put(LIST_ID, service(DOMAIN, T0).sign(LIST_ID, revokedAt(7)));
+        MutableClock clock = new MutableClock(start);
+        TokenStatusListService lists = service(DOMAIN, clock, properties("keymanager:status-es256", RENEW_WAIT, BACKOFF), signerThat(() -> {
+            clock.advance(Duration.ofSeconds(2));
+            throw new IllegalStateException("HSM session lost");
+        }));
+        assertEquals(TokenStatusListService.Freshness.RENEW, lists.freshness(LIST_ID, documents.get(LIST_ID)));
+
+        TokenStatusListUnavailableException refused = assertThrows(TokenStatusListUnavailableException.class, () -> lists.jwt(LIST_ID));
+        assertEquals(BACKOFF.getSeconds(), refused.retryAfterSeconds());
+        assertTrue(refused.getCause().getMessage().contains("HSM session lost"));
+    }
+
+    /**
+     * Review round 1, item 3: after a failed re-sign the list is not signed again for {@code renew-backoff}; meanwhile the
+     * stored list is served while it is valid and 503 is answered at once when it is not; after the window it is signed again.
+     */
+    @Test
+    void aFailedReSignIsNotRetriedWithinTheBackoff() throws Exception {
+        String stored = service(DOMAIN, T0).sign(LIST_ID, revokedAt(8));
+        documents.put(LIST_ID, stored);
+        AtomicInteger attempts = new AtomicInteger();
+        AtomicBoolean broken = new AtomicBoolean(true);
+        MutableClock clock = new MutableClock(T0.plus(TTL).plus(TTL).minusSeconds(10)); // due, valid for ten more seconds
+        TokenStatusListService lists = service(DOMAIN, clock, properties("keymanager:status-es256", RENEW_WAIT, BACKOFF), signerThat(() -> {
+            attempts.incrementAndGet();
+            if (broken.get()) {
+                throw new IllegalStateException("signer down");
+            }
+        }));
+
+        assertEquals(stored, lists.jwt(LIST_ID).orElseThrow(), "valid: served as stored after the failure");
+        assertEquals(1, attempts.get());
+        clock.advance(Duration.ofSeconds(5));
+        assertEquals(stored, lists.jwt(LIST_ID).orElseThrow(), "within the back-off and still valid: served as stored");
+        assertEquals(1, attempts.get(), "not signed again within the back-off");
+
+        clock.advance(Duration.ofSeconds(10)); // the stored list expired five seconds ago; fifteen seconds of the window are left
+        TokenStatusListUnavailableException refused = assertThrows(TokenStatusListUnavailableException.class, () -> lists.jwt(LIST_ID));
+        assertEquals(1, attempts.get(), "503 at once, without signing");
+        assertEquals(15, refused.retryAfterSeconds(), "Retry-After the rest of the window");
+
+        clock.advance(Duration.ofSeconds(15)); // the window has passed: signed again, failed again
+        assertThrows(TokenStatusListUnavailableException.class, () -> lists.jwt(LIST_ID));
+        assertEquals(2, attempts.get());
+
+        broken.set(false);
+        clock.advance(BACKOFF);
+        String renewed = lists.jwt(LIST_ID).orElseThrow();
+        assertEquals(3, attempts.get());
+        assertArrayEquals(revokedAt(8), TokenStatusListService.bits(renewed));
+        assertEquals(TokenStatusListService.Freshness.FRESH, lists.freshness(LIST_ID, renewed));
+    }
+
+    /** Review round 1, item 7: the endpoint answers an expired list whose signer throws with 503 and Retry-After, no body. */
+    @Test
+    void theEndpointAnswers503WithRetryAfterForAnExpiredListThatCannotBeSigned() throws Exception {
+        documents.put(LIST_ID, service(DOMAIN, T0).sign(LIST_ID, revokedAt(9)));
+        TokenStatusListService lists = service(DOMAIN, Clock.fixed(T0.plus(Duration.ofDays(1)), ZoneOffset.UTC),
+                properties("keymanager:status-es256", RENEW_WAIT, BACKOFF), signerThat(() -> {
+                    throw new IllegalStateException("keymanager unavailable");
+                }));
+        MockMvc mvc = MockMvcBuilders.standaloneSetup(new TokenStatusListController(lists)).build();
+
+        mvc.perform(get("/credentials/token-status-list/" + LIST_ID).accept(TokenStatusListService.MEDIA_TYPE))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(header().string(HttpHeaders.RETRY_AFTER, Long.toString(BACKOFF.getSeconds())))
+                .andExpect(content().string(""));
+        mvc.perform(get("/credentials/token-status-list/" + LIST_ID))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(header().exists(HttpHeaders.RETRY_AFTER));
+        mvc.perform(get("/credentials/token-status-list/no-such-list")).andExpect(status().isNotFound());
+    }
+
     // ---- helpers -------------------------------------------------------------------------------------
 
     TokenStatusListService service(String domain, Instant now) {
-        return service(domain, now, new TokenStatusListProperties("keymanager:status-es256", "ES256", "leaf", 1024, TTL));
+        return service(domain, now, properties("keymanager:status-es256", RENEW_WAIT, BACKOFF));
     }
 
     TokenStatusListService service(String domain, Instant now, TokenStatusListProperties properties) {
+        return service(domain, Clock.fixed(now, ZoneOffset.UTC), properties, keys);
+    }
+
+    TokenStatusListService service(String domain, Clock clock, TokenStatusListProperties properties, KeyProviderRegistry signers) {
         MockEnvironment environment = new MockEnvironment()
                 .withProperty("mosip.certify.domain.url", domain)
                 .withProperty("server.servlet.path", SERVLET_PATH);
         return new TokenStatusListService(repository, mock(StatusListCredentialService.class), mock(StatusListIndexProvider.class),
-                keys, properties, new ObjectMapper(), environment, Clock.fixed(now, ZoneOffset.UTC));
+                signers, properties, new ObjectMapper(), environment, clock);
+    }
+
+    static TokenStatusListProperties properties(String keyRef, Duration renewWait, Duration backoff) {
+        return new TokenStatusListProperties(keyRef, "ES256", "leaf", 1024, TTL, renewWait, backoff);
+    }
+
+    /** The test registry, with {@code before} run each time a list is about to be signed (to block, throw or move the clock). */
+    KeyProviderRegistry signerThat(Runnable before) {
+        KeyProviderRegistry signers = mock(KeyProviderRegistry.class);
+        when(signers.signingContext(any())).thenAnswer(inv -> {
+            before.run();
+            return keys.signingContext(inv.getArgument(0));
+        });
+        return signers;
+    }
+
+    /** A clock the test (or a signer) moves. */
+    static final class MutableClock extends Clock {
+        private final AtomicReference<Instant> now;
+
+        MutableClock(Instant start) {
+            now = new AtomicReference<>(start);
+        }
+
+        void advance(Duration by) {
+            now.updateAndGet(t -> t.plus(by));
+        }
+
+        @Override
+        public Instant instant() {
+            return now.get();
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            throw new UnsupportedOperationException();
+        }
     }
 
     static StatusListCredential row(String id, String document) {

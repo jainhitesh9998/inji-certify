@@ -36,6 +36,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.zip.DataFormatException;
 import java.util.zip.Deflater;
@@ -52,7 +53,9 @@ import java.util.zip.Inflater;
  * changes. So a served list whose {@code exp} is less than {@code ttl} away, or whose {@code sub} is not the list's URI
  * under the current {@code mosip.certify.domain.url}, is signed again before it is returned, with the same bits. The
  * new document replaces the stored one only if that one is still unchanged (compare-and-set), so a re-sign never undoes
- * a status change; one request per list re-signs at a time while the others are served the previous, still valid, list.
+ * a status change; one request per list re-signs at a time while the others are served the previous, still valid, list,
+ * or, when it is not valid, wait for the re-sign at most {@code renew-wait}. After a failed re-sign the list is not signed
+ * again for {@code renew-backoff}. An expired list is never served: the endpoint answers 503 with {@code Retry-After}.
  */
 @Slf4j
 @Service
@@ -76,6 +79,8 @@ public class TokenStatusListService {
     private final Clock clock;
     /** One re-sign per list at a time in this instance; other instances are kept consistent by the compare-and-set. */
     private final ConcurrentMap<String, ReentrantLock> renewals = new ConcurrentHashMap<>();
+    /** Per list, when its last re-sign failed; it is not signed again within {@code renew-backoff} of that instant. */
+    private final ConcurrentMap<String, Instant> failures = new ConcurrentHashMap<>();
 
     @Autowired
     public TokenStatusListService(StatusListCredentialRepository repository, StatusListCredentialService bitstringLists,
@@ -124,10 +129,14 @@ public class TokenStatusListService {
     /**
      * The list JWT to serve: the stored one while it is fresh, otherwise the list signed again (same bits, new
      * {@code iat}/{@code exp}, {@code sub} the current URI). A list that is only due for renewal is served as stored
-     * when another request is renewing it or the renewal fails; an expired list, or one whose {@code sub} is not the
-     * current URI, is never served as stored.
+     * when another request is renewing it, when the renewal fails, or within {@code renew-backoff} of a failed renewal;
+     * an expired list, or one whose {@code sub} is not the current URI, is never served as stored. Whatever is served as
+     * stored is judged against the clock at the moment it is returned, not when the request began.
      *
-     * @throws IllegalStateException when an unusable list cannot be signed again
+     * <p>A request for an unusable list waits at most {@code renew-wait} for the request that is signing it again, so a
+     * stalled signer holds one request thread per list, not every thread that asks for the list.
+     *
+     * @throws TokenStatusListUnavailableException when the list is unusable and cannot be signed again now
      */
     public Optional<String> jwt(String listId) {
         Optional<String> stored = repository.findById(listId).filter(l -> TYPE.equals(l.getCredentialType())).map(StatusListCredential::getVcDocument);
@@ -138,25 +147,103 @@ public class TokenStatusListService {
         if (freshness == Freshness.FRESH) {
             return stored;
         }
+        Optional<Duration> backingOff = backingOff(listId);
+        if (backingOff.isPresent()) {
+            return Optional.of(servedAsStored(listId, stored.get(), backingOff.get(), null));
+        }
         ReentrantLock lock = renewals.computeIfAbsent(listId, id -> new ReentrantLock());
-        if (freshness == Freshness.RENEW) {
-            if (!lock.tryLock()) {
-                return stored; // another request is signing it again; the stored list is valid for at least a while
-            }
-        } else {
-            lock.lock(); // expired or under another URI: wait for the renewal rather than serve what a verifier rejects
+        if (!acquire(listId, lock, freshness)) {
+            // only a list that is merely due gets here: another request is signing it again, this one is still valid
+            return Optional.of(servedAsStored(listId, stored.get(), properties.renewWait(), null));
         }
         try {
-            return Optional.of(renew(listId));
-        } catch (RuntimeException e) {
-            if (freshness == Freshness.RENEW) {
-                log.warn("Token status list {} could not be signed again; serving the stored list until it expires", listId, e);
-                return stored;
+            backingOff = backingOff(listId); // the request this one waited for may have failed meanwhile
+            if (backingOff.isPresent()) {
+                return Optional.of(servedAsStored(listId, latest(listId, stored.get()), backingOff.get(), null));
             }
-            throw new IllegalStateException("Token status list " + listId + " is expired or under another URI and could not be signed again", e);
+            String renewed;
+            try {
+                renewed = renew(listId);
+            } catch (RuntimeException e) {
+                failed(listId, e);
+                return Optional.of(servedAsStored(listId, latest(listId, stored.get()), properties.renewBackoff(), e));
+            }
+            failures.remove(listId);
+            return Optional.of(renewed);
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * Takes the list's renewal lock: at once or not at all for a list that is still valid, within {@code renew-wait} for
+     * one that is not (serving it as stored is no option).
+     *
+     * @return false when a still-valid list's lock is held by another request
+     * @throws TokenStatusListUnavailableException when an unusable list's lock is not free within {@code renew-wait}
+     */
+    private boolean acquire(String listId, ReentrantLock lock, Freshness freshness) {
+        if (freshness == Freshness.RENEW) {
+            return lock.tryLock();
+        }
+        try {
+            if (lock.tryLock(properties.renewWait().toNanos(), TimeUnit.NANOSECONDS)) {
+                return true;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new TokenStatusListUnavailableException("Interrupted while token status list " + listId + " was signed again",
+                    properties.renewWait(), e);
+        }
+        log.warn("Token status list {} is expired or under another URI and still being signed again after {}; answering 503",
+                listId, properties.renewWait());
+        throw new TokenStatusListUnavailableException("Token status list " + listId + " is still being signed again after "
+                + properties.renewWait(), properties.renewWait(), null);
+    }
+
+    /**
+     * The document as stored, when it is still usable now; a document that expired (or is under another URI) is never
+     * served, whatever it was when the request began.
+     *
+     * @throws TokenStatusListUnavailableException otherwise, with {@code retryAfter}
+     */
+    private String servedAsStored(String listId, String document, Duration retryAfter, RuntimeException cause) {
+        if (freshness(listId, document) != Freshness.UNUSABLE) {
+            return document;
+        }
+        throw new TokenStatusListUnavailableException("Token status list " + listId
+                + " is expired or under another URI and could not be signed again", retryAfter, cause);
+    }
+
+    /** The list as stored now (a status update may have replaced it while this request waited or signed), else {@code fallback}. */
+    private String latest(String listId, String fallback) {
+        try {
+            return repository.findById(listId).map(StatusListCredential::getVcDocument).orElse(fallback);
+        } catch (RuntimeException e) {
+            log.debug("Token status list {} could not be read again; judging the document read first", listId, e);
+            return fallback;
+        }
+    }
+
+    /** The rest of the back-off window after a failed re-sign of the list, empty when there is none. */
+    private Optional<Duration> backingOff(String listId) {
+        Instant failure = failures.get(listId);
+        if (failure == null) {
+            return Optional.empty();
+        }
+        Duration left = Duration.between(clock.instant(), failure.plus(properties.renewBackoff()));
+        if (left.isNegative() || left.isZero()) {
+            return Optional.empty();
+        }
+        log.debug("Token status list {} failed to be signed again at {}; not signing it again for {}", listId, failure, left);
+        return Optional.of(left);
+    }
+
+    /** Records a failed re-sign; its stack trace is logged once, since the list is not signed again within the back-off window. */
+    private void failed(String listId, RuntimeException e) {
+        failures.put(listId, clock.instant());
+        log.error("Token status list {} could not be signed again; not trying again for {} (the stored list is served while it is valid, 503 after)",
+                listId, properties.renewBackoff(), e);
     }
 
     enum Freshness { FRESH, RENEW, UNUSABLE }

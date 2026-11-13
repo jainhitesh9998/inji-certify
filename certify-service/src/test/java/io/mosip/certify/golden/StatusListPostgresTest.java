@@ -454,6 +454,26 @@ class StatusListPostgresTest {
         assertServedFresh(listId, entry.idx(), ttl);
     }
 
+    /**
+     * The compare-and-set the re-sign stores through, on PostgreSQL: a caller holding a document that is no longer the
+     * stored one (the batch job or another instance replaced it) changes nothing, and is told so.
+     */
+    @Test
+    void tokenStatusListReplaceDocumentIsACompareAndSet() throws Exception {
+        io.mosip.certify.status.TokenStatusListService.Entry entry = tokenStatusLists.allocate("revocation");
+        String listId = entry.uri().substring(entry.uri().lastIndexOf('/') + 1);
+        String stored = statusListRepository.findById(listId).orElseThrow().getVcDocument();
+
+        assertEquals(0, statusListRepository.replaceDocument(listId, "stale", "replacement"), "a stale previous document replaces nothing");
+        assertEquals(stored, statusListRepository.findById(listId).orElseThrow().getVcDocument(), "the stored document is unchanged");
+        assertEquals(0, statusListRepository.replaceDocument("no-such-list", stored, "replacement"));
+
+        assertEquals(1, statusListRepository.replaceDocument(listId, stored, "replacement"), "the current document is replaced");
+        assertEquals("replacement", statusListRepository.findById(listId).orElseThrow().getVcDocument());
+        assertEquals(1, statusListRepository.replaceDocument(listId, "replacement", stored));
+        assertEquals(stored, statusListRepository.findById(listId).orElseThrow().getVcDocument());
+    }
+
     /** Stores the list signed again (same bits) by a service with another domain or clock, as an older deployment left it. */
     private void signAgain(String listId, String domain, java.time.Clock clock) {
         org.springframework.mock.env.MockEnvironment elsewhere = new org.springframework.mock.env.MockEnvironment()

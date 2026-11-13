@@ -9,8 +9,20 @@ import java.time.Duration;
  * Token Status List (draft-ietf-oauth-status-list) settings: the key that signs every list ({@code key-ref} as
  * {@code provider:alias}, e.g. {@code x509-file:sdjwt-es256}; keymanager's EC key when absent), its JOSE algorithm, how
  * much of its chain the list's {@code x5c} carries, the list size in bits, and how long a fetched list may be cached ({@code ttl}).
+ *
+ * <p>Re-signing a stale list when it is served ({@link TokenStatusListService#jwt}): {@code renew-wait} is how long a
+ * request for an expired list (or one under another URI) waits for the request that is signing it again before it is
+ * answered 503, so a stalled signer (HSM, keymanager) holds one thread per list rather than every request thread;
+ * {@code renew-backoff} is how long after a failed re-sign the list is not signed again: the stored list is served
+ * while it is still valid, 503 otherwise.
  */
 @ConfigurationProperties(prefix = "certify.status.token-status-list")
 public record TokenStatusListProperties(String keyRef, @DefaultValue("ES256") String alg, @DefaultValue("without-anchor") String x5c,
-                                        @DefaultValue("131072") int sizeBits, @DefaultValue("PT1H") Duration ttl) {
+                                        @DefaultValue("131072") int sizeBits, @DefaultValue("PT1H") Duration ttl,
+                                        @DefaultValue("PT5S") Duration renewWait, @DefaultValue("PT30S") Duration renewBackoff) {
+
+    public TokenStatusListProperties {
+        renewWait = renewWait == null || renewWait.isNegative() ? Duration.ofSeconds(5) : renewWait;
+        renewBackoff = renewBackoff == null || renewBackoff.isNegative() ? Duration.ofSeconds(30) : renewBackoff;
+    }
 }
