@@ -85,7 +85,16 @@ class CacheExpiryCoverageTest {
         }
         assertEquals(List.of(1024, 32), offerClaimCaps("default", "csvdp-farmer", "rebuild", "mdl", "mdl-dev"));
         assertEquals(List.of(8192, 256), offerClaimCaps("default", "csvdp-farmer", "rebuild"),
-                "the shared default (Oid4vciProperties.Offers)");
+                "the compose stacks' caps (certify-default.properties)");
+        // the built-in defaults stay generous so a 0.14.0 deployment, whose offer claims were unbounded and may carry a
+        // portrait, upgrades with no new setting (non-negotiable 3; F-21 review round 3)
+        io.mosip.certify.oid4vci.Oid4vciProperties.Offers builtIn = new org.springframework.boot.context.properties.bind.Binder(
+                        new org.springframework.boot.context.properties.source.MapConfigurationPropertySource(Map.of()))
+                .bindOrCreate("certify.protocol.oid4vci-v1.offers", io.mosip.certify.oid4vci.Oid4vciProperties.Offers.class);
+        assertEquals(List.of(262144, 1024), List.of(builtIn.maxClaimsBytes(), builtIn.maxClaimsValues()),
+                "the built-in defaults (Oid4vciProperties.Offers)");
+        // the redemption transaction cache is sized like the code cache it follows (not the 100-entry fallback)
+        assertEquals(sizes(values).get("preAuthCodeCache"), sizes(values).get("preAuthCacheTxn"), "preAuthCacheTxn");
     }
 
     @Test

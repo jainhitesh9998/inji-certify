@@ -64,10 +64,15 @@ public record Oid4vciProperties(@DefaultValue CompatCore compatCore, @DefaultVal
      * ~180 KB of heap, the same 8 KiB in one string ~8 KB). Raise them for a data provider that takes large claims
      * ({@code PreAuthDataProviderPlugin} issues them as the credential's data); 0 refuses every non-empty
      * {@code claims}.
+     *
+     * <p>The built-in defaults (256 KiB, 1024 values) are generous on purpose: {@code POST /pre-authorized-data} shipped
+     * in 0.14.0 with unbounded claims, which {@code PreAuthDataProviderPlugin} issues as the credential's data (a base64
+     * portrait is often 10-50 KB), so an upgraded deployment keeps working with no new setting (non-negotiable 3). The
+     * compose stacks set 8 KiB / 256 and the mDL demo 1 KiB / 32, where the endpoint is public (F-21 review round 3).
      */
     public record Offers(@DefaultValue("legacy") OfferSurface defaultIssuer,
-                         @DefaultValue("8192") int maxClaimsBytes,
-                         @DefaultValue("256") int maxClaimsValues) {
+                         @DefaultValue("262144") int maxClaimsBytes,
+                         @DefaultValue("1024") int maxClaimsValues) {
         public Offers {
             if (maxClaimsBytes < 0 || maxClaimsValues < 0) {
                 throw new IllegalArgumentException("certify.protocol.oid4vci-v1.offers.max-claims-bytes and max-claims-values "
