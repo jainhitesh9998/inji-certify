@@ -123,11 +123,12 @@ class OfferPageSecurityTest {
         runner.withUserConfiguration(OfferPageSecurityConfiguration.class, OfferPageController.class).run(context -> {
             assertThat(context).hasNotFailed();
             MockMvc mockMvc = mockMvc((WebApplicationContext) context.getSourceApplicationContext());
-            // the stand-in entry point answers 401; a CSRF refusal is 403. Either proves the path was never served
+            // the stand-in entry point answers 401, so a GET next to the page is refused with exactly that status; a CSRF
+            // refusal (403) is only possible on the POSTs below
             for (String path : List.of("/offers", "/offer-admin", "/v2/credential-configurations-beside-the-page")) {
                 MvcResult result = mockMvc.perform(get(path)).andReturn();
                 int status = result.getResponse().getStatus();
-                assertTrue(List.of(401, 403).contains(status), "GET " + path + " answered " + status + ", not 401/403");
+                assertEquals(401, status, "GET " + path + " answered " + status + ", not 401");
                 assertFalse(result.getResponse().getContentAsString().contains(NEIGHBOUR),
                         path + " reached its controller without authentication (" + status + ")");
                 MvcResult posted = mockMvc.perform(post(path)).andReturn();

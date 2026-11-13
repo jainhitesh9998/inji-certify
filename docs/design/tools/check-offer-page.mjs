@@ -5,8 +5,9 @@
  * throwaway VM with a minimal fake DOM, a stub `fetch` and a stub `QRCode`, and the page is driven the way a visitor
  * drives it (choose a configuration, choose a subject, press "Create offer", let the page be the wallet).
  *
- * Plain Node (18 or later), no npm dependencies, no browser, no server: `node docs/design/tools/check-offer-page.mjs`.
- * One line per check, then `check-offer-page: all N checks passed`; a non-zero exit when anything fails.
+ * Plain Node (20 or later, the version CI pins), no npm dependencies, no browser, no server:
+ * `node docs/design/tools/check-offer-page.mjs`. One line per check, then
+ * `check-offer-page: all N checks passed`; a non-zero exit when anything fails.
  *
  * Why it exists: round 1 of the F-15 review found that the JUnit page tests asserted source strings, which stayed green
  * while two real defects shipped (a `[hidden]` attribute that the page's own `label { display: block }` overrode, so a
@@ -14,17 +15,24 @@
  * with). Those two checks below are the regression tests for exactly those defects.
  *
  * Faithfulness (F-18). Round 2 of the F-15 review found the harness could pass where a real browser fails, so the fake
- * DOM now answers the way a browser does wherever the page depends on it (the page itself changes only in the subject
- * label, which F-18 nit 6 prints once when it repeats the id):
- *   - `getElementById` returns null for an id the markup does not declare (it never invents an element), so a page
- *     that looks up a missing id fails here as it throws in a browser;
- *   - a `<select>` whose `value` is set to something no `<option>` carries reads back "" with `selectedIndex` -1, and
- *     the first appended option becomes the selection, as in a single-select;
- *   - `appendChild` moves a node out of its previous parent, so the page's `while (qr.firstChild) container.appendChild(...)`
- *     moves children exactly as a browser does;
- *   - the `QRCode` stub draws a child into the container it is handed, so the published QR can be located;
- *   - the page's own wallet runs for real: Node's WebCrypto signs a P-256 proof, and this file verifies that signature
- *     with an independent key check.
+ * DOM now answers the way a browser does wherever the page depends on it (the page itself gains the F-18 spec fixes to
+ * its wallet and prints a subject label once when it repeats the id):
+ *   - `getElementById` returns null for an id the markup does not declare (it never invents an element), an id comes
+ *     from an attribute whose name is exactly `id` (a `data-id` is not one), comments and raw-text content are not
+ *     markup, and the first element with an id wins, so a page that looks up a missing id fails here as it throws in a
+ *     browser;
+ *   - a `<select>` tracks per-option selectedness and derives `value`/`selectedIndex` from it: a value no `<option>`
+ *     carries reads back "" with `selectedIndex` -1, removing the selected option selects the first remaining one, a
+ *     re-appended option marked selected takes the selection back, and an option without a `value` reads its text with
+ *     whitespace collapsed;
+ *   - `appendChild` moves a node out of its previous parent, `innerHTML = ""` clears the text as well as the children,
+ *     and a disabled control dispatches no click;
+ *   - the `QRCode` stub draws a child into the container it is handed, so the published QR can be located and a
+ *     replaced one is seen to leave nothing behind;
+ *   - the page's own wallet runs for real against the documents the live stack serves (issuer metadata and RFC 8414
+ *     authorization server metadata at their well-known locations, the endpoints they name): Node's WebCrypto signs a
+ *     P-256 proof, this file verifies that signature with an independent key check, and the token form, the
+ *     transaction code, `authorization_details`, the nonce and the credential request are all asserted.
  *
  * `OFFER_PAGE_HTML=<path>` evaluates another copy of the page. It exists for negative controls (break a copy in /tmp
  * and watch this file fail); a broken copy is never committed.
@@ -37,7 +45,8 @@
  *   - CSP, CORS, cookies, TLS, real network timing, retries, and the clipboard;
  *   - focus, keyboard, tab order, pointer and drag-and-drop behaviour, form submission, and navigation;
  *   - anything about the issuer: every `fetch` answer is a fixture, so server behaviour (status codes, bodies, headers)
- *     is only as faithful as the fixtures below.
+ *     is only as faithful as the fixtures below (their shapes are the ones the live stack serves, read from
+ *     `docs/design/tools/smoke_mdl.py` and the server's metadata builders).
  */
 import { createPublicKey, verify, webcrypto } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -90,7 +99,7 @@ class Element {
         this.listeners = new Map();
         this._value = undefined;
         this._text = "";
-        this._selectedIndex = tag === "select" ? -1 : undefined;
+        this.selected = false;
         this.hidden = false;
         this.disabled = false;
         this.checked = false;
@@ -117,18 +126,31 @@ class Element {
         this.clearChildren();
     }
 
+    /** The selected option of a select, or null: a browser derives value and selectedIndex from per-option selectedness. */
+    selectedOption() {
+        return this.children.find((child) => child.tagName === "option" && child.selected) || null;
+    }
+
+    /** Makes `option` the only selected option of this select (null selects none). */
+    selectOnly(option) {
+        for (const child of this.children) {
+            if (child.tagName === "option") child.selected = child === option;
+        }
+    }
+
     /**
-     * A browser's `value`: a select reads the selected option's value, "" when nothing is selected; an option without a
-     * `value` attribute reads its own text. Setting a select's value selects the matching option and leaves
-     * `selectedIndex` at -1 (so `value` reads "") when no option matches — the F-18 finding.
+     * A browser's `value`: a select reads the value of the option that is selected ("" when none is), and an option
+     * without a `value` attribute reads its own text with its whitespace collapsed. Setting a select's value marks the
+     * matching option selected and leaves nothing selected when none matches (so `value` reads "" and `selectedIndex`
+     * is -1) — the F-18 finding.
      */
     get value() {
         if (this.isSelect) {
-            const option = this.children[this._selectedIndex];
-            return option === undefined ? "" : option.value;
+            const option = this.selectedOption();
+            return option === null ? "" : option.value;
         }
         if (this._value !== undefined) return String(this._value);
-        return this.tagName === "option" ? this._text.trim() : "";
+        return this.tagName === "option" ? this._text.replace(/\s+/g, " ").trim() : "";
     }
 
     set value(value) {
@@ -137,24 +159,24 @@ class Element {
             this._value = text;
             return;
         }
-        this._selectedIndex = this.children.findIndex((child) => child.tagName === "option" && child.value === text);
+        this.selectOnly(this.children.find((child) => child.tagName === "option" && child.value === text) || null);
     }
 
     get selectedIndex() {
-        return this.isSelect ? this._selectedIndex : -1;
+        if (!this.isSelect) return -1;
+        return this.children.findIndex((child) => child.tagName === "option" && child.selected);
     }
 
     set selectedIndex(index) {
         if (!this.isSelect) return;
         const at = Number(index);
-        this._selectedIndex = at >= 0 && at < this.children.length ? at : -1;
+        this.selectOnly(at >= 0 && at < this.children.length ? this.children[at] : null);
     }
 
     clearChildren() {
+        // a detached option keeps its own selectedness, which is what lets a re-appended option take the selection back
         for (const child of this.children) child.parent = null;
         this.children = [];
-        // no options left means nothing is selected, as in a browser
-        if (this.isSelect) this._selectedIndex = -1;
     }
 
     appendChild(child) {
@@ -163,8 +185,12 @@ class Element {
         if (child.parent) child.parent.removeChild(child);
         child.parent = this;
         this.children.push(child);
-        // a single-select with no selection selects its first option as soon as it has one
-        if (this.isSelect && this._selectedIndex < 0) this._selectedIndex = 0;
+        if (this.isSelect && child.tagName === "option") {
+            // inserting an option runs the selectedness setting algorithm: a selected one takes the selection of a
+            // single select, and a select with nothing selected selects its first option
+            if (child.selected) this.selectOnly(child);
+            else if (this.selectedOption() === null) this.selectOnly(this.children.find((o) => o.tagName === "option") || null);
+        }
         return child;
     }
 
@@ -173,10 +199,9 @@ class Element {
         if (index < 0) return child;
         this.children.splice(index, 1);
         child.parent = null;
-        if (this.isSelect) {
-            if (!this.children.length) this._selectedIndex = -1;
-            else if (index < this._selectedIndex) this._selectedIndex--;
-            else if (this._selectedIndex >= this.children.length) this._selectedIndex = this.children.length - 1;
+        // removing the selected option leaves the first remaining one selected (Chrome), so no removal blanks a select
+        if (this.isSelect && child.selected && this.selectedOption() === null) {
+            this.selectOnly(this.children.find((o) => o.tagName === "option") || null);
         }
         return child;
     }
@@ -194,6 +219,7 @@ class Element {
     // markup, so every assignment is recorded and the checks below look for a non-empty one
     set innerHTML(value) {
         this.innerHTMLWrites.push(String(value));
+        this._text = "";
         this.clearChildren();
     }
 
@@ -202,6 +228,8 @@ class Element {
     }
 
     async fire(type) {
+        // a disabled control does not dispatch events (the page disables Create and the wallet while they work)
+        if (this.disabled) return;
         const listeners = this.listeners.get(type) || [];
         for (const listener of listeners) await listener({ type, target: this });
     }
@@ -210,24 +238,29 @@ class Element {
 const VOID = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
     "track", "wbr"]);
 
-function applyMarkupAttributes(element, attributes) {
-    element.hidden = /(^|\s)hidden(\s|=|$)/.test(attributes);
-    element.disabled = /(^|\s)disabled(\s|=|$)/.test(attributes);
-    element.checked = /(^|\s)checked(\s|=|$)/.test(attributes);
-    const value = /\bvalue="([^"]*)"/.exec(attributes);
-    if (value) element._value = value[1];
+/** The attributes of one start tag by name: `data-id="x"` is an attribute named `data-id`, never one named `id`. */
+function tagAttributes(attributes) {
+    const found = new Map();
+    for (const match of attributes.matchAll(/([^\s"'>/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g)) {
+        const [, name, doubleQuoted, singleQuoted, unquoted] = match;
+        found.set(name.toLowerCase(), doubleQuoted !== undefined ? doubleQuoted
+            : singleQuoted !== undefined ? singleQuoted : unquoted !== undefined ? unquoted : "");
+    }
+    return found;
 }
 
 /**
  * The elements the markup declares, nested as the markup nests them (so a select owns its options), with the state the
- * markup gives them (hidden, disabled, value, the text between the tags). Only declared ids are returned: anything else
- * is absent, exactly as `document.getElementById` answers in a browser. The inline script is removed first: its `<`
- * comparisons are not markup.
+ * markup gives them (hidden, disabled, selected, value, the text between the tags). Only declared ids are returned:
+ * anything else is absent, exactly as `document.getElementById` answers in a browser. Comments and raw-text content are
+ * not markup, and a duplicate id answers with its first element, as a browser does.
  */
 function markupElements(markup) {
     const elements = new Map();
     const stack = [];
-    const source = markup.replace(/<script\b[\s\S]*?<\/script>/gi, "");
+    const source = markup
+        .replace(/<!--[\s\S]*?-->/g, "")
+        .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, "");
     const tags = /<(\/?)([a-zA-Z][\w-]*)((?:"[^"]*"|'[^']*'|[^>"'])*?)(\/?)>/g;
     let cursor = 0;
     for (const match of source.matchAll(tags)) {
@@ -236,7 +269,7 @@ function markupElements(markup) {
         // after the tag that was just matched
         cursor = match.index + match[0].length;
         if (text && stack.length) stack[stack.length - 1]._text += text;
-        const [, closing, rawName, attributes, selfClosing] = match;
+        const [, closing, rawName, attributeText, selfClosing] = match;
         const tag = rawName.toLowerCase();
         if (closing) {
             for (let i = stack.length - 1; i >= 0; i--) {
@@ -247,45 +280,106 @@ function markupElements(markup) {
             }
             continue;
         }
+        const attributes = tagAttributes(attributeText);
         const element = new Element(tag);
-        applyMarkupAttributes(element, attributes);
+        element.hidden = attributes.has("hidden");
+        element.disabled = attributes.has("disabled");
+        element.checked = attributes.has("checked");
+        element.selected = attributes.has("selected");
+        if (attributes.has("value")) element._value = attributes.get("value");
         if (stack.length) stack[stack.length - 1].appendChild(element);
-        const id = /\bid="([^"]*)"/.exec(attributes);
-        if (id) elements.set(id[1], element);
+        const id = attributes.get("id");
+        if (id !== undefined && !elements.has(id)) elements.set(id, element);
         if (!VOID.has(tag) && !selfClosing) stack.push(element);
     }
     return elements;
 }
 
-/* ---------------------------------------------------------------- fixtures */
+/* ---------------------------------------------------------------- fixtures: the documents the live stack serves */
 
 const GRANT = "urn:ietf:params:oauth:grant-type:pre-authorized_code";
-const TOKEN_ENDPOINT = "https://issuer.example/token";
-const ISSUER = "https://issuer.example/oid4vci";
-const OFFER_DOCUMENT = "https://issuer.example/v1/certify/credential-offer-data/";
+// the mDL deployment's identifiers (config/certify-default.properties: mosip.certify.identifier = domain.url; the
+// /oid4vci identifier appends the servlet path and /oid4vci, and certify-nginx maps each document's well-known location)
+const DOMAIN = "https://credentials.example";
+const OID4VCI_ISSUER = DOMAIN + "/v1/certify/oid4vci";
+const LEGACY_ISSUER = DOMAIN;
+const AS = DOMAIN;
+const TOKEN_ENDPOINT = DOMAIN + "/v1/certify/oauth/token";
+const OID4VCI_NONCE_ENDPOINT = OID4VCI_ISSUER + "/nonce";
+const OID4VCI_CREDENTIAL_ENDPOINT = OID4VCI_ISSUER + "/credential";
+const LEGACY_NONCE_ENDPOINT = DOMAIN + "/v1/certify/nonce";
+const LEGACY_CREDENTIAL_ENDPOINT = DOMAIN + "/v1/certify/issuance/credential";
+const OFFER_DOCUMENT = DOMAIN + "/v1/certify/credential-offer-data/";
 
-const METADATA = {
-    credential_configurations_supported: {
-        mdl: { format: "ldp_vc" },
-        demo: { format: "ldp_vc" },
-        farmer: { format: "ldp_vc" },
-    },
+const CONFIGURATIONS = {
+    mdl: { format: "ldp_vc" },
+    demo: { format: "ldp_vc" },
+    farmer: { format: "ldp_vc" },
 };
+
+/** The compatibility document the page loads for its configuration dropdown (its credentials never leave the page). */
+const METADATA = { credential_configurations_supported: CONFIGURATIONS };
+
+/** The /oid4vci document (Oid4vciDiscoveryController): its own identity, this surface's endpoints, the deployment's AS. */
+const OID4VCI_DOCUMENT = {
+    credential_issuer: OID4VCI_ISSUER,
+    authorization_servers: [AS],
+    credential_endpoint: OID4VCI_CREDENTIAL_ENDPOINT,
+    nonce_endpoint: OID4VCI_NONCE_ENDPOINT,
+    notification_endpoint: OID4VCI_ISSUER + "/notification",
+    credential_configurations_supported: CONFIGURATIONS,
+};
+
+/** The compatibility document (CredentialIssuerMetadataBuilder): the deployment identifier and its own endpoints. */
+const LEGACY_DOCUMENT = {
+    credential_issuer: LEGACY_ISSUER,
+    authorization_servers: [LEGACY_ISSUER],
+    credential_endpoint: LEGACY_CREDENTIAL_ENDPOINT,
+    nonce_endpoint: LEGACY_NONCE_ENDPOINT,
+    credential_configurations_supported: CONFIGURATIONS,
+};
+
+const DEFAULT_ISSUER_METADATA = { [OID4VCI_ISSUER]: OID4VCI_DOCUMENT, [LEGACY_ISSUER]: LEGACY_DOCUMENT };
+
+/** The RFC 8414 document the live stack serves (F-17 evidence: no authorization_code it cannot complete). */
+const AS_DOCUMENT = {
+    issuer: AS,
+    token_endpoint: TOKEN_ENDPOINT,
+    jwks_uri: DOMAIN + "/v1/certify/.well-known/jwks.json",
+    grant_types_supported: [GRANT],
+    dpop_signing_alg_values_supported: ["ES256", "ES384", "ES512", "RS256", "PS256", "EdDSA"],
+    "pre-authorized_grant_anonymous_access_supported": true,
+};
+
+const DEFAULT_AS_METADATA = { [AS]: AS_DOCUMENT };
+
+/** OpenID4VCI 1.0 section 6.1: the shape PreAuthorizedCodeService#buildTxCodeInfo publishes for an entered code. */
+const TX_CODE = { length: 4, input_mode: "numeric", description: "Please enter the transaction code provided to you" };
+
+/** RFC 8414 section 3 / OpenID4VCI 1.0 section 12.2.2: the well-known segment goes between the host and the path. */
+function wellKnown(identifier, suffix) {
+    const url = new URL(identifier);
+    return url.origin + "/.well-known/" + suffix + url.pathname.replace(/\/+$/, "");
+}
 
 /** A deep link whose `credential_offer_uri` parameter names an offer document, as the page's POST answer carries it. */
 const deepLink = (name) => `openid-credential-offer://?credential_offer_uri=${encodeURIComponent(OFFER_DOCUMENT + name)}`;
 
-/** An offer the issuer returned by value: the deep link plus the document, so the page fetches nothing. */
-const offerByValue = (name, code) => ({
-    credential_offer_uri: deepLink(name),
-    credential_offer: { grants: { [GRANT]: { "pre-authorized_code": code } } },
+/** An offer document as PreAuthorizedCodeService publishes it (OpenID4VCI 1.0 section 4.1.1). */
+const offerDocument = (credentialIssuer, configurationId, code, txCode) => ({
+    credential_issuer: credentialIssuer,
+    credential_configuration_ids: [configurationId],
+    grants: { [GRANT]: Object.assign({ "pre-authorized_code": code }, txCode ? { tx_code: txCode } : {}) },
 });
+
+/** An offer the issuer returned by value: the deep link plus the same document, so the page fetches nothing. */
+const offerByValue = (name, document) => ({ credential_offer_uri: deepLink(name), credential_offer: document });
 
 /** An offer the issuer returned by reference: only the deep link, whose parameter the page must fetch. */
 const offerByReference = (name) => ({ credential_offer_uri: deepLink(name) });
 
-const OFFER = offerByValue("abc", "abc");
-const REFERRED_OFFER = { grants: { [GRANT]: { "pre-authorized_code": "ref-code" } } };
+const OFFER = offerByValue("abc", offerDocument(OID4VCI_ISSUER, "demo", "abc"));
+const REFERRED_OFFER = offerDocument(OID4VCI_ISSUER, "demo", "ref-code");
 
 const SUBJECTS = [
     { id: "mdl-demo-1", label: "Asha Demo", credential_configuration_ids: ["mdl", "demo"] },
@@ -296,17 +390,20 @@ const SUBJECTS = [
 ];
 
 /**
- * Opens the page: the markup's elements, the inline script evaluated against them, and the four requests it makes on
- * load (two metadata documents, the authorization server metadata, the demo-subject list).
+ * Opens the page: the markup's elements, the inline script evaluated against them, and the requests it makes on load
+ * (the configuration document and the demo-subject list; the wallet's metadata is read when it redeems an offer).
  *
  * @param demo the answer to `GET /offer/demo-subjects`: a JSON value, a raw string, `false` for a 404, or `null` for a
  *             fetch that throws
- * @param options the page source (`html`), the answer to `POST /pre-authorized-data` (`offer`, or `offers` consumed one
- *                per click, the last one repeating), the answers to the by-reference offer fetch (`offerFetches`), and
- *                the `token`, `nonce` and `credential` answers of the page's wallet
+ * @param options the page source (`html`), the issuer metadata documents by issuer (`issuerMetadata`), the
+ *                authorization server documents by server (`asMetadata`), the answer to `POST /pre-authorized-data`
+ *                (`offer`, or `offers` consumed one per click, the last one repeating), the answers to the by-reference
+ *                offer fetch (`offerFetches`, an entry of `"throw"` being a fetch that rejects), and the `token`,
+ *                `nonce` and `credential` answers of the page's wallet
  */
 function openPage(demo, options = {}) {
-    const elements = markupElements(options.html === undefined ? html : options.html);
+    const source = options.html === undefined ? html : options.html;
+    const elements = markupElements(source);
     const created = [];
     const requests = [];
     const missingIds = [];
@@ -345,6 +442,17 @@ function openPage(demo, options = {}) {
         return offerFetches.length > 1 ? offerFetches.shift() : offerFetches[0];
     };
 
+    const issuerMetadata = options.issuerMetadata || DEFAULT_ISSUER_METADATA;
+    const asMetadata = options.asMetadata || DEFAULT_AS_METADATA;
+    const issuerDocuments = new Map(Object.entries(issuerMetadata)
+        .map(([issuer, document]) => [wellKnown(issuer, "openid-credential-issuer"), document]));
+    const asDocuments = new Map(Object.entries(asMetadata)
+        .map(([server, document]) => [wellKnown(server, "oauth-authorization-server"), document]));
+    // the page must post to the endpoints the documents advertise, so those are the only ones a POST is answered on
+    const nonceEndpoints = new Set(Object.values(issuerMetadata).map((entry) => entry && entry.nonce_endpoint).filter(Boolean));
+    const credentialEndpoints = new Set(Object.values(issuerMetadata).map((entry) => entry && entry.credential_endpoint).filter(Boolean));
+    const tokenEndpoints = new Set(Object.values(asMetadata).map((entry) => entry && entry.token_endpoint).filter(Boolean));
+
     const fetch = async (url, init = {}) => {
         const target = String(url);
         const method = (init.method || "GET").toUpperCase();
@@ -356,12 +464,11 @@ function openPage(demo, options = {}) {
             body: form ? form.toString() : init.body,
             form: form ? Object.fromEntries(form.entries()) : undefined,
         });
-        if (method === "GET" && target.endsWith("/.well-known/oauth-authorization-server")) {
-            return answer(200, { token_endpoint: TOKEN_ENDPOINT });
-        }
-        if (method === "GET" && target.endsWith("/oid4vci/.well-known/openid-credential-issuer")) {
-            return answer(200, { credential_issuer: ISSUER, credential_configurations_supported: {} });
-        }
+        // OpenID4VCI 1.0 section 12.2.2 and RFC 8414 section 3: the documents of the offer's issuer and of its
+        // authorization server, each at its well-known location
+        if (method === "GET" && issuerDocuments.has(target)) return answer(200, issuerDocuments.get(target));
+        if (method === "GET" && asDocuments.has(target)) return answer(200, asDocuments.get(target));
+        // the page's own configuration list, loaded from its own surface
         if (method === "GET" && target.endsWith("/.well-known/openid-credential-issuer")) return answer(200, METADATA);
         if (method === "GET" && target.endsWith("/offer/demo-subjects")) {
             if (demo === null) throw new TypeError("fetch failed");
@@ -375,11 +482,9 @@ function openPage(demo, options = {}) {
             return answer(next.status, next.body);
         }
         if (method === "POST" && target.endsWith("/pre-authorized-data")) return answer(200, nextOffer());
-        if (method === "POST" && target === TOKEN_ENDPOINT) return answer(tokenAnswer.status, tokenAnswer.body);
-        if (method === "POST" && target.endsWith("/oid4vci/nonce")) return answer(nonceAnswer.status, nonceAnswer.body);
-        if (method === "POST" && target.endsWith("/oid4vci/credential")) {
-            return answer(credentialAnswer.status, credentialAnswer.body);
-        }
+        if (method === "POST" && tokenEndpoints.has(target)) return answer(tokenAnswer.status, tokenAnswer.body);
+        if (method === "POST" && nonceEndpoints.has(target)) return answer(nonceAnswer.status, nonceAnswer.body);
+        if (method === "POST" && credentialEndpoints.has(target)) return answer(credentialAnswer.status, credentialAnswer.body);
         return answer(404, "not found");
     };
 
@@ -405,7 +510,8 @@ function openPage(demo, options = {}) {
         console: { log: () => {}, warn: () => {}, error: () => {} },
         setTimeout,
         clearTimeout,
-        // the page's wallet: URL/URLSearchParams for the offer fetch, WebCrypto for the proof, and the base64 helpers
+        // the page's wallet: URL/URLSearchParams for the documents and links, WebCrypto for the proof, and the base64
+        // helpers it encodes with
         URL,
         URLSearchParams,
         Blob,
@@ -415,8 +521,8 @@ function openPage(demo, options = {}) {
         btoa,
         atob,
     });
-    const inline = [...(options.html === undefined ? html : options.html).matchAll(/<script>([\s\S]*?)<\/script>/g)]
-        .map((match) => match[1]).find((source) => source.includes("(function () {"));
+    const inline = [...source.matchAll(/<script>([\s\S]*?)<\/script>/g)]
+        .map((match) => match[1]).find((script) => script.includes("(function () {"));
     if (!inline) throw new Error("the page's inline script is missing");
     // a page that looks up an id the markup does not declare throws here, as it does in a browser; the checks report it
     let scriptError = null;
@@ -474,21 +580,86 @@ function openPage(demo, options = {}) {
 
 const options = (page) => page.el("subjectChoice").children.map((option) => [option.value, option.textContent]);
 
+/** A property of a declared element, or undefined when the markup declares no such element (never a crash). */
+const prop = (page, id, name) => {
+    const element = page.el(id);
+    return element === null ? undefined : element[name];
+};
+
 /** The last request the page made that matches, or undefined. */
 const find = (page, method, pattern) => page.requests.filter((request) => request.method === method && pattern.test(request.url)).pop();
+
+/** The last metadata document the page fetched on its own behalf (the documents are absolute, the page's own is not). */
+const metadataRequest = (page, suffix) => page.requests
+    .filter((request) => request.method === "GET" && request.url.startsWith("http") && request.url.includes("/.well-known/" + suffix))
+    .pop();
+
+const tokenRequest = (page) => page.requests.filter((request) => request.method === "POST" && request.form && request.form.grant_type).pop();
+const nonceRequest = (page) => page.requests.filter((request) => request.method === "POST" && /\/nonce$/.test(request.url)).pop();
+const credentialRequest = (page) => page.requests
+    .filter((request) => request.method === "POST" && typeof request.body === "string" && request.body.includes("\"proofs\""))
+    .pop();
 
 /** The stand-in QR images published in the page's `#qr` container, by the text they encode. */
 const qrImages = (page) => page.el("qr").children.filter((child) => child.tagName === "img").map((child) => child.src);
 
-const decodePart = (part) => JSON.parse(Buffer.from(part, "base64url").toString("utf8"));
+const decodePart = (part) => {
+    try {
+        return JSON.parse(Buffer.from(part, "base64url").toString("utf8"));
+    } catch (error) {
+        return {};
+    }
+};
 
 /** Verifies a compact JWS proof against the JWK it carries, independently of how the page signed it. */
 function proofVerifies(proof) {
-    const [header, claims, signature] = String(proof).split(".");
-    const jwk = decodePart(header).jwk;
-    const key = createPublicKey({ key: { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y }, format: "jwk" });
-    return verify("sha256", Buffer.from(header + "." + claims), { key, dsaEncoding: "ieee-p1363" },
-        Buffer.from(signature, "base64url"));
+    try {
+        const [header, claims, signature] = String(proof).split(".");
+        const jwk = decodePart(header).jwk;
+        const key = createPublicKey({ key: { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y }, format: "jwk" });
+        return verify("sha256", Buffer.from(header + "." + claims), { key, dsaEncoding: "ieee-p1363" },
+            Buffer.from(signature, "base64url")) === true;
+    } catch (error) {
+        return false;
+    }
+}
+
+/**
+ * Everything the checks say about one wallet run's credential request: the body names the credential the offer (or the
+ * access token's `authorization_details`) allows, and the proof is a strict compact JWS carrying a public P-256 key,
+ * the offer issuer as `aud`, the nonce when the issuer gave one, and no `iss` (anonymous pre-authorized flow).
+ */
+function checkCredentialRequest(label, request, expected) {
+    const body = request && typeof request.body === "string" ? JSON.parse(request.body) : undefined;
+    check(`${label}: the credential request carries exactly one proof`, !!(body && body.proofs && body.proofs.jwt
+        && body.proofs.jwt.length === 1), body);
+    const proof = body && body.proofs && body.proofs.jwt && body.proofs.jwt[0];
+    check(`${label}: the proof is a strict compact JWS (three base64url segments, no padding)`,
+        /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(String(proof)), String(proof).slice(0, 48));
+    const [headerPart, claimsPart] = String(proof).split(".");
+    const header = headerPart ? decodePart(headerPart) : {};
+    const claims = claimsPart ? decodePart(claimsPart) : {};
+    const jwk = header.jwk || {};
+    equal(`${label}: the proof header marks an OpenID4VCI proof signed with the key it carries`,
+        [header.typ, header.alg, jwk.kty, jwk.crv, typeof jwk.x, typeof jwk.y],
+        ["openid4vci-proof+jwt", "ES256", "EC", "P-256", "string", "string"]);
+    equal(`${label}: the proof publishes a public key only (no private "d")`, "d" in jwk, false);
+    equal(`${label}: aud is the credential issuer the offer named`, claims.aud, expected.audience);
+    equal(`${label}: iss is absent in the anonymous pre-authorized flow`, "iss" in claims, false);
+    equal(`${label}: the proof binds the nonce the issuer answered with`, "nonce" in claims ? claims.nonce : null,
+        expected.nonce === undefined ? null : expected.nonce);
+    check(`${label}: the proof has an issued-at time`, Number.isInteger(claims.iat) && claims.iat > 0, claims.iat);
+    check(`${label}: the proof's signature verifies with the key it carries`, proofVerifies(proof));
+    equal(`${label}: the credential request carries the access token`, request && request.headers.Authorization,
+        "Bearer " + (expected.token === undefined ? "at-f18" : expected.token));
+    const fields = body || {};
+    if (expected.credentialIdentifier) {
+        equal(`${label}: the credential is named by credential_identifier, never by a configuration id`,
+            [fields.credential_identifier, "credential_configuration_id" in fields], [expected.credentialIdentifier, false]);
+    } else {
+        equal(`${label}: the credential is named by the configuration id the offer carries`,
+            [fields.credential_configuration_id, "credential_identifier" in fields], [expected.configurationId, false]);
+    }
 }
 
 /* ---------------------------------------------------------------- the page as it was */
@@ -665,7 +836,7 @@ await unchanged("one bad entry among good ones", { subjects: [SUBJECTS[0], { id:
     equal("no element was built from the label", images, []);
     equal("no label reached innerHTML", page.innerHTMLOfEverything().filter((written) => written !== ""), []);
     check("the label is text on the option, not markup",
-        page.el("subjectChoice").children[0].textContent.includes("<img src=x onerror=alert(1)>"));
+        page.el("subjectChoice").children[0]?.textContent.includes("<img src=x onerror=alert(1)>"));
 }
 
 // 6. a subject configured for another configuration leaves the page as it was: the dropdown hidden, the typed field and
@@ -679,19 +850,82 @@ await unchanged("one bad entry among good ones", { subjects: [SUBJECTS[0], { id:
     equal("and restores the claims label", page.el("claimsLabel").textContent, CLAIMS_LABEL);
 }
 
-// 7. the page against a browser's DOM: no invented elements, and a select's value means what it means in a browser
+// 7. the markup parser and the DOM rules the page depends on
+{
+    const parsed = markupElements(`<div id="first"><!-- <span id="in-a-comment"> --><script>var trap = '<b id="in-a-script">';</script>` +
+        `<style>#in-a-style { color: red }</style><button data-id="not-an-id">x</button><span id="first">y</span></div>`);
+    equal("an attribute named data-id is not an id", parsed.has("not-an-id"), false);
+    equal("an id inside an HTML comment is not declared", parsed.has("in-a-comment"), false);
+    equal("raw text inside a script is not markup", parsed.has("in-a-script"), false);
+    equal("raw text inside a style is not markup", parsed.has("in-a-style"), false);
+    equal("the first element with an id wins, as in a browser", parsed.get("first") && parsed.get("first").tagName, "div");
+
+    const cleared = new Element("div");
+    cleared.textContent = "old text";
+    cleared.appendChild(new Element("span"));
+    cleared.innerHTML = "";
+    equal("innerHTML = \"\" clears the text and the children", [cleared.textContent, cleared.children.length], ["", 0]);
+
+    const disabledControl = new Element("button");
+    let clicks = 0;
+    disabledControl.addEventListener("click", () => { clicks++; });
+    disabledControl.disabled = true;
+    await disabledControl.fire("click");
+    equal("a disabled control does not dispatch a click", clicks, 0);
+}
+
+// 8. a <select>'s selection is per-option selectedness, as in a browser (HTML selectedness setting algorithm)
+{
+    const select = new Element("select");
+    const option = (value) => {
+        const element = new Element("option");
+        element.value = value;
+        element.textContent = value;
+        return element;
+    };
+    const a = option("a"), b = option("b"), c = option("c");
+    select.appendChild(a);
+    select.appendChild(b);
+    select.appendChild(c);
+    equal("a select selects its first option while nothing is", [select.value, select.selectedIndex], ["a", 0]);
+    select.value = "b";
+    equal("a value an option carries selects that option", [select.value, select.selectedIndex], ["b", 1]);
+    select.value = "no-such-option";
+    equal("a value no option carries leaves nothing selected", [select.value, select.selectedIndex], ["", -1]);
+    select.value = "b";
+    select.removeChild(b);
+    equal("removing the selected middle option selects the first one", [select.value, select.selectedIndex], ["a", 0]);
+    select.value = "c";
+    select.removeChild(c);
+    equal("removing the selected last option selects the first one", [select.value, select.selectedIndex], ["a", 0]);
+    select.appendChild(b);
+    equal("a re-appended option still marked selected is the selection again", [select.value, select.selectedIndex], ["b", 1]);
+
+    const other = new Element("select");
+    const x = option("x"), y = option("y");
+    other.appendChild(x);
+    other.appendChild(y);
+    other.value = "y";
+    select.appendChild(y);
+    equal("a moved option takes its selection with it", [select.value, select.children.includes(y)], ["y", true]);
+    equal("and the select it left selects what is left", other.value, "x");
+
+    const bare = new Element("option");
+    bare.textContent = "  a   b  ";
+    equal("an option without a value reads its text, whitespace collapsed", bare.value, "a b");
+}
+
+// 9. the page against that DOM: no invented elements, and an unofferable select value takes the Other path
 {
     const page = openPage({ subjects: SUBJECTS });
     await page.settle();
     const el = page.el;
     equal("an id the markup does not declare has no element", el("no-such-element"), null);
 
-    // a select whose value matches no option reads back "", as a browser's does (selectedIndex -1)
     const choice = el("subjectChoice");
     const offered = choice.children.map((option) => option.value);
     choice.value = "no-such-subject";
-    equal("a select value that matches no option reads back empty", choice.value, "");
-    equal("and its selectedIndex is -1", choice.selectedIndex, -1);
+    equal("a select value that matches no option reads back empty", [choice.value, choice.selectedIndex], ["", -1]);
     choice.value = offered[0];
     equal("a value one of its options carries still selects it", [choice.value, choice.selectedIndex], [offered[0], 0]);
     choice.value = offered[offered.length - 1];
@@ -711,7 +945,7 @@ await unchanged("one bad entry among good ones", { subjects: [SUBJECTS[0], { id:
     el("claims").value = "";
 }
 
-// 8. a subject whose label repeats its id is shown as the id alone (F-18 nit 6), and so is a subject with no label
+// 10. a subject whose label repeats its id is shown as the id alone (F-18 nit 6), and so is a subject with no label
 {
     const page = openPage({
         subjects: [
@@ -729,22 +963,24 @@ await unchanged("one bad entry among good ones", { subjects: [SUBJECTS[0], { id:
     ]);
 }
 
-// 9. the published QR: the stub draws into the container it is given, and a new offer replaces the old QR
+// 11. the published QR: the stub draws into the container it is given, and a new offer replaces the old QR
 {
-    const page = openPage({ subjects: [] }, { offers: [offerByValue("qr-one", "code-one"), offerByValue("qr-two", "code-two")] });
+    const page = openPage({ subjects: [] }, {
+        offers: [offerByValue("qr-one", offerDocument(OID4VCI_ISSUER, "demo", "code-one")),
+            offerByValue("qr-two", offerDocument(OID4VCI_ISSUER, "demo", "code-two"))],
+    });
     await page.settle();
     const el = page.el;
     el("subject").value = "qr-subject";
     await page.createOffer();
     equal("qr: the first offer's QR is published into the page's container",
         qrImages(page), ["qr:" + deepLink("qr-one")]);
-    equal("qr: the container holds nothing else", el("qr").children.length, 1);
     await page.createOffer();
-    equal("qr: the next offer's QR replaces it", qrImages(page), ["qr:" + deepLink("qr-two")]);
-    equal("qr: no QR of the previous offer is left behind", el("qr").children.length, 1);
+    equal("qr: the container holds the current offer's QR and no other",
+        qrImages(page), ["qr:" + deepLink("qr-two")]);
 }
 
-// 10. an offer by reference: the page fetches the document its deep link names, and publishes it
+// 12. an offer by reference: the page fetches the document its deep link names, and publishes it
 {
     const page = openPage({ subjects: [] }, {
         offers: [offerByReference("by-reference")],
@@ -765,11 +1001,16 @@ await unchanged("one bad entry among good ones", { subjects: [SUBJECTS[0], { id:
     equal("by reference: the page looked up only ids the markup declares", page.missingIds, []);
 }
 
-// 11. a by-reference offer that cannot be fetched leaves the previous offer, its document and its QR in place
-{
+// 13. a replacement the page cannot complete leaves the previous offer, its document, its QR and the wallet's offer in
+//     place — after a first offer has been published, which is the state these refusals have to preserve
+for (const [label, answer] of [
+    ["404", { status: 404, body: "not found" }],
+    ["a fetch that throws", "throw"],
+    ["a document without the pre-authorized grant", { status: 200, body: { grants: {} } }],
+]) {
     const page = openPage({ subjects: [] }, {
         offers: [offerByReference("kept"), offerByReference("broken")],
-        offerFetches: [{ status: 200, body: REFERRED_OFFER }, { status: 404, body: "not found" }],
+        offerFetches: [{ status: 200, body: REFERRED_OFFER }, answer],
     });
     await page.settle();
     const el = page.el;
@@ -778,19 +1019,29 @@ await unchanged("one bad entry among good ones", { subjects: [SUBJECTS[0], { id:
     const keptUri = el("offerUri").textContent;
     const keptDocument = el("offerDoc").textContent;
     const keptQr = qrImages(page);
-    equal("a failed replacement: the previous offer was published first", keptUri, deepLink("kept"));
+    equal(`${label}: the previous offer was published first`, [keptUri, keptQr],
+        [deepLink("kept"), ["qr:" + deepLink("kept")]]);
 
     await page.createOffer();
-    check("a failed by-reference fetch is reported", el("offerStatus").textContent.includes("could not be fetched"),
-        el("offerStatus").textContent);
-    equal("a failed by-reference fetch keeps the previous deep link", el("offerUri").textContent, keptUri);
-    equal("a failed by-reference fetch keeps the previous document", el("offerDoc").textContent, keptDocument);
-    equal("a failed by-reference fetch keeps the previous QR", qrImages(page), keptQr);
-    check("a failed by-reference fetch keeps the wallet enabled", el("wallet").disabled === false);
-    check("a failed by-reference fetch re-enables the Create button", el("create").disabled === false);
+    // a rejected fetch reaches the page's outer catch and a refused one its by-reference message: either way the page
+    // reports the failure and publishes nothing
+    check(`${label}: the failed replacement is reported`,
+        el("offerStatus").className.includes("bad"), el("offerStatus").textContent);
+    equal(`${label}: the previous deep link stays`, el("offerUri").textContent, keptUri);
+    equal(`${label}: the previous document stays`, el("offerDoc").textContent, keptDocument);
+    equal(`${label}: the previous QR stays`, qrImages(page), keptQr);
+    check(`${label}: the wallet stays enabled`, el("wallet").disabled === false);
+    equal(`${label}: the Create button is usable again`, prop(page, "create", "disabled"), false);
+
+    // and the wallet still redeems the offer that is on screen, not the one that failed
+    await page.runWallet();
+    equalFields(`${label}: the wallet redeems the kept offer's pre-authorized code`,
+        tokenRequest(page) && tokenRequest(page).form, { grant_type: GRANT, "pre-authorized_code": "ref-code" });
+    checkCredentialRequest(`${label}: the wallet redeems the kept offer's configuration`,
+        credentialRequest(page), { audience: OID4VCI_ISSUER, nonce: "nonce-f18", configurationId: "demo" });
 }
 
-// 12. a by-reference document without the pre-authorized grant is not an offer the page publishes
+// 14. a first offer the page cannot publish leaves nothing published, and its disabled wallet dispatches nothing
 {
     const page = openPage({ subjects: [] }, {
         offers: [offerByReference("no-grant")],
@@ -804,11 +1055,14 @@ await unchanged("one bad entry among good ones", { subjects: [SUBJECTS[0], { id:
         el("offerStatus").textContent.includes("could not be fetched"), el("offerStatus").textContent);
     equal("and nothing is published", [el("offerUri").hidden, el("wallet").disabled], [true, true]);
     equal("and no QR is drawn", qrImages(page), []);
+    const before = page.requests.length;
+    await page.runWallet();
+    equal("a disabled wallet button dispatches no click", page.requests.slice(before), []);
 }
 
-// 13. the page's own wallet: token form, c_nonce, a real P-256 proof, and the credential request
+// 15. the page's own wallet: the metadata documents, the token form, the nonce, a real P-256 proof, the credential
 {
-    const page = openPage({ subjects: [] }, { offers: [offerByValue("wallet", "code-f18")] });
+    const page = openPage({ subjects: [] }, { offers: [offerByValue("wallet", offerDocument(OID4VCI_ISSUER, "demo", "code-f18"))] });
     await page.settle();
     const el = page.el;
     el("subject").value = "wallet-subject";
@@ -817,45 +1071,31 @@ await unchanged("one bad entry among good ones", { subjects: [SUBJECTS[0], { id:
     check("wallet: the pre-authorized grant enables the wallet button", el("wallet").disabled === false);
     await page.runWallet();
 
-    const token = find(page, "POST", /\/token$/);
-    check("wallet: the token request goes to the token endpoint the AS metadata advertises",
-        token !== undefined && token.url === TOKEN_ENDPOINT, token && token.url);
-    equal("wallet: the token request is a form", token && token.headers["Content-Type"],
-        "application/x-www-form-urlencoded");
+    equal("wallet: the offer issuer's metadata is read at its well-known location (12.2.2)",
+        metadataRequest(page, "openid-credential-issuer") && metadataRequest(page, "openid-credential-issuer").url,
+        "https://credentials.example/.well-known/openid-credential-issuer/v1/certify/oid4vci");
+    equal("wallet: its authorization server's metadata is read at its well-known location (RFC 8414 section 3)",
+        metadataRequest(page, "oauth-authorization-server") && metadataRequest(page, "oauth-authorization-server").url,
+        "https://credentials.example/.well-known/oauth-authorization-server");
+
+    const token = tokenRequest(page);
+    equal("wallet: the token request goes to the token endpoint the AS metadata advertises", token && token.url, TOKEN_ENDPOINT);
+    equal("wallet: the token request is a form", token && token.headers["Content-Type"], "application/x-www-form-urlencoded");
     equalFields("wallet: the token form carries the grant and the pre-authorized code, and no tx_code", token && token.form, {
         grant_type: GRANT,
         "pre-authorized_code": "code-f18",
     });
 
-    const nonce = find(page, "POST", /\/oid4vci\/nonce$/);
-    check("wallet: a c_nonce is fetched with POST /oid4vci/nonce and no body",
-        nonce !== undefined && nonce.body === undefined, nonce && nonce.body);
+    const nonce = nonceRequest(page);
+    equal("wallet: the c_nonce is fetched from the metadata's nonce_endpoint", nonce && nonce.url, OID4VCI_NONCE_ENDPOINT);
+    equal("wallet: the nonce request has no body", nonce && nonce.body, undefined);
 
-    const request = find(page, "POST", /\/oid4vci\/credential$/);
-    check("wallet: the credential is requested at /oid4vci/credential",
-        request !== undefined && request.url === "/v1/certify/oid4vci/credential", request && request.url);
-    equal("wallet: the credential request carries the token in the Authorization header",
-        request && request.headers.Authorization, "Bearer at-f18");
-    check("wallet: the page sends no DPoP header of its own", request !== undefined && !("DPoP" in request.headers));
+    const request = credentialRequest(page);
+    equal("wallet: the credential request goes to the metadata's credential_endpoint",
+        request && request.url, OID4VCI_CREDENTIAL_ENDPOINT);
     equal("wallet: the credential request is JSON", request && request.headers["Content-Type"], "application/json");
-
-    const body = JSON.parse(request.body);
-    equal("wallet: the credential request names the configuration the page offered",
-        body.credential_configuration_id, "demo");
-    equal("wallet: the proof travels in proofs.jwt", Array.isArray(body.proofs && body.proofs.jwt)
-        && body.proofs.jwt.length, 1);
-
-    const proof = body.proofs.jwt[0];
-    const proofHeader = decodePart(proof.split(".")[0]);
-    const proofClaims = decodePart(proof.split(".")[1]);
-    equal("wallet: the proof header's typ marks an OpenID4VCI proof", proofHeader.typ, "openid4vci-proof+jwt");
-    equal("wallet: the proof's alg matches the P-256 key it carries",
-        [proofHeader.alg, proofHeader.jwk && proofHeader.jwk.kty, proofHeader.jwk && proofHeader.jwk.crv],
-        ["ES256", "EC", "P-256"]);
-    equal("wallet: the proof's audience is the credential issuer", proofClaims.aud, ISSUER);
-    equal("wallet: the proof carries the c_nonce the nonce endpoint answered", proofClaims.nonce, "nonce-f18");
-    check("wallet: the proof has an issued-at time", Number.isInteger(proofClaims.iat) && proofClaims.iat > 0, proofClaims.iat);
-    check("wallet: the proof's signature verifies with the key it carries", proofVerifies(proof) === true);
+    check("wallet: the page sends no DPoP header of its own", request !== undefined && !("DPoP" in request.headers));
+    checkCredentialRequest("wallet", request, { audience: OID4VCI_ISSUER, nonce: "nonce-f18", configurationId: "demo" });
     check("wallet: the issued credential is shown",
         el("credential").hidden === false && el("credential").textContent.includes("ldp-credential"),
         el("credential").textContent);
@@ -864,22 +1104,165 @@ await unchanged("one bad entry among good ones", { subjects: [SUBJECTS[0], { id:
     equal("wallet: the page looked up only ids the markup declares", page.missingIds, []);
 }
 
-// 14. the wallet sends the transaction code the visitor typed, and only then
+// 16. section 6.1: the transaction code is sent for exactly the offers whose grant names one, with the value entered
+//     for that offer
 {
-    const page = openPage({ subjects: [] }, { offers: [offerByValue("wallet-tx", "code-tx")] });
+    const page = openPage({ subjects: [] }, {
+        offers: [offerByValue("wallet-tx", offerDocument(OID4VCI_ISSUER, "demo", "code-tx", TX_CODE))],
+    });
     await page.settle();
     const el = page.el;
     el("subject").value = "wallet-subject";
     el("txCode").value = "1234";
-    equal("wallet tx_code: the offer itself carries the transaction code",
-        (await page.createOffer()).tx_code, "1234");
+    equal("tx_code: the offer itself carries the transaction code", (await page.createOffer()).tx_code, "1234");
+    el("txCode").value = ""; // edited after the offer was created: the offer still asks for the value it was made with
     await page.runWallet();
-    const token = find(page, "POST", /\/token$/);
-    equalFields("wallet tx_code: the token form carries the entered transaction code", token && token.form, {
+    equalFields("tx_code: the token form carries the value entered for this offer", tokenRequest(page) && tokenRequest(page).form, {
         grant_type: GRANT,
         "pre-authorized_code": "code-tx",
         tx_code: "1234",
     });
+}
+{
+    const page = openPage({ subjects: [] }, {
+        offers: [offerByValue("wallet-no-tx", offerDocument(OID4VCI_ISSUER, "demo", "code-plain"))],
+    });
+    await page.settle();
+    const el = page.el;
+    el("subject").value = "wallet-subject";
+    el("txCode").value = "";
+    await page.createOffer();
+    el("txCode").value = "9999"; // filled, but this offer's grant names no transaction code
+    await page.runWallet();
+    equalFields("tx_code: an offer whose grant names none never sends the field", tokenRequest(page) && tokenRequest(page).form, {
+        grant_type: GRANT,
+        "pre-authorized_code": "code-plain",
+    });
+}
+
+// 17. section 8.2: an access token that names credential identifiers is redeemed with credential_identifier
+{
+    const page = openPage({ subjects: [] }, {
+        offers: [offerByValue("wallet-authz", offerDocument(OID4VCI_ISSUER, "demo", "code-authz"))],
+        token: {
+            status: 200,
+            body: {
+                access_token: "at-f18",
+                token_type: "Bearer",
+                authorization_details: [{ type: "openid_credential", credential_identifiers: ["credential-identifier-1"] }],
+            },
+        },
+    });
+    await page.settle();
+    const el = page.el;
+    el("subject").value = "wallet-subject";
+    await page.createOffer();
+    await page.runWallet();
+    checkCredentialRequest("authorization_details", credentialRequest(page), {
+        audience: OID4VCI_ISSUER,
+        nonce: "nonce-f18",
+        credentialIdentifier: "credential-identifier-1",
+    });
+}
+
+// 18. a compatibility-surface offer: its own metadata, the AS it names (itself), and aud = the issuer the offer named
+{
+    const page = openPage({ subjects: [] }, {
+        offers: [offerByValue("wallet-legacy", offerDocument(LEGACY_ISSUER, "demo", "code-legacy"))],
+    });
+    await page.settle();
+    const el = page.el;
+    el("subject").value = "wallet-subject";
+    await page.createOffer();
+    await page.runWallet();
+    equal("legacy offer: the offer issuer's own metadata is read at its well-known location",
+        metadataRequest(page, "openid-credential-issuer") && metadataRequest(page, "openid-credential-issuer").url,
+        "https://credentials.example/.well-known/openid-credential-issuer");
+    equal("legacy offer: the authorization server falls back to the credential issuer",
+        metadataRequest(page, "oauth-authorization-server") && metadataRequest(page, "oauth-authorization-server").url,
+        "https://credentials.example/.well-known/oauth-authorization-server");
+    equal("legacy offer: the credential is requested at the endpoint its metadata advertises",
+        credentialRequest(page) && credentialRequest(page).url, LEGACY_CREDENTIAL_ENDPOINT);
+    equal("legacy offer: the nonce comes from the endpoint its metadata advertises",
+        nonceRequest(page) && nonceRequest(page).url, LEGACY_NONCE_ENDPOINT);
+    checkCredentialRequest("legacy offer", credentialRequest(page), {
+        audience: LEGACY_ISSUER,
+        nonce: "nonce-f18",
+        configurationId: "demo",
+    });
+    check("legacy offer: the issued credential is shown", el("credential").hidden === false && el("walletStatus").textContent.includes("Credential issued"),
+        el("walletStatus").textContent);
+}
+
+// 19. an authorization server with a path of its own: RFC 8414 puts the well-known segment between host and path
+{
+    const as = "https://as.example/v1/esignet";
+    const page = openPage({ subjects: [] }, {
+        offers: [offerByValue("wallet-as-path", offerDocument(OID4VCI_ISSUER, "demo", "code-as"))],
+        issuerMetadata: {
+            [OID4VCI_ISSUER]: Object.assign({}, OID4VCI_DOCUMENT, { authorization_servers: [as] }),
+        },
+        asMetadata: {
+            [as]: {
+                issuer: as,
+                token_endpoint: as + "/oauth/token",
+                grant_types_supported: [GRANT],
+            },
+        },
+    });
+    await page.settle();
+    const el = page.el;
+    el("subject").value = "wallet-subject";
+    await page.createOffer();
+    await page.runWallet();
+    equal("AS with a path: its metadata is read at the RFC 8414 location",
+        metadataRequest(page, "oauth-authorization-server") && metadataRequest(page, "oauth-authorization-server").url,
+        "https://as.example/.well-known/oauth-authorization-server/v1/esignet");
+    equal("AS with a path: the token request goes to its token endpoint",
+        tokenRequest(page) && tokenRequest(page).url, as + "/oauth/token");
+    equalFields("AS with a path: the token form still carries the grant", tokenRequest(page) && tokenRequest(page).form, {
+        grant_type: GRANT,
+        "pre-authorized_code": "code-as",
+    });
+}
+
+// 20. section 7: the nonce endpoint is optional, and any 2xx from it is an answer
+{
+    const withoutNonce = Object.assign({}, OID4VCI_DOCUMENT);
+    delete withoutNonce.nonce_endpoint;
+    const page = openPage({ subjects: [] }, {
+        offers: [offerByValue("wallet-no-nonce", offerDocument(OID4VCI_ISSUER, "demo", "code-no-nonce"))],
+        issuerMetadata: { [OID4VCI_ISSUER]: withoutNonce },
+    });
+    await page.settle();
+    const el = page.el;
+    el("subject").value = "wallet-subject";
+    await page.createOffer();
+    await page.runWallet();
+    equal("no nonce_endpoint: the wallet asks for no c_nonce", nonceRequest(page), undefined);
+    checkCredentialRequest("no nonce_endpoint", credentialRequest(page), {
+        audience: OID4VCI_ISSUER,
+        nonce: undefined,
+        configurationId: "demo",
+    });
+}
+{
+    const page = openPage({ subjects: [] }, {
+        offers: [offerByValue("wallet-nonce-201", offerDocument(OID4VCI_ISSUER, "demo", "code-201"))],
+        nonce: { status: 201, body: { c_nonce: "nonce-201" } },
+    });
+    await page.settle();
+    const el = page.el;
+    el("subject").value = "wallet-subject";
+    await page.createOffer();
+    await page.runWallet();
+    checkCredentialRequest("a 201 nonce answer", credentialRequest(page), {
+        audience: OID4VCI_ISSUER,
+        nonce: "nonce-201",
+        configurationId: "demo",
+    });
+    check("a 201 nonce answer: the credential is issued", el("walletStatus").textContent.includes("Credential issued"),
+        el("walletStatus").textContent);
 }
 
 console.log();
