@@ -16,7 +16,7 @@ Standards: ISO/IEC 18013-5:2021 (data model 7.2, MSO 9.1.2, Annex B certificate 
 | D4 | Holder key types for the mDL | ES256 (P-256, EC2) and EdDSA (Ed25519, OKP, allowed by 18013-5 9.1.5.2) device keys and proofs. | owner |
 | D5 | How an offer chooses its surface | Optional `issuer: "oid4vci" \| "legacy"` on `POST /pre-authorized-data`, default from `certify.protocol.oid4vci-v1.offers.default-issuer` (default `legacy`; the mDL profile sets `oid4vci`). | agent |
 | D6 | Element typing | Built-in ISO 18013-5 table for namespace `org.iso.18013.5.1` plus an optional `formatConfig.elementTypes` override; the date heuristic stays only for untyped namespaces. | agent |
-| D7 | MSO validity | `certify.format.mdoc.mso-validity` (Duration, default `P90D`), capped at the DSC `notAfter`; `signed`/`validFrom` = signing instant truncated to seconds. | agent |
+| D7 | MSO validity | `certify.format.mdoc.mso-validity` (Duration, default `P90D`), capped at the DSC `notAfter`; `signed`/`validFrom` = signing instant truncated to seconds. Unset, it falls back to `certify.format.mdoc.validity-period-years`, then the 1.0.0-beta.1 key `mosip.certify.mdoc.validity-period-years` (CLAUDE.md rule 9; the digest algorithm likewise to `mosip.certify.mdoc.digest-algorithm`). | agent |
 | D8 | Status list for mDoc | Token Status List served as JWT (existing) and as CWT (`statuslist+cwt`) by `Accept` negotiation (M-11, after the core packages). | agent |
 | D9 | Merge-gate verifier | Multipaz JVM (`org.multipaz`) in a test-only module, Authlete `com.authlete:cbor` as a second COSE oracle, `pymdoccbor` and `openssl verify -x509_strict` in CI. | agent |
 | D10 | Demo data source | `FileCredentialDataSource` in `certify-service` (records keyed by `sub` from a JSON file; a binary field's file is read at startup and delivered to the template as base64url without padding — the contract M-03's `bstr` typing implements, decoding base64 and base64url, so a template may pass either; a missing key claim or record is `credential_request_denied`, not a 500); the mDL runs on the same compose stack as the farmer profile through an overlay. | agent |
@@ -58,26 +58,26 @@ Severity: B blocks wallets or verifiers, N not compliant, H nice to have. The ev
 | G4 | `digestID` copied from template, duplicates overwrite, sequential | 18013-5 9.1.2.5 | `MdocProcessor.java:132,214` | N | fixed by M-02 (`e2571268`; review rounds `d1f2408d`, `4d845efb`, `54eede02`), held by the M-01 gate since `d3d99fb9` |
 | G5 | Digest always SHA-256 whatever `digestAlgorithm` declares | 18013-5 9.1.2.5 | `MdocProcessor.java:213` vs `:410` | N | fixed by M-02 (`e2571268`; review rounds `d1f2408d`, `4d845efb`, `54eede02`), held by the M-01 gate since `d3d99fb9` |
 | G6 | Device key only from EC2 `did:jwk`; Ed25519 and `did:key` fail; `alg -7` hard-coded; failures are 500 | 18013-5 9.1.2.4, 9.1.5.2; OID4VCI 8.3.1 | `MdocProcessor.java:440-483` | B | fixed by M-02 (`e2571268`; review rounds `d1f2408d`, `4d845efb`, `54eede02`), held by the M-01 gate since `d3d99fb9` |
-| G7 | `docType` never compared with configuration `doctype` | 18013-5 9.1.2.4; A.2.2 | `MdocProcessor.java:96-97` | N | fixed by M-02/M-03 (`e2571268`, `f35d8d3f`): the template `docType` must equal the configuration `doctype`; held by the M-01 gate since `d3d99fb9` |
+| G7 | `docType` never compared with configuration `doctype` | 18013-5 9.1.2.4; A.2.2 | `MdocProcessor.java:96-97` | N | fixed by M-02/M-03 (`e2571268`, `f35d8d3f`), held by the M-01 gate since `d3d99fb9` (the template `docType` must equal the configuration `doctype`) |
 | G8 | Validity from `ZonedDateTime.now()`, 2 years, beyond DSC `notAfter` | 18013-5 9.1.2.4, 9.3.3 | `MdocProcessor.java:76-89` | N | fixed by M-02 (`e2571268`; review rounds `d1f2408d`, `4d845efb`, `54eede02`), held by the M-01 gate since `d3d99fb9` (`signed` = `validFrom` = the signing instant, decided in `sign()`) |
 | G9 | Default `x5chain=FULL` carries the IACA | HAIP; 18013-5 9.1.2.4 | `CoseHeaderPolicy.java:19-21` | N | fixed by M-02 (`e2571268`; review rounds `d1f2408d`, `4d845efb`, `54eede02`), held by the M-01 gate since `d3d99fb9` |
-| G10 | Dev CA is not an IACA | Annex B IACA profile | `DevKeys.java:61-80` | N | open: M-05 (the Annex B builders are in `certify-pki`, M-04, merged `38432c74`) |
-| G11 | Dev leaf is not a DSC (EKU, AKI/SKI, IAN, CRL DP, C) | Annex B DS profile | `DevKeys.java:83-103` | B | open: M-05 (the Annex B builders are in `certify-pki`, M-04, merged `38432c74`) |
+| G10 | Dev CA is not an IACA | Annex B IACA profile | `DevKeys.java:61-80` | N | open: M-05 (the Annex B builders are in `certify-pki`, fixed by M-04 (`38432c74`)) |
+| G11 | Dev leaf is not a DSC (EKU, AKI/SKI, IAN, CRL DP, C) | Annex B DS profile | `DevKeys.java:83-103` | B | open: M-05 (the Annex B builders are in `certify-pki`, fixed by M-04 (`38432c74`)) |
 | G12 | No DSC policy before signing | Annex B; 7.2.1 `issuing_country` | `CertificateChainPolicy.java:20-46` | N | open: M-06 |
 | G13 | Keymanager chain leaf-only and master-signed | Annex B | `KeymanagerKeyProvider.java:211` | N | open: M-06 |
 | G14 | No IACA, DSC-from-CSR, rotation, CRL, PEM import | Annex B | `certify-cli`, `X509FileKeyProviders` | B | open: M-07 |
 | G15 | No IACA or CRL publication | Annex B (CRL DP) | none | B | open: M-08 |
 | G16 | No DSC expiry gauge or rotation | 06a | `JcaKeyProvider.java:194-203` | H | open: M-05 |
-| G17 | Offer `credential_issuer` is the compatibility identifier | OID4VCI 4.1.1 | `PreAuthorizedCodeService.java:250` | B | M-09, merged `41766de1` |
-| G18 | Offers by reference only | OID4VCI 4.1 | `PreAuthorizedCodeService.java:263-268` | H | M-09, merged `41766de1` |
-| G19 | `/oid4vci` default document lacks issuer `display` | OID4VCI 12.2.4 | `Oid4vciDiscoveryController.java:52-62` | H | M-09, merged `41766de1` |
-| G20 | COSE alg map lacks ES384/ES512 | A.2.2 | `CredentialIssuerMetadataBuilder.java:38-42` | N | M-09, merged `41766de1` |
-| G21 | `cose_key` binding and proof algs only from the row | A.2.2 | `CredentialIssuerMetadataBuilder.java:133-134` | N | M-09, merged `41766de1` |
-| G22 | AS metadata lacks `pre-authorized_grant_anonymous_access_supported` | OID4VCI AS metadata | `OAuthAuthorizationServerMetadataDTO.java` | H | M-09, merged `41766de1` |
+| G17 | Offer `credential_issuer` is the compatibility identifier | OID4VCI 4.1.1 | `PreAuthorizedCodeService.java:250` | B | fixed by M-09 (`41766de1`) |
+| G18 | Offers by reference only | OID4VCI 4.1 | `PreAuthorizedCodeService.java:263-268` | H | fixed by M-09 (`41766de1`) |
+| G19 | `/oid4vci` default document lacks issuer `display` | OID4VCI 12.2.4 | `Oid4vciDiscoveryController.java:52-62` | H | fixed by M-09 (`41766de1`) |
+| G20 | COSE alg map lacks ES384/ES512 | A.2.2 | `CredentialIssuerMetadataBuilder.java:38-42` | N | fixed by M-09 (`41766de1`) |
+| G21 | `cose_key` binding and proof algs only from the row | A.2.2 | `CredentialIssuerMetadataBuilder.java:133-134` | N | fixed by M-09 (`41766de1`) |
+| G22 | AS metadata lacks `pre-authorized_grant_anonymous_access_supported` | OID4VCI AS metadata | `OAuthAuthorizationServerMetadataDTO.java` | H | fixed by M-09 (`41766de1`) |
 | G23 | Status list JWT only, keymanager signer | status-list draft (CWT) | `TokenStatusListService` | N | open: M-11 |
-| G24 | No independent mDoc verifier in tests | CLAUDE.md non-negotiable 2 | `IssuanceGoldenTest.java:574-612` | N | fixed by M-01, merged `ce1211ef` |
-| G25 | Admin endpoints reachable on a public host | security | `config/certify-default.properties:38-42` | B | M-12a, merged `90492798` |
-| G26 | No mDL configuration, data source, seed or IACA in compose | | | B | partly: the data source is M-10a, merged `8456685f`; compose profile, seed and IACA remain (M-10) |
+| G24 | No independent mDoc verifier in tests | CLAUDE.md non-negotiable 2 | `IssuanceGoldenTest.java:574-612` | N | fixed by M-01 (`ce1211ef`) |
+| G25 | Admin endpoints reachable on a public host | security | `config/certify-default.properties:38-42` | B | fixed by M-12a (`90492798`) |
+| G26 | No mDL configuration, data source, seed or IACA in compose | | | B | partly fixed by M-10a (`8456685f`): the data source; compose profile, seed and IACA remain open: M-10 |
 | G27 | Keymanager-generated certificate serials can be negative (`SecureRandom.nextLong()`, about half the keys); owner M-06 / keymanager provider | RFC 5280 4.1.2.2 | kernel-keymanager `CertificateUtility.generateX509Certificate`; M-01 check `x5chain.serialNumber` | N | open: M-06 / keymanager provider |
 
 G1-G9 are fixed in `certify-format-mdoc`, which serves `/oid4vci`, the draft-13 surface (D1) and `POST /issuance/credential` when the compatibility path runs through the core (`certify.protocol.oid4vci-v1.compat-core.enabled=true`). With compat-core off (the default) that endpoint still runs the unchanged legacy `utils.MDocProcessor` (rule 1: its bytes are the `legacy-develop` golden), which keeps its pre-M-02 behaviour until the legacy service is retired: its sample `IssuanceGoldenTest-legacy` declares exactly what the verifier reports there, G1's `mso.validityInfo.tdateTags:fractionalSeconds:{signed,validFrom,validUntil}` and G2's `mdl.elementTypes:untyped:portrait`.
@@ -126,6 +126,7 @@ Each under about 800 lines excluding goldens and binaries.
 ### M-06 DSC policy and trust anchors (G12, G13)
 - `certify-signing` `TrustAnchorRegistry` (`anchors(purpose)`, `crl(anchorId)`); `certify-format-mdoc` `MdocDscPolicy` (after the generic check in `MdocFormatter.sign`); `certify-service` `pki/FileTrustAnchorRegistry` with `PkiProperties` (`certify.pki.trust-anchors.mdoc-iaca[]: {id, certificate, crl}`; dev mode registers the x509-file IACA) through auto-configuration; `KeymanagerKeyProvider` completes leaf-only chains from a matching anchor (AKI or issuer DN); v2 preview runs the policy.
 - Refuse `certificate_chain_invalid` (named rule) on: EKU, keyUsage or validity cap of the DSC; `signed` outside DSC validity; no configured IACA signed the DSC; country mismatch; IACA expired (D16).
+- Already in place before M-06 (M-02/M-03 round 5): `MdocFormatter.requireX5chain` refuses a self-signed signing certificate with `certificate_chain_invalid`, since `without-anchor` would otherwise carry a lone self-signed certificate as the signer. M-06's `MdocDscPolicy` takes this rule over as one of its named rules.
 
 ### M-07 CLI: IACA flows (G14)
 - `certify-cli` `PkiCommand`: `pki iaca create`, `pki dsc issue --csr|--generate`, `pki dsc rotate`, `pki crl issue`, `pki check --profile iaca|mdoc-dsc`; `KeysCommand`: `csr`, `import --key --chain`. Depends on `certify-pki`.
