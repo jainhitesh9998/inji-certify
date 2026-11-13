@@ -71,8 +71,9 @@ A password is never printed or logged, and the CLI overwrites its `char[]` copie
   an existing alias is refused; an existing `--out` (chain, CSR, CRL) is refused unless `--overwrite` (`--force` is
   accepted as its alias on `pki dsc` and `keys csr`; on `pki crl issue`, `--force` means something else, see below).
   Even with `--overwrite`, an existing `--out` is replaced only when it already holds what the command writes: a CRL
-  (PEM or DER) for `pki crl issue`, PEM certificates only for `pki dsc issue|rotate`, a PKCS#10 request for `keys csr`.
-  Anything else — a keystore, a CRL state, a PEM file with a private key — is refused (exit `2`) and left as it was.
+  (PEM or DER) for `pki crl issue`, PEM certificates only whose first one is an end entity (a previous Document Signer
+  chain) and not the `--iaca` certificate for `pki dsc issue|rotate`, a PKCS#10 request for `keys csr`. Anything else
+  — a keystore, a CRL state, a PEM file with a private key, the IACA PEM — is refused (exit `2`) and left as it was.
 - **Links.** Every file the CLI locks or writes is first resolved to its real path (symbolic links followed; for a new
   file, the real directory plus its name), and that one path is locked, read, written through a temporary file in the
   real directory and replaced atomically. `-k issuer-link.p12` or `--state state-link.json` therefore updates the file
@@ -135,11 +136,16 @@ key identifier in hex, in the real directory of the IACA keystore (the command p
   with a **different** `--state` is refused (exit `1`, naming both files; to rebuild the inventory somewhere else on
   purpose, move the slot aside and pass the new `--state` with `--base-crl <the last published CRL>`). A pointer whose
   file is missing (a medium that is not mounted, a deleted file) stops every run (exit `2`): restore the file, or move
-  the pointer aside and rebuild with `--state <file> --base-crl <the last published CRL>`.
-- **Other holders.** Discovery also reads every `*.crlstate.json` in the IACA's directory and the `--state` directory.
-  A file there that records the same IACA (a copy, the round-2 name next to the canonical one) is a holder: the
-  inventory in use must be at or ahead of every holder — a lower `lastCrlNumber`, or a serial a holder lists and it
-  lacks, is refused (exit `2`; `--base-crl <the last published CRL>` catches it up), and a run that passes warns that
+  the pointer aside and rebuild with `--state <file> --base-crl <the last published CRL>` — or, when the IACA never
+  published a CRL (a first run that stopped between writing the pointer and the inventory), move it aside and run
+  again with `--initial`.
+- **Other holders.** Discovery also reads every `*.crlstate.json` in the IACA's directory and, when `--state` is
+  passed, in the `--state` directory (a run that only follows a pointer reads the file it names, not that file's
+  directory). A file there that records the same IACA (a copy, the round-2 name next to the canonical one) is a holder:
+  the inventory in use must be at or ahead of every holder — a lower `lastCrlNumber`, or a serial a holder lists and it
+  lacks, is refused (exit `2`; `--base-crl <the last published CRL>`, with the same `--state` if any, catches the
+  inventory in use up; making the holder the inventory instead is a deliberate rebuild: move the slot aside and pass
+  `--state <holder> --base-crl <the last published CRL>`), and a run that passes warns that
   the holder is now behind. With no slot and several holders, the command refuses until `--state` names one (which
   then gets the pointer). A file under the earlier name `<iaca-store>.crlstate.json` is still read, and renamed to
   `iaca-<ski>.crlstate.json` the first time the command uses it.
@@ -161,8 +167,9 @@ key identifier in hex, in the real directory of the IACA keystore (the command p
 - The number and the new revocations are recorded **before** the CRL file is written. A failure in between leaves a gap
   in the numbers, never a reused number or a lost revocation; the message says which number was recorded and that a
   rerun publishes the next one with the same revocations.
-- With no inventory for the IACA, the command refuses (it would drop revocations) unless one of:
-  `--initial` (the IACA's first CRL), `--base-crl <the last CRL it published>` (entries and number imported, after
+- With no inventory for the IACA, the command refuses (it would drop revocations) unless one of (if earlier runs used
+  `--state`, pass that same `--state` first):
+  `--initial` (only when the IACA has never published a CRL), `--base-crl <the last CRL it published>` (entries and number imported, after
   checking the CRL names the IACA as issuer and verifies under its key), or `--force --crl-number <n>` (no CRL is left
   either: `n` must exceed every number ever published, and only the serials passed again with `--revoke` are listed).
   `--force` and `--initial` are refused while an inventory of the IACA exists, so they can never go back to a number it
@@ -427,10 +434,16 @@ expired certificate) is refused by step 2, as `openssl verify` refuses it.
 - `keys import` verifies the chain as a certification path: each certificate signed by the next, ending at a
   self-signed root or `--anchor`, and then RFC 5280 path validation by the JDK `CertPathValidator` (PKIX, revocation
   not checked) anchored at that root, which is itself judged as an issuing CA — every issuer `CA:true` with
-  keyCertSign (when keyUsage is present), within its pathLen, every certificate valid now, no unknown critical
-  extension. An `--anchor` that is not self-signed is one the JDK trusts by key and name without examining it, so the
-  CLI judges it itself the same way: no critical extension outside those the validator processes (OpenSSL error 34,
-  unhandled critical extension), `CA:true`, keyCertSign, pathLen, valid now. A single self-signed end-entity
+  keyCertSign (when keyUsage is present), within its pathLen and its name and policy constraints, every certificate
+  valid now, no unknown critical extension. An `--anchor` that is not self-signed is one the JDK would trust by key and
+  name without examining it (and it refuses name constraints on a trust anchor), so the CLI first judges it itself, with
+  a message per duty: no critical extension outside those the validator processes (OpenSSL error 34, unhandled
+  critical extension), `CA:true`, keyCertSign, pathLen, valid now. It then validates the path with a stand-in for the
+  anchor — the anchor's own certificate, every field and extension unchanged, re-signed by a throwaway key that is the
+  trust anchor — so the anchor's nameConstraints (OpenSSL `-partial_chain` error 47), policyConstraints,
+  inhibitAnyPolicy and policies bind the path below it exactly as they do when the chain is anchored at its root
+  (RFC 5937; OpenSSL ignores a partial-chain anchor's policy constraints, the CLI does not). The stored chain is the
+  one given. A single self-signed end-entity
   certificate (a standalone signing key) remains accepted. Only EC P-256/384/521 keys are accepted. `--profile
   mdoc-dsc` judges `[DSC, IACA]` (the IACA from the chain or `--anchor`) with `validateDs`, `validateIaca` and
   `DS_KEY_IS_IACA_KEY`, and stores that pair; `keys list` shows it with the purpose `mdoc-dsc`, which the keystore does

@@ -135,7 +135,8 @@ class PkiCommand {
     /** What an existing {@code --out} must already hold to be replaced: the kind of object the command writes. */
     enum OutKind {
         CRL("a CRL", Set.of("X509 CRL")),
-        CERTIFICATES("PEM certificate(s)", Set.of("CERTIFICATE")),
+        CERTIFICATES("a PEM chain whose first certificate is an end entity (a previous Document Signer chain)",
+                Set.of("CERTIFICATE")),
         CSR("a PKCS#10 request", Set.of("CERTIFICATE REQUEST", "NEW CERTIFICATE REQUEST"));
 
         private static final Pattern BEGIN = Pattern.compile("-----BEGIN ([A-Z0-9 ]+)-----");
@@ -168,7 +169,9 @@ class PkiCommand {
                 switch (this) {
                     case CRL -> readCrl(file);
                     case CERTIFICATES -> {
-                        if (!pem || Pem.readCertificates(text).isEmpty()) {
+                        // a chain this command wrote starts with the Document Signer: never an IACA or other CA PEM
+                        List<X509Certificate> certificates = pem ? Pem.readCertificates(text) : List.of();
+                        if (certificates.isEmpty() || certificates.get(0).getBasicConstraints() >= 0) {
                             return false;
                         }
                     }
@@ -610,9 +613,32 @@ class PkiCommand {
          * is in the keystore entry too, so a failed {@code --out} loses nothing), then writes the chain. The caller
          * holds the keystore lock and has refused an existing alias.
          */
+        /**
+         * An existing {@code --out} whose first certificate is the {@code --iaca} certificate itself is never replaced,
+         * whatever its basicConstraints say: {@link OutKind#CERTIFICATES} admits only a previous chain, and the IACA
+         * PEM is the trust anchor every verifier holds.
+         */
+        static void refuseIacaOut(Path out, X509Certificate iaca) throws IOException {
+            if (out == null || !Files.isRegularFile(out)) {
+                return;
+            }
+            List<X509Certificate> existing;
+            try {
+                existing = Pem.readCertificates(Files.readString(out, StandardCharsets.ISO_8859_1));
+            } catch (RuntimeException e) {
+                return; // not a certificate PEM: refuseExisting has already refused it
+            }
+            if (!existing.isEmpty() && PkiFiles.sameCertificate(existing.get(0), iaca)) {
+                throw new IllegalArgumentException("--out " + out + " holds the --iaca certificate; --overwrite"
+                        + " replaces only a previous Document Signer chain, never the IACA PEM: refusing to replace it."
+                        + " Name another --out");
+            }
+        }
+
         static int issue(IacaKey authority, PublicKey subjectKey, PrivateKey subjectPrivate, String commonName,
                          int validityDays, Path out, boolean overwrite, KeyStore store, Path storePath,
                          boolean storeExists, char[] storePassword, String alias) throws IOException {
+            refuseIacaOut(out, authority.certificate());
             if (PkiFiles.sameKey(subjectKey, authority.certificate().getPublicKey())) {
                 throw new IllegalArgumentException("DS_KEY_IS_IACA_KEY: the Document Signer key is the IACA's own key;"
                         + " a Document Signer needs a key of its own");
@@ -859,8 +885,10 @@ class PkiCommand {
                     }
                     if (base == null && !initial && !force) {
                         throw new IllegalArgumentException("no revocation inventory for this IACA in " + statePath
-                                + ": a CRL issued now would drop every earlier revocation. Pass --base-crl <the last"
-                                + " CRL this IACA published> to rebuild it, or --initial for the IACA's first CRL");
+                                + ": a CRL issued now would drop every earlier revocation. If earlier runs used"
+                                + " --state, pass that same --state; otherwise pass --base-crl <the last CRL this IACA"
+                                + " published> to rebuild the inventory, or --initial only if this IACA has never"
+                                + " published a CRL");
                     }
                     inventory = new CrlState.Inventory(authority.certificate().getSubjectX500Principal().getName(),
                             null);
@@ -1053,8 +1081,7 @@ class PkiCommand {
                         throw new IllegalArgumentException("the CRL state " + statePath + " (CRL number "
                                 + (mine == null ? "none" : mine) + ") is behind " + other + " (CRL number "
                                 + held.lastCrlNumber() + "), which also records this IACA: issuing from it would"
-                                + " reuse a number. Pass --state " + other + " if that is the current inventory, or"
-                                + " catch up with --base-crl <the last CRL this IACA published>");
+                                + " reuse a number. " + catchUp(statePath, other, keyId));
                     }
                     List<String> missing = new ArrayList<>();
                     for (BigInteger serial : held.revoked().keySet()) {
@@ -1065,11 +1092,22 @@ class PkiCommand {
                     if (!missing.isEmpty()) {
                         throw new IllegalArgumentException("the CRL state " + statePath + " does not list "
                                 + String.join(", ", missing) + ", which " + other + " (also recording this IACA)"
-                                + " revokes: the next CRL would drop the revocation. Pass --state " + other
-                                + " if that is the current inventory, or catch up with --base-crl <the last CRL"
-                                + " this IACA published>");
+                                + " revokes: the next CRL would drop the revocation. " + catchUp(statePath, other,
+                                keyId));
                     }
                 }
+            }
+
+            /**
+             * The way out of a stale inventory: catch the inventory in use up from what was published. Never another
+             * {@code --state}, which the slot refuses once it names this one; moving the slot aside is for a deliberate
+             * rebuild elsewhere only.
+             */
+            private static String catchUp(Path statePath, Path other, String keyId) {
+                return "Catch " + statePath + " up with --base-crl <the last CRL this IACA published> (same --state,"
+                        + " if any). Only to rebuild the inventory in " + other + " on purpose: move the slot "
+                        + CrlState.canonicalName(keyId) + " (the state, or the pointer naming " + statePath + ")"
+                        + " aside and pass --state " + other + " --base-crl <the last CRL this IACA published>";
             }
 
             /** A CRL to import: signed by the IACA's key and naming the IACA as issuer, else refused. */

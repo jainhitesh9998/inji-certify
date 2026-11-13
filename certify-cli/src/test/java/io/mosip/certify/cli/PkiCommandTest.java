@@ -21,7 +21,10 @@ import org.bouncycastle.asn1.x500.RDN;
 import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.asn1.x500.style.BCStyle;
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
+import org.bouncycastle.asn1.ASN1Integer;
 import org.bouncycastle.asn1.DERNull;
+import org.bouncycastle.asn1.DERSequence;
+import org.bouncycastle.asn1.DERTaggedObject;
 import org.bouncycastle.asn1.x509.AlgorithmIdentifier;
 import org.bouncycastle.asn1.x509.BasicConstraints;
 import org.bouncycastle.asn1.x509.CRLDistPoint;
@@ -31,6 +34,8 @@ import org.bouncycastle.asn1.x509.ExtendedKeyUsage;
 import org.bouncycastle.asn1.x509.Extension;
 import org.bouncycastle.asn1.x509.GeneralName;
 import org.bouncycastle.asn1.x509.GeneralNames;
+import org.bouncycastle.asn1.x509.GeneralSubtree;
+import org.bouncycastle.asn1.x509.NameConstraints;
 import org.bouncycastle.asn1.x509.KeyPurposeId;
 import org.bouncycastle.asn1.x509.KeyUsage;
 import org.bouncycastle.cert.X509v3CertificateBuilder;
@@ -86,6 +91,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -1756,6 +1762,99 @@ class PkiCommandTest {
                 "--key", p("leaf-key.pem"), "--chain", p("leaf.pem"), "--anchor", p("mid.pem")), stderr());
     }
 
+    /**
+     * Reviewer finding: an --anchor issued by another CA binds the path below it with its own name and policy
+     * constraints. Name constraints as OpenSSL applies them to a partial chain ({@code verify -x509_strict
+     * -partial_chain -CAfile mid.pem}, error 47). Policy constraints as OpenSSL applies them with the same CA inside the
+     * path ({@code -policy_check}, error 43): OpenSSL does not process a partial-chain anchor's policy constraints, but
+     * RFC 5937 does, and an intermediate passed as --anchor must not lift a constraint that binds the path when the
+     * chain is anchored at its root instead.
+     */
+    @Test
+    void anAnchorsNameAndPolicyConstraintsBindThePathBelowIt() throws Exception {
+        requireOpenSsl();
+        Instant now = Instant.now();
+        Instant from = now.minus(1, ChronoUnit.HOURS);
+        Instant to = now.plus(30, ChronoUnit.DAYS);
+        KeyPair rootKey = ecKey();
+        KeyPair middleKey = ecKey();
+        KeyPair leafKey = ecKey();
+        Files.writeString(path("leaf-key.pem"), Pem.writePrivateKey(leafKey.getPrivate()));
+        // -x509_strict wants key identifiers on every certificate, so OpenSSL fails only for the reason under test
+        JcaX509ExtensionUtils ids = new JcaX509ExtensionUtils();
+        Extension rootId = Extension.create(Extension.subjectKeyIdentifier, false,
+                ids.createSubjectKeyIdentifier(rootKey.getPublic()));
+        Extension middleId = Extension.create(Extension.subjectKeyIdentifier, false,
+                ids.createSubjectKeyIdentifier(middleKey.getPublic()));
+        Extension leafId = Extension.create(Extension.subjectKeyIdentifier, false,
+                ids.createSubjectKeyIdentifier(leafKey.getPublic()));
+        Extension byRoot = Extension.create(Extension.authorityKeyIdentifier, false,
+                ids.createAuthorityKeyIdentifier(rootKey.getPublic()));
+        Extension byMiddle = Extension.create(Extension.authorityKeyIdentifier, false,
+                ids.createAuthorityKeyIdentifier(middleKey.getPublic()));
+        Extension permittedAllowed = Extension.create(Extension.nameConstraints, true, new NameConstraints(
+                new GeneralSubtree[] {new GeneralSubtree(new GeneralName(GeneralName.dNSName, ".allowed.example"))},
+                null));
+        Extension requireExplicitPolicy = Extension.create(Extension.policyConstraints, true,
+                new DERSequence(new DERTaggedObject(false, 0, new ASN1Integer(0))));
+        Map<String, Extension> constraints = new java.util.LinkedHashMap<>();
+        constraints.put("nameConstraints", permittedAllowed);
+        constraints.put("policyConstraints", requireExplicitPolicy);
+        Map<String, String> openSslError = Map.of("nameConstraints", "error 47", "policyConstraints", "error 43");
+        for (Map.Entry<String, Extension> constraint : constraints.entrySet()) {
+            String name = constraint.getKey();
+            X509Certificate middle = certificate("CN=Middle", middleKey, "CN=Root", rootKey, from, to,
+                    basicConstraints(true, -1), keyUsage(KeyUsage.keyCertSign | KeyUsage.cRLSign), middleId, byRoot,
+                    constraint.getValue());
+            X509Certificate bad = certificate("CN=Leaf", leafKey, "CN=Middle", middleKey, from, to,
+                    basicConstraints(false, -1), keyUsage(KeyUsage.digitalSignature), leafId, byMiddle,
+                    Extension.create(Extension.subjectAlternativeName, false,
+                            new GeneralNames(new GeneralName(GeneralName.dNSName, "bad.example"))));
+            X509Certificate root = certificate("CN=Root", rootKey, "CN=Root", rootKey, from, to,
+                    basicConstraints(true, -1), keyUsage(KeyUsage.keyCertSign | KeyUsage.cRLSign), rootId);
+            Files.writeString(path("root.pem"), Pem.writeCertificate(root));
+            Files.writeString(path("mid.pem"), Pem.writeCertificate(middle));
+            Files.writeString(path("bad.pem"), Pem.writeCertificate(bad));
+            Files.writeString(path("bad-mid.pem"), Pem.writeCertificates(List.of(bad, middle)));
+            OpenSsl refused = "nameConstraints".equals(name)
+                    ? opensslResult("verify", "-x509_strict", "-partial_chain", "-CAfile", p("mid.pem"), p("bad.pem"))
+                    : opensslResult("verify", "-x509_strict", "-policy_check", "-CAfile", p("root.pem"), "-untrusted",
+                            p("mid.pem"), p("bad.pem"));
+            assertTrue(refused.code() != 0 && refused.output().contains(openSslError.get(name))
+                    && refused.output().split("\\berror \\d+ at").length == 2,
+                    name + ": OpenSSL refuses the leaf for that reason alone: " + refused.output());
+            for (String chain : List.of("bad.pem", "bad-mid.pem")) {
+                reset();
+                assertEquals(2, run("keys", "import", "-k", p("imported.p12"), "-p", PASSWORD, "--alias", "leaf",
+                        "--key", p("leaf-key.pem"), "--chain", p(chain), "--anchor", p("mid.pem")),
+                        name + " " + chain + ": " + stdout());
+                assertTrue(stderr().contains("not a valid certification path"), name + ": " + stderr());
+            }
+            reset();
+            assertEquals(2, run("keys", "import", "-k", p("imported.p12"), "-p", PASSWORD, "--alias", "leaf",
+                    "--key", p("leaf-key.pem"), "--chain", p("bad-mid.pem"), "--anchor", p("root.pem")),
+                    name + ": anchored at the root, as before");
+            assertFalse(Files.exists(path("imported.p12")), name + ": nothing imported");
+        }
+
+        // a leaf inside the permitted subtree imports, and OpenSSL agrees
+        X509Certificate middle = certificate("CN=Middle", middleKey, "CN=Root", rootKey, from, to,
+                basicConstraints(true, -1), keyUsage(KeyUsage.keyCertSign | KeyUsage.cRLSign), middleId, byRoot,
+                permittedAllowed);
+        X509Certificate good = certificate("CN=Leaf", leafKey, "CN=Middle", middleKey, from, to,
+                basicConstraints(false, -1), keyUsage(KeyUsage.digitalSignature), leafId, byMiddle,
+                Extension.create(Extension.subjectAlternativeName, false,
+                        new GeneralNames(new GeneralName(GeneralName.dNSName, "issuer.allowed.example"))));
+        Files.writeString(path("mid.pem"), Pem.writeCertificate(middle));
+        Files.writeString(path("good.pem"), Pem.writeCertificate(good));
+        openssl("verify", "-x509_strict", "-partial_chain", "-CAfile", p("mid.pem"), p("good.pem"));
+        reset();
+        assertEquals(0, run("keys", "import", "-k", p("imported.p12"), "-p", PASSWORD, "--alias", "leaf",
+                "--key", p("leaf-key.pem"), "--chain", p("good.pem"), "--anchor", p("mid.pem")), stderr());
+        assertEquals(List.of(good), PkiFiles.chain(PkiFiles.read(path("imported.p12"), PASSWORD.toCharArray()),
+                "leaf"), "the entry stores the chain as given; the anchor's stand-in never leaves the validation");
+    }
+
     /** D3: a CA key never enters an issuer keystore, Annex B IACA or not. */
     @Test
     void aCaKeyIsNeverImported() throws Exception {
@@ -1799,9 +1898,11 @@ class PkiCommandTest {
                 stderr());
         assertEquals(0, run("keys", "generate", "-k", p("keys.p12"), "-p", PASSWORD, "--alias", "plain", "--alg",
                 "ES256"), stderr());
+        // certificate PEMs that are no Document Signer chain: the IACA alone, and a chain that starts with a CA
+        Files.writeString(path("iaca-first.pem"), readString("iaca.pem") + readString("other.pem"));
         Map<String, byte[]> victims = new HashMap<>();
         for (String name : List.of("other.p12", "other-state.json", "pem-iaca.pem", "keys.p12", "iaca.crl",
-                "dsc-chain.pem")) {
+                "dsc-chain.pem", "iaca.pem", "iaca-first.pem")) {
             victims.put(name, sha256(path(name)));
         }
 
@@ -1811,17 +1912,28 @@ class PkiCommandTest {
             assertEquals(2, crl(victim, "--overwrite"), victim);
             assertTrue(stderr().contains("--out " + p(victim) + " exists and is not a CRL"), stderr());
         }
-        // dsc issue and rotate: a keystore, a CRL or an IACA PEM (key and certificate) is no chain
-        for (String victim : List.of("other.p12", "iaca.crl", "pem-iaca.pem", "other-state.json")) {
+        // dsc issue and rotate: a keystore, a CRL, an IACA PEM (key and certificate, or the certificate alone) or a
+        // chain that starts with a CA is no Document Signer chain
+        for (String victim : List.of("other.p12", "iaca.crl", "pem-iaca.pem", "other-state.json", "iaca.pem",
+                "iaca-first.pem")) {
             reset();
             assertEquals(2, run("pki", "dsc", "issue", "--iaca", p("iaca.p12"), "-p", PASSWORD, "--generate",
                     "-k", p("issuer.p12"), "-P", ISSUER_PASSWORD, "--alias", "mdl-dsc@2026-11",
                     "--out", p(victim), "--overwrite"), victim);
-            assertTrue(stderr().contains("exists and is not PEM certificate(s)"), stderr());
+            assertTrue(stderr().contains("exists and is not a PEM chain whose first certificate is an end entity"),
+                    stderr());
             reset();
             assertEquals(2, run("pki", "dsc", "rotate", "--iaca", p("iaca.p12"), "-p", PASSWORD,
                     "-k", p("issuer.p12"), "-P", ISSUER_PASSWORD, "--out", p(victim), "--overwrite"), victim);
+            assertTrue(stderr().contains("exists and is not a PEM chain whose first certificate is an end entity"),
+                    stderr());
         }
+        // whatever its basicConstraints, a file that starts with the --iaca certificate is never replaced
+        X509Certificate iacaCertificate = Pem.readCertificate(readString("iaca.pem"));
+        IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
+                () -> PkiCommand.Dsc.refuseIacaOut(path("iaca-first.pem"), iacaCertificate));
+        assertTrue(refused.getMessage().contains("holds the --iaca certificate"), refused.getMessage());
+        PkiCommand.Dsc.refuseIacaOut(path("dsc-chain.pem"), iacaCertificate); // a previous chain: [DSC, IACA]
         reset();
         assertEquals(0, run("keys", "list", "-k", p("issuer.p12"), "-p", ISSUER_PASSWORD));
         assertEquals(1, stdout().lines().count(), "no key was added: " + stdout());

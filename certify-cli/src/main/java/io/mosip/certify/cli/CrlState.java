@@ -351,7 +351,9 @@ final class CrlState {
             throw new IllegalStateException("the CRL state pointer " + file + " names " + target + ", which does not"
                     + " exist (is the medium that holds it mounted?): this IACA's revocation inventory is there."
                     + " Restore " + target + " from a backup; if it is lost, move " + file + " aside and rebuild the"
-                    + " inventory with --state <file> --base-crl <the last CRL this IACA published>");
+                    + " inventory with --state <file> --base-crl <the last CRL this IACA published>. If this IACA has"
+                    + " never published a CRL (a first run that stopped between writing the pointer and the"
+                    + " inventory), move " + file + " aside and run again with --initial");
         }
         Path real = SecureFiles.canonical(target);
         Object entry = readEntry(real);

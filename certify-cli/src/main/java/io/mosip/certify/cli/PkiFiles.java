@@ -9,6 +9,9 @@ import org.bouncycastle.asn1.x500.style.BCStyle;
 import org.bouncycastle.asn1.x509.AlgorithmIdentifier;
 import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo;
 import org.bouncycastle.asn1.x9.X9ObjectIdentifiers;
+import org.bouncycastle.cert.X509CertificateHolder;
+import org.bouncycastle.cert.X509v3CertificateBuilder;
+import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.bouncycastle.operator.ContentSigner;
 import org.bouncycastle.operator.OperatorCreationException;
@@ -370,7 +373,9 @@ final class PkiFiles {
      * {@link CertPathValidator} (PKIX, revocation not checked: the CLI holds no CRL of a foreign CA): every issuing
      * certificate, the self-signed root or {@code anchor} included, must be a CA (basicConstraints {@code CA:true}) whose
      * keyUsage, when present, allows keyCertSign, within its pathLen; every certificate valid at {@code at}; no
-     * critical extension the validator does not understand. A single self-signed certificate (a standalone signing key)
+     * critical extension the validator does not understand; the name constraints and policy extensions of every CA,
+     * an {@code anchor} issued by another CA included, bind the certificates below it. A single self-signed certificate
+     * (a standalone signing key)
      * is its own anchor: only its validity and critical extensions are judged. The chain is leaf first.
      */
     static void verifyChain(List<X509Certificate> chain, X509Certificate anchor, Instant at) {
@@ -402,11 +407,14 @@ final class PkiFiles {
             root = last;
         }
         boolean selfSigned = signedBy(root, root);
+        TrustAnchor trustAnchor = new TrustAnchor(root, null);
         if (path.size() > 1 && !selfSigned) {
-            // an --anchor that is itself issued by another CA cannot anchor a path that contains it; the JDK takes its
-            // key and name, so its own CA constraints are checked here
-            path.remove(path.size() - 1);
-            requireIssuingCa(root, at, path.size() - 1);
+            // an --anchor issued by another CA: first its CA duties, with messages naming them, then the whole path
+            // with a stand-in for it (see anchorStandIn), so its name and policy constraints bind the path below it
+            requireIssuingCa(root, at, path.size() - 2);
+            KeyPair standInKey = keyPair("ES256");
+            path.set(path.size() - 1, anchorStandIn(root, standInKey));
+            trustAnchor = new TrustAnchor(root.getIssuerX500Principal(), standInKey.getPublic(), null);
         }
         if (path.size() == 1 && sameCertificate(path.get(0), root) && !selfSigned) {
             requireNoUnknownCriticalExtension(root, "the certificate");
@@ -416,7 +424,7 @@ final class PkiFiles {
         // a self-signed root stays in the path, anchored by itself, so the validator processes it as an issuing CA
         // (CA flag, keyCertSign, pathLen, validity) instead of trusting its key unexamined
         try {
-            PKIXParameters parameters = new PKIXParameters(Set.of(new TrustAnchor(root, null)));
+            PKIXParameters parameters = new PKIXParameters(Set.of(trustAnchor));
             parameters.setRevocationEnabled(false);
             parameters.setDate(Date.from(at));
             CertPath certPath = CertificateFactory.getInstance("X.509").generateCertPath(path);
@@ -427,9 +435,31 @@ final class PkiFiles {
                     ? " at " + path.get(index).getSubjectX500Principal().getName() : "";
             throw new IllegalArgumentException("the chain is not a valid certification path" + where + ": "
                     + e.getMessage() + " (RFC 5280 path validation: every issuer must be a CA with keyCertSign,"
-                    + " within its pathLen, every certificate valid now)", e);
+                    + " within its pathLen and its name and policy constraints, every certificate valid now)", e);
         } catch (GeneralSecurityException e) {
             throw new IllegalArgumentException("the chain cannot be validated: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * The {@code --anchor} certificate as it stands, its subject, key, validity, serial and every extension unchanged,
+     * re-signed by {@code key} under the anchor's own issuer name. The JDK {@code PKIX} validator refuses name
+     * constraints in a {@link TrustAnchor} ("not supported") and would take a non-self-signed anchor by its key and name
+     * only, dropping its nameConstraints, policyConstraints, inhibitAnyPolicy, policies and policy mappings. Trusting
+     * {@code key} instead puts the stand-in in the path as the top issuing CA, so RFC 5280 6.1 processes all of its
+     * extensions, as OpenSSL does for a partial chain ({@code -partial_chain}): only the anchor's own signature, which
+     * an anchor never needs, is not checked.
+     */
+    private static X509Certificate anchorStandIn(X509Certificate anchor, KeyPair key) {
+        try {
+            X509CertificateHolder template = new X509CertificateHolder(anchor.getEncoded());
+            ContentSigner signer = new JcaContentSignerBuilder(signatureAlgorithm(key.getPublic())).setProvider(BC)
+                    .build(key.getPrivate());
+            return new JcaX509CertificateConverter().setProvider(BC)
+                    .getCertificate(new X509v3CertificateBuilder(template).build(signer));
+        } catch (GeneralSecurityException | IOException | OperatorCreationException e) {
+            throw new IllegalArgumentException("the --anchor " + anchor.getSubjectX500Principal().getName()
+                    + " cannot be processed: " + e.getMessage(), e);
         }
     }
 
@@ -458,8 +488,9 @@ final class PkiFiles {
     }
 
     /**
-     * RFC 5280 6.1.4 for an anchor that is not self-signed, which the JDK takes as a trust anchor by its key and name
-     * only and never examines: no critical extension it cannot process, CA, keyCertSign, pathLen, valid at {@code at}.
+     * RFC 5280 6.1.4 for an anchor that is not self-signed, checked first so each refusal names the duty it breaks: no
+     * critical extension that cannot be processed, CA, keyCertSign, pathLen, valid at {@code at}. Path validation over
+     * its stand-in ({@link #anchorStandIn}) then repeats these and applies its name and policy constraints.
      */
     private static void requireIssuingCa(X509Certificate ca, Instant at, int intermediatesBelow) {
         String name = ca.getSubjectX500Principal().getName();
