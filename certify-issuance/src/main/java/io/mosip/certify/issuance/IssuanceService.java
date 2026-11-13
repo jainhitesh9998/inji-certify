@@ -7,7 +7,8 @@ public interface IssuanceService {
 
     /**
      * Renders and builds a credential for the configuration without attaching status, running the pre-sign listeners
-     * or signing: the dry run behind the configuration API's preview.
+     * or signing: the dry run behind the configuration API's preview. The format's checks of the signing key
+     * ({@code CredentialFormatter.checkSigningKey}) run too, so a key the format would refuse at signing is refused here.
      */
     default io.mosip.certify.spi.UnsignedCredential preview(io.mosip.certify.spi.CredentialConfiguration configuration, io.mosip.certify.spi.ClaimSet claims,
                                                             io.mosip.certify.spi.IssuanceContext context, io.mosip.certify.spi.HolderBinding holder) {

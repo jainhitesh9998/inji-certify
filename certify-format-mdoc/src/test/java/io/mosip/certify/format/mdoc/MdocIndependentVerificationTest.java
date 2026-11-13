@@ -72,10 +72,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *     the chain, a retyped or missing element, a non-preferred integer encoding.</li>
  * </ul>
  *
- * <p>The two samples written here ({@code MdocIndependentVerificationTest-formatter} and
- * {@code MdocIndependentVerificationTest-ed25519}) go to {@code target/mdoc-samples/} together with their holder key,
- * docType and gaps, for {@code certify-conformance-mdoc} and {@code docs/design/tools/verify_mdoc.py} to re-verify with
- * two more independent stacks.
+ * <p>The three samples written here ({@code MdocIndependentVerificationTest-formatter},
+ * {@code MdocIndependentVerificationTest-ed25519} and, signed by an Annex B Document Signer under its configured IACA,
+ * {@code MdocIndependentVerificationTest-annexb}) go to {@code target/mdoc-samples/} together with their holder key,
+ * docType, gaps and (for {@code annexb}) the IACA, for {@code certify-conformance-mdoc} and
+ * {@code docs/design/tools/verify_mdoc.py} to re-verify with two more independent stacks.
  */
 class MdocIndependentVerificationTest {
 
@@ -94,14 +95,14 @@ class MdocIndependentVerificationTest {
      * What the formatter's output cannot pass yet, one problem code per line, with the gap and the work package that
      * closes it. Written next to each sample as its {@code .gaps} sidecar; the work package that fixes one deletes its
      * line, and a problem not listed here (an expired window, a new element-type regression) fails. The x5chain is the
-     * DSC alone, as it must be, so a verifier needs the IACA from elsewhere: the sample does not hand it out
-     * ({@code .iaca.pem} is written only for a chain that carries its anchor), and configured trust anchors are M-06.
-     * {@link #theChainWithoutItsAnchorValidatesToTheIaca} shows the same credential passes every check once the IACA is
-     * supplied.
+     * DSC alone, as it must be, so a verifier needs the IACA from elsewhere: these samples sign with the fixtures' dev CA,
+     * which is no Annex B IACA and is not handed out. {@link #theChainWithoutItsAnchorValidatesToTheIaca} shows the same
+     * credential passes every check once the IACA is supplied, and the {@code annexb} sample
+     * ({@link #anAnnexBDocumentSignerUnderItsConfiguredIacaPassesEveryCheck}) hands its configured IACA over (M-06).
      */
     static final AcceptedGaps FORMATTER_GAPS = AcceptedGaps.none()
             .gap(IndependentMdocVerifier.CHECK_CHAIN_TO_IACA, "noAnchorSupplied",
-                    "the x5chain is the DSC alone (HAIP) and the sample carries no IACA for the verifier; trust anchors are M-06");
+                    "the x5chain is the DSC alone (HAIP) and this sample hands the verifier no IACA (the annexb sample does, M-06)");
 
     final IndependentMdocVerifier verifier = new IndependentMdocVerifier();
     final MdocFormatter formatter = new MdocFormatter(new ObjectMapper(), MdlFixtures.properties(Duration.ofDays(90)));
@@ -174,6 +175,70 @@ class MdocIndependentVerificationTest {
         VerificationReport report = verify(issuerSigned, Optional.of(IACA), Options.strict(DOCTYPE));
         AcceptedGaps.none().assertMatches(report, "formatter-with-iaca");
         assertTrue(report.passed(), report.toString());
+    }
+
+    /**
+     * M-06: a credential signed with x509-file dev mode's Annex B material (the IACA and Document Signer
+     * {@code JcaKeyProvider.generateIaca}/{@code generateMdocDsc} write, which x509-file dev mode calls) under the DSC
+     * policy enforced against that IACA. The sample hands the verifier the configured IACA ({@code .iaca.pem}), so the
+     * chain-to-IACA check passes and the sample declares no gap at all; OpenSSL verifies the DSC the IssuerAuth carries
+     * against the same IACA with {@code -x509_strict} (D9, deferred to M-06 by the decision log).
+     */
+    @Test
+    void anAnnexBDocumentSignerUnderItsConfiguredIacaPassesEveryCheck() throws Exception {
+        io.mosip.certify.keyprovider.jca.JcaKeyProvider devMode = new io.mosip.certify.keyprovider.jca.JcaKeyProvider("x509-file");
+        X509Certificate iaca = devMode.generateIaca("iaca", new io.mosip.certify.keyprovider.jca.MdocIacaSpec(SignatureAlgorithm.ES256,
+                "IN", null, "Lorem Ipsum Demo IACA", "https://credentials.example.test/v1/certify/mdoc/iaca", null,
+                AnnexBFixtures.CRL_URI, null)).chain().leaf().orElseThrow();
+        SigningKey dsc = devMode.generateMdocDsc("mdl-dsc@2026-11", SignatureAlgorithm.ES256, "Lorem Ipsum Demo DSC", 400, "iaca");
+        MdocFormatter enforced = new MdocFormatter(new ObjectMapper(), MdlFixtures.properties(Duration.ofDays(90)),
+                new MdocDscPolicy(AnnexBFixtures.trusting(iaca)));
+        // dev mode generates its certificates at startup, before any request: the request clock here is after them
+        // (notBefore is the generation instant truncated to the second, so it never exceeds this clock)
+        io.mosip.certify.spi.IssuanceContext request = MdlFixtures.context(Instant.now());
+        UnsignedCredential unsigned = enforced.build(ClaimSet.of(MdlFixtures.mdl()), MdlFixtures.configuration(enforced),
+                request, MdlFixtures.holder());
+        io.mosip.certify.spi.SigningContext signing = new io.mosip.certify.spi.SigningContext(new io.mosip.certify.spi.SigningConfig(
+                dsc.ref(), dsc.algorithm(), null, null, null, "did:web:issuer.example"), dsc, devMode);
+        byte[] issuerSigned = Base64.getUrlDecoder().decode((String) enforced.sign(unsigned, signing, request).credential());
+        MdocSamples.write(SAMPLES, getClass(), "annexb", issuerSigned, JWK.parse(MdlFixtures.HOLDER_JWK), DOCTYPE,
+                AcceptedGaps.none(), iaca);
+
+        assertEquals(1, x5chain(issuerSigned).size(), "the x5chain is the DSC alone (HAIP), the IACA comes from the sidecar");
+        VerificationReport report = verify(issuerSigned, Optional.of(iaca), Options.strict(DOCTYPE));
+        AcceptedGaps.none().assertMatches(report, MdocSamples.name(getClass(), "annexb"));
+        assertTrue(report.passed(), report.toString());
+        byte[] carried = ((ByteString) x5chain(issuerSigned).get(0)).getBytes();
+        assertEquals(dsc.chain().leaf().orElseThrow(), java.security.cert.CertificateFactory.getInstance("X.509")
+                .generateCertificate(new ByteArrayInputStream(carried)), "the IssuerAuth carries the dev-mode DSC");
+        opensslVerifiesStrictly(iaca, carried);
+    }
+
+    /** {@code openssl verify -x509_strict -CAfile <iaca> <dsc>}; skipped without OpenSSL locally, failing with CI set. */
+    static void opensslVerifiesStrictly(X509Certificate iaca, byte[] dscDer) throws Exception {
+        boolean available;
+        try {
+            available = new ProcessBuilder("openssl", "version").redirectErrorStream(true).start().waitFor() == 0;
+        } catch (java.io.IOException e) {
+            available = false;
+        }
+        if (!available) {
+            if (System.getenv("CI") != null) {
+                org.junit.jupiter.api.Assertions.fail("openssl is not on the PATH and CI is set: the independent verifier must run");
+            }
+            org.junit.jupiter.api.Assumptions.abort("openssl is not on the PATH");
+        }
+        Path directory = java.nio.file.Files.createDirectories(Path.of("target", "openssl-annexb"));
+        Path iacaFile = java.nio.file.Files.writeString(directory.resolve("iaca.pem"), MdocSamples.pem(iaca));
+        X509Certificate dsc = (X509Certificate) java.security.cert.CertificateFactory.getInstance("X.509")
+                .generateCertificate(new ByteArrayInputStream(dscDer));
+        Path dscFile = java.nio.file.Files.writeString(directory.resolve("dsc.pem"), MdocSamples.pem(dsc));
+        Process process = new ProcessBuilder("openssl", "verify", "-x509_strict", "-CAfile", iacaFile.toString(),
+                dscFile.toString()).redirectErrorStream(true).start();
+        String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        assertTrue(process.waitFor(30, java.util.concurrent.TimeUnit.SECONDS), "openssl did not finish");
+        assertEquals(0, process.exitValue(), output);
+        assertTrue(output.contains(": OK"), output);
     }
 
     // ---- the gaps M-02 and M-03 closed, one test each ----------------------------------------------------------

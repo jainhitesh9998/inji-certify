@@ -236,6 +236,57 @@ class KeymanagerKeyProviderTest {
         order.verifyNoMoreInteractions();
     }
 
+    /**
+     * M-06 (G13): keymanager returns a certificate alone. A Document Signer whose CSR a configured IACA signed (the CSR
+     * flow) is completed to [DSC, IACA] from the trust anchors, so the DSC policy can check it and without-anchor still
+     * carries the DSC alone; keymanager's own certificates, and every certificate when no anchor issued it or no registry
+     * exists, keep their one-certificate chain (the bytes of existing deployments).
+     */
+    @Test
+    void aLeafAConfiguredIacaIssuedIsCompletedFromTheTrustAnchorsAndNothingElseIs() {
+        KeymanagerAlias dsc = new KeymanagerAlias("CERTIFY_MDOC_DSC", "");
+        java.security.cert.X509Certificate iaca = keymanager.addIaca("iaca", "Lorem Ipsum Demo IACA");
+        java.security.cert.X509Certificate otherIaca = keymanager.addIaca("other-iaca", "Lorem Ipsum Other IACA");
+        String kid = keymanager.addIssuedKey(dsc, "iaca", KeymanagerStandIn.at("2025-01-01T00:00:00Z"), KeymanagerStandIn.at("2027-01-01T00:00:00Z"));
+        List<KeymanagerAlias> aliases = List.of(ED, R1, RSA, dsc);
+
+        KeymanagerKeyProvider completing = new KeymanagerKeyProvider(keymanager.keymanagerService, keymanager.signatureService,
+                aliases, clock, Duration.ofMinutes(1), () -> anchors(otherIaca, iaca));
+        SigningKey key = completing.resolve(dsc.toKeyRef());
+        java.security.cert.X509Certificate leaf = key.chain().leaf().orElseThrow();
+        assertEquals(List.of(leaf, iaca), key.chain().leafFirst(), "[DSC, IACA]");
+        assertEquals(List.of(leaf), key.chain().withoutAnchor().leafFirst(), "the IssuerAuth still carries the DSC alone");
+        assertEquals(kid, key.kid(), "the key id is keymanager's thumbprint of the DSC, as before");
+        assertEquals(1, completing.resolve(R1.toKeyRef()).chain().leafFirst().size(), "keymanager's own certificate stays alone");
+        assertEquals(2, completing.publicKeys(dsc.toKeyRef()).get(0).chain().leafFirst().size());
+
+        KeymanagerKeyProvider unrelated = new KeymanagerKeyProvider(keymanager.keymanagerService, keymanager.signatureService,
+                aliases, clock, Duration.ofMinutes(1), () -> anchors(otherIaca));
+        assertEquals(List.of(leaf), unrelated.resolve(dsc.toKeyRef()).chain().leafFirst(), "no configured IACA issued it");
+        KeymanagerKeyProvider noRegistry = new KeymanagerKeyProvider(keymanager.keymanagerService, keymanager.signatureService,
+                aliases, clock, Duration.ofMinutes(1));
+        assertEquals(List.of(leaf), noRegistry.resolve(dsc.toKeyRef()).chain().leafFirst(), "no registry: unchanged");
+    }
+
+    static io.mosip.certify.signing.TrustAnchorRegistry anchors(java.security.cert.X509Certificate... iacas) {
+        List<io.mosip.certify.signing.TrustAnchorRegistry.Anchor> entries = new java.util.ArrayList<>();
+        for (java.security.cert.X509Certificate iaca : iacas) {
+            entries.add(new io.mosip.certify.signing.TrustAnchorRegistry.Anchor(iaca.getSubjectX500Principal().getName(),
+                    io.mosip.certify.signing.TrustAnchorRegistry.MDOC_IACA, iaca));
+        }
+        return new io.mosip.certify.signing.TrustAnchorRegistry() {
+            @Override
+            public List<Anchor> entries(String purpose) {
+                return MDOC_IACA.equals(purpose) ? entries : List.of();
+            }
+
+            @Override
+            public Optional<java.security.cert.X509CRL> crl(String anchorId) {
+                return Optional.empty();
+            }
+        };
+    }
+
     @Test
     void aliasGrammarRoundTrips() {
         assertEquals(ED, KeymanagerAlias.parse("CERTIFY_VC_SIGN_ED25519/ED25519_SIGN"));

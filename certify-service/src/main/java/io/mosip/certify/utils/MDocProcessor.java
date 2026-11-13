@@ -17,6 +17,8 @@ import io.mosip.certify.core.constants.Constants;
 import io.mosip.certify.core.constants.ErrorConstants;
 import io.mosip.certify.core.constants.VCDM2Constants;
 import io.mosip.certify.core.exception.CertifyException;
+import io.mosip.certify.format.mdoc.MdocDscPolicy;
+import io.mosip.certify.format.mdoc.MdocFormatter;
 import io.mosip.certify.issuance.KeyProviderRegistry;
 import io.mosip.certify.signing.CoseEnvelope;
 import io.mosip.certify.signing.CoseHeaderPolicy;
@@ -26,6 +28,7 @@ import io.mosip.certify.signing.LegacyKeyRefs;
 import io.mosip.certify.signing.SignatureAlgorithm;
 import io.mosip.certify.signing.SigningException;
 import io.mosip.certify.signing.SigningKey;
+import io.mosip.certify.spi.FormatException;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
@@ -41,6 +44,7 @@ import java.util.Map;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
@@ -60,6 +64,10 @@ public class MDocProcessor {
 
     @Autowired
     private KeyProviderRegistry keyProviders;
+
+    /** The refactored formatter, for its DSC policy (M-06): one policy for every surface, this legacy one included. */
+    @Autowired
+    private ObjectProvider<MdocFormatter> mdocFormatter;
 
     /**
      * Process templated JSON to create final mDoc structure
@@ -509,6 +517,7 @@ public class MDocProcessor {
             SignatureAlgorithm algorithm = SignatureAlgorithm.fromJose(signAlgorithm)
                     .orElseThrow(() -> new CertifyException(ErrorConstants.VC_SIGNING_ERROR, "Unsupported signature algorithm " + signAlgorithm));
             SigningKey key = provider.resolve(ref).withAlgorithm(algorithm);
+            requireTrustedDocumentSigner(key);
             // ISO/IEC 18013-5 IssuerAuth: alg in the protected header, x5chain unprotected, untagged COSE_Sign1
             return CoseEnvelope.sign1(msoCbor, CoseHeaderPolicy.mdocIssuerAuth(), key, provider);
         } catch (CertifyException e) {
@@ -517,7 +526,25 @@ public class MDocProcessor {
         } catch (SigningException e) {
             log.error("Error during COSE signing: {}", e.getMessage(), e);
             throw new CertifyException(ErrorConstants.VC_SIGNING_ERROR, "COSE signing failed: " + e.getMessage());
+        } catch (FormatException e) {
+            log.error("mDoc DSC policy refused the signing key: {} {}", e.getErrorCode(), e.getMessage());
+            throw new CertifyException(ErrorConstants.VC_SIGNING_ERROR, "COSE signing failed: " + e.getErrorCode() + ": " + e.getMessage());
         }
+    }
+
+    /**
+     * The DSC policy's trust-anchor rules (docs/design/20-mdl-issuer.md M-06, D16 as refined in the decision log) hold on
+     * this legacy path too once IACAs are configured; without them nothing is checked here, so the bytes this path signs
+     * stay those of the {@code legacy-develop} golden (CLAUDE.md rule 1).
+     */
+    private void requireTrustedDocumentSigner(SigningKey key) {
+        MdocFormatter formatter = mdocFormatter == null ? null : mdocFormatter.getIfAvailable();
+        MdocDscPolicy policy = formatter == null ? null : formatter.dscPolicy();
+        if (policy == null || !policy.enforced()) {
+            return;
+        }
+        MdocDscPolicy.requireX5chain(CoseHeaderPolicy.mdocIssuerAuth().x5chain(), key.chain());
+        policy.check(key.chain(), java.time.Instant.now());
     }
 
     /**

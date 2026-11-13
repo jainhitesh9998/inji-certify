@@ -80,6 +80,7 @@ io.inji.certify:certify-issuance:jar:1.0.0-beta.1-SNAPSHOT:compile
 io.inji.certify:certify-keyprovider-jca:jar:1.0.0-beta.1-SNAPSHOT:compile
 io.inji.certify:certify-keyprovider-keymanager:jar:1.0.0-beta.1-SNAPSHOT:compile
 io.inji.certify:certify-keyprovider-x509-file:jar:1.0.0-beta.1-SNAPSHOT:compile
+io.inji.certify:certify-pki:jar:1.0.0-beta.1-SNAPSHOT:compile
 io.inji.certify:certify-signing:jar:1.0.0-beta.1-SNAPSHOT:compile
 io.inji.certify:certify-spi:jar:1.0.0-beta.1-SNAPSHOT:compile
 io.inji.certify:certify-template-velocity:jar:1.0.0-beta.1-SNAPSHOT:compile

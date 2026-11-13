@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.mosip.certify.signing.CertificateChain;
 import io.mosip.certify.signing.CoseEnvelope;
 import io.mosip.certify.signing.CoseHeaderPolicy;
-import io.mosip.certify.signing.JwsHeaderPolicy;
 import io.mosip.certify.spi.ClaimSet;
 import io.mosip.certify.spi.CredentialConfiguration;
 import io.mosip.certify.spi.CredentialFormatter;
@@ -24,13 +23,15 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
 /**
  * {@code mso_mdoc}: the rendered document (docType, validityInfo, nameSpaces of IssuerSignedItems) becomes salted,
  * digested namespaces and a Mobile Security Object whose device key is the holder's; {@link #sign} produces the
  * IssuerAuth COSE_Sign1 (alg protected, x5chain unprotected, untagged) through the {@link SigningContext} and returns
  * the base64url CBOR IssuerSigned structure, exactly as the legacy path does. The key must carry a certificate chain
- * and the IssuerAuth always carries {@code x5chain} (9.1.2.4); see {@link #requireX5chain}.
+ * and the IssuerAuth always carries {@code x5chain} (9.1.2.4); the Document Signer is held to {@link MdocDscPolicy},
+ * whose trust-anchor rules apply when IACAs are configured (M-06).
  *
  * <p>The document type and the data model are checked here, before anything is signed: a template whose {@code docType}
  * differs from the configuration's {@code doctype} is a template error, and an {@code org.iso.18013.5.1.mDL} that
@@ -48,11 +49,22 @@ public class MdocFormatter implements CredentialFormatter {
     private final MdocProperties properties;
     private final ObjectMapper objectMapper;
     private final MdocDataModelValidator validator = new MdocDataModelValidator();
+    private final MdocDscPolicy dscPolicy;
 
+    /** A formatter without configured trust anchors: the DSC policy's anchor rules do not apply. */
     public MdocFormatter(ObjectMapper objectMapper, MdocProperties properties) {
+        this(objectMapper, properties, MdocDscPolicy.notEnforced());
+    }
+
+    public MdocFormatter(ObjectMapper objectMapper, MdocProperties properties, MdocDscPolicy dscPolicy) {
         this.objectMapper = objectMapper;
         this.properties = properties;
         this.processor = new MdocProcessor(objectMapper, properties);
+        this.dscPolicy = dscPolicy == null ? MdocDscPolicy.notEnforced() : dscPolicy;
+    }
+
+    public MdocDscPolicy dscPolicy() {
+        return dscPolicy;
     }
 
     @Override
@@ -126,9 +138,8 @@ public class MdocFormatter implements CredentialFormatter {
         try {
             Instant now = context == null ? Instant.now() : context.now();
             CertificateChain chain = signing.key().chain();
-            CoseHeaderPolicy policy = signing.config().coseHeaders() == null ? CoseHeaderPolicy.mdocIssuerAuth()
-                    : new CoseHeaderPolicy(signing.config().coseHeaders().x5chain(), null, false); // the configuration's x5chain choice
-            requireX5chain(policy.x5chain(), chain);
+            CoseHeaderPolicy policy = headerPolicy(signing);
+            MdocDscPolicy.requireX5chain(policy.x5chain(), chain);
             X509Certificate leaf = chain.leaf().orElseThrow();
             // 9.1.2.4: validityInfo is decided when the document is signed, and never outlives the DSC or the document
             Map<String, Object> mso = new HashMap<>(credential.asMap());
@@ -140,11 +151,8 @@ public class MdocFormatter implements CredentialFormatter {
                     leaf.getNotAfter().toInstant(), MdocDataModelValidator.documentExpiry(docType, elementValues)));
 
             byte[] msoCbor = MdocProcessor.encodeToTaggedCBOR(mso);
-            try {
-                io.mosip.certify.signing.CertificateChainPolicy.check(chain, now);
-            } catch (io.mosip.certify.signing.SigningException e) {
-                throw new FormatException(MdocConstants.ERROR_CHAIN, e.getMessage(), e);
-            }
+            // the generic chain check, then the DSC policy (validity, trust anchor, Annex B, CRL; D16)
+            dscPolicy.check(chain, now);
             byte[] issuerAuth = CoseEnvelope.sign1(msoCbor, policy, signing.key(), signing.signer());
             Map<String, List<byte[]>> encodedNamespaces = (Map<String, List<byte[]>>) credential.attributes()
                     .getOrDefault(ATTRIBUTE_NAMESPACES, Map.of());
@@ -160,47 +168,32 @@ public class MdocFormatter implements CredentialFormatter {
     }
 
     /**
-     * ISO/IEC 18013-5 9.1.2.4: the IssuerAuth's unprotected header carries {@code x5chain} (RFC 9360, label 33) with the
-     * document signer certificate, and a verifier builds the path from it to the IACA it trusts. So the key must have a
-     * chain, the configuration may not leave the chain out ({@code none}), may not cut it to the DSC alone ({@code leaf})
-     * when intermediates stand between the DSC and the IACA, and may not carry the self-signed IACA ({@code full}; HAIP).
-     * The signer itself may not be self-signed: {@code without-anchor} keeps a lone self-signed certificate, which no
-     * Annex B Document Signer is.
+     * The key checks {@link #sign} runs, for the v2 dry run and preview: the {@code x5chain} rules always hold, but the
+     * key is resolved only when the DSC policy is {@link MdocDscPolicy#enforced enforced}, so a deployment without
+     * configured IACAs previews exactly as before M-06.
      */
-    static void requireX5chain(JwsHeaderPolicy.ChainInclusion inclusion, CertificateChain chain) {
-        if (chain == null || chain.isEmpty()) {
-            throw new FormatException(MdocConstants.ERROR_CHAIN, "the signing key has no certificate chain; ISO/IEC 18013-5"
-                    + " 9.1.2.4 requires the IssuerAuth to carry the document signer certificate in x5chain (label 33)");
+    @Override
+    public void checkSigningKey(Supplier<SigningContext> signing, CredentialConfiguration configuration, IssuanceContext context) {
+        if (!dscPolicy.enforced()) {
+            return;
         }
-        X509Certificate leaf = chain.leafFirst().get(0);
-        if (leaf.getSubjectX500Principal().equals(leaf.getIssuerX500Principal())) {
-            // a lone self-signed certificate survives without-anchor (nothing above it to drop), so the IssuerAuth would
-            // carry a self-signed signer; an ISO/IEC 18013-5 Annex B Document Signer is always issued by an IACA
-            throw new FormatException(MdocConstants.ERROR_CHAIN, "the signing certificate " + leaf.getSubjectX500Principal()
-                    + " is self-signed; an ISO/IEC 18013-5 Annex B document signer certificate is issued by an IACA,"
-                    + " so the key needs a DSC chain (docs/design/06a-x509-pki-and-mdoc.md)");
+        SigningContext resolved;
+        try {
+            resolved = signing.get();
+        } catch (RuntimeException e) {
+            throw new FormatException(MdocConstants.ERROR_CHAIN, MdocDscPolicy.KEY_UNRESOLVED + ": the signing key "
+                    + (configuration.signing() == null ? "" : configuration.signing().keyRef() + " ")
+                    + "cannot be resolved: " + e.getMessage(), e);
         }
-        switch (inclusion) {
-            case NONE -> throw new FormatException(MdocConstants.ERROR_CHAIN, "x5chain none would leave the IssuerAuth"
-                    + " without the document signer certificate, which ISO/IEC 18013-5 9.1.2.4 requires; use without-anchor");
-            case LEAF -> {
-                if (chain.withoutAnchor().leafFirst().size() > 1) {
-                    throw new FormatException(MdocConstants.ERROR_CHAIN, "x5chain leaf would drop the "
-                            + (chain.withoutAnchor().leafFirst().size() - 1) + " intermediate certificate(s) between the"
-                            + " document signer certificate and the IACA, so no verifier could build the path; use without-anchor");
-                }
-            }
-            case FULL -> {
-                X509Certificate root = chain.root().orElseThrow();
-                if (root.getSubjectX500Principal().equals(root.getIssuerX500Principal())) {
-                    // HAIP forbids carrying the trust anchor; the verifier must supply the IACA itself (D9, 9.1.2.4)
-                    throw new FormatException(MdocConstants.ERROR_CHAIN, "x5chain FULL would carry the self-signed trust anchor "
-                            + root.getSubjectX500Principal() + " in the IssuerAuth; an mDL carries at most the DSC and its"
-                            + " intermediates (HAIP, without-anchor)");
-                }
-            }
-            case WITHOUT_ANCHOR -> { }
-        }
+        CertificateChain chain = resolved.key().chain();
+        MdocDscPolicy.requireX5chain(headerPolicy(resolved).x5chain(), chain);
+        dscPolicy.check(chain, context == null ? Instant.now() : context.now());
+    }
+
+    /** The configuration's {@code x5chain} choice, or the mDoc default ({@code without-anchor}). */
+    private static CoseHeaderPolicy headerPolicy(SigningContext signing) {
+        return signing.config().coseHeaders() == null ? CoseHeaderPolicy.mdocIssuerAuth()
+                : new CoseHeaderPolicy(signing.config().coseHeaders().x5chain(), null, false);
     }
 
     private static String configuredDocType(CredentialConfiguration configuration) {

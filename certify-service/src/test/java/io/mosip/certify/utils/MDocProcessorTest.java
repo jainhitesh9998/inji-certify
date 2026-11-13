@@ -770,6 +770,43 @@ public class MDocProcessorTest {
         assertTrue("IssuerAuth must verify with JCA", verifier.verify(com.nimbusds.jose.crypto.impl.ECDSA.transcodeSignatureToDER(sign1.get(3).GetByteString())));
     }
 
+    /**
+     * M-06: once IACAs are configured the DSC policy holds on this legacy path too (fail closed on every surface); a key
+     * no configured IACA issued is refused before anything is signed. Without IACAs the path signs as before (above).
+     */
+    @Test
+    public void should_refuseSigning_when_dscPolicyIsEnforcedAndNoIacaIssuedTheKey() throws Exception {
+        ReflectionTestUtils.setField(mDocProcessor, "keyProviders", io.mosip.certify.signing.TestKeyProviders.registry("app/ref", io.mosip.certify.signing.SignatureAlgorithm.ES256));
+        java.security.KeyPairGenerator generator = java.security.KeyPairGenerator.getInstance("EC");
+        generator.initialize(new java.security.spec.ECGenParameterSpec("secp256r1"));
+        java.security.cert.X509Certificate iaca = io.mosip.certify.pki.IsoMdocProfiles.iaca(generator.generateKeyPair()).country("IN")
+                .commonName("Legacy Path Test IACA").issuerAltUri("https://credentials.example.test")
+                .crlDistributionPoint("https://credentials.example.test/iaca.crl").build();
+        io.mosip.certify.signing.TrustAnchorRegistry registry = new io.mosip.certify.signing.TrustAnchorRegistry() {
+            @Override
+            public List<Anchor> entries(String purpose) {
+                return List.of(new Anchor("legacy-test", MDOC_IACA, iaca));
+            }
+
+            @Override
+            public Optional<java.security.cert.X509CRL> crl(String anchorId) {
+                return Optional.empty();
+            }
+        };
+        io.mosip.certify.format.mdoc.MdocFormatter enforced = new io.mosip.certify.format.mdoc.MdocFormatter(new ObjectMapper(),
+                new io.mosip.certify.format.mdoc.MdocProperties("SHA-256", "1.0", java.time.Duration.ofDays(90), null),
+                new io.mosip.certify.format.mdoc.MdocDscPolicy(registry));
+        ReflectionTestUtils.setField(mDocProcessor, "mdocFormatter",
+                new org.springframework.beans.factory.support.StaticListableBeanFactory(Map.of("mdocFormatter", enforced))
+                        .getBeanProvider(io.mosip.certify.format.mdoc.MdocFormatter.class));
+        try {
+            mDocProcessor.signMSO(Map.of("version", "1.0"), "app", "ref", "ES256");
+            fail("a key no configured IACA issued must not sign");
+        } catch (CertifyException e) {
+            assertTrue(e.getMessage(), e.getMessage().contains("certificate_chain_invalid"));
+        }
+    }
+
     @Test(expected = CertifyException.class)
     public void should_throwException_when_signingKeyIsMissing() throws Exception {
         ReflectionTestUtils.setField(mDocProcessor, "keyProviders", io.mosip.certify.signing.TestKeyProviders.registry("other/key", io.mosip.certify.signing.SignatureAlgorithm.ES256));

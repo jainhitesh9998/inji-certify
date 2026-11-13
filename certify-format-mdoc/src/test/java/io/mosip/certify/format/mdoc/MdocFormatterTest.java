@@ -149,7 +149,9 @@ class MdocFormatterTest {
         environment.getPropertySources().addFirst(new org.springframework.core.env.MapPropertySource("beta1", Map.of(
                 "mosip.certify.mdoc.validity-period-years", "2", "mosip.certify.mdoc.digest-algorithm", "SHA-512")));
         MdocFormatter bean = new MdocAutoConfiguration().mdocFormatter(new ObjectMapper(),
-                new MdocProperties(null, "1.0", null, null), environment);
+                new MdocProperties(null, "1.0", null, null), environment,
+                new org.springframework.beans.factory.support.StaticListableBeanFactory()
+                        .getBeanProvider(io.mosip.certify.signing.TrustAnchorRegistry.class));
         MdocProperties applied = (MdocProperties) readField(bean, "properties");
         assertEquals(Duration.ofDays(730), applied.validity());
         assertEquals("SHA-512", applied.digestAlgorithm());

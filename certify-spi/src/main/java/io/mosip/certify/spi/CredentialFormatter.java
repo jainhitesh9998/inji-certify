@@ -2,6 +2,7 @@ package io.mosip.certify.spi;
 
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Supplier;
 
 /**
  * One credential format, end to end: configuration schema, metadata fragment, build and sign
@@ -33,4 +34,13 @@ public interface CredentialFormatter {
 
     /** Signs with the envelope builders of certify-signing; never calls a key provider directly. */
     IssuedCredential sign(UnsignedCredential credential, SigningContext signing, IssuanceContext context);
+
+    /**
+     * The checks {@link #sign} runs on the signing key, without signing anything: a configuration's dry run and preview
+     * call it so that a key this format would refuse is named before a wallet asks for a credential. The supplier
+     * resolves the key; a format with nothing to check never calls it, so a preview stays key-free for it. Throws
+     * {@link FormatException} with the rule the key breaks. Default: nothing to check.
+     */
+    default void checkSigningKey(Supplier<SigningContext> signing, CredentialConfiguration configuration, IssuanceContext context) {
+    }
 }
