@@ -116,8 +116,9 @@ public class W3CJsonLD extends Credential{
         // F-19: this used to be a strict LocalDateTime.parse of Constants.UTC_DATETIME_PATTERN, which requires the
         // fraction of a second; StatusListUpdateBatchJob writes validFrom as Instant.toString(), which omits it when it
         // is zero, so re-signing a Bitstring Status List threw DateTimeParseException at such an instant. The reader
-        // now accepts every form the writers produce, normalises the designator to UTC and keeps this path's JVM-zone
-        // reading (G38).
+        // now accepts the XML Schema dateTimeStamp grammar LegacyW3cDateTimes documents (every form the writers
+        // produce among them), applies the value's zone designator, refuses anything else before signing, and keeps
+        // this path's reading of the resulting UTC wall clock in the JVM's default zone (G38).
         Date createDate = LegacyW3cDateTimes.proofCreated(validFrom);
 
         CertificateResponseDTO certificateResponseDTO = didDocumentUtil.getCertificateDataResponseDto(appID, refID);

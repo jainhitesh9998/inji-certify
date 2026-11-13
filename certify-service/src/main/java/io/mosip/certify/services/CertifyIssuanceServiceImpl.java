@@ -337,8 +337,10 @@ public class CertifyIssuanceServiceImpl implements VCIssuanceService {
                     credentialId = templateParams.get(VCDMConstants.CREDENTIAL_ID).toString();
                 }
                 CredentialStatusDetail credentialStatusDetail = ledgerUtils.extractCredentialStatusDetails(jsonObject);
-                // F-19: read through the same tolerant reader as W3CJsonLD.addProof, so the ledger's issuance instant
-                // and the proof's created can never disagree about which forms this path accepts.
+                // F-19: read through the same reader as W3CJsonLD.addProof, so the ledger's issuance instant and the
+                // proof's created can never disagree about which forms this path accepts. The ledger keeps the UTC
+                // wall clock (time is this method's own ...SSS'Z' value); unlike the proof's created, no JVM zone is
+                // applied here (G38).
                 LocalDateTime issuanceDate = LegacyW3cDateTimes.localDateTime(time);
                 credentialLedgerService.storeLedgerEntry(credentialId, didUrl, credentialType, credentialStatusDetail, indexedAttributes, issuanceDate);
                 log.info("Successfully stored the credential issuance data in ledger with credentialType: {}", credentialType);

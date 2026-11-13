@@ -349,6 +349,35 @@ public class W3CJsonLDTest {
     }
 
     /**
+     * F-19 review round 3: {@code 24:00:00.000Z} (XML Schema end of day, the next day's {@code 00:00}) was signed by
+     * the former SMART reader and must keep the same proof {@code created}; it is computed here with the former
+     * expression itself.
+     */
+    @Test
+    public void testAddProofReadsTheEndOfDayAsTheFormerReaderDid() throws Exception {
+        String value = "2026-11-13T24:00:00.000Z";
+        Date former = Date.from(LocalDateTime.parse(value, java.time.format.DateTimeFormatter.ofPattern(
+                io.mosip.certify.core.constants.Constants.UTC_DATETIME_PATTERN)).atZone(ZoneId.systemDefault()).toInstant());
+        for (String field : List.of("validFrom", "issuanceDate")) {
+            assertEquals(field, former, proofFor(field, value).getCreated());
+        }
+    }
+
+    /** An offset beyond XML Schema's {@code ±14:00} is refused before anything is signed; {@code ±14:00} is not. */
+    @Test
+    public void testAddProofRefusesAnOffsetBeyondFourteenHours() throws Exception {
+        assertEquals(proofSecondOf("2026-11-13T15:00:23Z"),
+                proofFor("validFrom", "2026-11-14T05:00:23+14:00").getCreated());
+        for (String value : List.of("2026-11-14T05:01:23+14:01", "2026-11-13T15:00:23+18:00")) {
+            for (String field : List.of("validFrom", "issuanceDate")) {
+                assertThrows(field + " " + value, java.time.format.DateTimeParseException.class,
+                        () -> proofFor(field, value));
+            }
+        }
+        verify(proofGenerator, never()).generateProof(any(LdProof.class), anyString(), anyMap());
+    }
+
+    /**
      * The compatibility reader's rule, asserted rather than restated: the value's UTC wall clock (the same for every
      * zone designator) read in the JVM's default zone, at the seconds precision the proof's {@code created} is written
      * with. Applying the {@code Z}/offset instead would move {@code proof.created} on every deployment not on UTC, which
