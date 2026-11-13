@@ -6,6 +6,7 @@
 package io.mosip.certify.conformance.mdoc;
 
 import io.mosip.certify.testkit.mdoc.IndependentMdocVerifier;
+import io.mosip.certify.testkit.mdoc.IndependentStatusListVerifier;
 import io.mosip.certify.testkit.mdoc.MdocSamples;
 import io.mosip.certify.testkit.mdoc.Options;
 import io.mosip.certify.testkit.mdoc.VerificationReport;
@@ -118,8 +119,43 @@ class MdocSampleConformanceTest {
                 found.id() + ": the verifier did not run every check");
         assertFalse(report.check(IndependentMdocVerifier.CHECK_SIGNATURE_MULTIPAZ).message().isBlank());
         sample.gaps().assertMatches(report, found.id());
+        verifyStatusList(found, sample);
         System.out.println("[mdoc-conformance] " + found.id() + " accepted " + report.checks().stream()
                 .flatMap(check -> check.codes().stream().map(code -> check.name() + ":" + code)).toList() + "; " + report);
+    }
+
+    /**
+     * M-11b: when the MSO carries {@code status.status_list}, the sample's status list is verified against the mDL it
+     * belongs to — the IACA the credential chains to (ISO/IEC 18013-5 second edition 12.3.6.2) and the IssuerAuth
+     * {@code x5chain} it must equal (Credo's rule, Paradym's configuration).
+     *
+     * <p>Held to the {@code .gaps} the way M-01 holds a credential: a problem the sample declares as a gap would be
+     * accepted, but no sidecar can name a {@code statusList.*} code yet, so a list must pass every check. That is the
+     * exact form of "exactly its codes" while no producer records a list (M-11b); M-11e's samples pass with no
+     * {@code statusList.*} gap, and M-11h extends the sidecar when the dedicated signer needs one.
+     */
+    static void verifyStatusList(Found found, MdocSamples.Sample sample) {
+        boolean list = sample.statusList().isPresent();
+        boolean info = sample.statusListInfo().isPresent();
+        if (!list && !info) {
+            return;
+        }
+        assertTrue(info, found.id() + ": " + MdocSamples.STATUSLIST_CWT + " is recorded but the MSO carries no readable "
+                + "status.status_list {uri, idx}, so the list cannot be tied to the credential");
+        assertTrue(list, found.id() + ": the MSO carries status.status_list, so the producer must record the list it "
+                + "points at (" + MdocSamples.STATUSLIST_CWT + " and " + MdocSamples.STATUSLIST_CONTENT_TYPE + ")");
+        MdocSamples.StatusListInfo statusList = sample.statusListInfo().orElseThrow();
+        MdocSamples.StatusListToken token = sample.statusList().orElseThrow();
+        VerificationReport listReport = IndependentStatusListVerifier.verify(token.body(), token.contentType(),
+                statusList.uri(), statusList.idx(), sample.issuerAuthX5chain(), sample.iaca().orElse(null), Instant.now(),
+                IndependentStatusListVerifier.StatusListOptions.strictMode());
+        assertEquals(IndependentStatusListVerifier.CHECKS,
+                listReport.checks().stream().map(VerificationReport.Check::name).toList(),
+                found.id() + ": the status-list verifier did not run every check");
+        assertEquals(List.of(), listReport.failures(),
+                () -> found.id() + ": the status list at idx " + statusList.idx() + " must pass every check: " + listReport);
+        System.out.println("[mdoc-conformance] " + found.id() + " status list " + statusList.uri() + " idx "
+                + statusList.idx() + " passed every statusList.* check");
     }
 
     static List<Found> found(Optional<Instant> buildStart) {

@@ -13,6 +13,7 @@ import org.multipaz.cose.CoseNumberLabel;
 import org.multipaz.cose.CoseSign1;
 import org.multipaz.crypto.X509Cert;
 import org.multipaz.crypto.X509CertChain;
+import org.multipaz.crypto.X509CertChainJvmKt;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -56,6 +57,10 @@ public final class MdocSamples {
     public static final String DOCTYPE = ".doctype";
     public static final String GAPS = ".gaps";
     public static final String IACA_PEM = ".iaca.pem";
+    /** The status list the MSO's {@code status.status_list.uri} names, byte for byte as the endpoint answered it. */
+    public static final String STATUSLIST_CWT = ".statuslist.cwt";
+    /** The {@code Content-Type} the status list was served with (M-11b: both sidecars are required together). */
+    public static final String STATUSLIST_CONTENT_TYPE = ".statuslist.ct";
 
     /** Producers whose earlier samples this JVM already removed. */
     private static final Set<String> CLEANED = ConcurrentHashMap.newKeySet();
@@ -68,7 +73,22 @@ public final class MdocSamples {
      * @param documentDocType the {@code Document.docType} when the credential is a draft-13 {@code Document}
      */
     public record Sample(String name, Path path, byte[] received, byte[] issuerSigned, Optional<String> documentDocType,
-                         JWK holder, String docType, AcceptedGaps gaps, Optional<X509Certificate> iaca) {}
+                         JWK holder, String docType, AcceptedGaps gaps, Optional<X509Certificate> iaca,
+                         Optional<StatusListToken> statusList, Optional<StatusListInfo> statusListInfo,
+                         List<X509Certificate> issuerAuthX5chain) {}
+
+    /**
+     * A status list as the endpoint served it: the body as received and the {@code Content-Type}. M-11b's verifier
+     * takes both, because a JWT body with the right media type and a CWT body with the wrong one are two different
+     * defects (TSL 8.2).
+     */
+    public record StatusListToken(byte[] body, String contentType) {}
+
+    /**
+     * The MSO's {@code status.status_list}: {@code uri} and {@code idx} (ISO/IEC 18013-5 second edition 12.3.6,
+     * TSL 6.3). A sample whose MSO carries one must also record the list itself, in the two sidecars above.
+     */
+    public record StatusListInfo(String uri, long idx) {}
 
     private MdocSamples() {}
 
@@ -119,6 +139,26 @@ public final class MdocSamples {
         }
     }
 
+    /**
+     * Writes the status list a sample's MSO points at, beside its {@code .mdoc}: the body exactly as the endpoint
+     * answered it ({@code <name>.statuslist.cwt}) and its {@code Content-Type} ({@code <name>.statuslist.ct}). The
+     * producer of a sample whose MSO carries {@code status.status_list} writes both; the conformance run requires
+     * them together (M-11b).
+     */
+    public static void writeStatusList(Path mdoc, byte[] body, String contentType) {
+        String file = mdoc.getFileName().toString();
+        if (!file.endsWith(MDOC)) {
+            throw new IllegalArgumentException(mdoc + " is not a " + MDOC + " sample");
+        }
+        String name = file.substring(0, file.length() - MDOC.length());
+        try {
+            Files.write(mdoc.resolveSibling(name + STATUSLIST_CWT), body);
+            Files.writeString(mdoc.resolveSibling(name + STATUSLIST_CONTENT_TYPE), contentType, StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot write the status list of the mDoc sample " + name, e);
+        }
+    }
+
     /** Reads a sample back from its {@code .mdoc} file and the sidecars next to it; every sidecar but the IACA is required. */
     public static Sample read(Path mdoc) {
         String file = mdoc.getFileName().toString();
@@ -137,8 +177,21 @@ public final class MdocSamples {
             Path gapsFile = sidecar(directory, name, GAPS);
             AcceptedGaps gaps = AcceptedGaps.parse(Files.readString(gapsFile), gapsFile.toString());
             Path iaca = directory.resolve(name + IACA_PEM);
+            Path statusListBody = directory.resolve(name + STATUSLIST_CWT);
+            Path statusListType = directory.resolve(name + STATUSLIST_CONTENT_TYPE);
+            Optional<StatusListToken> statusList = Optional.empty();
+            if (Files.isRegularFile(statusListBody) || Files.isRegularFile(statusListType)) {
+                if (!Files.isRegularFile(statusListBody) || !Files.isRegularFile(statusListType)) {
+                    throw new IllegalStateException("the mDoc sample " + name + " records " + STATUSLIST_CWT + " and "
+                            + STATUSLIST_CONTENT_TYPE + " together: the body without its Content-Type cannot be held to "
+                            + "TSL 8.2, and a Content-Type without a body says nothing");
+                }
+                statusList = Optional.of(new StatusListToken(Files.readAllBytes(statusListBody),
+                        Files.readString(statusListType).trim()));
+            }
             return new Sample(name, mdoc, received, issuerSigned, documentDocType, holder, docType, gaps,
-                    Files.isRegularFile(iaca) ? Optional.of(readPem(iaca)) : Optional.empty());
+                    Files.isRegularFile(iaca) ? Optional.of(readPem(iaca)) : Optional.empty(),
+                    statusList, statusListInfoOf(issuerSigned), issuerAuthX5chainOf(issuerSigned));
         } catch (IOException e) {
             throw new UncheckedIOException("cannot read the mDoc sample " + mdoc, e);
         } catch (ParseException e) {
@@ -150,7 +203,7 @@ public final class MdocSamples {
     public static List<Path> files(Path mdoc) {
         String file = mdoc.getFileName().toString();
         String name = file.substring(0, file.length() - MDOC.length());
-        return Stream.of(MDOC, HOLDER_JWK, DOCTYPE, GAPS, IACA_PEM)
+        return Stream.of(MDOC, HOLDER_JWK, DOCTYPE, GAPS, IACA_PEM, STATUSLIST_CWT, STATUSLIST_CONTENT_TYPE)
                 .map(suffix -> mdoc.resolveSibling(name + suffix))
                 .filter(Files::isRegularFile)
                 .toList();
@@ -175,6 +228,80 @@ public final class MdocSamples {
             return WireIssuerSignedItems.valueOf(credential, "issuerSigned");
         }
         return credential;
+    }
+
+    /**
+     * The MSO's {@code status.status_list {uri, idx}} when it carries one, read from the bytes as received. A
+     * credential without the status mechanism, or one whose MSO cannot be read that far, answers empty: this reader
+     * exists to tell the conformance run <b>where</b> to fetch the list from, and M-01's own MSO checks own whether
+     * the MSO is well formed.
+     */
+    public static Optional<StatusListInfo> statusListInfoOf(byte[] issuerSignedCbor) {
+        try {
+            DataItem issuerSigned = Cbor.INSTANCE.decode(issuerSignedCbor);
+            DataItem issuerAuthItem = issuerSigned.get("issuerAuth");
+            if (issuerAuthItem.getMajorType() == MajorType.TAG) {
+                issuerAuthItem = issuerAuthItem.getAsTagged();
+            }
+            CoseSign1 issuerAuth = CoseSign1.Companion.fromDataItem(issuerAuthItem);
+            byte[] payload = issuerAuth.getPayload();
+            if (payload == null) {
+                return Optional.empty();
+            }
+            DataItem mso = Cbor.INSTANCE.decode(payload);
+            if (mso.getMajorType() == MajorType.TAG) {
+                mso = mso.getAsTaggedEncodedCbor();
+            }
+            DataItem status = mso.getOrNull("status");
+            if (status == null || status.getMajorType() != MajorType.MAP) {
+                return Optional.empty();
+            }
+            DataItem statusList = status.getOrNull("status_list");
+            if (statusList == null || statusList.getMajorType() != MajorType.MAP) {
+                return Optional.empty();
+            }
+            DataItem uri = statusList.getOrNull("uri");
+            DataItem idx = statusList.getOrNull("idx");
+            if (uri == null || uri.getMajorType() != MajorType.UNICODE_STRING
+                    || idx == null || idx.getMajorType() != MajorType.UNSIGNED_INTEGER) {
+                return Optional.empty();
+            }
+            return Optional.of(new StatusListInfo(uri.getAsTstr(), idx.getAsNumber()));
+        } catch (Throwable e) {
+            if (e instanceof VirtualMachineError fatal && !(e instanceof StackOverflowError)) {
+                throw fatal;
+            }
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * The credential's IssuerAuth {@code x5chain} as received, leaf first: what the status list's own chain has to
+     * equal for Credo and Paradym to accept it (M-11b {@code statusList.issuanceChain}).
+     */
+    public static List<X509Certificate> issuerAuthX5chainOf(byte[] issuerSignedCbor) {
+        try {
+            DataItem issuerSigned = Cbor.INSTANCE.decode(issuerSignedCbor);
+            DataItem issuerAuthItem = issuerSigned.get("issuerAuth");
+            if (issuerAuthItem.getMajorType() == MajorType.TAG) {
+                issuerAuthItem = issuerAuthItem.getAsTagged();
+            }
+            CoseSign1 issuerAuth = CoseSign1.Companion.fromDataItem(issuerAuthItem);
+            DataItem x5chain = issuerAuth.getUnprotectedHeaders().get(new CoseNumberLabel(33));
+            if (x5chain == null) {
+                x5chain = issuerAuth.getProtectedHeaders().get(new CoseNumberLabel(33));
+            }
+            if (x5chain == null) {
+                return List.of();
+            }
+            X509CertChain chain = X509CertChain.Companion.fromDataItem(x5chain);
+            return X509CertChainJvmKt.getJavaX509Certificates(chain);
+        } catch (Throwable e) {
+            if (e instanceof VirtualMachineError fatal && !(e instanceof StackOverflowError)) {
+                throw fatal;
+            }
+            return List.of();
+        }
     }
 
     /**

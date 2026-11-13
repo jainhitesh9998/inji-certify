@@ -32,6 +32,39 @@ class ProblemCodeRegistryTest {
             Pattern.DOTALL);
     static final Pattern KEY = Pattern.compile("^\\s*\"([^\"]+)\":", Pattern.MULTILINE);
 
+    /**
+     * The M-11b table (docs/design/wp/M-11-status-list-under-iaca.md, "Checks and problem codes"), transcribed: the
+     * status-list verifier's registry must be exactly this, in this order, so a code added or dropped without the
+     * table (and, from M-11f, {@code verify_status_list.py}) changing fails here. This is separate from the mDoc
+     * registry above on purpose: those codes belong to {@code .gaps}, these to the status list a sample carries.
+     */
+    @Test
+    void theStatusListVerifierListsTheM11bTable() {
+        Map<String, List<String>> expected = new LinkedHashMap<>();
+        expected.put("statusList.http", List.of("contentType"));
+        expected.put("statusList.envelope", List.of("notTagged18", "cwtTag61", "mac0", "detachedPayload"));
+        expected.put("statusList.typ", List.of("missing", "unprotected", "notText", "wrong"));
+        expected.put("statusList.x5chain", List.of("missing", "unprotectedOnly", "carriesAnchor", "serialNumber"));
+        expected.put("statusList.signature", List.of("invalid:multipaz", "invalid:authlete"));
+        expected.put("statusList.chain", List.of("untrusted", "noAnchorSupplied"));
+        expected.put("statusList.issuanceChain", List.of("differs"));
+        expected.put("statusList.claims", List.of("subMismatch", "iatMissing", "iatFuture", "expMissing", "expired",
+                "expAfterSigner", "ttlInvalid"));
+        expected.put("statusList.list", List.of("bitsNotOne", "lstNotZlib", "idxOutOfRange", "statusMismatch:*"));
+        expected.put("statusList.signerPurpose", List.of("ekuMissing", "kuMissing"));
+
+        assertEquals(expected, IndependentStatusListVerifier.PROBLEM_CODES,
+                "IndependentStatusListVerifier.PROBLEM_CODES must be the M-11b table");
+        assertEquals(List.copyOf(expected.keySet()), IndependentStatusListVerifier.CHECKS,
+                "CHECKS lists the status-list checks in the same report order as PROBLEM_CODES");
+        assertTrue(IndependentStatusListVerifier.CHECKS.stream().noneMatch(IndependentMdocVerifier.CHECKS::contains),
+                "the two registries name disjoint checks, so a .gaps line always has exactly one owner");
+        assertTrue(IndependentStatusListVerifier.isProblemCode("statusList.list", "statusMismatch:1"));
+        assertTrue(IndependentStatusListVerifier.isProblemCode("statusList.signature", "invalid:multipaz"));
+        assertTrue(!IndependentStatusListVerifier.isProblemCode("statusList.list", "statusMismatch:"));
+        assertTrue(!IndependentStatusListVerifier.isProblemCode("statusList.signature", "invalid:other"));
+    }
+
     @Test
     void thePythonVerifierCarriesTheSameProblemCodes() throws Exception {
         String source = Files.readString(VERIFY_MDOC);
