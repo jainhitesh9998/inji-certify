@@ -403,6 +403,71 @@ class TokenStatusListFreshnessTest {
         mvc.perform(get("/credentials/token-status-list/no-such-list")).andExpect(status().isNotFound());
     }
 
+    // ---- M-11d: the CWT branch of the same state machine ----------------------------------------------------------
+
+    /**
+     * A {@code TokenStatusListCwt} row goes through the same freshness machine: a token with less than {@code ttl} left
+     * is signed again when it is served, with the same bits, and answered in its own media type (D-M11-2).
+     */
+    @Test
+    void aCwtListIsSignedAgainWhenStaleAndServedInItsOwnMediaType() {
+        TokenStatusListCwtServiceTest.Fixture fixture = new TokenStatusListCwtServiceTest.Fixture();
+        TokenStatusListCwtServiceTest.MutableClock clock = new TokenStatusListCwtServiceTest.MutableClock(
+                TokenStatusListCwtServiceTest.T0);
+        fixture.clock = clock;
+        TokenStatusListService lists = fixture.lists(clock);
+        TokenStatusListService.Entry entry = lists.allocateCwt("revocation", fixture.dsc());
+        String listId = fixture.listId(entry);
+        byte[] before = TokenStatusListCwtServiceTest.TokenStatusListCwtBase.token(
+                fixture.rows.get(listId).getVcDocument());
+
+        clock.advance(TTL.plusSeconds(60));
+        TokenStatusListService.Served served = lists.served(listId).orElseThrow();
+        assertEquals(TokenStatusListService.MEDIA_TYPE_CWT, served.mediaType());
+        assertEquals(TokenStatusListService.Freshness.FRESH, lists.freshnessCwt(listId,
+                lists.envelope(fixture.rows.get(listId).getVcDocument())), "stored fresh once signed again");
+        TokenStatusListCwt.Decoded after = TokenStatusListCwt.decode(served.body());
+        assertEquals(clock.instant().getEpochSecond(), after.iat().getEpochSecond());
+        assertArrayEquals(TokenStatusListCwt.decode(before).lst(), after.lst(), "the bits are unchanged");
+        assertEquals(1, fixture.replaced.get());
+    }
+
+    /**
+     * M-11d's ordering rule: {@link StatusListRetiredException} extends {@link IllegalStateException}, so the service
+     * must catch it before the general refusal mapping. A retired list is {@link TokenStatusListGoneException} (410),
+     * while any other refusal on the same path is {@link TokenStatusListUnavailableException} (503, back-off): this test
+     * puts the two side by side on one fixture.
+     */
+    @Test
+    void aRetiredCwtListAnswersGoneWhereAFailedRenewalAnswers503() {
+        TokenStatusListCwtServiceTest.Fixture fixture = new TokenStatusListCwtServiceTest.Fixture();
+        TokenStatusListCwtServiceTest.MutableClock clock = new TokenStatusListCwtServiceTest.MutableClock(
+                TokenStatusListCwtServiceTest.T0);
+        fixture.clock = clock;
+        TokenStatusListService lists = fixture.lists(clock);
+
+        // retired: the stored signer is past its notAfter and the token's own exp has passed too
+        String retired = "a-retired-cwt-list";
+        byte[] token = TokenStatusListCwtServiceTest.TokenStatusListCwtBase.storedToken(
+                TokenStatusListCwtServiceTest.URI(retired), TokenStatusListCwtServiceTest.T0.minus(Duration.ofHours(3)),
+                TokenStatusListCwtServiceTest.T0.minus(Duration.ofHours(1)), new byte[128],
+                StatusListTestKeys.key("expired", StatusListTestKeys.EXPIRED_KEYS, StatusListTestKeys.EXPIRED));
+        fixture.rows.put(retired, fixture.row(retired, TokenStatusListService.TYPE_CWT,
+                TokenStatusListCwtServiceTest.TokenStatusListCwtBase.envelope(new TokenStatusListService.SignerBinding(
+                        TokenStatusListService.SIGNER_DOCUMENT, "x509-file:mdl-dsc",
+                        StatusListSigners.x5tS256(StatusListTestKeys.EXPIRED)), token)));
+        fixture.documents.put(retired, fixture.rows.get(retired).getVcDocument());
+        assertThrows(TokenStatusListGoneException.class, () -> lists.served(retired));
+
+        // not retired: the same expired token, but its signer is a live one that fails instead (503 + Retry-After)
+        TokenStatusListService.Entry live = lists.allocateCwt("revocation", fixture.dsc());
+        fixture.switching.failSigning.set(true);
+        clock.advance(TTL.multipliedBy(2));
+        TokenStatusListUnavailableException refused = assertThrows(TokenStatusListUnavailableException.class,
+                () -> lists.served(fixture.listId(live)));
+        assertEquals(BACKOFF.getSeconds(), refused.retryAfterSeconds());
+    }
+
     // ---- helpers -------------------------------------------------------------------------------------
 
     TokenStatusListService service(String domain, Instant now) {
@@ -422,7 +487,7 @@ class TokenStatusListFreshnessTest {
     }
 
     static TokenStatusListProperties properties(String keyRef, Duration renewWait, Duration backoff) {
-        return new TokenStatusListProperties(keyRef, "ES256", "leaf", 1024, TTL, renewWait, backoff);
+        return new TokenStatusListProperties(keyRef, "ES256", "leaf", 1024, TTL, renewWait, backoff, null);
     }
 
     /** The test registry, with {@code before} run each time a list is about to be signed (to block, throw or move the clock). */

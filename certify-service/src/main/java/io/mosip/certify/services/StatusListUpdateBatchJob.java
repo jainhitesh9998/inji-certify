@@ -149,8 +149,11 @@ public class StatusListUpdateBatchJob {
 
             // Apply transaction updates to the status data
             Map<Long, Boolean> updatedStatuses = getUpdatedStatus(transactions);
-            if (io.mosip.certify.status.TokenStatusListService.TYPE.equals(statusListCredential.getCredentialType())) {
-                // a Token Status List is a signed JWT, not a VC document
+            String credentialType = statusListCredential.getCredentialType();
+            if (io.mosip.certify.status.TokenStatusListService.TYPE.equals(credentialType)
+                    || io.mosip.certify.status.TokenStatusListService.TYPE_CWT.equals(credentialType)) {
+                // a Token Status List is a signed JWT or a CWT Status List Token, not a VC document; the service routes
+                // by the row's type, and a CWT list is re-signed by its own pinned signer (M-11d)
                 io.mosip.certify.status.TokenStatusListService tokenLists = tokenStatusLists == null ? null : tokenStatusLists.getIfAvailable();
                 if (tokenLists == null) {
                     throw new CertifyException(ErrorConstants.STATUS_LIST_UPDATE_FAILED, "Token status lists are not available");

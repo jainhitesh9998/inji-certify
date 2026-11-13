@@ -515,6 +515,70 @@ class StatusListPostgresTest {
         assertEquals(served, statusListRepository.findById(listId).orElseThrow().getVcDocument(), "the re-signed list is stored");
     }
 
+    /**
+     * M-11d on PostgreSQL: a CWT status list is created, allocated into, revoked through the batch job and re-served —
+     * the section 4.4 envelope in {@code vc_document}, the type {@code TokenStatusListCwt}, no migration (D-M11-4), and
+     * the endpoint answering {@code application/statuslist+cwt} whatever the {@code Accept} (D-M11-2). The token is read
+     * back with {@link io.mosip.certify.status.TokenStatusListCwt}; the independent verifier runs on conformance samples
+     * because Multipaz cannot be on this module's classpath (see the M-11d section of the plan).
+     */
+    @Test
+    void tokenStatusListCwtForMdoc() throws Exception {
+        io.mosip.certify.spi.SigningContext signing = keyProviders.signingContext(io.mosip.certify.spi.SigningConfig.of(
+                io.mosip.certify.signing.KeyRef.parse("x509-file:sdjwt-es256"), io.mosip.certify.signing.SignatureAlgorithm.ES256));
+        io.mosip.certify.status.TokenStatusListService.Entry entry = tokenStatusLists.allocateCwt("revocation", signing);
+        String listId = entry.uri().substring(entry.uri().lastIndexOf('/') + 1);
+
+        io.mosip.certify.entity.StatusListCredential row = statusListRepository.findById(listId).orElseThrow();
+        assertEquals(io.mosip.certify.status.TokenStatusListService.TYPE_CWT, row.getCredentialType());
+        assertEquals("revocation", row.getStatusPurpose());
+        assertEquals(io.mosip.certify.entity.StatusListCredential.CredentialStatus.AVAILABLE, row.getCredentialStatus());
+        io.mosip.certify.status.TokenStatusListService.StoredEnvelope envelope = tokenStatusLists.envelope(row.getVcDocument());
+        assertEquals(io.mosip.certify.status.TokenStatusListService.ENVELOPE_VERSION, envelope.v());
+        assertEquals(io.mosip.certify.status.TokenStatusListService.SIGNER_DOCUMENT, envelope.signer().mode());
+        java.security.cert.X509Certificate signer = keyProviders.provider("x509-file")
+                .resolve(io.mosip.certify.signing.KeyRef.parse("x509-file:sdjwt-es256")).chain().leaf().orElseThrow();
+        assertEquals(io.mosip.certify.status.StatusListSigners.x5tS256(signer), envelope.signer().x5tS256());
+
+        // a second entry for the same signer stays on the same list
+        assertTrue(tokenStatusLists.allocateCwt("revocation", signing).uri().endsWith("/" + listId));
+
+        // served as CWT for a client that asks for JWT: one format per list
+        MvcResult fetched = mockMvc.perform(get("/credentials/token-status-list/" + listId)
+                .accept("application/statuslist+jwt")).andReturn();
+        assertEquals(200, fetched.getResponse().getStatus());
+        assertEquals(io.mosip.certify.status.TokenStatusListService.MEDIA_TYPE_CWT, fetched.getResponse().getContentType());
+        io.mosip.certify.status.TokenStatusListCwt.Decoded decoded = io.mosip.certify.status.TokenStatusListCwt.decode(
+                fetched.getResponse().getContentAsByteArray());
+        assertEquals(entry.uri(), decoded.sub(), "sub is the URI the mDL's status_list carries");
+        assertEquals(1, decoded.bits());
+        assertEquals(signer, decoded.x5chain().get(0), "the x5chain is the Document Signer leaf, never the anchor");
+        assertFalse(io.mosip.certify.status.TokenStatusListService.get(decoded.lst(), entry.idx()), "a fresh entry is not revoked");
+
+        // revoke through the batch job: the bit is set and the list re-signed by the same pinned signer
+        CredentialStatusTransaction revocation = new CredentialStatusTransaction();
+        revocation.setCredentialId("token-status-cwt-" + entry.idx());
+        revocation.setStatusPurpose("revocation");
+        revocation.setStatusValue(true);
+        revocation.setStatusListCredentialId(listId);
+        revocation.setStatusListIndex(entry.idx());
+        revocation.setCreatedDtimes(java.time.LocalDateTime.now());
+        revocation.setIsProcessed(false);
+        transactionRepository.save(revocation);
+        batchJob.updateStatusList(listId, List.of(revocation));
+
+        io.mosip.certify.status.TokenStatusListCwt.Decoded revoked = io.mosip.certify.status.TokenStatusListCwt.decode(
+                mockMvc.perform(get("/credentials/token-status-list/" + listId)).andReturn()
+                        .getResponse().getContentAsByteArray());
+        assertTrue(io.mosip.certify.status.TokenStatusListService.get(revoked.lst(), entry.idx()), "the revoked bit is set");
+        assertEquals(signer, revoked.x5chain().get(0), "the re-signed list keeps its own signer");
+        assertEquals(io.mosip.certify.status.TokenStatusListService.TYPE_CWT,
+                statusListRepository.findById(listId).orElseThrow().getCredentialType());
+        assertTrue(transactionRepository.findByIsProcessedFalseOrderByCreatedDtimesAsc(PageRequest.of(0, 100)).stream()
+                .noneMatch(t -> listId.equals(t.getStatusListCredentialId()) && Long.valueOf(entry.idx()).equals(t.getStatusListIndex())),
+                "the transaction is processed");
+    }
+
     private JsonNode issueOid4vci() throws Exception {
         String proof = proofJwt(nonce("/oid4vci/nonce"), issuerIdentifier + "/oid4vci");
         MvcResult result = mockMvc.perform(post("/oid4vci/credential").header("Authorization", "TestBearer demo")
