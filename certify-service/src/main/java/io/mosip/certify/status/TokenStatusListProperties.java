@@ -1,6 +1,7 @@
 package io.mosip.certify.status;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.bind.ConstructorBinding;
 import org.springframework.boot.context.properties.bind.DefaultValue;
 
 import java.time.Duration;
@@ -22,14 +23,20 @@ import java.time.Duration;
  * (the default, ISO/IEC 18013-5 second edition 12.3.6.3 and D-M11-3), or today's shared JWT list with
  * {@code token-format=jwt} (D-M11-3's escape hatch). {@code size-bits}, {@code ttl} and the renewal settings apply to
  * both forms; {@code key-ref} signs JWT lists only.
+ *
+ * <p>{@code batch} is how the status-list batch job holds back a CWT list it cannot update ({@link #batch()}): a
+ * transient failure is retried with a bounded back-off, a permanent refusal is quarantined for a while; either way the
+ * list's transactions stay pending, in order, and other lists are not held up.
  */
 @ConfigurationProperties(prefix = "certify.status.token-status-list")
 public record TokenStatusListProperties(String keyRef, @DefaultValue("ES256") String alg, @DefaultValue("without-anchor") String x5c,
                                         @DefaultValue("131072") int sizeBits, @DefaultValue("PT1H") Duration ttl,
                                         @DefaultValue("PT5S") Duration renewWait, @DefaultValue("PT30S") Duration renewBackoff,
-                                        @DefaultValue Mdoc mdoc) {
+                                        @DefaultValue Mdoc mdoc, @DefaultValue Batch batch) {
 
+    @ConstructorBinding
     public TokenStatusListProperties {
+        batch = batch == null ? new Batch(null, null, null) : batch;
         renewWait = renewWait == null || renewWait.isNegative() ? Duration.ofSeconds(5) : renewWait;
         renewBackoff = renewBackoff == null || renewBackoff.isNegative() ? Duration.ofSeconds(30) : renewBackoff;
         mdoc = mdoc == null ? new Mdoc(null, null, null) : mdoc;
@@ -38,6 +45,48 @@ public record TokenStatusListProperties(String keyRef, @DefaultValue("ES256") St
             // stored and read back consistently (review round 1, nit 8)
             throw new IllegalArgumentException("certify.status.token-status-list.size-bits must be a positive multiple of"
                     + " 8 and at most " + TokenStatusListCwt.MAX_BITS + ", got " + sizeBits);
+        }
+    }
+
+    /** The shape before {@code batch}: the batch job's default back-off and quarantine. */
+    public TokenStatusListProperties(String keyRef, String alg, String x5c, int sizeBits, Duration ttl, Duration renewWait,
+                                     Duration renewBackoff, Mdoc mdoc) {
+        this(keyRef, alg, x5c, sizeBits, ttl, renewWait, renewBackoff, mdoc, null);
+    }
+
+    /**
+     * How the status-list batch job holds back a CWT list whose update failed (M-11d review round 2). Holding a list back
+     * never drops or reorders its transactions: they stay pending, the list is excluded from the job's selection while it
+     * is held, and once it is retried its transactions are applied oldest first.
+     *
+     * @param retryBackoff    after a transient failure (the key provider or HSM unavailable, a stale IACA CRL, a signer
+     *                        not yet valid) the list is retried on the next run; after each further consecutive failure it
+     *                        waits this long, doubled every time, up to {@code retry-backoff-max}
+     * @param retryBackoffMax the longest wait between two attempts on a list that keeps failing transiently
+     * @param quarantine      after a permanent refusal (a revoked or rotated-away Document Signer, a signer the IACA did
+     *                        not issue, a stored token its pinned signer did not sign) the list is retried after this long,
+     *                        or sooner when the IACA trust material (an anchor or its CRL) changes, so an operator's fix is
+     *                        picked up without a restart
+     */
+    public record Batch(@DefaultValue("PT1M") Duration retryBackoff, @DefaultValue("PT15M") Duration retryBackoffMax,
+                        @DefaultValue("PT1H") Duration quarantine) {
+
+        public Batch {
+            retryBackoff = retryBackoff == null ? Duration.ofMinutes(1) : retryBackoff;
+            retryBackoffMax = retryBackoffMax == null ? Duration.ofMinutes(15) : retryBackoffMax;
+            quarantine = quarantine == null ? Duration.ofHours(1) : quarantine;
+            if (retryBackoff.isNegative() || retryBackoff.isZero()) {
+                throw new IllegalArgumentException("certify.status.token-status-list.batch.retry-backoff must be positive,"
+                        + " got " + retryBackoff);
+            }
+            if (retryBackoffMax.compareTo(retryBackoff) < 0) {
+                throw new IllegalArgumentException("certify.status.token-status-list.batch.retry-backoff-max must be at"
+                        + " least retry-backoff (" + retryBackoff + "), got " + retryBackoffMax);
+            }
+            if (quarantine.isNegative() || quarantine.isZero()) {
+                throw new IllegalArgumentException("certify.status.token-status-list.batch.quarantine must be positive,"
+                        + " got " + quarantine);
+            }
         }
     }
 

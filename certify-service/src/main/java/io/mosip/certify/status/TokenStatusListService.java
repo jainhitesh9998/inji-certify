@@ -149,10 +149,24 @@ public class TokenStatusListService {
     private final ConcurrentMap<String, Instant> failures = new ConcurrentHashMap<>();
     /** Per CWT list, the SHA-256 of the signer leaf its envelope pins: a list's signer never changes. */
     private final ConcurrentMap<String, String> pinnedSigners = new ConcurrentHashMap<>();
-    /** Per CWT list, the stored token whose signature has been checked (review round 1, major 1). */
-    private final ConcurrentMap<String, String> verified = new ConcurrentHashMap<>();
-    /** Per CWT list, the stored token that failed its signature check, so the ERROR is logged once per document. */
-    private final ConcurrentMap<String, String> refusedDocuments = new ConcurrentHashMap<>();
+    /**
+     * Per CWT list, the stored envelope whose token has been checked against the certificate it pins (review round 1,
+     * major 1). Keyed on the whole envelope, not the token alone: an envelope edited to pin another certificate around the
+     * same token must be checked again, or a warm instance would serve what a cold one refuses (review round 2, minor 7).
+     */
+    private final ConcurrentMap<String, StoredEnvelope> verified = new ConcurrentHashMap<>();
+    /** Per CWT list, the stored envelope that failed its check, so the ERROR is logged once per document. */
+    private final ConcurrentMap<String, StoredEnvelope> refusedDocuments = new ConcurrentHashMap<>();
+    /**
+     * Per CWT list, the {@code validUntil} of its pinned signer's path (section 4.1): what serving needs to tell a list
+     * whose {@code exp} is already capped from one due for renewal, without asking the key provider on every request in
+     * a list's last {@code ttl} (review round 2, minor 8). Set from the signing context whenever this instance signs the
+     * list, and from the stored token's own {@code x5chain} otherwise.
+     */
+    private final ConcurrentMap<String, SignerValidity> validUntils = new ConcurrentHashMap<>();
+
+    /** The {@code validUntil} of the signer a list pins, by the SHA-256 of its leaf. */
+    private record SignerValidity(String x5tS256, Instant validUntil) {}
     /** Per CWT list that is retired, the instant its stored token expires: no lock, no resolve, no repeated log. */
     private final ConcurrentMap<String, Instant> retired = new ConcurrentHashMap<>();
 
@@ -300,6 +314,7 @@ public class TokenStatusListService {
         StatusListCredential saved = repository.saveAndFlush(list);
         bitstringLists.initializeAvailableIndices(saved);
         pinnedSigners.put(id, pinned.x5tS256());
+        validUntils.put(id, new SignerValidity(pinned.x5tS256(), signerPolicy.validUntil(signing)));
         log.info("Created CWT token status list {} for {} with {} bit(s), signed by {} ({}), exp {}", id, purpose,
                 bits.length * 8, pinned.keyRef(), signing.key().chain().leaf().map(X509Certificate::getSubjectX500Principal).orElse(null), exp);
         return saved;
@@ -312,8 +327,9 @@ public class TokenStatusListService {
                 TYPE, purpose, StatusListCredential.CredentialStatus.AVAILABLE).orElseGet(() -> create(purpose));
         Optional<Long> index = indexProvider.acquireIndex(list.getId(), Map.of());
         if (index.isEmpty()) {
-            list.setCredentialStatus(StatusListCredential.CredentialStatus.FULL);
-            repository.save(list);
+            // credential_status only: saving the entity read above would write back its vc_document and revert a
+            // revocation committed between that read and this marking (review round 2, major 4; G39)
+            repository.updateCredentialStatus(list.getId(), StatusListCredential.CredentialStatus.FULL);
             list = create(purpose);
             index = indexProvider.acquireIndex(list.getId(), Map.of());
         }
@@ -483,8 +499,7 @@ public class TokenStatusListService {
         if (Duration.between(now, decoded.exp()).compareTo(properties.ttl()) >= 0) {
             return Freshness.FRESH;
         }
-        Optional<Instant> next = nextExpiry(stored, decoded);
-        if (next.isPresent() && !next.get().isAfter(decoded.exp())) {
+        if (!nextExpiry(listId, stored, decoded).isAfter(decoded.exp())) {
             return Freshness.FRESH;
         }
         return Freshness.RENEW;
@@ -492,17 +507,28 @@ public class TokenStatusListService {
 
     /**
      * When a token signed now would expire: {@code min(now + 2·ttl, validUntil)} of the list's pinned signer (section
-     * 4.1). Empty when the signer cannot be resolved (retired, gone): the renewal path answers that with its retirement
-     * or back-off, and freshness must not decide it here.
+     * 4.1). {@code validUntil} comes from the signer's own certificates, never from a key-provider lookup, so serving a
+     * list in its last {@code ttl} costs no provider call (review round 2, minor 8); whether the signer can still sign is
+     * the renewal's question, answered with its retirement or back-off.
      */
-    private Optional<Instant> nextExpiry(StoredEnvelope stored, TokenStatusListCwt.Decoded decoded) {
-        try {
-            SigningContext signing = signers.resolve(pinned(stored), decoded.x5chain().get(0));
-            return Optional.of(cap(clock.instant().plus(properties.ttl()).plus(properties.ttl()),
-                    signerPolicy.validUntil(signing)));
-        } catch (RuntimeException e) {
-            return Optional.empty();
+    private Instant nextExpiry(String listId, StoredEnvelope stored, TokenStatusListCwt.Decoded decoded) {
+        return cap(clock.instant().plus(properties.ttl()).plus(properties.ttl()), validUntil(listId, stored, decoded));
+    }
+
+    /**
+     * The {@code validUntil} of the list's pinned signer path: the value cached when this instance last signed the list
+     * (computed from the signing context, exactly what {@code encode} caps {@code exp} at), else computed from the
+     * stored token's protected {@code x5chain} and the configured IACA, and cached.
+     */
+    private Instant validUntil(String listId, StoredEnvelope stored, TokenStatusListCwt.Decoded decoded) {
+        String pin = stored.signer().x5tS256();
+        SignerValidity cached = validUntils.get(listId);
+        if (cached != null && cached.x5tS256().equals(pin)) {
+            return cached.validUntil();
         }
+        Instant computed = signerPolicy.validUntil(decoded.x5chain());
+        validUntils.put(listId, new SignerValidity(pin, computed));
+        return computed;
     }
 
     /** The stored envelope as served: the token bytes, with the row's own single media type (D-M11-2). */
@@ -566,25 +592,24 @@ public class TokenStatusListService {
      * once; a refusal is cached too, so the ERROR is logged once per document, and nothing is ever repaired by signing.
      */
     private void requireSignedByPinnedSigner(String listId, StoredEnvelope stored, TokenStatusListCwt.Decoded decoded) {
-        String token = stored.token();
-        if (token.equals(verified.get(listId))) {
-            return;
+        if (stored.equals(verified.get(listId))) {
+            return; // this exact envelope — signer binding and token — was checked before
         }
         X509Certificate leaf = decoded.x5chain().get(0);
         String leafHash = StatusListSigners.x5tS256(leaf);
         if (!leafHash.equals(stored.signer().x5tS256())) {
-            throw refuseUnsigned(listId, token, "its x5chain leaf (SHA-256 " + leafHash
+            throw refuseUnsigned(listId, stored, "its x5chain leaf (SHA-256 " + leafHash
                     + ") is not the signer the envelope pins");
         }
         if (!TokenStatusListCwt.verifies(token(stored), leaf)) {
-            throw refuseUnsigned(listId, token, "the COSE_Sign1 signature does not verify with the pinned certificate");
+            throw refuseUnsigned(listId, stored, "the COSE_Sign1 signature does not verify with the pinned certificate");
         }
-        verified.put(listId, token);
+        verified.put(listId, stored);
         refusedDocuments.remove(listId);
     }
 
-    private TokenStatusListUnavailableException refuseUnsigned(String listId, String token, String why) {
-        if (!token.equals(refusedDocuments.put(listId, token))) {
+    private TokenStatusListUnavailableException refuseUnsigned(String listId, StoredEnvelope stored, String why) {
+        if (!stored.equals(refusedDocuments.put(listId, stored))) {
             log.error("CWT token status list {} is not served, re-signed or updated: {}. A stored token its pinned signer"
                     + " did not sign is never repaired by signing it again (review round 1, major 1)", listId, why);
         }
@@ -608,16 +633,40 @@ public class TokenStatusListService {
         return servedAsStoredCwt(listId, latestCwt(listId, renewed), properties.renewBackoff(), stale);
     }
 
-    /** The CWT list as stored now (a status update may have replaced it while this request waited), else {@code fallback}. */
+    /**
+     * The CWT list as stored now (a status update may have replaced it while this request waited), else
+     * {@code fallback}, which the caller has already checked. A document read here is served only once its token checks
+     * against the certificate its envelope pins, exactly as the one read at the start of the request: a fallback, a
+     * retirement or any other re-read never serves a token the pinned signer did not sign (review round 2, major 5).
+     *
+     * @throws TokenStatusListUnavailableException when the document read now is unreadable or does not check (503)
+     */
     private StoredEnvelope latestCwt(String listId, StoredEnvelope fallback) {
+        Optional<String> current;
         try {
             // a scalar projection, not findById: Spring's open-in-view keeps the session, and findById would return the
             // copy this request read before another writer committed (review round 1, m6)
-            return repository.findDocumentById(listId).map(this::envelope).orElse(fallback);
+            current = repository.findDocumentById(listId);
         } catch (RuntimeException e) {
             log.debug("CWT token status list {} could not be read again; judging the document read first", listId, e);
             return fallback;
         }
+        if (current.isEmpty()) {
+            return fallback;
+        }
+        StoredEnvelope latest;
+        TokenStatusListCwt.Decoded decoded;
+        try {
+            latest = envelope(current.get());
+            if (latest.equals(fallback)) {
+                return fallback;
+            }
+            decoded = TokenStatusListCwt.decode(token(latest));
+        } catch (RuntimeException e) {
+            throw unreadable(listId, e);
+        }
+        requireSignedByPinnedSigner(listId, latest, decoded);
+        return latest;
     }
 
     /**
@@ -640,8 +689,7 @@ public class TokenStatusListService {
                 return stored; // signed again by a status update, another request or another instance
             }
             if (freshness == Freshness.RENEW) {
-                Optional<Instant> next = nextExpiry(stored, decoded);
-                if (next.isPresent() && !next.get().isAfter(decoded.exp())) {
+                if (!nextExpiry(listId, stored, decoded).isAfter(decoded.exp())) {
                     // still valid and capped by the signer path's validUntil: signing again would carry the same exp
                     // (review round 1, major 5). An expired token is never short-circuited here: it must be signed
                     // again, and in the signer's last second encode answers that as retirement.
@@ -670,9 +718,12 @@ public class TokenStatusListService {
         SigningContext signing = signers.resolve(pinned(stored), decoded.x5chain().get(0));
         Instant now = clock.instant();
         Duration ttl = properties.ttl();
-        Instant exp = cap(now.plus(ttl).plus(ttl), signerPolicy.validUntil(signing));
+        Instant validUntil = signerPolicy.validUntil(signing);
+        Instant exp = cap(now.plus(ttl).plus(ttl), validUntil);
         byte[] token = TokenStatusListCwt.encode(uri(listId), now, exp, ttl, bits, signing, signerPolicy, now,
                 modeOf(stored));
+        // the exact cap encode used, from the signing context: serving judges freshness against it without the provider
+        validUntils.put(listId, new SignerValidity(stored.signer().x5tS256(), validUntil));
         return new StoredEnvelope(ENVELOPE_VERSION, stored.signer(), tokenBase64(token));
     }
 
@@ -912,20 +963,63 @@ public class TokenStatusListService {
      * provider resolves for the alias today — a rotated Document Signer keeps signing its own lists until its
      * {@code notAfter} (section 4.3).
      *
-     * @throws StatusListRetiredException when the pinned signer is past its {@code notAfter}: the revocation cannot be
-     *                                    published because no mDL on the list can still be valid (D-M11-7)
+     * <p>Every other failure is a {@link TokenStatusListUpdateException} that says whether a retry can succeed (review
+     * round 2, major 2): the batch job retries a transient one with a bounded back-off and quarantines a permanent one
+     * for a while, and either way leaves the list's transactions pending, in order.
+     *
+     * @throws StatusListRetiredException       when the pinned signer is past its {@code notAfter}: the revocation
+     *                                          cannot be published because no mDL on the list can still be valid
+     *                                          (D-M11-7)
+     * @throws TokenStatusListUpdateException   when the list cannot be updated now, transiently or permanently
      */
     private void updateCwt(StatusListCredential list, Map<Long, Boolean> statuses) {
-        StoredEnvelope stored = envelope(list.getVcDocument());
-        TokenStatusListCwt.Decoded decoded = TokenStatusListCwt.decode(token(stored));
-        // the bits are applied to the document the pinned signer signed, and that document is re-signed only after its
-        // signature checked (review round 1, major 1)
-        requireSignedByPinnedSigner(list.getId(), stored, decoded);
+        String listId = list.getId();
+        StoredEnvelope stored;
+        TokenStatusListCwt.Decoded decoded;
+        try {
+            stored = envelope(list.getVcDocument());
+            decoded = TokenStatusListCwt.decode(token(stored));
+        } catch (RuntimeException e) {
+            throw TokenStatusListUpdateException.permanent(listId, TokenStatusListUpdateException.UNREADABLE, e);
+        }
+        try {
+            // the bits are applied to the document the pinned signer signed, and that document is re-signed only after
+            // its signature checked (review round 1, major 1)
+            requireSignedByPinnedSigner(listId, stored, decoded);
+        } catch (TokenStatusListUnavailableException e) {
+            throw TokenStatusListUpdateException.permanent(listId, TokenStatusListUpdateException.UNVERIFIABLE, e);
+        }
         byte[] bits = decoded.lst().clone();
-        statuses.forEach((idx, value) -> set(bits, idx, Boolean.TRUE.equals(value)));
-        list.setVcDocument(document(resignCwt(list.getId(), stored, decoded, bits)));
+        try {
+            statuses.forEach((idx, value) -> set(bits, idx, Boolean.TRUE.equals(value)));
+        } catch (IllegalStateException e) {
+            throw TokenStatusListUpdateException.permanent(listId, TokenStatusListUpdateException.INDEX_OUT_OF_RANGE, e);
+        }
+        StoredEnvelope renewed;
+        try {
+            renewed = resignCwt(listId, stored, decoded, bits);
+        } catch (StatusListRetiredException e) {
+            throw e; // D-M11-7: the job closes the transactions, nothing is retried
+        } catch (RuntimeException e) {
+            throw TokenStatusListUpdateException.signing(listId, e);
+        }
+        list.setVcDocument(document(renewed));
         list.setUpdatedDtimes(LocalDateTime.now());
         repository.save(list);
+    }
+
+    /**
+     * A value that changes whenever the {@code mdoc-iaca} trust material a CWT signer is judged against changes: the
+     * anchors and the CRL each one publishes now. The batch job releases a quarantined list early when it moves, so a
+     * CRL an operator refreshed (or a revocation lifted) is picked up at the next run rather than after the quarantine.
+     */
+    public int trustMaterialVersion() {
+        List<Object> material = new java.util.ArrayList<>();
+        for (TrustAnchorRegistry.Anchor anchor : trustAnchors.entries(TrustAnchorRegistry.MDOC_IACA)) {
+            material.add(anchor); // the id and the certificate, whose hash covers its DER
+            material.add(trustAnchors.crl(anchor.id()).orElse(null)); // X509CRL hashes its encoded form
+        }
+        return material.hashCode();
     }
 
     private StatusListCredential create(String purpose) {

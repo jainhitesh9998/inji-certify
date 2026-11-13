@@ -922,7 +922,10 @@ Branch `wp/m-11d-status-cwt-lists`. Depends on M-11c. About 650 lines.
      updated (review round 1, major 1: `resignCwt` would otherwise re-sign a tampered payload into a valid token).
      `x5chain` is the leaf whose SHA-256 equals `signer.x5tS256`; a mismatch or a bad COSE_Sign1 signature is an
      `ERROR` once per document and `503` + `Retry-After` — never a re-sign and never a silent repair. Verification is
-     cached per stored token (`TokenStatusListCwt.verifies`).
+     cached per stored envelope — the signer binding and the token, so an envelope edited to pin another certificate
+     around a verified token is checked again (review round 2, minor 7) — and **every** document read again during
+     the request (the renewal's fallback, the retirement branch, any re-read) is checked the same way before it is
+     returned; a failure is `503` (review round 2, major 5).
    - An **unparseable or unsupported envelope** (not JSON, `v` other than 1, an unknown `signer.mode`, bytes that are
      not CBOR) is `UNUSABLE` → `503` + `Retry-After` (review round 1, major 3: it used to escape as a 500 through the
      global advice).
@@ -930,7 +933,9 @@ Branch `wp/m-11d-status-cwt-lists`. Depends on M-11c. About 650 lines.
      compare-and-set through `replaceDocument` on the stored envelope), using `TokenStatusListCwt.decode` for `sub`
      and `exp`. A list is `FRESH` when a new signature could not push `exp` later — `exp` already equals
      `cap(now + 2·ttl, validUntil)` — so the last `ttl` before the signer path's `validUntil` signs nothing (review
-     round 1, major 5).
+     round 1, major 5). `validUntil` is computed from the stored token's `x5chain` and the configured IACA (or the
+     value cached when the instance last signed the list), never by resolving the signer, so serving touches no key
+     provider (review round 2, minor 8).
    - Re-signing goes through `StatusListSigners.resolve(envelope.signer, storedLeaf)`, then `encode` with the same
      bits, the stored `signer.mode`, and a new `iat`/`exp = min(iat + 2·ttl, signerPolicy.validUntil(signing))`
      (`encode` runs the policy); `storedLeaf` is the first certificate of the stored token's protected `x5chain`,
@@ -949,7 +954,32 @@ Branch `wp/m-11d-status-cwt-lists`. Depends on M-11c. About 650 lines.
    snapshot and lose one of the bits, and a re-sign's compare-and-set cannot overwrite a status update committed in
    between (review round 1, major 2; the JWT path had the same two-writer lost update, now fixed the same way, G39).
    For `TYPE_CWT` the bits are applied to the verified document and re-signed with the list's pinned signer. The batch
-   job routes `TYPE_CWT` rows the same way as `TYPE` rows.
+   job routes `TYPE_CWT` rows the same way as `TYPE` rows. A CWT update that cannot be applied is a
+   `TokenStatusListUpdateException` saying whether a retry can help (review round 2, major 2); the batch job applies
+   each list's transactions strictly oldest first and holds back a list that failed (review round 2):
+   - **Selection.** Each run reads the oldest pending transactions that name a list (`ORDER BY cr_dtimes,
+     transaction_log_id`), at most `batch-size`, **without** the lists it holds back — the exclusion is in the query
+     (`status_list_credential_id NOT IN (:excluded)`), so stuck rows never fill the window and there is no OFFSET
+     paging and no `max-pages`. One id per held list, not per row: the set is bounded by the number of lists, far
+     below PostgreSQL's bind-parameter ceiling, so no exclusion table (and no migration, D-M11-4) is needed.
+   - **Order.** A list whose update fails is excluded for the rest of the run, so none of its newer transactions is
+     applied before an older one that failed (major 1).
+   - **Transient** (the provider cannot resolve the pinned reference — `STATUS_SIGNER_GONE` with a cause —, a signing
+     failure, `CRL_STALE`, `STATUS_SIGNER_NOT_YET_VALID`, `STATUS_SIGNER_IACA_NOT_YET_VALID`): tried again on the next
+     run, then after `certify.status.token-status-list.batch.retry-backoff` (`PT1M`), doubled per consecutive
+     failure up to `batch.retry-backoff-max` (`PT15M`).
+   - **Permanent** (`STATUS_SIGNER_GONE` without a cause — the reference names another certificate —, `REVOKED`,
+     `PURPOSE`, `NO_TRUSTED_IACA`, `SELF_SIGNED`, `CARRIES_ANCHOR`, `ISSUER_NOT_CA`, `PATH_LENGTH`, `NO_CHAIN`,
+     `EXPIRED`, `IACA_EXPIRED`, `CHAIN_LINK_INVALID`; an unreadable or unverifiable row; an index outside the list):
+     quarantined for `batch.quarantine` (`PT1H`) and tried again after it, or at the next run once the IACA trust
+     material (an anchor or its CRL) changes, so an operator's fix needs no restart.
+   - **Observable.** The first failure of a streak is an ERROR (a stack trace for a transient one, none for a
+     refusal), later ones WARN; every run WARNs the quarantined lists with their pending transactions (and the lists
+     backing off), and the gauges `certify.status.batch.quarantined-lists` and
+     `certify.status.batch.quarantined-transactions` count them. Holds are per instance (in memory): an instance that
+     takes the next run without them tries the list again, which costs attempts, never order.
+   - JWT and Bitstring lists keep their behaviour across runs: a failure excludes the list for the rest of the run
+     (order, no starvation) and it is tried again on the next run, without back-off.
 7. Controller:
    - `TYPE` rows keep the current code path verbatim (`ResponseEntity<String>`, header `application/statuslist+jwt`).
    - `TYPE_CWT` rows answer `ResponseEntity<byte[]>` with `Content-Type: application/statuslist+cwt`.
@@ -1028,6 +1058,49 @@ unreadable one is skipped; `encode`'s last-second retirement and an intermediate
 concurrency test counts signatures; the tampered-token test shows a verifier rejecting it; `signer.mode` is validated
 on read and used at renewal; retirement is cached; `size-bits` is bounded at binding (`TokenStatusListCwt.MAX_BITS`,
 a multiple of 8). Opus m6 (a waiter re-signing under open-in-view) is fixed by the scalar document re-read.
+
+**Review round 2 (2026-11-14: Opus 3 majors + minors, GPT-6.1 Sol 4 majors; fix round 3 on `wp/m-11d-r3`, escalated
+from DeepSeek).** (1) the batch job applied a list's transactions out of order: a transient failure on the first page
+was not excluded, the next page applied the list's newer transactions alone and the next run applied the older ones on
+top (`{5:false}` then `{5:true}`, HSM session lost: `[{5=true},{5=false}]`, the revocation lost). A failure now
+excludes the list for the rest of the run, in the selection. (2) every provider exception was wrapped as
+`STATUS_SIGNER_GONE` and every `STATUS_SIGNER_*` and `CRL_STALE` parked a list until a restart, while the endpoint kept
+serving the pre-revocation list. Failures are classified by rule (point 6), a transient one is retried with a bounded
+back-off, a permanent one is quarantined for a configurable interval and released early by a trust-material change, and
+both are reported every run and by two gauges. (3) a stuck list's rows starved the others (OFFSET paging restarted at
+page 0 every run, `batch-size × max-pages` rows deep): the exclusion is in the query and `max-pages` is gone. (4) the
+JWT `allocate()` still saved the entity it had read when marking a list `FULL` (reproduced on PostgreSQL:
+`revokedBitKept=false`): a targeted `updateCredentialStatus`, with deterministic PostgreSQL interleavings through JWT
+`allocate()` and CWT `allocateCwt()` (G39). (5) the renewal's fallback served a re-read token without checking it:
+every re-read is verified, failure `503`. Minors: the batch settings are a typed record (`batch` in
+`TokenStatusListProperties`, rule 9) and the round-1 `max-pages` `@Value` is removed; the verification cache is keyed on
+the whole envelope; serving computes `validUntil` without the key provider. Nits: `findByIdForUpdate` keeps
+`PESSIMISTIC_WRITE` — Hibernate renders it `for no key update` on PostgreSQL, which does not block the `key share` lock
+an inserted `credential_status_transaction` row takes on its list through the 0.12 foreign key, where a plain
+`for update` would hold every revocation request while the job signs; an H2 context under `PostgreSQLDialect` (the
+`local` profile without an `H2Dialect` override) must set `H2Dialect`, as documented on the method. The JWT
+`renew()`/`latest()` `findById` under open-in-view is recorded as G40 and not changed (I4). I4 re-checked: 80/80
+GET/HEAD × `Accept` × JWT row-kind cases identical to `7de07e8e`.
+
+- [x] Two-page order: older `{5:false}`, newer `{5:true}`, the first update fails transiently → nothing of the list is
+  applied that run; the next runs apply `{5=false}` then `{5=true}`
+  (`StatusListUpdateBatchJobStuckListsTest.aListThatFailsIsNeverUpdatedWithANewerTransactionBeforeAnOlderOne`, JWT
+  variant `aJwtListThatFailsKeepsItsOrderAndIsRetriedOnTheNextRun`); the `5956c26b` job fails both.
+- [x] Transient provider outage → retried next run, applied in order once it recovers; `CRL_STALE` → recovered after
+  the CRL is refreshed, same instance; `REVOKED` → quarantined, a WARN with the pending count every run, the gauges,
+  tried again after the interval, released at the next run when the CRL changes; a tampered row → quarantined with no
+  stack trace on any run (`StatusListBatchJobCwtTest`, real service and policy); the `5956c26b` job fails all four.
+- [x] Batch size 1, sixty stuck rows of a refused list ahead of a healthy row → the healthy row is processed in the
+  first run (`StatusListUpdateBatchJobStuckListsTest.stuckRowsOfAQuarantinedListDoNotStarveAHealthyRowBehindThem`, and
+  on PostgreSQL with thirty rows, `StatusListPostgresTest.aQuarantinedListsStuckRowsDoNotStarveAHealthyList`); the
+  `5956c26b` job fails it.
+- [x] JWT `allocate()` marking `FULL` keeps a revocation committed after its read (PostgreSQL,
+  `jwtAllocationMarkingFullKeepsARevocationCommittedAfterItsRead`; the CWT twin next to it); the entity save fails it.
+- [x] A re-read document is served only when it verifies (`aDocumentReadAgainForTheFallbackIsServedOnlyWhenItVerifies`,
+  `aRetiredListsDocumentReadAgainIsServedOnlyWhenItVerifies`); the unverified fallback fails both.
+- [x] Every `StatusListSignerPolicy` rule is classified on purpose (`TokenStatusListUpdateExceptionTest`); an edited
+  signer binding is refused warm and cold (`aWarmInstanceChecksAnEditedSignerBindingAgain`); serving in the last `ttl`
+  resolves nothing (`servingAListInItsLastTtlAsksTheKeyProviderForNothing`).
 
 ### M-11e Issuance binding: the DSC that signs the mDL signs its list (certify-spi, certify-issuance, certify-format-mdoc, certify-service)
 

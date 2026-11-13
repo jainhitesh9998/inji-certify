@@ -633,6 +633,104 @@ class TokenStatusListCwtServiceTest {
                 String.valueOf(refused.getCause()));
     }
 
+    /**
+     * Review round 2, major 5 (GPT's case): the request reads a genuine document, the list is due, and by the time the
+     * renewal reads the table it holds a token the pinned signer did not sign. The renewal refuses it, and its fallback
+     * must not serve it either: every document read again is checked before it is returned, so the answer is 503.
+     */
+    @Test
+    void aDocumentReadAgainForTheFallbackIsServedOnlyWhenItVerifies() {
+        Fixture fixture = new Fixture();
+        MutableClock clock = new MutableClock(T0);
+        TokenStatusListService lists = fixture.lists(clock);
+        String listId = fixture.listId(lists.allocateCwt("revocation", fixture.dsc()));
+        StatusListCredential genuine = Fixture.copy(fixture.rows.get(listId));
+        fixture.storeToken(listId, TokenStatusListCwtBase.tamperLst(tokenOf(fixture, listId), 9, true));
+        // the request's first read still sees the genuine row (open-in-view, or a read just before the write committed)
+        when(fixture.repository.findById(listId)).thenReturn(Optional.of(genuine));
+        clock.advance(TTL.plusSeconds(60)); // due: the renewal reads the table again and finds the tampered token
+
+        TokenStatusListUnavailableException refused = assertThrows(TokenStatusListUnavailableException.class,
+                () -> lists.served(listId));
+        assertTrue(refused.getMessage().contains("does not verify with its pinned signer"), refused.getMessage());
+        assertEquals(0, fixture.replaced.get(), "nothing is written");
+    }
+
+    /**
+     * Review round 2, major 5, the retirement branch: the renewal finds the signer retired and reads the table again; a
+     * document another writer left there — a later {@code exp} and a flipped bit the pinned certificate did not sign —
+     * is checked before it is served as stored, so the answer is 503, not that token.
+     */
+    @Test
+    void aRetiredListsDocumentReadAgainIsServedOnlyWhenItVerifies() {
+        Fixture fixture = new Fixture();
+        MutableClock clock = new MutableClock(T0);
+        TokenStatusListService lists = fixture.lists(clock);
+        String listId = "a-retired-cwt-list";
+        SigningKey expired = StatusListTestKeys.key("expired", EXPIRED_KEYS, EXPIRED);
+        TokenStatusListService.SignerBinding binding = new TokenStatusListService.SignerBinding(
+                TokenStatusListService.SIGNER_DOCUMENT, "x509-file:mdl-dsc", StatusListSigners.x5tS256(EXPIRED));
+        String stored = TokenStatusListCwtBase.envelope(binding, TokenStatusListCwtBase.storedToken(URI(listId),
+                T0.minus(Duration.ofHours(2)), T0.plus(Duration.ofMinutes(30)), new byte[128], expired));
+        String forged = TokenStatusListCwtBase.envelope(binding, TokenStatusListCwtBase.tamperLst(
+                TokenStatusListCwtBase.storedToken(URI(listId), T0, T0.plus(Duration.ofHours(3)), new byte[128], expired),
+                9, true));
+        fixture.rows.put(listId, fixture.row(listId, TokenStatusListService.TYPE_CWT, stored));
+        when(fixture.repository.findDocumentById(listId)).thenReturn(Optional.of(stored), Optional.of(forged));
+        clock.advance(Duration.ofMinutes(31)); // the stored token expired: the renewal finds the signer retired
+
+        assertThrows(TokenStatusListUnavailableException.class, () -> lists.served(listId));
+        assertEquals(0, fixture.signed.get());
+    }
+
+    /**
+     * Review round 2, minor 7: the verification cache is keyed on the whole envelope. Once a list was served, an
+     * envelope edited to pin another certificate around the same token is refused by the warm instance exactly as by a
+     * cold one.
+     */
+    @Test
+    void aWarmInstanceChecksAnEditedSignerBindingAgain() {
+        Fixture fixture = new Fixture();
+        MutableClock clock = new MutableClock(T0);
+        TokenStatusListService warm = fixture.lists(clock);
+        String listId = fixture.listId(warm.allocateCwt("revocation", fixture.dsc()));
+        assertEquals(TokenStatusListService.MEDIA_TYPE_CWT, warm.served(listId).orElseThrow().mediaType());
+
+        TokenStatusListService.StoredEnvelope stored = warm.envelope(fixture.rows.get(listId).getVcDocument());
+        String edited = TokenStatusListCwtBase.envelope(new TokenStatusListService.SignerBinding(stored.signer().mode(),
+                stored.signer().keyRef(), StatusListSigners.x5tS256(DEDICATED)), tokenOf(fixture, listId));
+        fixture.rows.get(listId).setVcDocument(edited);
+        fixture.documents.put(listId, edited);
+
+        assertThrows(TokenStatusListUnavailableException.class, () -> warm.served(listId), "the warm instance");
+        assertThrows(TokenStatusListUnavailableException.class, () -> fixture.lists(clock).served(listId), "a cold one");
+    }
+
+    /**
+     * Review round 2, minor 8: in a list's last {@code ttl} before its signer's {@code notAfter} every request used to
+     * resolve the signer through the key provider to learn that a new signature could not push {@code exp} later. The
+     * cap comes from the signer's own certificates now: serving asks the provider for nothing, warm or cold.
+     */
+    @Test
+    void servingAListInItsLastTtlAsksTheKeyProviderForNothing() {
+        Fixture fixture = new Fixture();
+        MutableClock clock = new MutableClock(T0);
+        X509Certificate soon = signerUntil(SOON_KEYS, T0.plus(TTL), "Status List Test Last Hour DSC");
+        fixture.provider.add("mdl-dsc@2030-01", SOON_KEYS.getPrivate(), CertificateChain.of(soon, IACA),
+                SignatureAlgorithm.ES256, "mdoc-dsc");
+        TokenStatusListService lists = fixture.lists(clock);
+        String listId = fixture.listId(lists.allocateCwt("revocation", fixture.signing("x509-file:mdl-dsc@2030-01")));
+        clock.advance(TTL.minusSeconds(60));
+
+        int resolvedBefore = fixture.resolved.get();
+        for (int request = 0; request < 5; request++) {
+            lists.served(listId).orElseThrow();
+            fixture.lists(clock).served(listId).orElseThrow(); // a cold instance computes it from the stored x5chain
+        }
+        assertEquals(resolvedBefore, fixture.resolved.get(), "no key-provider lookup while serving");
+        assertEquals(0, fixture.replaced.get());
+    }
+
     private static byte[] tokenOf(Fixture fixture, String listId) {
         return TokenStatusListCwtBase.token(fixture.rows.get(listId).getVcDocument());
     }
@@ -707,6 +805,8 @@ class TokenStatusListCwtServiceTest {
         final Map<String, Integer> sequence = new ConcurrentHashMap<>();
         final AtomicInteger replaced = new AtomicInteger();
         final AtomicInteger signed = new AtomicInteger();
+        /** Every key-provider lookup the services built here make (pinning, re-signing; never serving). */
+        final AtomicInteger resolved = new AtomicInteger();
         final AtomicInteger sequenceCounter = new AtomicInteger();
 
         final JcaKeyProvider provider = new JcaKeyProvider("x509-file");
@@ -881,6 +981,7 @@ class TokenStatusListCwtServiceTest {
 
                 @Override
                 public SigningKey resolve(KeyRef ref) {
+                    resolved.incrementAndGet();
                     return delegate.provider(id()).resolve(ref);
                 }
 

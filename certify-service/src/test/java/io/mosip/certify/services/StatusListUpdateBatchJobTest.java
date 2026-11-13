@@ -81,12 +81,12 @@ public class StatusListUpdateBatchJobTest {
     public void should_returnEarly_when_batchJobIsDisabled() {
         ReflectionTestUtils.setField(batchJob, "batchJobEnabled", false);
         batchJob.updateStatusLists();
-        verify(transactionRepository, never()).findByIsProcessedFalseOrderByCreatedDtimesAsc(any());
+        verify(transactionRepository, never()).findPending(any());
     }
 
     @Test
     public void should_returnEarly_when_noTransactionsExist() {
-        when(transactionRepository.findByIsProcessedFalseOrderByCreatedDtimesAsc(any(Pageable.class)))
+        when(transactionRepository.findPending(any(Pageable.class)))
                 .thenReturn(Collections.emptyList());
         batchJob.updateStatusLists();
         verify(statusListRepository, never()).findById(anyString());
@@ -96,7 +96,7 @@ public class StatusListUpdateBatchJobTest {
     public void should_processGroups_when_transactionsExist() {
         List<CredentialStatusTransaction> txns = List.of(
                 txn("list-a", 1L, true), txn("list-a", 2L, true), txn("list-b", 1L, true));
-        when(transactionRepository.findByIsProcessedFalseOrderByCreatedDtimesAsc(any(Pageable.class)))
+        when(transactionRepository.findPending(any(Pageable.class)))
                 .thenReturn(txns);
         doNothing().when(batchJob).updateStatusList(anyString(), anyList());
 
@@ -109,7 +109,7 @@ public class StatusListUpdateBatchJobTest {
     @Test
     public void should_continueProcessing_when_oneGroupFails() {
         List<CredentialStatusTransaction> txns = List.of(txn("list-a", 1L, true), txn("list-b", 1L, true));
-        when(transactionRepository.findByIsProcessedFalseOrderByCreatedDtimesAsc(any(Pageable.class)))
+        when(transactionRepository.findPending(any(Pageable.class)))
                 .thenReturn(txns);
         doThrow(new RuntimeException("fail")).when(batchJob).updateStatusList(eq("list-a"), anyList());
         doNothing().when(batchJob).updateStatusList(eq("list-b"), anyList());
@@ -121,7 +121,7 @@ public class StatusListUpdateBatchJobTest {
 
     @Test
     public void should_wrapInCertifyException_when_fetchThrows() {
-        when(transactionRepository.findByIsProcessedFalseOrderByCreatedDtimesAsc(any(Pageable.class)))
+        when(transactionRepository.findPending(any(Pageable.class)))
                 .thenThrow(new RuntimeException("db error"));
         assertThrows(CertifyException.class, () -> batchJob.updateStatusLists());
     }

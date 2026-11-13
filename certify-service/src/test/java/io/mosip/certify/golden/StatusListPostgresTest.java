@@ -664,6 +664,164 @@ class StatusListPostgresTest {
         assertEquals(revoked, full.getVcDocument(), "marking the list FULL wrote no document and keeps the revocation");
     }
 
+    /**
+     * Review round 2, major 4 (GPT, reproduced on PostgreSQL 15): JWT {@code allocate()} read the list, a revocation was
+     * committed, the pool was exhausted, and marking the list {@code FULL} saved the entity it had read, reverting the
+     * revocation ({@code revokedBitKept=false}). Here the revocation commits from another thread inside the index call,
+     * after the read and before the marking: a deterministic interleaving of that schedule.
+     */
+    @Test
+    void jwtAllocationMarkingFullKeepsARevocationCommittedAfterItsRead() throws Exception {
+        io.mosip.certify.status.TokenStatusListService.Entry entry = tokenStatusLists.allocate("revocation");
+        String listId = listIdOf(entry);
+        exhaustThePool(listId);
+        CredentialStatusTransaction revocation = transactionRepository.save(pending("jwt-full-race-" + entry.idx(), listId, entry.idx()));
+        io.mosip.certify.status.TokenStatusListService racing = new io.mosip.certify.status.TokenStatusListService(
+                statusListRepository, statusListCredentialService,
+                committingDuringTheIndexCall(listId, () -> batchJob.updateStatusList(listId, List.of(revocation))),
+                keyProviders, tokenStatusListProperties, objectMapper, environment);
+
+        // the service instance bypasses Spring's proxy, so allocate's transaction is opened here, as the proxy would
+        io.mosip.certify.status.TokenStatusListService.Entry next = new org.springframework.transaction.support
+                .TransactionTemplate(transactionManager).execute(status -> racing.allocate("revocation"));
+
+        assertNotEquals(listId, listIdOf(next), "the full list takes no more indices");
+        io.mosip.certify.entity.StatusListCredential full = statusListRepository.findById(listId).orElseThrow();
+        assertEquals(io.mosip.certify.entity.StatusListCredential.CredentialStatus.FULL, full.getCredentialStatus());
+        byte[] bits = io.mosip.certify.status.TokenStatusListService.decode(SignedJWT.parse(full.getVcDocument())
+                .getJWTClaimsSet().getJSONObjectClaim("status_list").get("lst").toString());
+        assertTrue(io.mosip.certify.status.TokenStatusListService.get(bits, entry.idx()),
+                "revokedBitKept: marking the list FULL wrote no document");
+    }
+
+    /** The same schedule through {@code allocateCwt}, which reads candidates as a projection and marks FULL alone. */
+    @Test
+    void cwtAllocationMarkingFullKeepsARevocationCommittedAfterItsRead() throws Exception {
+        io.mosip.certify.spi.SigningContext signing = keyProviders.signingContext(io.mosip.certify.spi.SigningConfig.of(
+                io.mosip.certify.signing.KeyRef.parse("x509-file:sdjwt-es256"), io.mosip.certify.signing.SignatureAlgorithm.ES256));
+        io.mosip.certify.status.TokenStatusListService.Entry entry = tokenStatusLists.allocateCwt("revocation", signing);
+        String listId = listIdOf(entry);
+        exhaustThePool(listId);
+        CredentialStatusTransaction revocation = transactionRepository.save(pending("cwt-full-race-" + entry.idx(), listId, entry.idx()));
+        io.mosip.certify.status.TokenStatusListService racing = new io.mosip.certify.status.TokenStatusListService(
+                statusListRepository, statusListCredentialService,
+                committingDuringTheIndexCall(listId, () -> batchJob.updateStatusList(listId, List.of(revocation))),
+                keyProviders, tokenStatusListProperties, objectMapper, environment);
+
+        io.mosip.certify.status.TokenStatusListService.Entry next = new org.springframework.transaction.support
+                .TransactionTemplate(transactionManager).execute(status -> racing.allocateCwt("revocation", signing));
+
+        assertNotEquals(listId, listIdOf(next));
+        io.mosip.certify.entity.StatusListCredential full = statusListRepository.findById(listId).orElseThrow();
+        assertEquals(io.mosip.certify.entity.StatusListCredential.CredentialStatus.FULL, full.getCredentialStatus());
+        assertTrue(io.mosip.certify.status.TokenStatusListService.get(io.mosip.certify.status.TokenStatusListCwt.decode(
+                java.util.Base64.getUrlDecoder().decode(tokenStatusLists.envelope(full.getVcDocument()).token())).lst(),
+                entry.idx()), "revokedBitKept");
+    }
+
+    /**
+     * Review round 2, major 3, on PostgreSQL: batch size 1 and thirty pending rows of a CWT list the job refuses
+     * permanently (its stored token is not the one its envelope pins), ahead of one healthy JWT revocation. The job's
+     * selection excludes the refused list in SQL ({@code NOT IN}), so the healthy row is published in the first run.
+     */
+    @Test
+    void aQuarantinedListsStuckRowsDoNotStarveAHealthyList() throws Exception {
+        StatusListUpdateBatchJob job = org.springframework.test.util.AopTestUtils.getTargetObject(batchJob);
+        try (Connection c = dataSource.getConnection(); PreparedStatement ps = c.prepareStatement("UPDATE " + SCHEMA
+                + ".credential_status_transaction SET is_processed = true WHERE is_processed = false")) {
+            ps.executeUpdate(); // what earlier tests left pending is theirs, not this run's
+        }
+        io.mosip.certify.spi.SigningContext signing = keyProviders.signingContext(io.mosip.certify.spi.SigningConfig.of(
+                io.mosip.certify.signing.KeyRef.parse("x509-file:sdjwt-es256"), io.mosip.certify.signing.SignatureAlgorithm.ES256));
+        io.mosip.certify.status.TokenStatusListService.Entry stuckEntry = tokenStatusLists.allocateCwt("revocation", signing);
+        String stuck = listIdOf(stuckEntry);
+        String document = statusListRepository.findById(stuck).orElseThrow().getVcDocument();
+        String pin = tokenStatusLists.envelope(document).signer().x5tS256();
+        try (Connection c = dataSource.getConnection(); PreparedStatement ps = c.prepareStatement("UPDATE " + SCHEMA
+                + ".status_list_credential SET vc_document = ? WHERE id = ?")) {
+            ps.setString(1, document.replace(pin, java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(new byte[32])));
+            ps.setString(2, stuck);
+            ps.executeUpdate();
+        }
+        for (int index = 0; index < 30; index++) {
+            transactionRepository.save(pending("stuck-" + stuck + "-" + index, stuck, index));
+        }
+        io.mosip.certify.status.TokenStatusListService.Entry healthy = tokenStatusLists.allocate("revocation");
+        String healthyList = listIdOf(healthy);
+        CredentialStatusTransaction revocation = transactionRepository.save(pending("healthy-" + healthy.idx(), healthyList, healthy.idx()));
+
+        Object batchSizeBefore = org.springframework.test.util.ReflectionTestUtils.getField(job, "batchSize");
+        org.springframework.test.util.ReflectionTestUtils.setField(job, "batchSize", 1);
+        org.springframework.test.util.ReflectionTestUtils.setField(job, "batchJobEnabled", true);
+        net.javacrumbs.shedlock.core.LockAssert.TestHelper.makeAllAssertsPass(true);
+        try {
+            job.updateStatusLists();
+        } finally {
+            net.javacrumbs.shedlock.core.LockAssert.TestHelper.makeAllAssertsPass(false);
+            org.springframework.test.util.ReflectionTestUtils.setField(job, "batchJobEnabled", false);
+            org.springframework.test.util.ReflectionTestUtils.setField(job, "batchSize", batchSizeBefore);
+            // the edited row must not be handed to a later test's allocation
+            statusListRepository.updateCredentialStatus(stuck, io.mosip.certify.entity.StatusListCredential.CredentialStatus.FULL);
+        }
+
+        assertTrue(transactionRepository.findById(revocation.getTransactionLogId()).orElseThrow().getIsProcessed(),
+                "the healthy row is processed in the first run");
+        assertEquals(30, transactionRepository.findPending(PageRequest.of(0, 100)).stream()
+                .filter(t -> stuck.equals(t.getStatusListCredentialId())).count(), "the refused list's rows all stay pending");
+        SignedJWT list = SignedJWT.parse(mockMvc.perform(get("/credentials/token-status-list/" + healthyList)).andReturn()
+                .getResponse().getContentAsString());
+        assertTrue(io.mosip.certify.status.TokenStatusListService.get(io.mosip.certify.status.TokenStatusListService.decode(
+                list.getJWTClaimsSet().getJSONObjectClaim("status_list").get("lst").toString()), healthy.idx()),
+                "and its revocation is published");
+    }
+
+    private static String listIdOf(io.mosip.certify.status.TokenStatusListService.Entry entry) {
+        return entry.uri().substring(entry.uri().lastIndexOf('/') + 1);
+    }
+
+    /** Takes the list's free indices away without assigning them: the next allocation finds the pool exhausted. */
+    private void exhaustThePool(String listId) throws Exception {
+        try (Connection c = dataSource.getConnection();
+             PreparedStatement ps = c.prepareStatement("DELETE FROM " + SCHEMA
+                     + ".status_list_available_indices WHERE status_list_credential_id = ? AND is_assigned = false")) {
+            ps.setString(1, listId);
+            ps.executeUpdate();
+        }
+    }
+
+    /**
+     * The application's index provider, except that the first call for {@code listId} first lets another writer commit
+     * {@code commit} on another thread (its own transaction) and waits for it: the allocation has read the list by then and
+     * has not yet learnt that its pool is exhausted.
+     */
+    private io.mosip.certify.services.StatusListIndexProvider committingDuringTheIndexCall(String listId, ThrowingRunnable commit) {
+        java.util.concurrent.atomic.AtomicBoolean done = new java.util.concurrent.atomic.AtomicBoolean();
+        return new io.mosip.certify.services.StatusListIndexProvider() {
+            @Override
+            public String getProviderName() {
+                return "committing-during-the-index-call";
+            }
+
+            @Override
+            public java.util.Optional<Long> acquireIndex(String id, Map<String, Object> options) {
+                if (listId.equals(id) && done.compareAndSet(false, true)) {
+                    java.util.concurrent.ExecutorService other = java.util.concurrent.Executors.newSingleThreadExecutor();
+                    try {
+                        other.submit(() -> {
+                            commit.run();
+                            return null;
+                        }).get(60, java.util.concurrent.TimeUnit.SECONDS);
+                    } catch (Exception e) {
+                        throw new IllegalStateException("the concurrent revocation failed", e);
+                    } finally {
+                        other.shutdownNow();
+                    }
+                }
+                return statusListIndexProvider.acquireIndex(id, options);
+            }
+        };
+    }
+
     private static CredentialStatusTransaction pending(String credentialId, String listId, long idx) {
         CredentialStatusTransaction txn = new CredentialStatusTransaction();
         txn.setCredentialId(credentialId);

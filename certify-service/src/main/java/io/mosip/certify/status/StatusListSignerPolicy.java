@@ -278,7 +278,22 @@ public final class StatusListSignerPolicy {
             throw refuse(NO_CHAIN, "the key " + signing.key().ref() + " has no certificate, so no token it signs has"
                     + " a validity to be bounded by");
         }
-        List<X509Certificate> certificates = chain.leafFirst();
+        return validUntil(chain.leafFirst());
+    }
+
+    /**
+     * {@link #validUntil(SigningContext)} over a chain already in hand, leaf first: a stored token's protected
+     * {@code x5chain} (which never carries the IACA) plus, once {@link #enforced()}, the configured IACA that issued its
+     * top. Serving a list judges its freshness from this, so no request has to ask the key provider for the signer
+     * (M-11d review round 2, minor 8). It equals the signing context's value except when the provider's chain carries an
+     * anchor the registry does not, which can only end earlier; the service caches the exact value whenever it signs.
+     *
+     * @throws IllegalStateException {@value #NO_CHAIN} when the chain is empty
+     */
+    public Instant validUntil(List<X509Certificate> certificates) {
+        if (certificates == null || certificates.isEmpty()) {
+            throw refuse(NO_CHAIN, "an empty certificate chain bounds no token's validity");
+        }
         Instant earliest = Instant.MAX;
         for (X509Certificate certificate : certificates) {
             earliest = min(earliest, certificate.getNotAfter().toInstant());

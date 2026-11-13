@@ -69,6 +69,18 @@ public interface StatusListCredentialRepository extends JpaRepository<StatusList
      * The row locked for the rest of the transaction: the single writer of a list's document (a status update now, a
      * re-sign later) reads it through here, so two updates cannot each sign a snapshot and lose one of the bits, and a
      * re-sign cannot overwrite a status update committed between its read and its compare-and-set.
+     *
+     * <p>{@code PESSIMISTIC_WRITE} is rendered by the dialect: {@code for no key update} with {@code PostgreSQLDialect}
+     * (Hibernate 6, PostgreSQL 9.3 and later) and {@code for update} with {@code H2Dialect}. The PostgreSQL form is the
+     * one wanted: a deployment upgraded from 0.12 has a foreign key from {@code credential_status_transaction} to this
+     * table, and the {@code key share} lock each new transaction row takes on its list conflicts with
+     * {@code for update} but not with {@code for no key update}, so a plain {@code for update} would hold every
+     * revocation request for the list while the batch job signs. The consequence for tests: an H2 database under
+     * {@code PostgreSQLDialect} — the {@code local} profile's {@code application-local.properties} sets it, and an H2
+     * {@code @SpringBootTest} that activates {@code local} keeps it unless it overrides
+     * {@code spring.jpa.database-platform} with {@code H2Dialect} as {@code OfferPageTest} does — receives
+     * {@code for no key update}, which H2 rejects; such a context must set {@code H2Dialect} to run a status update
+     * (M-11d review round 2, nit 9).
      */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT s FROM StatusListCredential s WHERE s.id = :id")
