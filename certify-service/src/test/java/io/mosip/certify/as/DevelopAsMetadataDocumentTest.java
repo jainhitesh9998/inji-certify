@@ -22,6 +22,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * <p>The deployment here is the one that keeps {@code authorization_code}: {@code certify-default.properties} configures
  * the Interactive Authorization Endpoint, which is the owner-approved compatibility interpretation of RFC 8414's
  * "no grant type uses the authorization endpoint" clause (docs/design/20-mdl-issuer.md G29).
+ *
+ * <p>Both literals were (re)produced the same way in F-17 review round 3: the {@code 4f67ee7c} source of
+ * {@code OAuthAuthorizationServerMetadataService} ({@code git show 4f67ee7c:certify-service/src/main/java/io/mosip/certify/services/OAuthAuthorizationServerMetadataService.java})
+ * compiled into the test tree under another name, given the field values {@link ComposeProperties#documentService}
+ * binds for each property set, and serialised with a plain {@code ObjectMapper}; the throwaway copy was then deleted.
  */
 class DevelopAsMetadataDocumentTest {
 
@@ -35,6 +40,34 @@ class DevelopAsMetadataDocumentTest {
             + "\"dpop_signing_alg_values_supported\":[\"ES256\",\"ES384\",\"ES512\",\"RS256\",\"PS256\",\"EdDSA\"],"
             + "\"interactive_authorization_endpoint\":\"http://certify-nginx:80/v1/certify/oauth/iae\","
             + "\"require_interactive_authorization_request\":true}";
+
+    /**
+     * Plain {@code docker-compose.yaml} ({@code active_profile_env=default, csvdp-farmer}, no rebuild overlay): the
+     * authorization server is {@code mosip.certify.authorization.url=https://esignet-mock.collab.mosip.net} from
+     * {@code certify-default.properties}, and every URL of the document is built from it. Recorded from the
+     * {@code 4f67ee7c} implementation with these properties.
+     */
+    static final String PLAIN_COMPOSE_DOCUMENT = "{\"issuer\":\"https://esignet-mock.collab.mosip.net\","
+            + "\"token_endpoint\":\"https://esignet-mock.collab.mosip.net/v1/certify/oauth/token\","
+            + "\"jwks_uri\":\"https://esignet-mock.collab.mosip.net/v1/certify/.well-known/jwks.json\","
+            + "\"grant_types_supported\":[\"authorization_code\",\"urn:ietf:params:oauth:grant-type:pre-authorized_code\"],"
+            + "\"response_types_supported\":[\"code\"],"
+            + "\"code_challenge_methods_supported\":[\"S256\"],"
+            + "\"dpop_signing_alg_values_supported\":[\"ES256\",\"ES384\",\"ES512\",\"RS256\",\"PS256\",\"EdDSA\"],"
+            + "\"interactive_authorization_endpoint\":\"https://esignet-mock.collab.mosip.net/v1/certify/oauth/iae\","
+            + "\"require_interactive_authorization_request\":true}";
+
+    @Test
+    void thePlainComposeDocumentIsByteIdentical() throws Exception {
+        Binder binder = ComposeProperties.binder(ComposeProperties.sources(
+                Map.of("mosip.certify.domain.url", "http://certify-nginx:80"), "default", "csvdp-farmer"));
+        assertEquals("https://esignet-mock.collab.mosip.net", ComposeProperties.get(binder, "mosip.certify.authorization.url"));
+
+        String document = ComposeProperties.document(ComposeProperties.documentService(binder));
+
+        assertEquals(PLAIN_COMPOSE_DOCUMENT, document,
+                "develop's plain compose document must not change (F-17 review round 2, m5)");
+    }
 
     @Test
     void theDevelopComposeDocumentIsByteIdentical() throws Exception {

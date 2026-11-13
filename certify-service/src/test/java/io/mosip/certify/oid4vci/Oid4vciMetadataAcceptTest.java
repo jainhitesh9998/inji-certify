@@ -42,10 +42,12 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
  * {@code /issuance/.well-known/...} alias (whose path routes errors through the {@code /issuance/} advice), into a 500.
  *
  * <p>The test runs on a database of its own. It used to share {@code jdbc:h2:mem:mosip_esignet} with every other test in
- * the JVM, and a row another test had seeded made the first and later responses differ (G32: the H2 test schema declares
- * the {@code TEXT[]} columns as {@code VARCHAR}, and the metadata read used to flush that representation back one
- * bracket level deeper). The read path is a read-only transaction now, but the test still owns its rows and its database,
- * so it cannot depend on what another test class wrote or on its order.
+ * the JVM, and a row another test had seeded made the first and later responses differ (G32: every metadata read
+ * rewrote each {@code mso_mdoc} row because {@code msoMdocClaims} was falsely dirty, and on the H2 test schema, whose
+ * {@code TEXT[]} columns are {@code VARCHAR}, the rewrite nested the array columns one bracket level deeper). Reads no
+ * longer write ({@code TypedJsonBinaryType}, read-only transactions), but the test still owns its rows and its database,
+ * so it cannot depend on what another test class wrote or on its order. The root-mapped form is
+ * {@code Oid4vciMetadataAcceptRootMappedTest}.
  */
 @SpringBootTest
 @AutoConfigureMockMvc

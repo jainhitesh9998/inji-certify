@@ -84,7 +84,17 @@ final class ComposeProperties {
         ReflectionTestUtils.setField(service, "requireInteractiveAuthorizationRequest", require == null || Boolean.parseBoolean(require.trim()));
         ReflectionTestUtils.setField(service, "authorizationUrl", get(binder, "mosip.certify.authorization.url"));
         ReflectionTestUtils.setField(service, "domainUrl", get(binder, "mosip.certify.domain.url"));
+        ReflectionTestUtils.setField(service, "identifier", get(binder, "mosip.certify.identifier"));
         ReflectionTestUtils.setField(service, "servletPath", get(binder, "server.servlet.path"));
+        // where Boot mounts the DispatcherServlet (spring.mvc.servlet.path; certify-default.properties sets it)
+        String mounted = get(binder, "spring.mvc.servlet.path");
+        if (mounted != null) {
+            DefaultListableBeanFactory web = new DefaultListableBeanFactory();
+            web.registerSingleton("dispatcherServletPath",
+                    (org.springframework.boot.autoconfigure.web.servlet.DispatcherServletPath) () -> mounted);
+            ReflectionTestUtils.setField(service, "dispatcherServletPath",
+                    web.getBeanProvider(org.springframework.boot.autoconfigure.web.servlet.DispatcherServletPath.class));
+        }
 
         DpopProofValidator dpop = new DpopProofValidator();
         String algorithms = get(binder, "mosip.certify.dpop.allowed-algorithms");

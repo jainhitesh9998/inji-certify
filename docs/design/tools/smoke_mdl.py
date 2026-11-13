@@ -6,7 +6,8 @@ metadata say:
 
   1. pre-authorized offers for the mDL configuration with "issuer": "oid4vci", by reference and by value;
   2. issuer metadata at the OpenID4VCI 1.0 section 12.2.2 location derived from the offer's credential_issuer - also
-     with Accept: application/jwt, which must still answer 200 application/json (12.2.2) - and the authorization
+     GET and HEAD with no Accept, application/jwt, text/html, application/json and */*, each of which must answer 200
+     application/json, every GET with the same bytes (12.2.2; G30) - and the authorization
      server metadata (RFC 8414) of its authorization server: a present, non-empty grant_types_supported, and every
      authorization_code it lists completable through authorization_endpoint or interactive_authorization_endpoint (gap
      G29: the demo listed the grant without either and Talao's wallet aborted);
@@ -503,13 +504,20 @@ class Smoke:
                "authorization_endpoint": self.as_metadata.get("authorization_endpoint"),
                "interactive_authorization_endpoint": self.as_metadata.get("interactive_authorization_endpoint")})
         # OpenID4VCI 1.0 section 12.2.2: the unsigned form is the one this issuer serves and its Content-Type must say
-        # so. A wallet that prefers the signed form (Accept: application/jwt) must still get the document, not a 406.
-        jwt_status, jwt_headers, jwt_metadata = call("GET", url, headers={"Accept": "application/jwt"})
-        content_type = (jwt_headers.get("content-type") or "").lower()
-        check("issuer metadata with Accept: application/jwt: 200 and application/json (OID4VCI 1.0 12.2.2)",
-              jwt_status == 200 and content_type.startswith("application/json") and isinstance(jwt_metadata, dict)
-              and jwt_metadata.get("credential_issuer") == self.issuer,
-              {"status": jwt_status, "content-type": content_type})
+        # so. A wallet that prefers the signed form (Accept: application/jwt) or a browser (text/html) must still get the
+        # document, not a 406, at the root-mapped location the proxy serves; HEAD answers the same way (G30).
+        _, _, reference = call("GET", url, headers={"Accept": "application/json"}, binary=True)
+        answers = []
+        for method in ("GET", "HEAD"):
+            for accept in (None, "application/jwt", "text/html", "application/json", "*/*"):
+                status, headers, body = call(method, url, headers={"Accept": accept} if accept else None, binary=True)
+                content_type = (headers.get("content-type") or "").lower()
+                same_bytes = method == "HEAD" or body == reference
+                if status != 200 or not content_type.startswith("application/json") or not same_bytes:
+                    answers.append({"method": method, "accept": accept, "status": status, "content-type": content_type,
+                                    "same bytes as Accept: application/json": same_bytes})
+        check("issuer metadata at the 12.2.2 location: GET and HEAD answer 200 application/json for every Accept, one document",
+              not answers and isinstance(reference, bytes) and b'"credential_issuer"' in reference, answers)
         return bool(self.metadata.get("credential_endpoint") and self.as_metadata.get("token_endpoint"))
 
     # ---------------------------------------------------------------------------------------------- the flow

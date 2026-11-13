@@ -72,6 +72,7 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
 
 
     /** The deployment-wide values the v1 API applies to every configuration; the v2 API applies them when a body omits them. */
+    @Transactional(readOnly = true) // reads configuration only; joins the caller's transaction when there is one
     public ProtocolDefaults protocolDefaults(String format) {
         return new ProtocolDefaults(cryptographicBindingMethodsSupportedMap == null ? null : cryptographicBindingMethodsSupportedMap.get(format),
                 proofTypesSupported, allowedCredentialStatusPurposes);
@@ -249,7 +250,9 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
         }
     }
 
+    /** A pure read, like {@link #fetchCredentialIssuerMetadata()}: read-only, so loading the row can never write it. */
     @Override
+    @Transactional(readOnly = true)
     public CredentialConfigurationDTO getCredentialConfigurationById(String credentialConfigKeyId) {
         CredentialConfig credentialConfig = getActiveCredentialConfig(credentialConfigKeyId);
 
@@ -316,14 +319,18 @@ public class CredentialConfigurationServiceImpl implements CredentialConfigurati
     }
 
     /**
-     * A read, and only a read: the compatibility metadata document is rebuilt from the rows without touching them.
-     * The class-level {@code @Transactional} made this a read-write transaction, so Hibernate's dirty check could flush
-     * an entity the read itself had "changed". On the H2 test schema, whose {@code TEXT[]} columns are plain
-     * {@code VARCHAR} (see {@code src/test/resources/schema.sql}), a {@code List<String>} attribute reads back as a
-     * one-element array holding the column's text, which Hibernate then wrote back one bracket level deeper - the first
-     * metadata response after a write differed from every later one (G32, found by F-17 review round 1). PostgreSQL's
-     * real {@code text[]} columns round-trip correctly, so the live stack never showed it. A read-only transaction also
-     * makes that impossible on H2.
+     * A read, and only a read: the compatibility metadata document is rebuilt from the rows without touching them, in a
+     * read-only transaction, so Hibernate takes no snapshot and never flushes what it loaded.
+     *
+     * <p>Before F-17 this ran in the class-level read-write {@code @Transactional}, and every read of an
+     * {@code mso_mdoc} row rewrote the row: the {@code msoMdocClaims} attribute was falsely dirty on every load (the
+     * JSON type's snapshot copy turned each nested {@code Claims} into a {@code LinkedHashMap}; fixed at the root by
+     * {@link io.mosip.certify.entity.TypedJsonBinaryType}), so Hibernate flushed one whole-row {@code UPDATE} per mDoc
+     * row and read. On PostgreSQL the rewritten values were the ones just read, so nothing visible changed, but a read
+     * wrote, and its stale copy could silently revert an admin update committed in between. On the H2 test schema,
+     * whose {@code TEXT[]} columns are {@code VARCHAR}, the rewrite also nested the array columns one bracket level
+     * deeper per read (G32, F-17 review rounds 1 and 2). Both the root fix and this read-only transaction hold;
+     * {@code LegacyMetadataPostgresTest} checks the rows' {@code xmin} and Hibernate's update count.
      */
     @Override
     @Transactional(readOnly = true)
