@@ -131,14 +131,16 @@ read-only at `/pki`. Startup fails when:
 
 - the keystore lacks `MDL_DSC_ALIAS` (default `mdl-dsc@2026-11`);
 - that entry is not an Annex B Document Signer with the chain `[DSC, IACA]`;
-- the IACA differs from `iaca.pem`, or the CRL distribution point's `<id>` is not `lorem-ipsum-demo`;
-- the CRL is more than `certify.pki.stale-crl-grace` (PT24H) past its `nextUpdate`.
+- the IACA's CRL distribution point does not end in `/mdoc/iaca/lorem-ipsum-demo.crl`, the anchor id.
+
+A CRL more than `certify.pki.stale-crl-grace` (PT24H) past its `nextUpdate` does not stop the service. It logs an
+ERROR (at startup too) and refuses to sign mDLs (`CRL_STALE`) until a fresh CRL is in place; the gauge
+`certify.pki.crl.next_update` shows when that comes.
 
 The configuration signs with `x509-file:mdl-dsc`, the newest version valid now, so a rotated Document Signer is used
 as soon as the keystore holds it. Before the CRL's `nextUpdate`, issue the next one offline (`certify pki crl issue
 --iaca iaca.p12 --out iaca.crl --overwrite`) and copy it into `MDL_PKI_DIR`. The service re-reads it within
-`crl-refresh-interval` (PT5M), refuses a CRL with a smaller cRLNumber, and stops signing mDLs once the CRL is stale
-beyond the grace.
+`crl-refresh-interval` (PT5M) and refuses a CRL with a smaller cRLNumber.
 
 **File permissions.** `certify-cli` writes the keystore `rw-------`. The stack runs the `certify` container as root
 (`user: root` in `docker-compose.yaml`), which reads such files; on Docker Desktop (macOS, Windows) a bind mount shows
@@ -165,6 +167,12 @@ CERTIFY_PUBLIC_URL=https://credentials.loremipsum.co.in docker compose -f docker
   `/.well-known/oauth-authorization-server`;
 - offer links, token and status list URLs;
 - in dev mode, the IACA's issuerAltName and CRL distribution point (start with a fresh `data/MDL_PKI`).
+
+Switch the URL on a fresh database too (`docker compose ... rm -sfv database`, then `up` again). A Token Status List is
+signed once, with the URL of the day it was created as its `sub`. After a switch, new mDLs point at the same list under
+the new URL while the served list still names the old one, until a status update re-signs it. A verifier that checks
+`sub` against the MSO's `uri` (draft-ietf-oauth-status-list) then rejects the status. This is the service's behaviour,
+reported for a fix; it is not specific to the mDL.
 
 The tunnel in front of the stack forwards the host to certify-nginx on port 8091 (M-12). certify-nginx refuses the
 admin APIs (`v2/credential-configurations`, `system-info`, `credentials/status`, `ledger-search`, `vc-api`) to requests
