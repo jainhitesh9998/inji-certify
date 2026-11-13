@@ -34,16 +34,25 @@ import java.security.KeyStore;
 import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.Signature;
+import java.security.cert.CertPath;
+import java.security.cert.CertPathValidator;
+import java.security.cert.CertPathValidatorException;
 import java.security.cert.Certificate;
+import java.security.cert.CertificateFactory;
+import java.security.cert.PKIXParameters;
+import java.security.cert.TrustAnchor;
 import java.security.cert.X509Certificate;
 import java.security.spec.ECGenParameterSpec;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Date;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Files and keys the {@code pki} and {@code keys} commands share: PKCS#12 keystores read whole and written whole
@@ -198,6 +207,20 @@ final class PkiFiles {
         }
     }
 
+    /**
+     * Refuses an alias (or alias prefix) with upper-case letters: the JDK PKCS#12 keystore stores and returns every
+     * alias in lower case, so {@code Mdl-DSC@2026-11} would be written as {@code mdl-dsc@2026-11} and every key reference
+     * spelled as given would miss it. The same rule as the x509-file provider's, which refuses such an alias at bind
+     * time (M-05).
+     */
+    static void requireLowerCaseAlias(String alias, String option) {
+        if (alias != null && !alias.equals(alias.toLowerCase(Locale.ROOT))) {
+            throw new UsageException(option + " " + alias + " has upper-case letters; PKCS#12 keystores store aliases"
+                    + " in lower case, so pass " + alias.toLowerCase(Locale.ROOT) + " (and spell every key reference"
+                    + " that names it the same way)");
+        }
+    }
+
     /** Whether the keystore holds an entry under the alias. */
     static boolean contains(KeyStore store, String alias) {
         try {
@@ -339,10 +362,16 @@ final class PkiFiles {
     // ------------------------------------------------------------------ chains
 
     /**
-     * Refuses a chain that does not link: every certificate must be issued and signed by the next one, and the last
-     * must be self-signed or issued and signed by {@code anchor} (or be the anchor itself). The chain is leaf first.
+     * Refuses a chain that is not a valid certification path at {@code at}. First the links, with a message naming the
+     * broken one: every certificate must be issued and signed by the next one, and the last must be self-signed or
+     * issued and signed by {@code anchor} (or be the anchor itself). Then RFC 5280 path validation with the JDK
+     * {@link CertPathValidator} (PKIX, revocation not checked: the CLI holds no CRL of a foreign CA): every issuing
+     * certificate, the self-signed root or {@code anchor} included, must be a CA (basicConstraints {@code CA:true}) whose
+     * keyUsage, when present, allows keyCertSign, within its pathLen; every certificate valid at {@code at}; no
+     * critical extension the validator does not understand. A single self-signed certificate (a standalone signing key)
+     * is its own anchor: only its validity and critical extensions are judged. The chain is leaf first.
      */
-    static void verifyChain(List<X509Certificate> chain, X509Certificate anchor) {
+    static void verifyChain(List<X509Certificate> chain, X509Certificate anchor, Instant at) {
         for (int i = 0; i + 1 < chain.size(); i++) {
             if (!signedBy(chain.get(i), chain.get(i + 1))) {
                 throw new IllegalArgumentException("certificate " + (i + 1) + " of the chain ("
@@ -352,16 +381,81 @@ final class PkiFiles {
             }
         }
         X509Certificate last = chain.get(chain.size() - 1);
+        List<X509Certificate> path = new ArrayList<>(chain);
+        X509Certificate root;
         if (anchor != null) {
-            if (sameCertificate(last, anchor) || signedBy(last, anchor)) {
-                return;
+            if (!sameCertificate(last, anchor) && !signedBy(last, anchor)) {
+                throw new IllegalArgumentException("the chain ends at " + last.getSubjectX500Principal().getName()
+                        + ", which is not signed by the --anchor " + anchor.getSubjectX500Principal().getName());
             }
-            throw new IllegalArgumentException("the chain ends at " + last.getSubjectX500Principal().getName()
-                    + ", which is not signed by the --anchor " + anchor.getSubjectX500Principal().getName());
+            if (!sameCertificate(last, anchor)) {
+                path.add(anchor);
+            }
+            root = anchor;
+        } else {
+            if (!signedBy(last, last)) {
+                throw new IllegalArgumentException("the chain ends at " + last.getSubjectX500Principal().getName()
+                        + ", which is not self-signed; append its issuer to the chain or pass --anchor <issuer.pem>");
+            }
+            root = last;
         }
-        if (!signedBy(last, last)) {
-            throw new IllegalArgumentException("the chain ends at " + last.getSubjectX500Principal().getName()
-                    + ", which is not self-signed; append its issuer to the chain or pass --anchor <issuer.pem>");
+        boolean selfSigned = signedBy(root, root);
+        if (path.size() > 1 && !selfSigned) {
+            // an --anchor that is itself issued by another CA cannot anchor a path that contains it; the JDK takes its
+            // key and name, so its own CA constraints are checked here
+            path.remove(path.size() - 1);
+            requireIssuingCa(root, at, path.size() - 1);
+        }
+        if (path.size() == 1 && sameCertificate(path.get(0), root) && !selfSigned) {
+            requireValidAt(root, at);
+            return;
+        }
+        // a self-signed root stays in the path, anchored by itself, so the validator processes it as an issuing CA
+        // (CA flag, keyCertSign, pathLen, validity) instead of trusting its key unexamined
+        try {
+            PKIXParameters parameters = new PKIXParameters(Set.of(new TrustAnchor(root, null)));
+            parameters.setRevocationEnabled(false);
+            parameters.setDate(Date.from(at));
+            CertPath certPath = CertificateFactory.getInstance("X.509").generateCertPath(path);
+            CertPathValidator.getInstance("PKIX").validate(certPath, parameters);
+        } catch (CertPathValidatorException e) {
+            int index = e.getIndex();
+            String where = index >= 0 && index < path.size()
+                    ? " at " + path.get(index).getSubjectX500Principal().getName() : "";
+            throw new IllegalArgumentException("the chain is not a valid certification path" + where + ": "
+                    + e.getMessage() + " (RFC 5280 path validation: every issuer must be a CA with keyCertSign,"
+                    + " within its pathLen, every certificate valid now)", e);
+        } catch (GeneralSecurityException e) {
+            throw new IllegalArgumentException("the chain cannot be validated: " + e.getMessage(), e);
+        }
+    }
+
+    /** RFC 5280 6.1.4 for an anchor that is not self-signed: CA, keyCertSign, pathLen, valid at {@code at}. */
+    private static void requireIssuingCa(X509Certificate ca, Instant at, int intermediatesBelow) {
+        String name = ca.getSubjectX500Principal().getName();
+        int pathLen = ca.getBasicConstraints();
+        if (pathLen < 0) {
+            throw new IllegalArgumentException("the --anchor " + name + " is not a CA certificate (basicConstraints"
+                    + " CA:true missing) and cannot issue certificates");
+        }
+        boolean[] usage = ca.getKeyUsage();
+        if (usage != null && (usage.length <= 5 || !usage[5])) {
+            throw new IllegalArgumentException("the --anchor " + name + " keyUsage does not allow keyCertSign");
+        }
+        if (pathLen != Integer.MAX_VALUE && intermediatesBelow > pathLen) {
+            throw new IllegalArgumentException("the --anchor " + name + " allows " + pathLen + " intermediate CA(s)"
+                    + " below it (pathLen), the chain has " + intermediatesBelow);
+        }
+        requireValidAt(ca, at);
+    }
+
+    private static void requireValidAt(X509Certificate certificate, Instant at) {
+        try {
+            certificate.checkValidity(Date.from(at));
+        } catch (GeneralSecurityException e) {
+            throw new IllegalArgumentException(certificate.getSubjectX500Principal().getName() + " is not valid at "
+                    + at + " (" + certificate.getNotBefore().toInstant() + " to "
+                    + certificate.getNotAfter().toInstant() + ")", e);
         }
     }
 

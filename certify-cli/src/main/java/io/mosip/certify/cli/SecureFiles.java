@@ -15,13 +15,14 @@ import java.nio.file.attribute.FileAttribute;
 import java.nio.file.attribute.PosixFileAttributeView;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Deque;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -32,6 +33,13 @@ import java.util.concurrent.locks.ReentrantLock;
  * {@code rw-------} at creation time, not chmod-ed afterwards; public objects (certificates, CRLs) are created
  * {@code rw-r--r--} minus the umask. Read-modify-write of a keystore or of CRL state happens under an exclusive lock on
  * a stable {@code <file>.lock} next to it, held across processes ({@link FileChannel#lock()}) and threads.
+ *
+ * <p>Every target is first made canonical ({@link #canonical}: symbolic links resolved, the real directory of a file that
+ * does not exist yet), and that one real path is used for the lock, the read, the temporary file (created in the real
+ * directory) and the atomic rename. A keystore or state file named through a symbolic link is therefore updated where
+ * the link points, and the link stays a link; a write never replaces the link itself, so the file the deployment reads
+ * and the file the CLI locked and read are always the same. A file with more than one hard link is refused: renaming a
+ * new file over one name would leave the other names on the old content.
  *
  * <p>Before anything is written, a command passes its input and output paths to {@link #requireDistinct}: two names
  * for one file (the same path, a symbolic link, {@code ./x} and {@code x}, a hard link) are refused, so {@code --out}
@@ -54,28 +62,31 @@ final class SecureFiles {
     // ------------------------------------------------------------------ paths
 
     /**
-     * The canonical name of a path: the real path when it exists (symbolic links resolved), else the real path of its
-     * nearest existing ancestor followed by the remaining names, so a file that is about to be created compares equal
-     * to the same file named another way.
+     * The canonical name of a path: the real path when it exists (every symbolic link resolved), else the canonical
+     * name of its parent followed by its own name, so a file that is about to be created compares equal to the same
+     * file named another way and is created in the real directory. A symbolic link whose target does not exist is
+     * refused: writing through it would replace the link, not create its target.
      */
     static Path canonical(Path path) throws IOException {
-        Path absolute = path.toAbsolutePath().normalize();
+        Path absolute = path.toAbsolutePath();
         if (Files.exists(absolute)) {
             return absolute.toRealPath();
         }
-        Deque<String> tail = new ArrayDeque<>();
-        Path probe = absolute;
-        while (probe != null && !Files.exists(probe)) {
-            if (probe.getFileName() != null) {
-                tail.addFirst(probe.getFileName().toString());
-            }
-            probe = probe.getParent();
+        if (Files.isSymbolicLink(absolute)) {
+            throw new UsageException(path + " is a symbolic link to " + Files.readSymbolicLink(absolute)
+                    + ", which does not exist; name the target itself");
         }
-        Path base = probe == null ? absolute.getRoot() : probe.toRealPath();
-        for (String name : tail) {
-            base = base.resolve(name);
+        Path parent = absolute.getParent();
+        Path name = absolute.getFileName();
+        if (parent == null || name == null) {
+            return absolute;
         }
-        return base;
+        Path canonicalParent = canonical(parent);
+        return switch (name.toString()) {
+            case "." -> canonicalParent;
+            case ".." -> canonicalParent.getParent() == null ? canonicalParent : canonicalParent.getParent();
+            default -> canonicalParent.resolve(name);
+        };
     }
 
     /** {@code <file>.lock} next to the canonical file; the lock file is created once and never removed. */
@@ -139,7 +150,46 @@ final class SecureFiles {
 
     /** An exclusive lock on {@code <target>.lock}, across threads of this JVM and across processes. */
     static Lock lock(Path target) throws IOException {
-        Path lockFile = lockFile(target);
+        return lockFileAt(lockFile(target));
+    }
+
+    /**
+     * Exclusive locks on several lock files, taken in the order of their canonical paths so that two commands asking
+     * for overlapping sets can never deadlock; released in reverse order when the returned lock is closed.
+     */
+    static Lock lockAll(Collection<Path> lockFiles) throws IOException {
+        SortedSet<Path> ordered = new TreeSet<>();
+        for (Path lockFile : lockFiles) {
+            ordered.add(canonical(lockFile));
+        }
+        List<Lock> held = new ArrayList<>();
+        try {
+            for (Path lockFile : ordered) {
+                held.add(lockFileAt(lockFile));
+            }
+        } catch (IOException | RuntimeException e) {
+            closeAll(held);
+            throw e;
+        }
+        return () -> closeAll(held);
+    }
+
+    private static void closeAll(List<Lock> held) throws IOException {
+        IOException failure = null;
+        for (int i = held.size() - 1; i >= 0; i--) {
+            try {
+                held.get(i).close();
+            } catch (IOException e) {
+                failure = failure == null ? e : failure;
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
+    }
+
+    /** An exclusive lock on the lock file itself (created {@code rw-------} once, never removed). */
+    static Lock lockFileAt(Path lockFile) throws IOException {
         ReentrantLock jvmLock = JVM_LOCKS.computeIfAbsent(lockFile, path -> new ReentrantLock());
         jvmLock.lock();
         FileChannel channel = null;
@@ -149,7 +199,7 @@ final class SecureFiles {
             channel = posix(lockFile.getParent())
                     ? FileChannel.open(lockFile, options, PosixFilePermissions.asFileAttribute(OWNER_ONLY))
                     : FileChannel.open(lockFile, options);
-            return new Lock(jvmLock, channel, channel.lock());
+            return new FileLockHandle(jvmLock, channel, channel.lock());
         } catch (IOException | RuntimeException e) {
             if (channel != null) {
                 channel.close();
@@ -159,13 +209,19 @@ final class SecureFiles {
         }
     }
 
-    /** A held lock; closing it releases the file lock, the channel and the in-JVM lock. */
-    static final class Lock implements AutoCloseable {
+    /** A held lock, or a set of them; closing it releases them. */
+    interface Lock extends AutoCloseable {
+        @Override
+        void close() throws IOException;
+    }
+
+    /** One held lock file: closing it releases the file lock, the channel and the in-JVM lock. */
+    private static final class FileLockHandle implements Lock {
         private final ReentrantLock jvmLock;
         private final FileChannel channel;
         private final FileLock fileLock;
 
-        private Lock(ReentrantLock jvmLock, FileChannel channel, FileLock fileLock) {
+        private FileLockHandle(ReentrantLock jvmLock, FileChannel channel, FileLock fileLock) {
             this.jvmLock = jvmLock;
             this.channel = channel;
             this.fileLock = fileLock;
@@ -188,13 +244,18 @@ final class SecureFiles {
     // ------------------------------------------------------------------ writes
 
     /**
-     * Writes {@code bytes} to {@code target}: a temporary file in the same directory created with the visibility's
-     * permissions, forced to disk, then renamed over the target atomically. With {@code replace} false the target must
-     * not exist: it is reserved with {@code CREATE_NEW} first, so two writers cannot both create it and an existing file
-     * is refused ({@link FileAlreadyExistsException}) rather than replaced.
+     * Writes {@code bytes} to the canonical {@code target} ({@link #canonical}: through symbolic links, to the real
+     * file): a temporary file in the real directory created with the visibility's permissions, forced to disk, then
+     * renamed over the real file atomically. With {@code replace} false the target must not exist: it is reserved with
+     * {@code CREATE_NEW} first, so two writers cannot both create it and an existing file is refused
+     * ({@link FileAlreadyExistsException}) rather than replaced. An existing target with more than one hard link is
+     * refused before anything is written.
      */
     static void write(Path target, byte[] bytes, Visibility visibility, boolean replace) throws IOException {
-        Path absolute = target.toAbsolutePath().normalize();
+        Path absolute = canonical(target);
+        if (replace) {
+            requireSingleLink(absolute);
+        }
         Path parent = absolute.getParent();
         Files.createDirectories(parent);
         boolean posix = posix(parent);
@@ -229,6 +290,39 @@ final class SecureFiles {
             if (reserved && !moved) {
                 Files.deleteIfExists(absolute);
             }
+        }
+    }
+
+    /**
+     * Renames {@code from} to {@code to} in one atomic step (both in one directory), refusing an existing {@code to}:
+     * the caller holds the locks of both names.
+     */
+    static void rename(Path from, Path to) throws IOException {
+        if (Files.exists(to, LinkOption.NOFOLLOW_LINKS)) {
+            throw new FileAlreadyExistsException(to.toString());
+        }
+        Files.move(from, to, StandardCopyOption.ATOMIC_MOVE);
+        forceDirectory(to.getParent());
+    }
+
+    /**
+     * Refuses an existing file with more than one hard link: the atomic rename would give one name the new content and
+     * leave every other name on the old one, the fork a symbolic link is resolved to avoid.
+     */
+    static void requireSingleLink(Path file) throws IOException {
+        if (!Files.exists(file, LinkOption.NOFOLLOW_LINKS)) {
+            return;
+        }
+        Object links;
+        try {
+            links = Files.getAttribute(file, "unix:nlink", LinkOption.NOFOLLOW_LINKS);
+        } catch (UnsupportedOperationException | IllegalArgumentException e) {
+            return; // no link count on this platform
+        }
+        if (links instanceof Integer count && count > 1) {
+            throw new UsageException(file + " has " + count + " hard links; replacing it would update one name and"
+                    + " leave the others on the old content. Keep one name (copy it, delete the other links) and"
+                    + " rerun");
         }
     }
 

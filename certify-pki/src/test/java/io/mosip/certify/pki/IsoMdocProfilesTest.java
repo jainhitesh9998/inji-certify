@@ -420,10 +420,6 @@ class IsoMdocProfilesTest {
                 .thisUpdate(iaca.getNotBefore().toInstant().minusSeconds(1)).build());
     }
 
-    /**
-     * Every builder verifies the signature it produced under the public key a verifier will use, so a key pair whose
-     * private key belongs to another key is refused rather than turned into a certificate or CRL nobody can verify.
-     */
     /** A Document Signer certified for the IACA's own public key would let the IACA key sign documents (M-07 review). */
     @Test
     void aDocumentSignerForTheIacaKeyIsRefused() {
@@ -434,6 +430,10 @@ class IsoMdocProfilesTest {
                 fixture.iacaKeyPair).commonName("Same Key DSC").build());
     }
 
+    /**
+     * Every builder verifies the signature it produced under the public key a verifier will use, so a key pair whose
+     * private key belongs to another key is refused rather than turned into a certificate or CRL nobody can verify.
+     */
     @Test
     void aKeyPairWhosePrivateKeyBelongsToAnotherKeyIsRefused() {
         Fixture fixture = new Fixture();

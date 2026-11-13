@@ -14,6 +14,7 @@ import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.security.NoSuchAlgorithmException;
 import java.security.cert.X509CRL;
@@ -22,15 +23,20 @@ import java.security.cert.X509Certificate;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.time.temporal.ChronoUnit;
-import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.SortedMap;
+import java.util.SortedSet;
 import java.util.TreeMap;
+import java.util.TreeSet;
+import java.util.stream.Collectors;
 
 /**
  * The CRL state an offline IACA needs and a CRL cannot be rebuilt without: for each IACA (keyed by its subject key
@@ -52,9 +58,19 @@ import java.util.TreeMap;
  * }
  * </pre>
  *
- * <p>The file lives next to the IACA keystore as {@code <iaca-store>.crlstate.json}, written atomically
- * ({@code rw-------}) under the lock of {@link SecureFiles#lock}. An empty or unreadable file is a hard error, never an
- * empty inventory: it is the only record of what was revoked.
+ * <p>One inventory per IACA identity: the file is {@code iaca-<ski-hex>.crlstate.json} in the real directory of the IACA
+ * keystore or PEM file (symbolic links resolved), or the file {@code --state} names. Every run for the IACA first takes
+ * the identity lock {@code .<ski-hex>.crl.lock} in that directory (and in the {@code --state} directory when it is
+ * another one), then discovers the state under the lock ({@link #discover}), so two copies of one IACA in one directory
+ * ({@code a.p12}, {@code b.p12}, {@code iaca-key.pem}) find, create and update the same file and never start two
+ * inventories. Writes then also hold the file's own lock ({@code <state>.lock}), so two IACAs sharing a {@code --state}
+ * file are serialised too. A file under the round-2 name {@code <iaca-store>.crlstate.json} is still read and, when it
+ * holds only this IACA, renamed to the canonical name under the lock.
+ *
+ * <p>Files are written atomically ({@code rw-------}). An empty or unreadable file is a hard error, never an empty
+ * inventory: it is the only record of what was revoked. Discovery reads every {@code *.crlstate.json} in the directory,
+ * so a corrupt state file of another IACA there blocks this one too (it fails safe: nothing is issued until the file is
+ * restored or moved aside).
  */
 final class CrlState {
 
@@ -147,44 +163,95 @@ final class CrlState {
         }
     }
 
-    /** {@code <iaca-store>.crlstate.json}, next to the IACA keystore or PEM file. */
-    static Path defaultPath(Path iacaStore) {
+    /** The canonical inventory file name of an IACA: {@code iaca-<ski-hex>.crlstate.json}. */
+    static String canonicalName(String keyId) {
+        return "iaca-" + keyId + SUFFIX;
+    }
+
+    /** The round-2 default name, {@code <iaca-store>.crlstate.json} next to the store; read and migrated, never created. */
+    static Path legacyPath(Path iacaStore) {
         return iacaStore.resolveSibling(iacaStore.getFileName() + SUFFIX);
     }
 
+    /** {@code .<ski-hex>.crl.lock} in {@code directory}: taken before this IACA's state there is discovered or created. */
+    static Path identityLock(Path directory, String keyId) {
+        return directory.resolve("." + keyId + ".crl.lock");
+    }
+
+    /** Where discovery found (or will create) the IACA's inventory; {@code migratedFrom} when a legacy file was renamed. */
+    record Location(Path path, Path migratedFrom) {}
+
     /**
-     * The state file for this IACA: {@code explicit} when given; else the one file in the IACA store's directory
-     * ({@code <iaca-store>.crlstate.json} first, then any other {@code *.crlstate.json}) that already holds this IACA's
-     * inventory, so the {@code .p12} and the PEM form of one IACA find the same record; else the default path for a
-     * first CRL. Two files holding the same IACA are refused: the operator says which one with {@code --state}.
+     * The inventory file of the IACA with {@code keyId}; the caller holds the identity locks of the IACA's directory and
+     * of the {@code explicit} file's directory. Every {@code *.crlstate.json} in those directories is read, and the
+     * files that record this IACA are its holders (canonical paths, so a symbolic link and its target count once).
+     *
+     * <ul>
+     *   <li>{@code --state} given: that file when it is a holder or when there is none; refused when another file
+     *       records the IACA, which would start a second inventory.</li>
+     *   <li>One holder: that file; the legacy {@code <iaca-store>.crlstate.json} holding only this IACA is renamed to
+     *       {@code iaca-<ski-hex>.crlstate.json} first.</li>
+     *   <li>No holder: {@code iaca-<ski-hex>.crlstate.json} in the IACA's directory, for a first CRL.</li>
+     *   <li>Two or more holders: refused, listing them; {@code --state} says which one is current.</li>
+     * </ul>
+     *
+     * @param iacaStore the canonical (real) path of the IACA keystore or PEM file
+     * @param explicit  the canonical {@code --state} path, or {@code null}
      */
-    static Path locate(Path iacaStore, String keyId, Path explicit) throws IOException {
+    static Location discover(Path iacaStore, String keyId, Path explicit) throws IOException {
+        Path home = iacaStore.getParent();
+        Set<Path> directories = new LinkedHashSet<>();
+        directories.add(home);
         if (explicit != null) {
-            return explicit;
+            directories.add(explicit.getParent());
         }
-        Path preferred = defaultPath(iacaStore);
-        Path canonicalPreferred = SecureFiles.canonical(preferred);
-        List<Path> holders = new ArrayList<>();
-        if (holds(preferred, keyId)) {
-            holders.add(preferred);
-        }
-        // listed under the name the caller used (not the canonical one), so a found file is reported as given
-        Path directory = preferred.toAbsolutePath().getParent();
-        if (Files.isDirectory(directory)) {
-            try (DirectoryStream<Path> siblings = Files.newDirectoryStream(directory, "*" + SUFFIX)) {
-                for (Path sibling : siblings) {
-                    if (Files.isRegularFile(sibling) && !SecureFiles.canonical(sibling).equals(canonicalPreferred)
-                            && holds(sibling, keyId)) {
-                        holders.add(sibling);
+        SortedSet<Path> holders = new TreeSet<>();
+        for (Path directory : directories) {
+            if (!Files.isDirectory(directory)) {
+                continue;
+            }
+            try (DirectoryStream<Path> files = Files.newDirectoryStream(directory, "*" + SUFFIX)) {
+                for (Path file : files) {
+                    if (Files.isRegularFile(file) && holds(file, keyId)) {
+                        holders.add(SecureFiles.canonical(file));
                     }
                 }
             }
         }
+        if (explicit != null) {
+            // a --state of any name that records the IACA is the operator's choice among several holders
+            if (holders.isEmpty() || holders.contains(explicit) || holds(explicit, keyId)) {
+                return new Location(explicit, null);
+            }
+            throw new UsageException("--state " + explicit + " does not record this IACA, but " + list(holders)
+                    + " does: a second file would start a second inventory and reuse CRL numbers; pass --state with"
+                    + " that file");
+        }
         if (holders.size() > 1) {
-            throw new UsageException("the CRL state of this IACA is recorded in more than one file " + holders
+            throw new UsageException("the CRL state of this IACA is recorded in more than one file " + list(holders)
                     + "; pass --state <file> to say which one is current");
         }
-        return holders.isEmpty() ? preferred : holders.get(0);
+        Path canonical = home.resolve(canonicalName(keyId));
+        if (holders.isEmpty()) {
+            return new Location(canonical, null);
+        }
+        Path holder = holders.first();
+        if (holder.equals(legacyPath(iacaStore)) && !Files.exists(canonical, LinkOption.NOFOLLOW_LINKS)) {
+            try (SecureFiles.Lock files = SecureFiles.lockAll(
+                    List.of(SecureFiles.lockFile(holder), SecureFiles.lockFile(canonical)))) {
+                CrlState legacy = read(holder);
+                if (legacy != null && legacy.iacas.size() == 1 && legacy.inventory(keyId) != null
+                        && !Files.exists(canonical, LinkOption.NOFOLLOW_LINKS)) {
+                    SecureFiles.rename(holder, canonical);
+                    return new Location(canonical, holder);
+                }
+            }
+        }
+        return new Location(holder, null);
+    }
+
+    private static String list(Collection<Path> paths) {
+        return paths.stream().map(Path::toString).collect(Collectors.joining(", ", "[", "]"));
     }
 
     private static boolean holds(Path path, String keyId) throws IOException {
@@ -224,14 +291,22 @@ final class CrlState {
             if (!keyId.matches("[0-9a-f]{2,128}") || !node.isObject()) {
                 throw corrupt(path, "the IACA entry \"" + keyId + "\" is not a key identifier with an object");
             }
+            // every inventory the CLI writes has issued a CRL, so a missing number is damage, never "no CRL yet":
+            // reading it as such would restart the sequence at 1 under revocations already published
             BigInteger last;
             JsonNode lastNode = node.get("lastCrlNumber");
+            if (lastNode == null || lastNode.isNull()) {
+                throw corrupt(path, "lastCrlNumber of " + keyId + " is missing");
+            }
             try {
-                last = lastNode == null || lastNode.isNull() ? null : new BigInteger(lastNode.asText());
+                if (!lastNode.isTextual() && !lastNode.isIntegralNumber()) {
+                    throw new NumberFormatException(lastNode.getNodeType().toString());
+                }
+                last = new BigInteger(lastNode.asText());
             } catch (NumberFormatException e) {
                 throw corrupt(path, "lastCrlNumber of " + keyId + " is not a decimal integer");
             }
-            if (last != null && last.signum() < 0) {
+            if (last.signum() < 0) {
                 throw corrupt(path, "lastCrlNumber of " + keyId + " is negative");
             }
             Inventory inventory = new Inventory(text(node, "subject"), last);
@@ -264,13 +339,12 @@ final class CrlState {
         root.put("format", FORMAT);
         ObjectNode iacasNode = root.putObject("iacas");
         iacas.forEach((keyId, inventory) -> {
+            if (inventory.lastCrlNumber == null) {
+                throw new IllegalStateException("the inventory of " + keyId + " has no CRL number to record");
+            }
             ObjectNode node = iacasNode.putObject(keyId);
             node.put("subject", inventory.subject);
-            if (inventory.lastCrlNumber == null) {
-                node.putNull("lastCrlNumber");
-            } else {
-                node.put("lastCrlNumber", inventory.lastCrlNumber.toString());
-            }
+            node.put("lastCrlNumber", inventory.lastCrlNumber.toString());
             ArrayNode revoked = node.putArray("revoked");
             inventory.revoked.forEach((serial, at) -> revoked.addObject()
                     .put("serial", serial.toString(16))
