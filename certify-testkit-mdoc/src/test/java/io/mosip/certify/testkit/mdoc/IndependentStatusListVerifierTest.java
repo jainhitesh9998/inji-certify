@@ -455,6 +455,95 @@ class IndependentStatusListVerifierTest {
                 "both oracles verified: " + report.check(IndependentStatusListVerifier.CHECK_SIGNATURE));
     }
 
+    /**
+     * Review round 3, 1: the suppression is decided from the token's state, not from check names, because several
+     * check codes also cover shapes Multipaz accepts. Each probe keeps exp = now + 400 days on the Annex B 457-day
+     * signer, so {@code fromCwt} refuses on maxValidity; only a defect {@code fromCwt} itself refuses on may explain
+     * that, and none of these does.
+     */
+    @Test
+    void aBitsValueMultipazAcceptsDoesNotHideItsMaxValidityRefusal() {
+        Fixture fixture = new Fixture();
+        X509Cert longLived = longLived(fixture, 25L);
+        long exp = NOW.plusSeconds(400L * 24 * 3600).getEpochSecond();
+        assertProblems(multipazRefusal(fixture, longLived, exp, claims -> claims.put(claim(65533),
+                        statusListClaim(2, fixture.zlib(STATUSES)))),
+                Map.of(IndependentStatusListVerifier.CHECK_LIST, List.of("bitsNotOne"),
+                        IndependentStatusListVerifier.CHECK_CHAIN, List.of("untrusted")));
+    }
+
+    @Test
+    void anUntaggedCoseSign1DoesNotHideMultipazsMaxValidityRefusal() {
+        Fixture fixture = new Fixture();
+        X509Cert longLived = longLived(fixture, 26L);
+        long exp = NOW.plusSeconds(400L * 24 * 3600).getEpochSecond();
+        VerificationReport report = verify(fixture, fixture.builder().signer(longLived, fixture.statusKey)
+                        .claims(claimsOf(fixture, exp)).tag(null).build(),
+                new IndependentStatusListVerifier.StatusListOptions(true, 0, true), longLived);
+        assertProblems(report, Map.of(
+                IndependentStatusListVerifier.CHECK_ENVELOPE, List.of("notTagged18"),
+                IndependentStatusListVerifier.CHECK_CHAIN, List.of("untrusted")));
+    }
+
+    @Test
+    void aFutureIatNextToAnExpDoesNotHideMultipazsMaxValidityRefusal() {
+        Fixture fixture = new Fixture();
+        X509Cert longLived = longLived(fixture, 27L);
+        long exp = NOW.plusSeconds(400L * 24 * 3600).getEpochSecond();
+        assertProblems(multipazRefusal(fixture, longLived, exp, claims -> claims.put(claim(6),
+                        DataItemExtensionsKt.toDataItem(NOW.plusSeconds(3600).getEpochSecond()))),
+                Map.of(IndependentStatusListVerifier.CHECK_CLAIMS, List.of("iatFuture"),
+                        IndependentStatusListVerifier.CHECK_CHAIN, List.of("untrusted")));
+    }
+
+    @Test
+    void aGarbageLstBstrDoesNotHideMultipazsMaxValidityRefusal() {
+        Fixture fixture = new Fixture();
+        X509Cert longLived = longLived(fixture, 28L);
+        long exp = NOW.plusSeconds(400L * 24 * 3600).getEpochSecond();
+        assertProblems(multipazRefusal(fixture, longLived, exp, claims -> claims.put(claim(65533),
+                        statusListClaim(1, new byte[] {(byte) 0xb9, (byte) 0xa3}))),
+                Map.of(IndependentStatusListVerifier.CHECK_LIST, List.of("lstNotZlib"),
+                        IndependentStatusListVerifier.CHECK_CHAIN, List.of("untrusted")));
+    }
+
+    private static X509Cert longLived(Fixture fixture, long serial) {
+        return fixture.issuedValid(fixture.statusKey, "Long-Lived Status Signer", serial,
+                List.of(IndependentStatusListVerifier.STATUS_SIGNING_EKU), true, NOW.minusSeconds(86_400),
+                NOW.plusSeconds(457L * 24 * 3600));
+    }
+
+    /** Review round 3, 1: a non-integer ttl is a fromCwt refusal (its exp-absent branch), so it owns the outcome. */
+    @Test
+    void aTextTtlExplainsMultipazsRefusal() {
+        Fixture fixture = new Fixture();
+        X509Cert longLived = fixture.issuedValid(fixture.statusKey, "Long-Lived Status Signer", 26L,
+                List.of(IndependentStatusListVerifier.STATUS_SIGNING_EKU), true, NOW.minusSeconds(86_400),
+                NOW.plusSeconds(457L * 24 * 3600));
+        long exp = NOW.plusSeconds(400L * 24 * 3600).getEpochSecond();
+        Map<DataItem, DataItem> claims = claimsOf(fixture, exp);
+        claims.put(claim(4), DataItemExtensionsKt.toDataItem(NOW.plusSeconds(TTL).getEpochSecond()));
+        claims.put(claim(65534), new Tstr("3600"));
+        VerificationReport report = verify(fixture, fixture.builder().signer(longLived, fixture.statusKey).claims(claims).build(),
+                new IndependentStatusListVerifier.StatusListOptions(true, 0, true), longLived);
+        assertProblems(report, Map.of(IndependentStatusListVerifier.CHECK_CLAIMS, List.of("ttlInvalid")));
+    }
+
+    private static VerificationReport multipazRefusal(Fixture fixture, X509Cert signer, long exp,
+                                                      java.util.function.Consumer<Map<DataItem, DataItem>> mutation) {
+        Map<DataItem, DataItem> claims = claimsOf(fixture, exp);
+        mutation.accept(claims);
+        return verify(fixture, fixture.builder().signer(signer, fixture.statusKey).claims(claims).build(),
+                new IndependentStatusListVerifier.StatusListOptions(true, 0, true), signer);
+    }
+
+    /** The canonical claims with exp set. */
+    private static Map<DataItem, DataItem> claimsOf(Fixture fixture, long exp) {
+        Map<DataItem, DataItem> claims = fixture.canonicalClaims();
+        claims.put(claim(4), DataItemExtensionsKt.toDataItem(exp));
+        return claims;
+    }
+
     /** A signer past its notAfter at the evaluation instant fails the chain, not a claim, for the trust decision. */
     @Test
     void aSignerExpiredAtTheEvaluationInstantIsUntrusted() {

@@ -160,25 +160,13 @@ public final class IndependentStatusListVerifier {
      * "not yet issued".
      */
     static final long IAT_FUTURE_SKEW_SECONDS = 5;
+    /** Multipaz's {@code fromCwt} default {@code maxValidity} (365 days), which {@code CachingRevocationChecker} uses. */
+    static final long MAX_VALIDITY_SECONDS = 365L * 24 * 3600;
+    /** The {@code bits} values Multipaz's {@code CompressedStatusList} constructor accepts (ISO2 12.3.6.5 wants 1). */
+    static final Set<Long> FROM_CWT_BITS = Set.of(1L, 2L, 4L, 8L);
     static final int MAX_SERIAL_OCTETS = 20;
 
     private static final Pattern CODE = Pattern.compile("([A-Za-z][A-Za-z0-9]*)(?::([A-Za-z0-9_./-]+))?");
-
-    /**
-     * The codes each check reports that {@code CompressedStatusList.fromCwt} itself refuses on, read from Multipaz
-     * 0.102.0's {@code validateCwt} and {@code fromCwt}/{@code fromCborMap}: the COSE/tag envelope, the protected
-     * {@code typ}, the signature, {@code sub}, {@code exp}/{@code iat} (including Multipaz's own maxValidity) and the
-     * presence/shape of the {@code status_list} claim. A {@code fromCwt} refusal is charged to the chain only when one
-     * of <b>these</b> codes failed; a code {@code fromCwt} never looks at ({@code ttlInvalid}, {@code expAfterSigner},
-     * {@code iatAfterExp}, {@code idxOutOfRange}, {@code statusMismatch}) cannot explain its refusal, so the refusal is
-     * a real gate failure (maxValidity today) and must be reported.
-     */
-    private static final Map<String, Set<String>> FROM_CWT_CODES = Map.of(
-            CHECK_ENVELOPE, Set.of("notTagged18", "cwtTag61", "mac0", "detachedPayload"),
-            CHECK_TYP, Set.of("missing", "unprotected", "notText", "wrong"),
-            CHECK_SIGNATURE, Set.of("invalid:multipaz", "invalid:authlete"),
-            CHECK_CLAIMS, Set.of("subMismatch", "iatMissing", "iatFuture", "expMissing", "expired"),
-            CHECK_LIST, Set.of("missing", "bitsNotOne", "lstNotZlib"));
 
     private static Map<String, List<String>> problemCodes() {
         Map<String, List<String>> codes = new LinkedHashMap<>();
@@ -198,20 +186,6 @@ public final class IndependentStatusListVerifier {
             throw new IllegalStateException("PROBLEM_CODES must list every check in report order");
         }
         return Collections.unmodifiableMap(codes);
-    }
-
-    /**
-     * True when one of {@code checks} failed on a code {@link #FROM_CWT_CODES} lists, i.e. {@code fromCwt} refuses
-     * this token for a reason the report already names. Any other failure cannot explain a {@code fromCwt} refusal.
-     */
-    static boolean fromCwtRefusalExplained(VerificationReport.Check... checks) {
-        for (VerificationReport.Check check : checks) {
-            Set<String> owned = FROM_CWT_CODES.get(check.name());
-            if (owned != null && check.codes().stream().anyMatch(owned::contains)) {
-                return true;
-            }
-        }
-        return false;
     }
 
     /** True when {@code code} is one {@code check} reports: a listed code, or a parameterised one with its parameter. */
@@ -280,9 +254,9 @@ public final class IndependentStatusListVerifier {
                 problems -> token.signature(problems, !envelope.passed()));
         VerificationReport.Check claims = run(CHECK_CLAIMS, problems -> token.claims(problems, uri, at));
         VerificationReport.Check list = run(CHECK_LIST, problems -> token.list(problems, idx, options.expectedStatus()));
-        // Only a failure fromCwt itself makes can explain its refusal; ttl, exp-vs-notAfter, idx and the status are
-        // outside its rules, so a refusal next to one of those is the gate (maxValidity) and belongs to the chain.
-        boolean fromCwtRefusalExplained = fromCwtRefusalExplained(envelope, typ, signature, claims, list);
+        // Only a defect fromCwt itself refuses on can explain its refusal; the decision is taken from the token's
+        // state (tags, payload, claims), not from check names, because several codes cover shapes fromCwt accepts.
+        boolean fromCwtRefusalExplained = token.fromCwtRefusesOnAReportedDefect(uri, at, typ, signature);
         List<VerificationReport.Check> checks = new ArrayList<>();
         checks.add(run(CHECK_HTTP, problems -> http(problems, contentType)));
         checks.add(envelope);
@@ -683,10 +657,14 @@ public final class IndependentStatusListVerifier {
                 return "the x5chain validates to " + iaca.getSubjectX500Principal() + "; fromCwt refused for a reason one "
                         + "of the checks it also makes already reports (" + describe(fromCwtRefusal) + ")";
             }
-            problems.add("untrusted", fromCwtReason + ", and no check fromCwt also makes failed, so the refusal is the "
-                    + "gate: Multipaz's maxValidity caps exp at 365 days after the evaluation instant (the wallet "
-                    + "default in CachingRevocationChecker), and the chain itself validates to "
-                    + iaca.getSubjectX500Principal());
+            Long exp = claims == null ? null : numeric(claims, CLAIM_EXP);
+            boolean beyondMaxValidity = exp != null && exp > at.getEpochSecond() + MAX_VALIDITY_SECONDS;
+            problems.add("untrusted", fromCwtReason + ", and no defect fromCwt refuses on is reported by another check: "
+                    + (beyondMaxValidity
+                            ? "most likely maxValidity — exp " + Instant.ofEpochSecond(exp) + " is more than 365 days after "
+                                    + at + ", the wallet default in CachingRevocationChecker"
+                            : "the refusal comes from a rule no check names")
+                    + "; the chain itself validates to " + iaca.getSubjectX500Principal());
             return null;
         }
 
@@ -823,6 +801,77 @@ public final class IndependentStatusListVerifier {
                         + expectedStatus + " (TSL 7.1: 0 VALID, 1 INVALID)");
             }
             return "bits 1, a zlib lst of " + statuses.length + " octets and status " + status + " at idx " + idx;
+        }
+
+        /**
+         * Whether {@code CompressedStatusList.fromCwt} refuses this token for a defect one of our checks reports, read
+         * from the token's own state rather than from check names. Verified against the Multipaz 0.102.0 bytecode:
+         * <ul>
+         *     <li>{@code ValidateCwtKt.validateCwt-efNRYWU} unwraps at most one tag 18 (an untagged COSE_Sign1 and
+         *     exactly {@code [18]} are accepted; a second tag, or any other tag, fails {@code getAsCoseSign1}), so
+         *     {@code notTagged18} explains a refusal only for a parse failure or such a tag stack, never for an
+         *     untagged token;</li>
+         *     <li>its {@code checks} map carries TYP and SUB, and it verifies the COSE signature — so any
+         *     {@code statusList.typ}, {@code statusList.signature} or {@code subMismatch} failure explains one;</li>
+         *     <li>{@code exp} is read first ({@code WebTokenClaim.get}), so a present non-integer {@code exp} refuses;
+         *     {@code exp} absent reads {@code iat} ({@code "either 'exp' or 'iat' is required"}, {@code "'iat' is in
+         *     future"} beyond 5 s) and then computes {@code iat + maxValidity} — so {@code iatMissing}/{@code iatFuture}
+         *     explain only when {@code exp} is absent, {@code expired} explains always, and maxValidity (no code of
+         *     ours) never does;</li>
+         *     <li>{@code CompressedStatusList$Companion.fromCborMap} reads {@code ttl} only in its exp-absent branch
+         *     ({@code ttl.asNumber}), so a non-integer {@code ttl} refuses only without {@code exp}; with {@code exp}
+         *     present {@code ttl} is not read at all;</li>
+         *     <li>{@code fromCborMap} requires the {@code status_list} key, {@code fromStatusListClaim} requires
+         *     {@code bits} to be a {@code Uint} and {@code lst} a {@code Bstr} (it never inflates {@code lst}), and the
+         *     {@code CompressedStatusList} constructor requires {@code bits in 1,2,4,8} — so {@code list:missing},
+         *     a missing/non-uint/out-of-set {@code bits} ({@code bitsNotOne} for bits 2,4,8 are accepted) and a
+         *     missing/non-bstr {@code lst} ({@code lstNotZlib} for a garbage bstr is not) explain one.</li>
+         * </ul>
+         */
+        boolean fromCwtRefusesOnAReportedDefect(String uri, Instant at, VerificationReport.Check typ,
+                                                VerificationReport.Check signature) {
+            if (parseError != null || detached) {
+                return true;
+            }
+            if (!tags.isEmpty() && !tags.equals(List.of(TAG_COSE_SIGN1))) {
+                return true;
+            }
+            if (!typ.passed() || !signature.passed()) {
+                return true;
+            }
+            if (claims == null) {
+                return false;
+            }
+            DataItem sub = claims.getOrNull(CLAIM_SUB);
+            if (sub == null || sub.getMajorType() != MajorType.UNICODE_STRING || !sub.getAsTstr().equals(uri)) {
+                return true;
+            }
+            DataItem expItem = claims.getOrNull(CLAIM_EXP);
+            if (expItem != null && !isInteger(expItem)) {
+                return true;
+            }
+            if (expItem == null) {
+                DataItem iatItem = claims.getOrNull(CLAIM_IAT);
+                if (!isInteger(iatItem) || iatItem.getAsNumber() > at.getEpochSecond() + IAT_FUTURE_SKEW_SECONDS) {
+                    return true;
+                }
+                DataItem ttlItem = claims.getOrNull(CLAIM_TTL);
+                if (ttlItem != null && !isInteger(ttlItem)) {
+                    return true;
+                }
+            } else if (expItem.getAsNumber() < at.getEpochSecond()) {
+                return true;
+            }
+            DataItem statusList = claims.getOrNull(CLAIM_STATUS_LIST);
+            if (statusList == null || statusList.getMajorType() != MajorType.MAP) {
+                return true;
+            }
+            DataItem bits = statusList.getOrNull("bits");
+            if (!isInteger(bits) || !FROM_CWT_BITS.contains(bits.getAsNumber())) {
+                return true;
+            }
+            DataItem lst = statusList.getOrNull("lst");
+            return lst == null || lst.getMajorType() != MajorType.BYTE_STRING;
         }
 
         /**
@@ -1030,6 +1079,11 @@ public final class IndependentStatusListVerifier {
         }
     }
 
+    private static boolean isInteger(DataItem value) {
+        return value != null && (value.getMajorType() == MajorType.UNSIGNED_INTEGER
+                || value.getMajorType() == MajorType.NEGATIVE_INTEGER);
+    }
+
     private static String shortly(DataItem value) {
         String text = String.valueOf(value);
         return text.length() <= 80 ? text : text.substring(0, 77) + "...";
@@ -1062,7 +1116,7 @@ public final class IndependentStatusListVerifier {
         private static Method bridge;
         private static String failure;
         /** Test seam: makes resolution fail as if a Multipaz upgrade had changed fromCwt. */
-        private static String forcedFailure;
+        private static volatile String forcedFailure;
 
         static synchronized Method bridge() {
             if (forcedFailure != null) {

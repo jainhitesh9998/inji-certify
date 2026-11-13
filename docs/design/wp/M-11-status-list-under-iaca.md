@@ -568,7 +568,7 @@ days.
 | `statusList.typ` | `missing`, `unprotected`, `notText`, `wrong` | TSL §5.2 |
 | `statusList.x5chain` | `missing`, `unprotectedOnly`, `carriesAnchor` (any self-signed certificate), `serialNumber` (≤ 0 or > 20 octets) | ISO2 12.3.6.3; HAIP §6.1 analogue; RFC 5280 §4.1.2.2 |
 | `statusList.signature` | `invalid:multipaz`, `invalid:authlete` | TSL §5.2 rule 2 |
-| `statusList.chain` | `untrusted` (Multipaz `fromCwt` against `iaca` refuses, reported when no code `fromCwt` also decides failed — envelope, `typ`, signature, `subMismatch`/`iatMissing`/`iatFuture`/`expMissing`/`expired`, `list:missing`/`bitsNotOne`/`lstNotZlib` — so a `ttlInvalid`, `expAfterSigner`, `iatAfterExp`, `idxOutOfRange` or `statusMismatch` next to a maxValidity refusal cannot hide it), `noAnchorSupplied` | ISO2 12.3.6.2 |
+| `statusList.chain` | `untrusted` (Multipaz `fromCwt` against `iaca` refuses, reported when the token's state is not defective in a way `fromCwt` itself refuses on — its rule set, read from `ValidateCwtKt.validateCwt-efNRYWU`, `CompressedStatusList$Companion.fromCborMap`/`fromStatusListClaim` and the `CompressedStatusList` constructor: at most one tag 18 (an untagged COSE_Sign1 is accepted), protected `typ`, the SUB check, the signature, `exp`/`iat`/`ttl` with `iat` and `ttl` read only when `exp` is absent, and the presence/type/range of `status_list`/`bits` (1,2,4,8)/`lst` (bstr, never inflated). maxValidity, which no check names, is therefore never suppressed, so `ttlInvalid` with an `exp`, `expAfterSigner`, `iatAfterExp`, `idxOutOfRange` and `statusMismatch` next to it cannot hide it), `noAnchorSupplied` | ISO2 12.3.6.2 |
 | `statusList.issuanceChain` | `differs` (the token `x5chain` is not certificate-for-certificate equal to `issuerAuthX5chain`) | Credo `mdocUtil.ts:76-115` |
 | `statusList.claims` | `subMismatch`, `iatMissing`, `iatFuture` (> `at` + 5 s, Multipaz `validateCwt`'s own clock allowance), `iatAfterExp`, `expMissing`, `expired`, `expAfterSigner` (exp > leaf `notAfter`), `ttlInvalid` | TSL §5.2, §8.3 4a/4c; ISO2 12.3.6.3 |
 | `statusList.list` | `missing` (no `status_list` claim, or not a map), `bitsNotOne`, `lstNotZlib` (including raw DEFLATE without the zlib wrapper), `idxOutOfRange`, `statusMismatch:<n>` (read with Multipaz's `StatusList.get`) | ISO2 12.3.6.5; TSL §4.3, §4.1, §8.3 step 6 |
@@ -610,8 +610,17 @@ itself) and falls back to the unwrapped array only for a tag stack whose envelop
 (`18(18(…))`). Tests: `aMaxValidityRefusalIsNotHiddenByACodeFromCwtNeverChecks`,
 `oneGapSetCoversBothReportsAndOnlyTheMalformedMsoGapIsDeclarable`,
 `theFromCwtAdapterResolvesAgainstThePinnedMultipazJar`, `aBrokenFromCwtAdapterIsAnErrorNotAnUntrustedChain`,
-`authleteVerifiesTheWireBytesOfAMultipazBuiltToken`, and the IdentifierList-only absent case. **Open (unchanged):** an
-algorithm allow-list (isomdl accepts only ES256/ES384) — owner decision later.
+`authleteVerifiesTheWireBytesOfAMultipazBuiltToken`, and the IdentifierList-only absent case. **Review round 3 (2026-11-13, approved with one minor and two nits).** Fixed here: the suppression is decided from
+the token's state (tags, payload, `sub`/`exp`/`iat`/`ttl`/`status_list`/`bits`/`lst`) against the bytecode of
+`validateCwt`/`fromCborMap`/`fromStatusListClaim`/the constructor, not from check names, because several codes also
+cover shapes `fromCwt` accepts — an untagged COSE_Sign1, `bits` 2/4/8, a `iat` with `exp` present, a garbage `lst` bstr
+and a `ttl` with `exp` present all used to suppress its maxValidity refusal and no longer do (a non-integer `ttl`
+explains only in the exp-absent branch `fromCborMap` reads); the `untrusted` message now says "most likely
+maxValidity" and names it only when `exp > at + 365 days`; the test seam is `volatile`. Probes are one test each
+(`aBitsValueMultipazAcceptsDoesNotHideItsMaxValidityRefusal`, `anUntaggedCoseSign1DoesNotHideMultipazsMaxValidityRefusal`,
+`aFutureIatNextToAnExpDoesNotHideMultipazsMaxValidityRefusal`, `aGarbageLstBstrDoesNotHideMultipazsMaxValidityRefusal`,
+`aTextTtlExplainsMultipazsRefusal`). **Open (unchanged):** an algorithm allow-list (isomdl accepts only ES256/ES384) —
+owner decision later.
 
 **Acceptance checklist.**
 
