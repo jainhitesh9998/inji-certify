@@ -115,6 +115,8 @@ pass public HEAD /v1/certify/oid4vci/.well-known/openid-credential-issuer
 pass public GET  /v1/certify/offer
 pass public GET  /v1/certify/offer/
 pass public GET  /v1/certify/offer?subject=mdl-demo-1
+pass public GET  /v1/certify/offer/qrcode.min.js
+pass public GET  /v1/certify/offer/cbor.js
 pass public GET  /v1/certify/credential-offer-data/0b9a6c1e-4c1d-4f1e-9d39-0d2d1b5b8c55
 pass public GET  /v1/certify/credentials/status-list/abc
 pass public GET  /v1/certify/credentials/token-status-list/abc
@@ -222,6 +224,10 @@ pass public POST /oid4vci/credential
 403  public PUT  /v1/certify/pre-authorized-data
 403  public POST /v1/certify/.well-known/openid-credential-issuer
 403  public DELETE /v1/certify/credential-offer-data/abc
+403  public GET  /v1/certify/offer/other.js
+403  public GET  /v1/certify/offer/qrcode.min.js.map
+403  public GET  /v1/certify/offer/x/cbor.js
+403  public POST /v1/certify/offer/cbor.js
 # --- evasions ---
 403  public POST /v1/certify/oid4vci/../sign
 403  public POST /v1/certify/oid4vci/%2e%2e/sign
