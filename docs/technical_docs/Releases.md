@@ -146,6 +146,8 @@ An issuer can name the ISO/IEC 18013-5 IACAs its mDoc Document Signers chain to 
 
 - `/oid4vci` issuer metadata. The document under `/oid4vci/.well-known/openid-credential-issuer` no longer carries members whose value is null (`logo`, `background_image`, `background_color`, `text_color`, a claim's `display`): OpenID4VCI 1.0 section 12.2.4 defines them as optional, so they are absent unless configured. `credential_metadata.claims` now follows the configuration's `display.order` (claims it does not list come after, ordered by path) instead of map order. The compatibility documents (`/.well-known/openid-credential-issuer`, `/issuance/...`) are unchanged.
 
+- v2 configuration API errors. `POST`/`PUT /v2/credential-configurations` now require `scope`, `display.display` and `display.order` (empty lists are allowed) and answer `400 invalid_configuration` naming the missing field; a body without `display.order` used to reach the database and come back as HTTP 200 with the MOSIP error envelope and the SQL statement. Whatever else fails on the v2 API is answered with a 4xx or 5xx status and `{error, error_description}`, without SQL text: a unique-key conflict is `409 configuration_exists`, another database constraint `400 invalid_configuration`, an unreadable body `400`, an unexpected failure `500 server_error`. The v1 API is unchanged.
+
 ## Removal of  Artifactory dependency
 
 ```text
