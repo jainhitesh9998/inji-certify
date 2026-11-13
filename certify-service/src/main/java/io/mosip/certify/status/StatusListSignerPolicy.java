@@ -17,6 +17,7 @@ import java.security.cert.X509CRLEntry;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
@@ -35,14 +36,15 @@ import java.util.Set;
  * <p>Two groups, as for the mDoc Document Signer ({@code MdocDscPolicy}):
  * <ul>
  *     <li><b>always</b>: the signer has a certificate chain, the leaf is not self-signed, every certificate that issues
- *     another one in the path is a CA allowed to do so (RFC 5280 section 6.1.4: {@code basicConstraints cA} TRUE,
- *     {@code pathLenConstraint} respected, key usage {@code keyCertSign}), the signing instant lies inside every
- *     certificate's validity and every link verifies ({@link CertificateChainPolicy}), and the {@code x5chain} the
- *     token would carry holds no self-signed certificate;</li>
+ *     another one in the chain — a trust anchor the chain carries included — is a CA allowed to do so (RFC 5280
+ *     section 6.1.4: {@code basicConstraints cA} TRUE, key usage {@code keyCertSign}, {@code pathLenConstraint}
+ *     respected), the signing instant lies inside every certificate's validity and every link verifies
+ *     ({@link CertificateChainPolicy}), and the {@code x5chain} the token would carry holds no self-signed
+ *     certificate;</li>
  *     <li><b>once an {@code mdoc-iaca} anchor is configured</b> ({@link #enforced()}): an IACA issued the chain's top
- *     certificate and is valid at the signing instant, that certificate's serial is not on the anchor's CRL, the CRL is
- *     not stale, and the leaf carries the extended key usage its {@link Mode} needs plus {@code digitalSignature} key
- *     usage.</li>
+ *     certificate, is a CA whose {@code pathLenConstraint} allows the intermediates between it and the leaf, and is
+ *     valid at the signing instant; that certificate's serial is not on the anchor's CRL, the CRL is not stale, and the
+ *     leaf carries the extended key usage its {@link Mode} needs plus {@code digitalSignature} key usage.</li>
  * </ul>
  *
  * <p>This class runs <b>before every</b> {@code CwtEnvelope.signOrdered} call: M-11a's envelope refuses only an empty
@@ -66,8 +68,13 @@ public final class StatusListSignerPolicy {
     public static final String NOT_YET_VALID = "STATUS_SIGNER_NOT_YET_VALID";
     /** A link of the chain does not verify. */
     public static final String CHAIN_LINK_INVALID = "CHAIN_LINK_INVALID";
-    /** A certificate that issues another one in the path is not a CA, or is not allowed to issue it. */
+    /** A certificate that issues another one in the path is not a CA, or its key usage does not allow keyCertSign. */
     public static final String ISSUER_NOT_CA = "STATUS_SIGNER_ISSUER_NOT_CA";
+    /**
+     * A CA of the path — the trust anchor included, whether the chain carries it or the registry supplies it — has a
+     * {@code pathLenConstraint} smaller than the number of non-self-issued intermediates between it and the leaf.
+     */
+    public static final String PATH_LENGTH = "STATUS_SIGNER_PATH_LENGTH";
     /** The {@code x5chain} the token would emit holds a self-signed certificate above the leaf. */
     public static final String CARRIES_ANCHOR = "STATUS_SIGNER_CARRIES_ANCHOR";
     /** No configured IACA issued the chain's top certificate. */
@@ -148,7 +155,7 @@ public final class StatusListSignerPolicy {
         } catch (SigningException e) {
             throw validityRefusal(e);
         }
-        requireIssuersAreCas(certificates, registry.entries(TrustAnchorRegistry.MDOC_IACA));
+        requireIssuersAreCas(certificates);
         List<X509Certificate> emitted = chain.withoutAnchor().leafFirst();
         for (int index = 1; index < emitted.size(); index++) {
             X509Certificate certificate = emitted.get(index);
@@ -172,21 +179,28 @@ public final class StatusListSignerPolicy {
     }
 
     /**
-     * RFC 5280 section 6.1.4 for every certificate of the chain that issues the one below it: {@code basicConstraints}
-     * must say {@code cA} TRUE, {@code pathLenConstraint} must allow the intermediates beneath it, and key usage must
-     * include {@code keyCertSign}. Without this an end-entity certificate (no basicConstraints, only
-     * {@code digitalSignature}) could stand in as an intermediate and the path would look complete to every signature
-     * check while no RFC 5280 verifier would build it. The trust anchor is not checked here: a leaf-only chain leaves it
-     * to the registry, which validates an IACA when it loads it ({@code FileTrustAnchorRegistry}).
+     * RFC 5280 section 6.1.4 for every certificate of {@code path} (leaf first) that issues the one below it:
+     * {@code basicConstraints} must say {@code cA} TRUE and key usage must include {@code keyCertSign}
+     * ({@value #ISSUER_NOT_CA}), and its {@code pathLenConstraint} must allow the non-self-issued intermediates between
+     * it and the leaf ({@value #PATH_LENGTH}; 6.1.4 (l) and (m): a self-issued certificate does not count, the leaf
+     * never does). Without the CA checks an end-entity certificate (no basicConstraints, only {@code digitalSignature})
+     * could stand in as an intermediate and the path would look complete to every signature check while no RFC 5280
+     * verifier would build it.
+     *
+     * <p>The trust anchor is held to the same rules, whether the chain carries it ({@link #check}) or the registry
+     * supplies it ({@link #checkTrust}). RFC 5280 section 6.1.1 lets a verifier ignore the constraints of the anchor's
+     * certificate, but RFC 5937 makes enforcing them an option and the verifiers that read these lists take it: Multipaz
+     * and OpenSSL 3 refuse {@code IACA (pathLenConstraint 0) -> intermediate -> signer} ("path length exceeded"), so a
+     * list signed under that path is invalid on arrival. An Annex B IACA carries {@code pathLenConstraint} 0, so its
+     * Document Signers and status-list signers are issued by it directly.
      */
-    private static void requireIssuersAreCas(List<X509Certificate> certificates,
-                                             List<TrustAnchorRegistry.Anchor> anchors) {
-        for (int index = 1; index < certificates.size(); index++) {
-            X509Certificate issuer = certificates.get(index);
+    private static void requireIssuersAreCas(List<X509Certificate> path) {
+        for (int index = 1; index < path.size(); index++) {
+            X509Certificate issuer = path.get(index);
             int pathLen = issuer.getBasicConstraints();
             if (pathLen < 0) {
                 throw refuse(ISSUER_NOT_CA, "the certificate " + issuer.getSubjectX500Principal() + " at position "
-                        + index + " issues " + certificates.get(index - 1).getSubjectX500Principal() + " but is not a CA:"
+                        + index + " issues " + path.get(index - 1).getSubjectX500Principal() + " but is not a CA:"
                         + " basicConstraints cA TRUE is required for a certificate that issues another one"
                         + " (RFC 5280 section 4.2.1.9 and 6.1.4), so an end-entity certificate cannot act as an"
                         + " intermediate of a status list signer's chain");
@@ -194,28 +208,31 @@ public final class StatusListSignerPolicy {
             boolean[] keyUsage = issuer.getKeyUsage();
             if (keyUsage == null || keyUsage.length <= 5 || !keyUsage[5]) {
                 throw refuse(ISSUER_NOT_CA, "the certificate " + issuer.getSubjectX500Principal() + " at position "
-                        + index + " issues " + certificates.get(index - 1).getSubjectX500Principal() + " but its key"
+                        + index + " issues " + path.get(index - 1).getSubjectX500Principal() + " but its key"
                         + " usage does not assert keyCertSign (RFC 5280 section 4.2.1.3), which a certificate that issues"
                         + " another one needs");
             }
-            if (isAnchor(issuer, anchors) || (index == certificates.size() - 1 && CertificateLinks.selfIssued(issuer))) {
-                // the trust anchor is an input to path validation, not a certificate of the path (RFC 5280 section
-                // 6.1.1): its own pathLenConstraint is the verifier's business, and an Annex B IACA carries 0 because
-                // an ISO/IEC 18013-5 Document Signer is issued directly
-                continue;
+            int intermediatesBelow = 0;
+            for (int below = 1; below < index; below++) {
+                if (!CertificateLinks.selfIssued(path.get(below))) {
+                    intermediatesBelow++;
+                }
             }
-            int intermediatesBelow = index - 1;
             if (intermediatesBelow > pathLen) {
-                throw refuse(ISSUER_NOT_CA, "the certificate " + issuer.getSubjectX500Principal() + " at position "
+                throw refuse(PATH_LENGTH, "the certificate " + issuer.getSubjectX500Principal() + " at position "
                         + index + " has pathLenConstraint " + pathLen + " but " + intermediatesBelow
-                        + " intermediate certificate(s) follow it in the path (RFC 5280 section 6.1.4)");
+                        + " intermediate certificate(s) lie between it and the signer (RFC 5280 section 6.1.4 (l) and"
+                        + " (m)); verifiers that enforce the trust anchor's constraints, Multipaz and OpenSSL among them,"
+                        + " refuse this path, so the signer must be issued "
+                        + (pathLen == 0 ? "by it directly" : "within " + pathLen + " intermediate(s) of it"));
             }
         }
     }
 
     private void checkTrust(X509Certificate leaf, List<X509Certificate> certificates, Instant now, Mode mode) {
         List<TrustAnchorRegistry.Anchor> anchors = registry.entries(TrustAnchorRegistry.MDOC_IACA);
-        X509Certificate candidate = topmostNonAnchor(certificates, anchors);
+        int top = topmostNonAnchor(certificates, anchors);
+        X509Certificate candidate = certificates.get(top);
         TrustAnchorRegistry.Anchor anchor = anchors.stream()
                 .filter(candidateAnchor -> CertificateLinks.issuedBy(candidate, candidateAnchor.certificate()))
                 .findFirst()
@@ -223,6 +240,11 @@ public final class StatusListSignerPolicy {
                         + " (issuer " + candidate.getIssuerX500Principal() + ", at the top of the signer's chain) was"
                         + " not issued by any configured IACA " + anchors.stream().map(TrustAnchorRegistry.Anchor::id).toList()
                         + "; status lists are signed only under certify.pki.trust-anchors.mdoc-iaca (D16)"));
+        // the path a verifier builds ends at the anchor it supplies: hold that anchor to RFC 5280 section 6.1.4 over the
+        // certificates below it, which the chain alone cannot do when it does not carry the anchor
+        List<X509Certificate> path = new ArrayList<>(certificates.subList(0, top + 1));
+        path.add(anchor.certificate());
+        requireIssuersAreCas(path);
         requireAnchorValid(anchor, now);
         Optional<X509CRL> crl = registry.crl(anchor.id());
         if (crl.isPresent()) {
@@ -237,6 +259,45 @@ public final class StatusListSignerPolicy {
             requireFresh(crl.get(), anchor, now);
         }
         requirePurpose(leaf, mode);
+    }
+
+    /**
+     * The latest instant a token this signer signs may stay valid: the earliest {@code notAfter} among the certificates
+     * of the signer's chain and, once {@link #enforced()}, of the IACA that issued the chain's top. A verifier builds the
+     * path from the token's {@code x5chain} to the IACA it holds, and that path is only as valid as its shortest-lived
+     * certificate, so a token whose {@code exp} passed it would outlive its own verification path (section 4.1).
+     * {@link TokenStatusListCwt#encode} refuses an {@code exp} after it; the caller computes
+     * {@code exp = min(iat + 2·ttl, validUntil)}.
+     *
+     * @throws IllegalStateException {@value #NO_CHAIN} when the signing key has no certificate
+     */
+    public Instant validUntil(SigningContext signing) {
+        Objects.requireNonNull(signing, "signing");
+        CertificateChain chain = signing.key().chain();
+        if (chain == null || chain.isEmpty() || chain.leaf().isEmpty()) {
+            throw refuse(NO_CHAIN, "the key " + signing.key().ref() + " has no certificate, so no token it signs has"
+                    + " a validity to be bounded by");
+        }
+        List<X509Certificate> certificates = chain.leafFirst();
+        Instant earliest = Instant.MAX;
+        for (X509Certificate certificate : certificates) {
+            earliest = min(earliest, certificate.getNotAfter().toInstant());
+        }
+        if (enforced()) {
+            List<TrustAnchorRegistry.Anchor> anchors = registry.entries(TrustAnchorRegistry.MDOC_IACA);
+            X509Certificate top = certificates.get(topmostNonAnchor(certificates, anchors));
+            for (TrustAnchorRegistry.Anchor anchor : anchors) {
+                if (CertificateLinks.issuedBy(top, anchor.certificate())) {
+                    earliest = min(earliest, anchor.certificate().getNotAfter().toInstant());
+                    break;
+                }
+            }
+        }
+        return earliest;
+    }
+
+    private static Instant min(Instant first, Instant second) {
+        return first.isBefore(second) ? first : second;
     }
 
     /** The anchor must be inside its own validity at the signing instant, as {@code MdocDscPolicy} holds for an mDL. */
@@ -254,16 +315,16 @@ public final class StatusListSignerPolicy {
     }
 
     /**
-     * The certificate a configured IACA had to issue: the chain's top certificate, or — when the chain carries the
-     * anchor itself — the one below it (a verifier builds the path from the signer to the IACA it supplies, so the
-     * anchor's own presence says nothing about who issued the signer).
+     * The position of the certificate a configured IACA had to issue: the chain's top certificate, or — when the chain
+     * carries the anchor itself — the one below it (a verifier builds the path from the signer to the IACA it supplies,
+     * so the anchor's own presence says nothing about who issued the signer).
      */
-    private static X509Certificate topmostNonAnchor(List<X509Certificate> certificates, List<TrustAnchorRegistry.Anchor> anchors) {
+    private static int topmostNonAnchor(List<X509Certificate> certificates, List<TrustAnchorRegistry.Anchor> anchors) {
         int index = certificates.size() - 1;
         while (index > 0 && isAnchor(certificates.get(index), anchors)) {
             index--;
         }
-        return certificates.get(index);
+        return index;
     }
 
     private static boolean isAnchor(X509Certificate certificate, List<TrustAnchorRegistry.Anchor> anchors) {

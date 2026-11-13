@@ -259,7 +259,7 @@ d2                                     tag 18: COSE_Sign1_Tagged (RFC 9052 §4.2
     59 xxxx <payload bstr>             bstr .cbor {
       a5
         02 78 .. "https://<host>/v1/certify/credentials/token-status-list/<id>"   2 sub = the MSO status_list.uri
-        04 1a <exp>                    4 exp = min(iat + 2·ttl, signer notAfter) (ISO2 12.3.6.3: shall be present)
+        04 1a <exp>                    4 exp = min(iat + 2·ttl, validUntil) (ISO2 12.3.6.3: shall be present)
         06 1a <iat>                    6 iat = signing time, whole seconds
         19 fffd a2 63 6c7374 59 xxxx <zlib bytes> 64 62697473 01   65533 {"lst": bstr, "bits": 1} (TSL §4.3)
         19 fffe 19 0e10                65534 ttl = certify.status.token-status-list.ttl in seconds (default 3600)
@@ -267,9 +267,16 @@ d2                                     tag 18: COSE_Sign1_Tagged (RFC 9052 §4.2
 ```
 
 - The HTTP body is these bytes, raw (TSL §8.2), with `Content-Type: application/statuslist+cwt`.
-- `exp` is never later than the signer certificate's `notAfter` (a list does not outlive the certificate that signs it),
-  and `ttl`'s whole seconds are positive (TSL §5.2 makes it an unsigned integer, and 0 would tell a verifier not to
-  cache a list it must cache).
+- `exp` is never later than `validUntil` = `StatusListSignerPolicy.validUntil(signing)`: the earliest `notAfter` of the
+  signer's chain (an intermediate, or an IACA the chain carries, may end before the leaf) and, once IACAs are configured,
+  of the IACA that issued the chain's top. A verifier's path runs through every one of them, so a list does not outlive
+  any certificate it is verified through. `ttl`'s whole seconds are positive (TSL §5.2 makes it an unsigned integer,
+  and 0 would tell a verifier not to cache a list it must cache).
+- In the last second of the leaf's validity (`notAfter` is inclusive, RFC 5280 §4.1.2.5, so the policy still accepts the
+  signer) `min(iat + 2·ttl, notAfter)` equals `iat` and no token can be valid for a second. `encode` answers that as
+  retirement, `StatusListRetiredException`, the answer `StatusListSigners.resolve` gives one second later (D-M11-7); when
+  another certificate of the path ends first it is `STATUS_SIGNER_EXPIRED`, the refusal the policy gives one second
+  later. Neither is an `IllegalArgumentException`.
 - Stored in `status_list_credential.vc_document` as described in 4.4.
 - The protected header for ES256 and one certificate begins `a3 01 26 10 78 1a 61 70 70 6c …`. This is the same
   prefix as the draft's example, `a2 01 26 10 78 1a …`, with `x5chain` added.
@@ -372,11 +379,18 @@ status-list CWT without the policy; it also maps a `SigningException` from `Cose
   - `STATUS_SIGNER_SELF_SIGNED`: the leaf is self-signed.
   - `CertificateChainPolicy.check(chain, now)`, which yields `STATUS_SIGNER_EXPIRED`, `STATUS_SIGNER_NOT_YET_VALID` and
     `CHAIN_LINK_INVALID`.
-  - `STATUS_SIGNER_ISSUER_NOT_CA`: RFC 5280 §6.1.4 for every certificate of the chain that issues the one below it:
-    `basicConstraints cA` TRUE, `pathLenConstraint` respected, key usage `keyCertSign`. Without it an end-entity
-    certificate (no basicConstraints, only `digitalSignature`) could act as an intermediate and every signature check
-    would still pass. The trust anchor is not a certificate of the path (§6.1.1), so its own `pathLenConstraint` — 0 on
-    an Annex B IACA, whose Document Signers it issues directly — is not applied.
+  - `STATUS_SIGNER_ISSUER_NOT_CA`: RFC 5280 §6.1.4 for every certificate of the chain that issues the one below it,
+    the trust anchor included when the chain carries it: `basicConstraints cA` TRUE and key usage `keyCertSign`.
+    Without it an end-entity certificate (no basicConstraints, only `digitalSignature`) could act as an intermediate and
+    every signature check would still pass.
+  - `STATUS_SIGNER_PATH_LENGTH`: the `pathLenConstraint` of every such certificate, the trust anchor included when the
+    chain carries it, allows the non-self-issued intermediates between it and the leaf (§6.1.4 (l) and (m); a
+    self-issued certificate and the leaf do not count). RFC 5280 §6.1.1 lets a verifier ignore the constraints of the
+    anchor's certificate, but RFC 5937 makes enforcing them an option and the verifiers that read these lists take it:
+    Multipaz and OpenSSL 3 (`error 25 … path length constraint exceeded`) refuse `IACA (pathLenConstraint 0) ->
+    intermediate -> signer`, so Certify must refuse it before signing. An Annex B IACA carries 0 (AnnexBValidator
+    `IACA_PATHLEN`), so under one the signer is always issued by the IACA directly. A rule of its own, not part of
+    `ISSUER_NOT_CA`, because the operator's fix differs: the certificates are CAs, the hierarchy is too deep.
   - `STATUS_SIGNER_CARRIES_ANCHOR`: the `x5chain` to be emitted contains a self-signed certificate.
   - "Self-signed" means subject and issuer names are equal, the test `CertificateChain.withoutAnchor()` itself uses, so
     a self-issued key-rollover intermediate counts as self-signed. `CoseEnvelope` (`M-11a`) already refuses an empty
@@ -386,6 +400,12 @@ status-list CWT without the policy; it also maps a `SigningException` from `Cose
 - **Once `TrustAnchorRegistry` holds an `mdoc-iaca` anchor** (the D16 enforcement switch):
   - `STATUS_SIGNER_NO_TRUSTED_IACA`: the leaf, or the last certificate of the chain, was not issued by a configured
     IACA (AKI = SKI, else issuer name, plus signature).
+  - `STATUS_SIGNER_ISSUER_NOT_CA` / `STATUS_SIGNER_PATH_LENGTH` again, over the path a verifier builds: the chain up to
+    the certificate the IACA issued, plus the IACA from the registry. This is what catches `[signer, intermediate]`
+    under an IACA with `pathLenConstraint` 0 when the chain does not carry the IACA. Cross-checked with
+    `openssl verify -x509_strict` (3.6.3, review round 2): every chain the policy accepts with its anchor in the chain
+    or the registry OpenSSL accepts, and every path-length case it refuses OpenSSL refuses (error 25). With no anchor in
+    either there is nothing to judge the path against, as for every rule of this group (D16).
   - `STATUS_SIGNER_IACA_EXPIRED` / `STATUS_SIGNER_IACA_NOT_YET_VALID`: the IACA is outside its own validity at the
     signing instant, as `MdocDscPolicy` holds for an mDL.
   - `STATUS_SIGNER_REVOKED`: the anchor's CRL lists the certificate the IACA issued — the top of the signer's chain,
@@ -647,18 +667,23 @@ Branch `wp/m-11c-status-cwt-codec`. Depends on M-11a. About 450 lines.
      `BEST_COMPRESSION` as `TokenStatusListService.encode` uses before base64url); 65534 → `ttl.getSeconds()`.
    - Signed with `CwtEnvelope.signOrdered(claims, CoseHeaderPolicy.statusListCwt(), signing.key(), signing.signer())`.
    - `iat` and `exp` are whole seconds, with `exp > iat`; `ttl`'s whole seconds are positive (≥ 1, so a sub-second
-     duration is refused rather than truncated to 0); `exp` is not later than the signer leaf's `notAfter`; otherwise
-     `IllegalArgumentException`.
+     duration is refused rather than truncated to 0); `exp` is not later than `policy.validUntil(signing)` (the earliest
+     `notAfter` of the chain and of the IACA that issued it, 4.1); otherwise `IllegalArgumentException`.
+   - When the leaf's `notAfter` is not after `iat` (its last second, where no `exp` exists), `StatusListRetiredException`;
+     when another certificate of the path ends first, `IllegalStateException("STATUS_SIGNER_EXPIRED: …")` (4.1).
 2. `TokenStatusListCwt.decode(byte[])` (and `decode(byte[], int maxBits)`) returns
    `record Decoded(String sub, Instant iat, Instant exp, Long ttl, int bits, byte[] lst, List<X509Certificate> x5chain)`,
    without verifying the signature; `lst` is the bit array the wire `lst` inflates to.
    - Refuses (`IllegalStateException`) anything that is not exactly one tag 18 around an untagged 4-array with a `bstr`
      payload and signature, a protected `bstr` map and an unprotected map, no protected `1` (`alg`), no protected
      `16 == "application/statuslist+cwt"`, no protected 33, a label in both header buckets (RFC 9052 §3), a missing 2,
-     6, 4 or 65533, `bits` other than 1, `exp` not after `iat`, a `ttl` that is not a positive unsigned integer, a
-     floating-point NumericDate, an `lst` that is not zlib data, or one that inflates past `maxBits / 8`
-     (`MAX_BITS` = 8× the largest configured list by default). A uint64 above `Long.MAX_VALUE` is refused as the same
-     `IllegalStateException`, never as an escaping `ArithmeticException`.
+     6, 4 or 65533, a tagged value of claim 2, 4, 6, 65533 or 65534 or of a `status_list` member (RFC 8392 §2: tag 1
+     MUST be omitted; PeterO's `getType()` looks through tags), a blank `sub`, `bits` other than 1, `exp` not after
+     `iat`, a `ttl` that is not a positive unsigned integer, a floating-point NumericDate, an `lst` that is not exactly
+     one complete zlib stream (empty, ending before its Adler-32, bytes after it, a preset dictionary, raw DEFLATE), or
+     one that inflates past `maxBits / 8` (`MAX_BITS` = 8× the largest configured list by default). A uint64 above
+     `Long.MAX_VALUE` is refused as the same `IllegalStateException`, never as an escaping `ArithmeticException`. The
+     strict zlib reader is the codec's own; the JWT path's `TokenStatusListService.decode(String)` is unchanged (I4).
 3. `StatusListSigners.pin(SigningContext)` returns `record Pinned(KeyRef keyRef, String x5tS256)`.
    - `x5tS256` is the base64url SHA-256 of the leaf DER.
    - `keyRef`: if `signing.key().descriptor().kid()` equals the configured alias or starts with `alias + "@"` (the JCA
@@ -708,10 +733,14 @@ Branch `wp/m-11c-status-cwt-codec`. Depends on M-11a. About 450 lines.
 - `decode` refuses a tag-61 token, an untagged token, a nested tag (`18(61(…))`, `18(18(…))`), `typ` in the
   unprotected header, `x5chain` unprotected only, a label in both header buckets, a non-map unprotected header, no
   protected `alg`, a null signature, a non-`bstr` payload, missing `exp`, `bits` = 2, `exp` not after `iat`, a zero or
-  negative `ttl`, an `lst` that is not zlib data, an `lst` that inflates past the ceiling, and a uint64 above
-  `Long.MAX_VALUE`.
-- `encode` refuses a blank `sub`, `exp` not after `iat`, `exp` after the signer's `notAfter`, and a `ttl` below one
-  second.
+  negative `ttl`, an `lst` that is not zlib data, an `lst` that inflates past the ceiling, a uint64 above
+  `Long.MAX_VALUE`, `exp` = `1(…)` and a tagged `iat`, `sub`, `ttl`, `lst`, `bits` or `status_list`, an empty or blank
+  `sub`, and an `lst` that is empty, lacks its Adler-32, is cut in half, carries trailing bytes or asks for a preset
+  dictionary.
+- `encode` refuses a blank `sub`, `exp` not after `iat`, `exp` after the signer's `notAfter`, `exp` after an
+  intermediate's or the registry IACA's earlier `notAfter`, and a `ttl` below one second. In the leaf's last second it
+  throws `StatusListRetiredException`, in the last second of an intermediate or the IACA `STATUS_SIGNER_EXPIRED`, and
+  nothing is signed.
 - `resolve` refuses a rotated keymanager key (`STATUS_SIGNER_GONE`), a stored leaf that is not the pinned one, a
   provider failure (`STATUS_SIGNER_GONE`, cause kept), and an expired stored DSC (retired) — with the real
   `JcaKeyProvider`, not a stub.
@@ -722,7 +751,10 @@ Branch `wp/m-11c-status-cwt-codec`. Depends on M-11a. About 450 lines.
   - a DSC-mode signer without the mDL EKU;
   - a dedicated-mode signer without EKU `.45`;
   - an end-entity certificate used as an intermediate (`STATUS_SIGNER_ISSUER_NOT_CA`), and a `pathLenConstraint`
-    violation;
+    violation (`STATUS_SIGNER_PATH_LENGTH`): an intermediate's; the Annex B IACA's (0) with an intermediate below it,
+    as `[signer, intermediate, IACA]` and as `[signer, intermediate]` with the IACA only in the registry; and a root
+    allowing one intermediate with two below it. `[signer, intermediate, root]` under a root with
+    `pathLenConstraint` 1 passes, carried or supplied;
   - an IACA expired or not yet valid at the signing instant.
 
 ### M-11d CWT lists in the service (certify-service)
@@ -757,17 +789,26 @@ Branch `wp/m-11d-status-cwt-lists`. Depends on M-11c. About 650 lines.
    - Cache list id → `x5tS256` in a `ConcurrentHashMap`; the signer of a list never changes.
    - The first candidate gets `indexProvider.acquireIndex`; when full, mark it `FULL` and create the next one. With no
      candidate, `createCwt(purpose, signing, pinned)`.
-4. `createCwt` stores the 4.4 envelope with a token from `TokenStatusListCwt.encode(uri(id), now, min(now + 2·ttl, leaf
-   notAfter), ttl, zero bits, signing, signerPolicy, now, DOCUMENT_SIGNER)` — `encode` runs the policy itself, so the
-   service cannot forget it.
+4. `createCwt` stores the 4.4 envelope with a token from `TokenStatusListCwt.encode(uri(id), now, min(now + 2·ttl,
+   signerPolicy.validUntil(signing)), ttl, zero bits, signing, signerPolicy, now, DOCUMENT_SIGNER)` — `encode` runs the
+   policy itself, so the service cannot forget it. `validUntil` is the earliest `notAfter` of the chain and its IACA
+   (4.1), not the leaf's alone; re-signing (point 5) uses the same cap.
+   - In the leaf's last second `encode` throws `StatusListRetiredException` (4.1): at creation it is an
+     `IllegalStateException` like any refusal (`status_list_unavailable`); at renewal it takes the retirement branch of
+     point 5 (served as stored while `exp > now`, then `410`), exactly what `resolve` answers one second later. An
+     intermediate or IACA ending first gives `STATUS_SIGNER_EXPIRED` (back-off and `503`), as the policy does a second
+     later. `encode` throws no `IllegalArgumentException` for this case, so nothing needs a mapping for it.
 5. Serving: `Optional<Served> served(String listId)`, with `record Served(String mediaType, byte[] body)`. For `TYPE`
    rows it returns what `jwt(listId)` returns today; keep `jwt()` for existing callers and tests. For `TYPE_CWT` rows:
    - The **same freshness state machine** (`FRESH` / `RENEW` / `UNUSABLE`, `renew-wait`, `renew-backoff`,
      compare-and-set through `replaceDocument` on the stored envelope), using `TokenStatusListCwt.decode` for `sub`
      and `exp`.
    - Re-signing goes through `StatusListSigners.resolve(envelope.signer, storedLeaf)`, then `encode` with the same
-     bits and a new `iat`/`exp` (`encode` runs the policy); `storedLeaf` is the first certificate of the stored token's
-     protected `x5chain`, checked against `signer.x5tS256` (4.4).
+     bits and a new `iat`/`exp = min(iat + 2·ttl, signerPolicy.validUntil(signing))` (`encode` runs the policy);
+     `storedLeaf` is the first certificate of the stored token's protected `x5chain`, checked against
+     `signer.x5tS256` (4.4).
+   - `StatusListRetiredException` from `encode` (the leaf's last second) is handled exactly like the one from
+     `resolve`.
    - `StatusListRetiredException`: no re-sign attempt. Serve as stored while `exp > now`; afterwards throw
      `TokenStatusListGoneException` (new). **`StatusListRetiredException` extends `IllegalStateException`**, so catch
      it *before* any general `IllegalStateException`/`SigningException` → back-off/503 mapping, or the `410` of D-M11-7
@@ -809,6 +850,27 @@ Branch `wp/m-11d-status-cwt-lists`. Depends on M-11c. About 650 lines.
 `IndependentStatusListVerifier` (M-11b) was not merged. When M-11b lands, the same token must be re-run through
 `IndependentStatusListVerifier.verify(...)` against the IACA with `issuerAuthX5chain = [DSC]`, and M-11d's CWT-row
 checklist item inherits that re-run.
+
+**Where the independent check runs (review round 2 of M-11c).** Not on `certify-service`'s test classpath:
+
+- `certify-service/pom.xml` declares `kotlin-stdlib` at compile scope (1.9.22 from the Spring Boot BOM, which
+  `pixelpass-jar` 0.8.0 needs for claim-169 QR issuance), and Multipaz 0.102.0 needs Kotlin 2.2.21
+  (`kotlin.time.Instant`). Maven resolves one version per artifact per module, so a test-scope override of an
+  artifact already on the compile scope is impossible, and bumping it moves `runtime-classpath.txt` (I3) and the
+  runtime of every QR issuance. Neither is allowed.
+- The check runs where Multipaz already runs with its own Kotlin: a `certify-service` test writes the token and its
+  inputs as a sample under `target/mdoc-samples/` (`<sample>.statuslist.cwt`, `<sample>.statuslist.ct`, the
+  `.iaca.pem`, and the mDL whose IssuerAuth `x5chain` is `issuerAuthX5chain`), and `certify-conformance-mdoc`
+  (test-only, `kotlin-stdlib` 2.2.21 at test scope, never published) verifies it with
+  `IndependentStatusListVerifier`, held to the sample's `.gaps` like every M-01 sample. This is the M-11b sample
+  contract; M-11d's CWT-row item and M-11e's revoked sample both go this way. A sample that carries a list but no MSO
+  (an M-11d unit fixture) needs a list-only sample kind in `MdocSamples`, which is M-11d's to add if it wants one;
+  otherwise M-11d's CWT-row item is discharged by M-11e's samples, with Authlete and plain JCA in-module meanwhile.
+- The alternative, a separate surefire execution in `certify-service` with its own classpath
+  (`classpathDependencyExcludes` for `kotlin-stdlib` plus `additionalClasspathElements` for 2.2.21), is possible but
+  fragile — it has to keep every Kotlin consumer of the default execution off that run — and is not recommended.
+- Whatever form it takes, `certify-service/runtime-classpath.txt` does not move and `check-runtime-classpath.sh`
+  stays green.
 
 ### M-11e Issuance binding: the DSC that signs the mDL signs its list (certify-spi, certify-issuance, certify-format-mdoc, certify-service)
 
@@ -867,8 +929,13 @@ Branch `wp/m-11e-status-binding`. Depends on M-11d and M-11b. About 550 lines.
    - Issue one mDL through `/oid4vci` with `TokenStatusList`.
    - `GET` its `uri` with `Accept: application/statuslist+cwt`.
    - Write `target/mdoc-samples/MdocStatusListSampleTest-oid4vci.{mdoc,holder.jwk,doctype,iaca.pem,statuslist.cwt,statuslist.ct}`.
-   - Revoke it through `/credentials/status` and the batch job; check in-test with `IndependentStatusListVerifier`
-     (`expectedStatus = 1`) that the bit is set and the token is re-signed by the same DSC.
+   - Revoke it through `/credentials/status` and the batch job, and write the re-signed list as a second sample
+     (`…-revoked`); `certify-conformance-mdoc` checks with `IndependentStatusListVerifier` (`expectedStatus = 1`) that
+     the bit is set and the token is re-signed by the same DSC. The conformance run verifies samples with
+     `StatusListOptions.strictMode()` (`expectedStatus = 0`) today, so how a sample declares an expected status of 1 is
+     this package's to add to `MdocSamples`. In-test, `certify-service` checks the bit and the leaf with
+     `TokenStatusListCwt.decode` only: the verifier cannot run on its classpath (M-11d, "Where the independent check
+     runs").
    - Add the sample to the CI expected list of `certify-conformance-mdoc`.
 6. The draft-13 surface: one more sample `…-d13` from the same test, through the draft-13 endpoint. It declares the
    draft-13 shape codes (`credential.shape:documentWrapper`, `issuerAuth.untagged:tagged`) exactly as

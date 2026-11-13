@@ -16,10 +16,14 @@ import io.mosip.certify.spi.SigningContext;
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.asn1.x509.BasicConstraints;
+import org.bouncycastle.asn1.x509.CRLNumber;
+import org.bouncycastle.asn1.x509.CRLReason;
 import org.bouncycastle.asn1.x509.ExtendedKeyUsage;
 import org.bouncycastle.asn1.x509.Extension;
 import org.bouncycastle.asn1.x509.KeyPurposeId;
 import org.bouncycastle.asn1.x509.KeyUsage;
+import org.bouncycastle.cert.X509v2CRLBuilder;
+import org.bouncycastle.cert.jcajce.JcaX509CRLConverter;
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
 import org.bouncycastle.cert.jcajce.JcaX509ExtensionUtils;
 import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder;
@@ -44,8 +48,10 @@ import java.util.Set;
 
 /**
  * The certificates the M-11c tests need, built here rather than embedded so each test can break exactly one rule: an
- * Annex B IACA (built by {@code certify-pki}, so the CRL builder accepts it), Document Signers and dedicated signers
- * with chosen extended key usages, validity windows and issuers, and the CRLs the policy reads.
+ * Annex B IACA (built by {@code certify-pki}, so the CRL builder accepts it; {@code pathLenConstraint} 0, so it issues
+ * its signers directly), a multi-tier test root with {@code pathLenConstraint} 1 for the chains with an intermediate,
+ * Document Signers and dedicated signers with chosen extended key usages, validity windows and issuers, and the CRLs
+ * the policy reads.
  *
  * <p>Only the ECDSA signature of a built certificate is random; every test compares claims, headers and rules, never
  * certificate bytes.
@@ -115,16 +121,73 @@ final class StatusListTestKeys {
             IACA_KEYS, List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true,
             Instant.now().plus(1, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
 
-    /** A CA intermediate between the IACA and a Document Signer: cA TRUE, keyCertSign, no pathLen limit. */
+    /**
+     * A self-signed test root with {@code pathLenConstraint} 1, standing in for an anchor that allows one intermediate.
+     * An Annex B IACA carries 0 (AnnexBValidator {@code IACA_PATHLEN}), so the intermediate chains that must pass live
+     * under this root, not under {@link #IACA}; {@link #rootCrl} is its CRL.
+     */
+    static final KeyPair MULTI_TIER_ROOT_KEYS = p256();
+    static final X509Certificate MULTI_TIER_ROOT = root(MULTI_TIER_ROOT_KEYS, "Status List Test Multi-Tier Root", 1,
+            LONG_AGO, Instant.now().plus(300, ChronoUnit.DAYS));
+
+    /** A CA intermediate between the multi-tier root and a Document Signer: cA TRUE, keyCertSign, no pathLen limit. */
     static final KeyPair INTERMEDIATE_KEYS = p256();
-    static final X509Certificate INTERMEDIATE = ca(INTERMEDIATE_KEYS, "Status List Test Intermediate", IACA,
-            IACA_KEYS, null, LONG_AGO.plus(100, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
+    static final X509Certificate INTERMEDIATE = ca(INTERMEDIATE_KEYS, "Status List Test Intermediate", MULTI_TIER_ROOT,
+            MULTI_TIER_ROOT_KEYS, null, LONG_AGO.plus(100, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
 
     static final KeyPair BEHIND_INTERMEDIATE_KEYS = p256();
     static final X509Certificate BEHIND_INTERMEDIATE = signer(BEHIND_INTERMEDIATE_KEYS,
             "Status List Test Intermediate DSC", INTERMEDIATE, INTERMEDIATE_KEYS,
             List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true, LONG_AGO.plus(100, ChronoUnit.DAYS),
             Instant.now().plus(200, ChronoUnit.DAYS));
+
+    /** A second CA below {@link #INTERMEDIATE}: two intermediates, one more than the multi-tier root allows. */
+    static final KeyPair DEEP_INTERMEDIATE_KEYS = p256();
+    static final X509Certificate DEEP_INTERMEDIATE = ca(DEEP_INTERMEDIATE_KEYS, "Status List Test Deep Intermediate",
+            INTERMEDIATE, INTERMEDIATE_KEYS, null, LONG_AGO.plus(100, ChronoUnit.DAYS),
+            Instant.now().plus(200, ChronoUnit.DAYS));
+    static final KeyPair BEHIND_DEEP_INTERMEDIATE_KEYS = p256();
+    static final X509Certificate BEHIND_DEEP_INTERMEDIATE = signer(BEHIND_DEEP_INTERMEDIATE_KEYS,
+            "Status List Test Deep Intermediate DSC", DEEP_INTERMEDIATE, DEEP_INTERMEDIATE_KEYS,
+            List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true, LONG_AGO.plus(100, ChronoUnit.DAYS),
+            Instant.now().plus(200, ChronoUnit.DAYS));
+
+    /**
+     * A CA intermediate the Annex B {@link #IACA} ({@code pathLenConstraint} 0) issued, and a Document Signer below it:
+     * the path Annex B forbids, which Multipaz and OpenSSL refuse ("path length exceeded").
+     */
+    static final KeyPair IACA_INTERMEDIATE_KEYS = p256();
+    static final X509Certificate IACA_INTERMEDIATE = ca(IACA_INTERMEDIATE_KEYS, "Status List Test IACA Intermediate",
+            IACA, IACA_KEYS, null, LONG_AGO.plus(100, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
+    static final KeyPair BEHIND_IACA_INTERMEDIATE_KEYS = p256();
+    static final X509Certificate BEHIND_IACA_INTERMEDIATE = signer(BEHIND_IACA_INTERMEDIATE_KEYS,
+            "Status List Test Behind An IACA Intermediate", IACA_INTERMEDIATE, IACA_INTERMEDIATE_KEYS,
+            List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true, LONG_AGO.plus(100, ChronoUnit.DAYS),
+            Instant.now().plus(200, ChronoUnit.DAYS));
+
+    /** A CA intermediate that expires ten days from now, long before the signer below it. */
+    static final KeyPair SHORT_INTERMEDIATE_KEYS = p256();
+    static final X509Certificate SHORT_INTERMEDIATE = ca(SHORT_INTERMEDIATE_KEYS, "Status List Test Short Intermediate",
+            MULTI_TIER_ROOT, MULTI_TIER_ROOT_KEYS, null, LONG_AGO.plus(100, ChronoUnit.DAYS),
+            Instant.now().plus(10, ChronoUnit.DAYS).truncatedTo(ChronoUnit.SECONDS));
+    static final KeyPair BEHIND_SHORT_INTERMEDIATE_KEYS = p256();
+    static final X509Certificate BEHIND_SHORT_INTERMEDIATE = signer(BEHIND_SHORT_INTERMEDIATE_KEYS,
+            "Status List Test Behind A Short Intermediate", SHORT_INTERMEDIATE, SHORT_INTERMEDIATE_KEYS,
+            List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true, LONG_AGO.plus(100, ChronoUnit.DAYS),
+            Instant.now().plus(200, ChronoUnit.DAYS));
+
+    /** An IACA that expires ten days from now, and a signer it issued that outlives it (the anchor ends first). */
+    static final KeyPair SHORT_IACA_KEYS = p256();
+    static final X509Certificate SHORT_IACA = IsoMdocProfiles.iaca(SHORT_IACA_KEYS).country("IN")
+            .commonName("Status List Test Short IACA").issuerAltUri("https://short.example.test")
+            .crlDistributionPoint("https://short.example.test/iaca.crl").notBefore(LONG_AGO)
+            .validity(Duration.between(LONG_AGO.truncatedTo(ChronoUnit.SECONDS),
+                    Instant.now().plus(10, ChronoUnit.DAYS).truncatedTo(ChronoUnit.SECONDS)))
+            .build();
+    static final KeyPair UNDER_SHORT_IACA_KEYS = p256();
+    static final X509Certificate UNDER_SHORT_IACA = signer(UNDER_SHORT_IACA_KEYS, "Status List Test Under A Short IACA",
+            SHORT_IACA, SHORT_IACA_KEYS, List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true,
+            LONG_AGO.plus(100, ChronoUnit.DAYS), Instant.now().plus(100, ChronoUnit.DAYS));
 
     /**
      * A self-issued key-rollover intermediate (subject and issuer names equal, signed by another key), the shape
@@ -152,10 +215,13 @@ final class StatusListTestKeys {
             List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true, LONG_AGO.plus(100, ChronoUnit.DAYS),
             Instant.now().plus(200, ChronoUnit.DAYS));
 
-    /** A CA with {@code pathLenConstraint} 0 and a CA intermediate below it: RFC 5280 section 6.1.4 forbids that. */
+    /**
+     * An intermediate CA with {@code pathLenConstraint} 0 and a CA intermediate below it: RFC 5280 section 6.1.4 forbids
+     * that whatever the anchor allows.
+     */
     static final KeyPair PATHLEN_ZERO_KEYS = p256();
-    static final X509Certificate PATHLEN_ZERO = ca(PATHLEN_ZERO_KEYS, "Status List Test PathLen Zero CA", IACA,
-            IACA_KEYS, 0, LONG_AGO.plus(100, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
+    static final X509Certificate PATHLEN_ZERO = ca(PATHLEN_ZERO_KEYS, "Status List Test PathLen Zero CA", MULTI_TIER_ROOT,
+            MULTI_TIER_ROOT_KEYS, 0, LONG_AGO.plus(100, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
     static final KeyPair SUB_INTERMEDIATE_KEYS = p256();
     static final X509Certificate SUB_INTERMEDIATE = ca(SUB_INTERMEDIATE_KEYS, "Status List Test Sub Intermediate",
             PATHLEN_ZERO, PATHLEN_ZERO_KEYS, null, LONG_AGO.plus(100, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
@@ -213,6 +279,24 @@ final class StatusListTestKeys {
                               Integer pathLen, Instant notBefore, Instant notAfter) {
         return issue(subject, new X500Name("CN=" + commonName), issuer, issuerKeys, List.of(), true, notBefore,
                 notAfter, true, pathLen);
+    }
+
+    /** A self-signed CA: {@code basicConstraints cA TRUE, pathLenConstraint} as given (critical), keyCertSign and cRLSign. */
+    static X509Certificate root(KeyPair keys, String commonName, int pathLen, Instant notBefore, Instant notAfter) {
+        try {
+            X500Name name = new X500Name("CN=" + commonName);
+            JcaX509v3CertificateBuilder builder = new JcaX509v3CertificateBuilder(name, serial(), Date.from(notBefore),
+                    Date.from(notAfter), name, keys.getPublic());
+            builder.addExtension(Extension.subjectKeyIdentifier, false,
+                    new JcaX509ExtensionUtils().createSubjectKeyIdentifier(keys.getPublic()));
+            builder.addExtension(Extension.basicConstraints, true, new BasicConstraints(pathLen));
+            builder.addExtension(Extension.keyUsage, true, new KeyUsage(KeyUsage.keyCertSign | KeyUsage.cRLSign));
+            return new JcaX509CertificateConverter().getCertificate(builder.build(
+                    new JcaContentSignerBuilder("SHA256withECDSA").setProvider(BouncyCastleProvider.PROVIDER_NAME)
+                            .build(keys.getPrivate())));
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
     }
 
     /** The key-rollover intermediate: its subject and issuer names are equal, so the chain library calls it self-signed. */
@@ -277,6 +361,28 @@ final class StatusListTestKeys {
             builder.revoke(serial, thisUpdate);
         }
         return builder.build();
+    }
+
+    /**
+     * A CRL of {@link #MULTI_TIER_ROOT} revoking {@code serials}: built with Bouncy Castle directly, because
+     * {@code CrlBuilder.forIaca} accepts only an Annex B IACA ({@code pathLenConstraint} 0).
+     */
+    static X509CRL rootCrl(Instant thisUpdate, Instant nextUpdate, BigInteger... serials) {
+        try {
+            X509v2CRLBuilder builder = new X509v2CRLBuilder(
+                    X500Name.getInstance(MULTI_TIER_ROOT.getSubjectX500Principal().getEncoded()), Date.from(thisUpdate));
+            builder.setNextUpdate(Date.from(nextUpdate));
+            builder.addExtension(Extension.cRLNumber, false, new CRLNumber(BigInteger.ONE));
+            builder.addExtension(Extension.authorityKeyIdentifier, false,
+                    new JcaX509ExtensionUtils().createAuthorityKeyIdentifier(MULTI_TIER_ROOT.getPublicKey()));
+            for (BigInteger serial : serials) {
+                builder.addCRLEntry(serial, Date.from(thisUpdate), CRLReason.unspecified);
+            }
+            return new JcaX509CRLConverter().getCRL(builder.build(new JcaContentSignerBuilder("SHA256withECDSA")
+                    .setProvider(BouncyCastleProvider.PROVIDER_NAME).build(MULTI_TIER_ROOT_KEYS.getPrivate())));
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
     }
 
     /** A CRL of the test IACA that does not list {@link #DSC} and is fresh at {@code now}. */

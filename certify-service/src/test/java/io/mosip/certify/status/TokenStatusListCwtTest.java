@@ -34,14 +34,21 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static io.mosip.certify.status.StatusListTestKeys.BEHIND_SHORT_INTERMEDIATE;
+import static io.mosip.certify.status.StatusListTestKeys.BEHIND_SHORT_INTERMEDIATE_KEYS;
 import static io.mosip.certify.status.StatusListTestKeys.DSC;
 import static io.mosip.certify.status.StatusListTestKeys.DSC_KEYS;
 import static io.mosip.certify.status.StatusListTestKeys.EXPIRED;
 import static io.mosip.certify.status.StatusListTestKeys.EXPIRED_KEYS;
 import static io.mosip.certify.status.StatusListTestKeys.IACA;
+import static io.mosip.certify.status.StatusListTestKeys.MULTI_TIER_ROOT;
 import static io.mosip.certify.status.StatusListTestKeys.NO_EKU;
 import static io.mosip.certify.status.StatusListTestKeys.NO_EKU_KEYS;
 import static io.mosip.certify.status.StatusListTestKeys.OTHER_CA;
+import static io.mosip.certify.status.StatusListTestKeys.SHORT_IACA;
+import static io.mosip.certify.status.StatusListTestKeys.SHORT_INTERMEDIATE;
+import static io.mosip.certify.status.StatusListTestKeys.UNDER_SHORT_IACA;
+import static io.mosip.certify.status.StatusListTestKeys.UNDER_SHORT_IACA_KEYS;
 import static io.mosip.certify.status.StatusListTestKeys.UNTRUSTED;
 import static io.mosip.certify.status.StatusListTestKeys.UNTRUSTED_KEYS;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -69,7 +76,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   every other shape a stored or replayed token could have, malformed COSE and unfaithful claims included;</li>
  *   <li>an independent COSE implementation (Authlete) and plain JCA accept the signature over the production shape,
  *   with the chain that verifies against the IACA — the M-11b verifier's checks, without M-11b (not merged yet);</li>
- *   <li>encode refuses inputs it cannot represent faithfully, so no ambiguous token is signed.</li>
+ *   <li>encode refuses inputs it cannot represent faithfully, so no ambiguous token is signed, caps {@code exp} at the
+ *   earliest {@code notAfter} of the chain and its IACA, and answers the last second of a signer's validity as
+ *   retirement (leaf) or the mapped expiry (another certificate of the path), never as an unmapped caller error;</li>
+ *   <li>decode refuses tagged claim values (RFC 8392 section 2), a blank {@code sub}, and an {@code lst} that is not
+ *   exactly one complete zlib stream (empty, truncated, missing its Adler-32, trailing bytes, preset dictionary).</li>
  * </ul>
  */
 class TokenStatusListCwtTest {
@@ -299,6 +310,66 @@ class TokenStatusListCwtTest {
     }
 
     @Test
+    void encodeCapsExpAtTheEarliestNotAfterOfTheChainAndItsIaca() {
+        // an intermediate that ends before the leaf bounds the token: a verifier's path runs through it
+        SigningContext shortIntermediate = StatusListTestKeys.context(BEHIND_SHORT_INTERMEDIATE_KEYS,
+                BEHIND_SHORT_INTERMEDIATE, SHORT_INTERMEDIATE, MULTI_TIER_ROOT);
+        Instant intermediateEnds = SHORT_INTERMEDIATE.getNotAfter().toInstant();
+        assertTrue(intermediateEnds.isBefore(BEHIND_SHORT_INTERMEDIATE.getNotAfter().toInstant()));
+        IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
+                () -> encode(SUB, IAT, intermediateEnds.plusSeconds(1), TTL, BITS, shortIntermediate));
+        assertTrue(refused.getMessage().contains("earliest notAfter"), refused.getMessage());
+        assertEquals(intermediateEnds, TokenStatusListCwt.decode(
+                encode(SUB, IAT, intermediateEnds, TTL, BITS, shortIntermediate)).exp(), "exactly at it is accepted");
+
+        // the IACA the registry supplies, when it ends before the signer it issued
+        StatusListSignerPolicy shortIaca = new StatusListSignerPolicy(anchors(SHORT_IACA));
+        SigningContext underShortIaca = StatusListTestKeys.context(UNDER_SHORT_IACA_KEYS, UNDER_SHORT_IACA);
+        Instant iacaEnds = SHORT_IACA.getNotAfter().toInstant();
+        assertTrue(iacaEnds.isBefore(UNDER_SHORT_IACA.getNotAfter().toInstant()));
+        assertThrows(IllegalArgumentException.class, () -> TokenStatusListCwt.encode(SUB, IAT, iacaEnds.plusSeconds(1),
+                TTL, BITS, underShortIaca, shortIaca, NOW, MODE));
+        assertEquals(iacaEnds, TokenStatusListCwt.decode(TokenStatusListCwt.encode(SUB, IAT, iacaEnds, TTL, BITS,
+                underShortIaca, shortIaca, NOW, MODE)).exp());
+    }
+
+    @Test
+    void inTheLastSecondOfTheLeafTheListIsRetiredNotACallerError() {
+        // notAfter is inclusive (RFC 5280 section 4.1.2.5), so at notAfter the policy still accepts the signer, but
+        // exp = min(iat + 2·ttl, notAfter) lands on iat: no token is valid for a second. That is the retirement
+        // StatusListSigners.resolve decides a second later (D-M11-7), answered the same way now, never an
+        // IllegalArgumentException that M-11d does not map
+        Instant notAfter = DSC.getNotAfter().toInstant();
+        SigningContext leafOnly = StatusListTestKeys.context(DSC_KEYS, DSC);
+        SIGNED.set(0);
+        StatusListRetiredException retired = assertThrows(StatusListRetiredException.class,
+                () -> TokenStatusListCwt.encode(SUB, notAfter, notAfter, TTL, BITS, counting(DSC_KEYS, DSC), POLICY,
+                        notAfter, MODE));
+        assertTrue(retired.getMessage().contains("retired"), retired.getMessage());
+        assertEquals(0, SIGNED.get(), "nothing is signed");
+        // a second earlier the same signer still signs a one-second token
+        assertEquals(notAfter, TokenStatusListCwt.decode(TokenStatusListCwt.encode(SUB, notAfter.minusSeconds(1),
+                notAfter, TTL, BITS, leafOnly, POLICY, notAfter.minusSeconds(1), MODE)).exp());
+    }
+
+    @Test
+    void inTheLastSecondOfAnIntermediateTheRefusalIsTheMappedExpiry() {
+        // when another certificate of the path ends first, the refusal is the one the policy gives a second later
+        Instant notAfter = SHORT_INTERMEDIATE.getNotAfter().toInstant();
+        IllegalStateException refused = assertThrows(IllegalStateException.class, () -> TokenStatusListCwt.encode(SUB,
+                notAfter, notAfter, TTL, BITS, StatusListTestKeys.context(BEHIND_SHORT_INTERMEDIATE_KEYS,
+                        BEHIND_SHORT_INTERMEDIATE, SHORT_INTERMEDIATE, MULTI_TIER_ROOT), POLICY, notAfter, MODE));
+        assertFalse(refused instanceof StatusListRetiredException, "the leaf itself is still valid");
+        assertTrue(refused.getMessage().startsWith(StatusListSignerPolicy.EXPIRED + ": "), refused.getMessage());
+        // and a second later the policy refuses it with the same rule
+        IllegalStateException later = assertThrows(IllegalStateException.class, () -> TokenStatusListCwt.encode(SUB,
+                notAfter.plusSeconds(1), notAfter.plusSeconds(2), TTL, BITS, StatusListTestKeys.context(
+                        BEHIND_SHORT_INTERMEDIATE_KEYS, BEHIND_SHORT_INTERMEDIATE, SHORT_INTERMEDIATE, MULTI_TIER_ROOT),
+                POLICY, notAfter.plusSeconds(1), MODE));
+        assertTrue(later.getMessage().startsWith(StatusListSignerPolicy.EXPIRED + ": "), later.getMessage());
+    }
+
+    @Test
     void encodeRefusesASignerNoVerifierCouldAnchor() {
         // M-11a's envelope refuses the chain, and encode maps it through refusal() into the one shape the service handles
         SigningContext noChain = StatusListTestKeys.context(DSC_KEYS, CertificateChain.EMPTY);
@@ -491,6 +562,96 @@ class TokenStatusListCwtTest {
                     () -> TokenStatusListCwt.decode(candidate), HexFormat.of().formatHex(candidate));
             assertTrue(failure.getMessage().startsWith("Not a CWT Status List Token: "), failure.getMessage());
         }
+    }
+
+    @Test
+    void decodeRefusesTaggedClaimValues() {
+        // PeterO's getType() looks through tags, so 1(1700000000) reads as an integer: RFC 8392 section 2 says tag 1
+        // MUST be omitted from a NumericDate, and Certify tags no claim, so each of these is refused
+        byte[] token = encode(BITS);
+        List<byte[]> refused = List.of(
+                mutate(token, (protectedHeader, unprotectedHeader, payload) -> payload.set(
+                        CBORObject.FromObject(TokenStatusListCwt.CLAIM_EXP),
+                        CBORObject.FromObjectAndTag(EXP.getEpochSecond(), 1))),
+                mutate(token, (protectedHeader, unprotectedHeader, payload) -> payload.set(
+                        CBORObject.FromObject(TokenStatusListCwt.CLAIM_IAT),
+                        CBORObject.FromObjectAndTag(IAT.getEpochSecond(), 1))),
+                mutate(token, (protectedHeader, unprotectedHeader, payload) -> payload.set(
+                        CBORObject.FromObject(TokenStatusListCwt.CLAIM_SUB), CBORObject.FromObjectAndTag(SUB, 32))),
+                mutate(token, (protectedHeader, unprotectedHeader, payload) -> payload.set(
+                        CBORObject.FromObject(TokenStatusListCwt.CLAIM_TTL), CBORObject.FromObjectAndTag(TTL_SECONDS, 1))),
+                mutate(token, (protectedHeader, unprotectedHeader, payload) -> {
+                    CBORObject statusList = payload.get(CBORObject.FromObject(TokenStatusListCwt.CLAIM_STATUS_LIST));
+                    statusList.set(CBORObject.FromObject("lst"), CBORObject.FromObjectAndTag(
+                            statusList.get(CBORObject.FromObject("lst")).GetByteString(), 24));
+                }),
+                mutate(token, (protectedHeader, unprotectedHeader, payload) -> payload.get(
+                        CBORObject.FromObject(TokenStatusListCwt.CLAIM_STATUS_LIST)).set(CBORObject.FromObject("bits"),
+                        CBORObject.FromObjectAndTag(1, 1))),
+                mutate(token, (protectedHeader, unprotectedHeader, payload) -> {
+                    CBORObject statusList = payload.get(CBORObject.FromObject(TokenStatusListCwt.CLAIM_STATUS_LIST));
+                    payload.set(CBORObject.FromObject(TokenStatusListCwt.CLAIM_STATUS_LIST),
+                            CBORObject.FromObjectAndTag(statusList, 259));
+                }));
+        for (byte[] candidate : refused) {
+            IllegalStateException failure = assertThrows(IllegalStateException.class,
+                    () -> TokenStatusListCwt.decode(candidate), HexFormat.of().formatHex(candidate));
+            assertTrue(failure.getMessage().startsWith("Not a CWT Status List Token: ")
+                    && failure.getMessage().contains(" is tagged "), failure.getMessage());
+        }
+        // the wire form of tag 1 around exp is c1 1a <exp>: what was refused is exactly that shape
+        byte[] tagOneExp = refused.get(0);
+        assertTrue(HexFormat.of().formatHex(payload(tagOneExp)).contains("04c11a"), "claim 4 = 1(uint32)");
+    }
+
+    @Test
+    void decodeRefusesABlankSub() {
+        for (String blank : List.of("", " ")) {
+            byte[] token = mutate(encode(BITS), (protectedHeader, unprotectedHeader, payload) ->
+                    payload.set(CBORObject.FromObject(TokenStatusListCwt.CLAIM_SUB), CBORObject.FromObject(blank)));
+            IllegalStateException refused = assertThrows(IllegalStateException.class, () -> TokenStatusListCwt.decode(token));
+            assertTrue(refused.getMessage().contains("claim 2 (sub) is blank"), refused.getMessage());
+        }
+    }
+
+    @Test
+    void decodeRefusesAnLstThatIsNotExactlyOneCompleteZlibStream() {
+        byte[] stream = TokenStatusListService.zlib(BITS);
+        byte[] withDictionary;
+        {
+            java.util.zip.Deflater deflater = new java.util.zip.Deflater(java.util.zip.Deflater.BEST_COMPRESSION);
+            deflater.setDictionary(new byte[]{1, 2, 3, 4});
+            deflater.setInput(BITS);
+            deflater.finish();
+            byte[] buffer = new byte[BITS.length + 64];
+            int length = deflater.deflate(buffer);
+            assertTrue(deflater.finished());
+            deflater.end();
+            withDictionary = Arrays.copyOf(buffer, length);
+        }
+        assertEquals(0x20, withDictionary[1] & 0x20, "FLG.FDICT is set: the stream asks for a preset dictionary");
+        byte[] trailing = Arrays.copyOf(stream, stream.length + 2);
+        trailing[stream.length] = 0x00;
+        trailing[stream.length + 1] = 0x01;
+        java.util.Map<String, byte[]> refused = new java.util.LinkedHashMap<>();
+        refused.put("is empty", new byte[0]);
+        refused.put("no Adler-32 check", Arrays.copyOf(stream, stream.length - 4));
+        refused.put("ends before its zlib stream does", Arrays.copyOf(stream, stream.length / 2));
+        refused.put("after its zlib stream", trailing);
+        refused.put("preset dictionary", withDictionary);
+        refused.put("not zlib data", Arrays.copyOfRange(stream, 2, stream.length)); // raw DEFLATE, no zlib header
+        for (java.util.Map.Entry<String, byte[]> entry : refused.entrySet()) {
+            byte[] token = mutate(encode(BITS), (protectedHeader, unprotectedHeader, payload) ->
+                    payload.get(CBORObject.FromObject(TokenStatusListCwt.CLAIM_STATUS_LIST))
+                            .set(CBORObject.FromObject("lst"), CBORObject.FromObject(entry.getValue())));
+            IllegalStateException failure = assertThrows(IllegalStateException.class,
+                    () -> TokenStatusListCwt.decode(token), entry.getKey());
+            assertTrue(failure.getMessage().startsWith("Not a CWT Status List Token: status_list.lst ")
+                    && failure.getMessage().contains(entry.getKey()), entry.getKey() + ": " + failure.getMessage());
+        }
+        // the JWT reader is unchanged and stays lenient: the same truncated stream still inflates there (I4)
+        assertArrayEquals(BITS, TokenStatusListService.decode(java.util.Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(Arrays.copyOf(stream, stream.length - 4))));
     }
 
     // ---- helpers ----------------------------------------------------------------------------------------------

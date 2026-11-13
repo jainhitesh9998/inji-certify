@@ -10,6 +10,7 @@ import io.mosip.certify.signing.SigningException;
 import io.mosip.certify.spi.SigningContext;
 
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
@@ -18,6 +19,8 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Objects;
+import java.util.zip.DataFormatException;
+import java.util.zip.Inflater;
 
 /**
  * The CWT form of a Token Status List (draft-ietf-oauth-status-list-21 section 5.2; ISO/IEC 18013-5 second edition
@@ -42,10 +45,12 @@ import java.util.Objects;
  * <p>{@link #decode} reads a token back without verifying its signature: it is the codec, not a verifier. It does
  * refuse anything that is not this profile — so a stored or served token cannot silently change shape — including
  * malformed COSE (extra or nested tags, a non-map unprotected header, a label in both header buckets, a missing
- * {@code alg}, a non-{@code bstr} payload or signature), a {@code ttl} that is not a positive integer, an
- * {@code exp} that is not after {@code iat}, and an {@code lst} that does not inflate as zlib within the size ceiling.
- * Floating-point NumericDates are refused too: RFC 8392 permits them, Certify never writes them, and a token that
- * carried one would not be one of ours.
+ * {@code alg}, a non-{@code bstr} payload or signature), a tagged claim value (RFC 8392 section 2: tag 1 MUST be
+ * omitted from a NumericDate, and Certify tags no claim), a blank {@code sub}, a {@code ttl} that is not a positive
+ * integer, an {@code exp} that is not after {@code iat}, and an {@code lst} that is not exactly one complete zlib stream
+ * (header, data, Adler-32, nothing after it, no preset dictionary) within the size ceiling. Floating-point
+ * NumericDates are refused too: RFC 8392 permits them, Certify never writes them, and a token that carried one would
+ * not be one of ours.
  */
 public final class TokenStatusListCwt {
 
@@ -94,17 +99,27 @@ public final class TokenStatusListCwt {
      * @param sub     the {@code status_list.uri} of the Referenced Tokens this list answers for (claim 2, TSL section
      *                8.3 step 4a)
      * @param iat     the signing instant, in whole seconds (claim 6)
-     * @param exp     when the token expires, in whole seconds, later than {@code iat} and never later than the signer
-     *                certificate's {@code notAfter} (claim 4 is REQUIRED for an mDoc list, ISO2 12.3.6.3; section 4.1)
+     * @param exp     when the token expires, in whole seconds, later than {@code iat} and never later than
+     *                {@link StatusListSignerPolicy#validUntil}: the earliest {@code notAfter} of the signer's chain and of
+     *                the IACA that issued it (claim 4 is REQUIRED for an mDoc list, ISO2 12.3.6.3; section 4.1)
      * @param ttl     how long a verifier may cache the list (claim 65534); its whole seconds must be positive
      * @param bits    the bit array, one bit per index, least significant bit first
      * @param signing the signer
      * @param policy  the signer policy, with the configured IACA anchors, CRLs and stale-CRL grace
      * @param now     the instant the policy judges validity, revocation and CRL freshness at
      * @param mode    which extended key usage the signer needs (the mDL Document Signer's or a dedicated signer's)
-     * @throws IllegalArgumentException when a claim could not be represented faithfully, so no ambiguous token is signed
-     * @throws IllegalStateException    a policy refusal (the message starts with its rule), or a {@code STATUS_SIGNER_}
-     *                                  refusal of M-11a's envelope mapped by {@link StatusListSignerPolicy#refusal}
+     * @throws IllegalArgumentException   when a claim could not be represented faithfully, so no ambiguous token is
+     *                                    signed: a blank {@code sub}, a {@code ttl} under one second, an {@code exp} not
+     *                                    after {@code iat} or after {@link StatusListSignerPolicy#validUntil}
+     * @throws StatusListRetiredException when the signer leaf's {@code notAfter} is not after {@code iat} in whole
+     *                                    seconds: in the last second of its validity no {@code exp} with
+     *                                    {@code iat < exp <= notAfter} exists, and a second later
+     *                                    {@link StatusListSigners#resolve} retires the list on the same clock (D-M11-7)
+     * @throws IllegalStateException      a policy refusal (the message starts with its rule) — including
+     *                                    {@value StatusListSignerPolicy#EXPIRED} when another certificate of the chain,
+     *                                    or the IACA, ends its validity no later than {@code iat} — or a
+     *                                    {@code STATUS_SIGNER_} refusal of M-11a's envelope mapped by
+     *                                    {@link StatusListSignerPolicy#refusal}
      */
     public static byte[] encode(String sub, Instant iat, Instant exp, Duration ttl, byte[] bits,
                                 SigningContext signing, StatusListSignerPolicy policy, Instant now,
@@ -118,10 +133,6 @@ public final class TokenStatusListCwt {
         }
         Objects.requireNonNull(iat, "iat");
         Objects.requireNonNull(exp, "exp");
-        if (exp.getEpochSecond() <= iat.getEpochSecond()) {
-            throw new IllegalArgumentException("exp " + exp + " must be later than iat " + iat
-                    + ": a token is not signed already expired, and both claims are whole seconds (RFC 8392 section 2)");
-        }
         if (ttl == null || ttl.getSeconds() < 1) {
             throw new IllegalArgumentException("ttl must be at least one second, got " + ttl
                     + ": TSL section 5.2 makes the time to live a positive unsigned integer");
@@ -131,11 +142,16 @@ public final class TokenStatusListCwt {
         try {
             // mandatory, before anything is encoded or signed: no public path signs a status-list CWT without it
             policy.check(signing, now, mode);
-            X509Certificate leaf = leaf(signing);
-            Instant notAfter = leaf.getNotAfter().toInstant();
-            if (exp.isAfter(notAfter)) {
-                throw new IllegalArgumentException("exp " + exp + " is after the signer certificate's notAfter " + notAfter
-                        + "; a list is not signed to outlive the certificate that signs it (section 4.1, D7)");
+            Instant validUntil = policy.validUntil(signing);
+            requireValidAfter(leaf(signing), validUntil, iat);
+            if (exp.getEpochSecond() <= iat.getEpochSecond()) {
+                throw new IllegalArgumentException("exp " + exp + " must be later than iat " + iat
+                        + ": a token is not signed already expired, and both claims are whole seconds (RFC 8392 section 2)");
+            }
+            if (exp.isAfter(validUntil)) {
+                throw new IllegalArgumentException("exp " + exp + " is after " + validUntil + ", the earliest notAfter of"
+                        + " the signer's chain and its IACA; a list is not signed to outlive the certificates a verifier"
+                        + " builds its path through (section 4.1, D7)");
             }
             LinkedHashMap<Integer, CBORObject> claims = new LinkedHashMap<>();
             claims.put(CLAIM_SUB, CBORObject.FromObject(sub));
@@ -145,9 +161,33 @@ public final class TokenStatusListCwt {
             claims.put(CLAIM_TTL, CBORObject.FromObject(ttl.getSeconds()));
             return CwtEnvelope.signOrdered(claims, CoseHeaderPolicy.statusListCwt(), signing.key(), signing.signer());
         } catch (RuntimeException e) {
-            // the policy's IllegalStateException and M-11a's STATUS_SIGNER_ SigningException become one shape; a
-            // caller's own IllegalArgumentException keeps its type (refusal returns it unchanged)
+            // the policy's IllegalStateException (StatusListRetiredException included) and M-11a's STATUS_SIGNER_
+            // SigningException become one shape; a caller's own IllegalArgumentException keeps its type (refusal
+            // returns it unchanged)
             throw StatusListSignerPolicy.refusal(e);
+        }
+    }
+
+    /**
+     * The signer can still sign a token that is valid for at least a second: {@code iat < exp <= validUntil} must have
+     * a solution in whole seconds. In the last second of the leaf's validity it has none, and the caller's
+     * {@code exp = min(iat + 2·ttl, notAfter)} lands on {@code iat}; that is the retirement D-M11-7 decides one second
+     * later in {@link StatusListSigners#resolve}, so it is answered the same way now ({@link StatusListRetiredException}:
+     * served as stored until its {@code exp}, then {@code 410}) instead of as a caller error no one maps. When another
+     * certificate of the path ends first, it is the {@value StatusListSignerPolicy#EXPIRED} refusal that policy gives a
+     * second later.
+     */
+    private static void requireValidAfter(X509Certificate leaf, Instant validUntil, Instant iat) {
+        Instant leafNotAfter = leaf.getNotAfter().toInstant();
+        if (leafNotAfter.getEpochSecond() <= iat.getEpochSecond()) {
+            throw new StatusListRetiredException("the status list signer " + leaf.getSubjectX500Principal()
+                    + " is valid until " + leafNotAfter + ", not after iat " + iat + ": no token it signs could be valid"
+                    + " for a second, so the list is retired rather than signed again (D-M11-7)");
+        }
+        if (validUntil.getEpochSecond() <= iat.getEpochSecond()) {
+            throw new IllegalStateException(StatusListSignerPolicy.EXPIRED + ": a certificate of the path from "
+                    + leaf.getSubjectX500Principal() + " to its IACA is valid until " + validUntil + ", not after iat "
+                    + iat + ", so no token signed now could be verified for a second");
         }
     }
 
@@ -184,9 +224,10 @@ public final class TokenStatusListCwt {
      *                               missing protected/unprotected header, a label in both headers (RFC 9052 section 3),
      *                               no protected {@code alg} 1, no protected {@code typ} 16 equal to
      *                               {@value #MEDIA_TYPE}, no protected {@code x5chain} 33, a missing claim 2/6/4/65533,
-     *                               an {@code exp} not after {@code iat}, a {@code ttl} that is not a positive
-     *                               unsigned integer, {@code bits} other than 1, or an {@code lst} that is not zlib
-     *                               data within {@code maxBits}
+     *                               a tagged value of claim 2/4/6/65533/65534 or of a {@code status_list} member, a
+     *                               blank {@code sub}, an {@code exp} not after {@code iat}, a {@code ttl} that is not a
+     *                               positive unsigned integer, {@code bits} other than 1, or an {@code lst} that is not
+     *                               one complete zlib stream inflating to at most {@code maxBits / 8} bytes
      */
     public static Decoded decode(byte[] token, int maxBits) {
         Objects.requireNonNull(token, "token");
@@ -257,6 +298,10 @@ public final class TokenStatusListCwt {
         if (sub.getType() != CBORType.TextString) {
             throw refuse("claim 2 (sub) is a " + sub.getType() + ", not the uri text");
         }
+        if (sub.AsString().isBlank()) {
+            throw refuse("claim 2 (sub) is blank; it is the status_list.uri of the Referenced Tokens (TSL section 8.3"
+                    + " step 4a), which encode never signs empty");
+        }
         Instant iat = instant(claim(payload, CLAIM_IAT, "iat"), "iat");
         Instant exp = instant(claim(payload, CLAIM_EXP, "exp"), "exp");
         if (!exp.isAfter(iat)) {
@@ -266,6 +311,7 @@ public final class TokenStatusListCwt {
         CBORObject ttlClaim = payload.get(CBORObject.FromObject(CLAIM_TTL));
         Long ttl = null;
         if (ttlClaim != null) {
+            untagged(ttlClaim, "claim 65534 (ttl)");
             long seconds = unsigned(ttlClaim, "ttl");
             if (seconds < 1) {
                 throw refuse("ttl is " + seconds + "; TSL section 5.2 makes the time to live a positive unsigned"
@@ -276,6 +322,9 @@ public final class TokenStatusListCwt {
         CBORObject statusList = claim(payload, CLAIM_STATUS_LIST, "status list");
         if (statusList.getType() != CBORType.Map) {
             throw refuse("claim 65533 (status_list) is a " + statusList.getType() + ", not a StatusList map");
+        }
+        for (CBORObject member : statusList.getKeys()) {
+            untagged(statusList.get(member), "status_list." + member);
         }
         CBORObject bits = statusList.get(CBORObject.FromObject("bits"));
         if (bits == null) {
@@ -289,12 +338,7 @@ public final class TokenStatusListCwt {
         if (lst == null) {
             throw refuse("claim 65533 (status_list) has no lst");
         }
-        byte[] bitArray;
-        try {
-            bitArray = TokenStatusListService.inflate(bytes(lst, "status_list.lst"), maxBits / 8);
-        } catch (IllegalStateException e) {
-            throw refuse("status_list.lst is not a usable zlib stream: " + e.getMessage(), e);
-        }
+        byte[] bitArray = inflate(bytes(lst, "status_list.lst"), maxBits / 8);
         return new Decoded(sub.AsString(), iat, exp, ttl, BITS, bitArray, x5chain);
     }
 
@@ -303,7 +347,70 @@ public final class TokenStatusListCwt {
         if (value == null) {
             throw refuse("no claim " + label + " (" + name + "), which a Status List Token carries (TSL section 5.2)");
         }
+        return untagged(value, "claim " + label + " (" + name + ")");
+    }
+
+    /**
+     * PeterO's {@code getType()} looks through tags, so {@code 1(1700000000)} reads as an integer and {@code 32("…")}
+     * as text; a tag is refused here instead. RFC 8392 section 2: "the CBOR tag 1 … MUST be omitted" from a
+     * NumericDate, and Certify writes no tag on any claim of a status list, so a tagged value is not one of its tokens.
+     * (A bignum, tag 2 or 3, already reads as a byte string and is refused as not an integer.)
+     */
+    private static CBORObject untagged(CBORObject value, String name) {
+        if (value.isTagged()) {
+            throw refuse(name + " is tagged " + value.getMostOuterTag() + "; RFC 8392 section 2 omits tag 1 from a"
+                    + " NumericDate and Certify tags no claim of a Status List Token");
+        }
         return value;
+    }
+
+    /**
+     * The bit array an {@code lst} inflates to, holding it to exactly one complete zlib stream (RFC 1950; TSL section 4.1
+     * "compressed using DEFLATE with the ZLIB data format"): the stream must end — data and its Adler-32 check both read
+     * ({@link Inflater#finished()}) — before the input does, nothing may follow it, and it may not ask for a preset
+     * dictionary (FDICT; the token names none). The JWT path keeps its own lenient reader
+     * ({@link TokenStatusListService#decode(String)}, unchanged); this one reads stored and fetched CWT tokens, where a
+     * truncated stream would otherwise inflate to a prefix of the list and an index past it would read as "valid".
+     * A stream that inflates past {@code maxBytes} is refused before it is allocated (a decompression bomb).
+     */
+    static byte[] inflate(byte[] compressed, int maxBytes) {
+        if (compressed.length == 0) {
+            throw refuse("status_list.lst is empty, not a zlib stream (TSL section 4.1)");
+        }
+        Inflater inflater = new Inflater();
+        inflater.setInput(compressed);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buffer = new byte[4096];
+        try {
+            while (!inflater.finished()) {
+                int n = inflater.inflate(buffer);
+                if (n == 0 && !inflater.finished()) {
+                    if (inflater.needsDictionary()) {
+                        throw refuse("status_list.lst asks for a preset dictionary (zlib FDICT), which no Status List"
+                                + " Token names (TSL section 4.1)");
+                    }
+                    if (inflater.needsInput()) {
+                        throw refuse("status_list.lst ends before its zlib stream does (" + compressed.length + " bytes"
+                                + " read, no Adler-32 check): a truncated list would read as all-valid past the cut");
+                    }
+                    throw refuse("status_list.lst stops inflating before its zlib stream ends");
+                }
+                if ((long) out.size() + n > maxBytes) {
+                    throw refuse("status_list.lst inflates to more than " + maxBytes + " bytes, which no list of this"
+                            + " size does");
+                }
+                out.write(buffer, 0, n);
+            }
+            if (inflater.getRemaining() > 0) {
+                throw refuse("status_list.lst carries " + inflater.getRemaining() + " byte(s) after its zlib stream,"
+                        + " which is not one zlib stream (RFC 1950)");
+            }
+        } catch (DataFormatException e) {
+            throw refuse("status_list.lst is not zlib data: " + e.getMessage(), e);
+        } finally {
+            inflater.end();
+        }
+        return out.toByteArray();
     }
 
     private static Instant instant(CBORObject value, String name) {
