@@ -35,10 +35,6 @@
     "content": "@@mdl.vm@@"
   },
   "dataSourceId": "mdldemo",
-  "status": {
-    "mechanism": "TokenStatusList",
-    "purposes": ["revocation"]
-  },
   "display": {
     "display": [
       {

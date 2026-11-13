@@ -154,6 +154,77 @@ class StatusListProblems(unittest.TestCase):
             self.assertEqual(1, len(s.status_list_problems(payload, self.URI, 3, self.NOW)), claims)
 
 
+class StatusEntry(unittest.TestCase):
+    """The MSO's status entry is optional (ISO/IEC 18013-5 9.1.2.4); the demo issues none until M-11 (F-21)."""
+
+    def test_an_mso_without_a_status_has_none(self):
+        self.assertFalse(s.has_status({"docType": s.MDL_DOCTYPE, "valueDigests": {}}))
+        self.assertFalse(s.has_status({"status": None}))
+
+    def test_a_status_with_only_an_identifier_list_carries_no_status_list_entry(self):
+        # ISO2 12.3.6: Status = { ? status_list, ? identifier_list, * tstr => RFU }
+        self.assertFalse(s.has_status({"status": {}}))
+        self.assertFalse(s.has_status({"status": {"identifier_list": {}}}))
+
+    def test_a_status_list_entry_is_seen_whatever_it_holds(self):
+        self.assertTrue(s.has_status({"status": {"status_list": {}}}))
+        self.assertTrue(s.has_status({"status": {"status_list": {"idx": 3, "uri": "https://i/v1/certify/status/1"}}}))
+
+    def test_values_that_are_not_an_mso_have_none(self):
+        for mso in (None, [], "status", {"status": "status_list"}):
+            self.assertFalse(s.has_status(mso), mso)
+
+    def test_the_run_reports_the_missing_entry_as_a_pass_and_makes_no_request(self):
+        s.results.clear()
+        smoke = s.Smoke("http://localhost:1", s.MDL_DOCTYPE, "mdl-demo-1", Path("."))  # nothing listens there
+        smoke.status({"docType": s.MDL_DOCTYPE})
+        self.assertEqual([("MSO carries no status entry (status disabled on this demo until M-11)", True)],
+                         [(step, ok) for step, ok, _ in s.results])
+        s.results.clear()
+
+
+class TalaoPath(unittest.TestCase):
+    """What a wallet that looks for an authorization endpoint even on a pre-authorized offer needs (F-21), and RFC 8414
+    section 2 with it."""
+    TOKEN = "https://issuer.example/v1/certify/oauth/token"
+    AUTHORIZE = "https://issuer.example/v1/certify/oauth/authorize"
+    PRE_AUTH = "urn:ietf:params:oauth:grant-type:pre-authorized_code"
+
+    def test_the_demo_document_has_no_problem(self):
+        document = {"authorization_endpoint": self.AUTHORIZE, "token_endpoint": self.TOKEN,
+                    "grant_types_supported": ["authorization_code", self.PRE_AUTH]}
+        self.assertEqual([], s.talao_path_problems(document))
+
+    def test_a_pre_authorized_only_document_fails_because_it_has_no_authorization_endpoint(self):
+        # the document the demo served before F-21: Talao refused it (G29)
+        problems = s.talao_path_problems({"token_endpoint": self.TOKEN,
+                                          "grant_types_supported": [self.PRE_AUTH]})
+        self.assertEqual(["authorization_endpoint None is missing or blank"], problems)
+        # ... and listing authorization_code without it is the RFC 8414 section 2 violation on top
+        self.assertEqual(2, len(s.talao_path_problems({"token_endpoint": self.TOKEN,
+                                                       "grant_types_supported": ["authorization_code", self.PRE_AUTH]})))
+
+    def test_a_blank_or_non_string_endpoint_is_as_absent_as_a_missing_one(self):
+        for blank in ("", "   ", None, 7, [self.AUTHORIZE]):
+            self.assertTrue(s.talao_path_problems({"authorization_endpoint": blank, "token_endpoint": self.TOKEN}), blank)
+            self.assertTrue(s.talao_path_problems({"authorization_endpoint": self.AUTHORIZE, "token_endpoint": blank}), blank)
+
+    def test_authorization_code_needs_a_way_to_obtain_a_code(self):
+        ends = {"authorization_endpoint": self.AUTHORIZE, "token_endpoint": self.TOKEN}
+        self.assertEqual([], s.talao_path_problems(ends | {"grant_types_supported": ["authorization_code"]}))
+        self.assertEqual([], s.talao_path_problems(ends | {"grant_types_supported": [self.PRE_AUTH]}))
+        problems = s.talao_path_problems({"token_endpoint": self.TOKEN, "grant_types_supported": ["authorization_code"]})
+        self.assertEqual(2, len(problems), problems)
+        self.assertTrue(problems[1].startswith("authorization_code is listed with no authorization_endpoint"), problems)
+
+    def test_the_interactive_authorization_endpoint_does_not_satisfy_the_talao_path(self):
+        # RFC 8414 consistency holds through the IAE (the owner-approved compatibility interpretation), but a wallet
+        # that looks for an authorization_endpoint still finds none, so both checks are reported separately
+        iae = {"interactive_authorization_endpoint": "https://issuer.example/v1/certify/oauth/iae",
+               "token_endpoint": self.TOKEN, "grant_types_supported": ["authorization_code"]}
+        self.assertEqual(["authorization_endpoint None is missing or blank"], s.talao_path_problems(iae))
+
+
 class IssuerHint(unittest.TestCase):
 
     def test_the_public_url_is_suggested_when_the_base_differs(self):

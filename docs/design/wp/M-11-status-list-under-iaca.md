@@ -1119,7 +1119,26 @@ mvn -B -ntp -s .mvn/settings-local.xml -Dmaven.legacyLocalRepo=true -Dgpg.skip=t
 grep -n "token-status-list" docker-compose/docker-compose-injistack/config/certify-mdl*.properties
 #    expect no "token-format=jwt" and no "mdoc.signer=dedicated"
 
-# 3. Restart Certify only; the database, keystores and secrets are unchanged.
+# 3. Restore the demo's status block (F-21). The demo carried no status entry until this merge (G23: the only list the
+#    stack could write was a JWT signed by keymanager's key, which does not chain to the IACA, so Paradym rejected the
+#    mDL). Put the member back into config/mdl/mdl-configuration.json before "display" - exactly what
+#    config/mdl/README.md ("Restoring the status list, after M-11") shows:
+#
+#      "status": {
+#        "mechanism": "TokenStatusList",
+#        "purposes": ["revocation"]
+#      },
+#
+#    and re-seed, which replaces the stored configuration (the seed's POST answers 409, MDL_SEED_UPDATE=true makes it PUT):
+cd docker-compose/docker-compose-injistack
+export MDL_PKI_PROFILE=mdl-operator MDL_PKI_DIR="$HOME/.certify-mdl/deploy"
+export CERTIFY_PUBLIC_URL=https://credentials.loremipsum.co.in CERTIFY_SECRETS_DIR="$HOME/certify-mdl-secrets"
+unset CERTIFY_KEYSTORE_PASSWORD
+MDL_SEED_UPDATE=true docker compose -p certify-mdl -f docker-compose.yaml -f docker-compose.rebuild.yaml \
+    -f docker-compose.mdl.yaml -f docker-compose.public.yaml up --no-deps mdl-seed
+#    mdl-seed: replaced the credential configuration org.iso.18013.5.1.mDL (MDL_SEED_UPDATE=true)
+
+# 4. Restart Certify only; the database, keystores and secrets are unchanged (step 3 already replaced the configuration).
 cd docker-compose/docker-compose-injistack
 export MDL_PKI_PROFILE=mdl-operator MDL_PKI_DIR="$HOME/.certify-mdl/deploy"
 export CERTIFY_PUBLIC_URL=https://credentials.loremipsum.co.in CERTIFY_SECRETS_DIR="$HOME/certify-mdl-secrets"
@@ -1131,12 +1150,12 @@ mdl_public up -d --no-build certify
 mdl_public logs --since 10m certify | grep -iE "token status|statuslist|status list|CRL|ERROR" | head -40
 #    no ERROR; no "token-format=jwt" WARN
 
-# 4. Smoke, which issues a fresh mDL and checks the CWT list (M-11f).
+# 5. Smoke, which issues a fresh mDL and checks the CWT list (M-11f).
 cd "$(git rev-parse --show-toplevel)"
 .venv/bin/python docs/design/tools/smoke.py --mdl "$CERTIFY_PUBLIC_URL" --iaca "$MDL_PKI_DIR/iaca.pem"
 #    expect "status list served as statuslist+cwt …" PASS and every other check as before
 
-# 5. By hand, on the mDL the smoke run kept (its --out directory prints the MSO uri and idx).
+# 6. By hand, on the mDL the smoke run kept (its --out directory prints the MSO uri and idx).
 URI='<status_list.uri from the smoke output>'; IDX='<idx>'; OUT="$(mktemp -d)"
 curl -sS -D "$OUT/h" -o "$OUT/list.cwt" -H 'Accept: application/statuslist+cwt' "$URI"
 grep -iE '^HTTP|^content-type' "$OUT/h"                     # 200, application/statuslist+cwt
@@ -1153,7 +1172,7 @@ print("sub", c[2], "iat", c[6], "exp", c[4], "ttl", c.get(65534), "bits", c[6553
 EOF
 #    tag 18, typ application/statuslist+cwt, x5chain protected, unprotected {}, bits 1
 
-# 6. Wallets. Reissue from https://credentials.loremipsum.co.in/v1/certify/offer/ into Paradym: the import succeeds.
+# 7. Wallets. Reissue from https://credentials.loremipsum.co.in/v1/certify/offer/ into Paradym: the import succeeds.
 #    The proxy log shows one GET per credential of the batch, each 200:
 cd docker-compose/docker-compose-injistack && mdl_public logs --since 10m certify-nginx | grep token-status-list | tail -12
 #    mDLs issued before step 3 still point at the JWT list (D-M11-6): delete them in the wallet and reissue.
