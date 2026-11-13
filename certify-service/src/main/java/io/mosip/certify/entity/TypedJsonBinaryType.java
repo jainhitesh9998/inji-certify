@@ -3,6 +3,7 @@ package io.mosip.certify.entity;
 import io.hypersistence.utils.hibernate.type.json.JsonBinaryType;
 import io.hypersistence.utils.hibernate.type.util.JsonConfiguration;
 import io.hypersistence.utils.hibernate.type.util.ObjectMapperWrapper;
+import org.hibernate.type.spi.TypeBootstrapContext;
 import org.hibernate.usertype.DynamicParameterizedType;
 
 import java.io.Serializable;
@@ -46,7 +47,21 @@ import java.util.Properties;
  */
 public class TypedJsonBinaryType extends JsonBinaryType {
 
-    private static final ObjectMapperWrapper JSON = JsonConfiguration.INSTANCE.getObjectMapperWrapper();
+    /**
+     * The mapper this type copies with: the same one {@link JsonBinaryType} reads and writes with, so a deployment that
+     * configures hypersistence's ObjectMapper through Hibernate settings gets one mapper for the column end to end.
+     */
+    private final ObjectMapperWrapper json;
+
+    public TypedJsonBinaryType() {
+        super();
+        this.json = JsonConfiguration.INSTANCE.getObjectMapperWrapper();
+    }
+
+    public TypedJsonBinaryType(TypeBootstrapContext bootstrapContext) {
+        super(bootstrapContext);
+        this.json = new JsonConfiguration(bootstrapContext.getConfigurationSettings()).getObjectMapperWrapper();
+    }
 
     /** The attribute's declared type, generics included ({@code Map<String, Map<String, Claims>>}). */
     private Type declaredType;
@@ -60,17 +75,17 @@ public class TypedJsonBinaryType extends JsonBinaryType {
 
     @Override
     public Object deepCopy(Object value) {
-        return value == null ? null : JSON.fromString(JSON.toString(value), type());
+        return value == null ? null : json.fromString(json.toString(value), type());
     }
 
     @Override
     public Serializable disassemble(Object value) {
-        return value == null ? null : JSON.toString(value);
+        return value == null ? null : json.toString(value);
     }
 
     @Override
     public Object assemble(Serializable cached, Object owner) {
-        return cached == null ? null : JSON.fromString((String) cached, type());
+        return cached == null ? null : json.fromString((String) cached, type());
     }
 
     private Type type() {
