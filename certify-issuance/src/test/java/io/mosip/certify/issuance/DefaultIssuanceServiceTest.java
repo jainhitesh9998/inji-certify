@@ -101,9 +101,14 @@ class DefaultIssuanceServiceTest {
 
     private DefaultIssuanceService service(List<CredentialDataSource> dataSources, String defaultDataSourceId,
                                            List<StatusProvider> statusProviders) {
+        return service(dataSources, defaultDataSourceId, statusProviders, List.of(listener));
+    }
+
+    private DefaultIssuanceService service(List<CredentialDataSource> dataSources, String defaultDataSourceId,
+                                           List<StatusProvider> statusProviders, List<IssuanceListener> listeners) {
         return new DefaultIssuanceService(registry, new FormatterRegistry(List.of(formatter)), new KeyProviderRegistry(List.of(JCA)),
                 dataSources, List.of(new FakeExternalIssuer()), List.of(proofValidator), List.of(templateEngine),
-                statusProviders, List.of(listener), AuthorizationPolicy.SCOPE, Clock.fixed(NOW, ZoneOffset.UTC), Duration.ofDays(30),
+                statusProviders, listeners, AuthorizationPolicy.SCOPE, Clock.fixed(NOW, ZoneOffset.UTC), Duration.ofDays(30),
                 defaultDataSourceId);
     }
 
@@ -271,6 +276,20 @@ class DefaultIssuanceServiceTest {
         assertInstanceOf(IssuanceResult.Issued.class, result);
     }
 
+    /**
+     * A binding is required: the default method refuses {@code null} with a message that says which call to write instead,
+     * rather than letting a provider dereference it later (review round 1, nit 8).
+     */
+    @Test
+    void theFourArgumentAttachRefusesANullBinding() {
+        NullPointerException refused = assertThrows(NullPointerException.class, () -> statusProvider.attach(
+                new UnsignedCredential("vc+jwt", Map.of("name", "Alice"), Map.of()),
+                registry.byId("default", "farmer-status").orElseThrow(), null, null));
+
+        assertTrue(String.valueOf(refused.getMessage()).contains("binding"), refused.getMessage());
+        assertEquals(0, statusProvider.attached, "nothing was attached");
+    }
+
     /** The binding tells a status provider what the credential is signed with and how its format carries a status list. */
     @Test
     void theBindingCarriesTheSigningContextAndTheFormatsTokenFormat() {
@@ -335,6 +354,88 @@ class DefaultIssuanceServiceTest {
         assertTrue(e.getMessage().contains("12.3.6.1"), e.getMessage());
         assertNull(formatter.signed, "nothing was signed");
         assertEquals(1, listener.failures.size());
+    }
+
+    /**
+     * M-11e, owner decision D-M11e-1 ("check first, then release"): the format's signing-key policy runs before the
+     * status step takes an index, so a key the format refuses at signing time costs no index at all. The same refusal
+     * maps the same way, so no client sees a different error for it.
+     */
+    @Test
+    void aRefusedSigningKeyIsCheckedBeforeTheStatusStep() {
+        formatter.keyRefusal = new FormatException("certificate_chain_invalid",
+                "DSC_NO_TRUSTED_IACA: the certificate was not issued by any configured IACA");
+
+        IssuanceException e = assertThrows(IssuanceException.class, () -> service.issue(command("farmer-status").build()));
+
+        assertEquals(IssuanceException.ISSUANCE_FAILED, e.getErrorCode());
+        assertTrue(e.getMessage().contains("DSC_NO_TRUSTED_IACA"), e.getMessage());
+        assertEquals(0, statusProvider.attached, "the key was refused before the status provider was asked");
+        assertTrue(statusProvider.released.isEmpty(), "nothing was allocated, so nothing is given back");
+        assertNull(formatter.signed);
+    }
+
+    /**
+     * The rest of D-M11e-1: a signature that does not happen after the attachment gives the entry back, so the index
+     * belongs to no credential that a wallet could reference and is not retired.
+     */
+    @Test
+    void aSigningFailureGivesTheStatusEntryBack() {
+        formatter.signFailure = new FormatException("certificate_chain_invalid",
+                "issuing_country is US but the document signer certificate belongs to IN");
+
+        assertThrows(IssuanceException.class, () -> service.issue(command("farmer-status").build()));
+
+        assertEquals(1, statusProvider.attached);
+        assertEquals(1, statusProvider.released.size(), "the entry of the credential that was never produced is given back");
+        assertEquals("list#1", statusProvider.released.get(0).attributes().get("status"), "the attachment as the provider made it");
+        assertEquals(List.of("proof", "fetch", "render", "build", "status", "beforeSign", "sign", "release"), Trace.STEPS);
+        assertEquals(1, listener.failures.size());
+    }
+
+    /** A listener that throws after the attachment is the same case: the request fails, the index is given back. */
+    @Test
+    void aListenerFailureGivesTheStatusEntryBack() {
+        ThrowingListener throwing = new ThrowingListener();
+        throwing.failWith = new IllegalStateException("the ledger is down");
+        service = service(List.of(dataSource), null, List.of(statusProvider), List.of(listener, throwing));
+
+        assertThrows(IssuanceException.class, () -> service.issue(command("farmer-status").build()));
+
+        assertEquals(1, statusProvider.released.size());
+        assertNull(formatter.signed);
+    }
+
+    /**
+     * A batch that fails on its second credential gives back the first one's entry too, signed though it is: nothing of a
+     * failed request reaches a wallet, so neither credential may hold an index.
+     */
+    @Test
+    void everyEntryOfAFailedBatchIsGivenBack() {
+        // the first credential of the batch is signed; the second one's side effect fails after its index was taken
+        service = service(List.of(dataSource), null, List.of(statusProvider), List.of(new ThrowingCountdownListener(1)));
+
+        assertThrows(IssuanceException.class, () -> service.issue(command("farmer-status")
+                .proofs(List.of(new ProofInput("jwt", "proof-1"), new ProofInput("jwt", "proof-2"))).build()));
+
+        assertEquals(2, statusProvider.attached, "both credentials of the batch took an index");
+        assertEquals(2, statusProvider.released.size(), "both are given back");
+    }
+
+    /** Succeeds on the first {@code allowed} calls and throws on the next: a side effect that fails part-way. */
+    static final class ThrowingCountdownListener implements IssuanceListener {
+        private int allowed;
+
+        ThrowingCountdownListener(int allowed) {
+            this.allowed = allowed;
+        }
+
+        public UnsignedCredential beforeSign(UnsignedCredential credential, CredentialConfiguration configuration, IssuanceContext context) {
+            if (allowed-- <= 0) {
+                throw new IllegalStateException("the side effect failed");
+            }
+            return credential;
+        }
     }
 
     @Test
@@ -606,6 +707,13 @@ class DefaultIssuanceServiceTest {
         CredentialConfiguration configuration;
         int attached;
         FormatException refuseWith;
+        /** The credentials whose entries the core gave back, in the order it did (M-11e, D-M11e-1). */
+        final List<UnsignedCredential> released = new ArrayList<>();
+
+        public void release(UnsignedCredential credential, CredentialConfiguration configuration, IssuanceContext context) {
+            Trace.step("release");
+            released.add(credential);
+        }
 
         public String mechanism() { return "token-status-list"; }
 
@@ -653,6 +761,18 @@ class DefaultIssuanceServiceTest {
         public void onFailed(IssuanceFailure failure) { failures.add(failure); }
     }
 
+    /** A listener that fails the way a side effect can (the ledger, a QR encoder, an audit sink). */
+    static final class ThrowingListener implements IssuanceListener {
+        RuntimeException failWith;
+
+        public UnsignedCredential beforeSign(UnsignedCredential credential, CredentialConfiguration configuration, IssuanceContext context) {
+            if (failWith != null) {
+                throw failWith;
+            }
+            return credential;
+        }
+    }
+
     /** A JWT-VC-shaped formatter: claims + holder into a payload, then a compact JWS through the signing context. */
     static final class FakeFormatter implements CredentialFormatter {
         final List<HolderBinding> holders = new ArrayList<>();
@@ -660,7 +780,16 @@ class DefaultIssuanceServiceTest {
         boolean explode;
         FormatException buildFailure;
         FormatException signFailure;
+        FormatException keyRefusal;
         String tokenFormat = "jwt";
+
+        @Override
+        public void checkSigningKey(java.util.function.Supplier<SigningContext> signing, CredentialConfiguration configuration,
+                                    IssuanceContext context) {
+            if (keyRefusal != null) {
+                throw keyRefusal;
+            }
+        }
 
         public String formatId() { return "vc+jwt"; }
 

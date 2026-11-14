@@ -493,6 +493,67 @@ class StatusListPostgresTest {
         assertEquals(stored, statusListRepository.findById(listId).orElseThrow().getVcDocument());
     }
 
+    /**
+     * M-11e review round 1, major 2 (gap G48): a Token Status List's pool is exactly the number of statuses its own
+     * {@code lst} carries, not {@code capacity_in_kb × 8192}. {@code size-bits} accepts any multiple of 8 from 8, and
+     * {@code capacity_in_kb} is a whole-kilobyte column, so with {@code size-bits=256} every list used to hand out 8192
+     * indices of which about 97% fell outside the list: the verifier refuses them, and M-11d's out-of-range rule made
+     * those credentials unrevocable. Every index allocated here is inside its list, every pool is the size the list says,
+     * and an entry the service hands out is readable from the list it names.
+     */
+    @Test
+    void aSmallTokenStatusListHandsOutOnlyIndicesItCarries() throws Exception {
+        for (int sizeBits : new int[] {256, 1000}) {
+            String purpose = "small-status-list-" + sizeBits;
+            io.mosip.certify.status.TokenStatusListProperties small = new io.mosip.certify.status.TokenStatusListProperties(
+                    tokenStatusListProperties.keyRef(), tokenStatusListProperties.alg(), tokenStatusListProperties.x5c(),
+                    sizeBits, tokenStatusListProperties.ttl(), tokenStatusListProperties.renewWait(),
+                    tokenStatusListProperties.renewBackoff(), tokenStatusListProperties.mdoc(), tokenStatusListProperties.batch());
+            io.mosip.certify.status.TokenStatusListService service = new io.mosip.certify.status.TokenStatusListService(
+                    statusListRepository, statusListCredentialService, statusListIndexProvider, keyProviders, small,
+                    objectMapper, environment);
+            java.util.Set<String> lists = new java.util.LinkedHashSet<>();
+            long largest = -1;
+            for (int i = 0; i < sizeBits + 50; i++) {
+                io.mosip.certify.status.TokenStatusListService.Entry entry = service.allocate(purpose);
+                assertTrue(entry.idx() < sizeBits, "index " + entry.idx() + " is outside a list of " + sizeBits + " statuses");
+                largest = Math.max(largest, entry.idx());
+                lists.add(entry.uri().substring(entry.uri().lastIndexOf('/') + 1));
+            }
+            assertTrue(lists.size() > 1, "a list of " + sizeBits + " statuses fills up, so more than one was created");
+            for (String listId : lists) {
+                io.mosip.certify.entity.StatusListCredential row = statusListRepository.findById(listId).orElseThrow();
+                assertEquals(sizeBits, io.mosip.certify.status.TokenStatusListService.capacity(
+                                row.getCredentialType(), row.getVcDocument(), row.getId()).orElseThrow(),
+                        "the list itself carries " + sizeBits + " statuses");
+                assertEquals((long) sizeBits, indexRows(listId), "its free-index pool has exactly as many");
+            }
+            assertTrue(largest >= sizeBits / 2, "the pool really was used: largest index " + largest);
+
+            // an entry the service hands out is inside the list it names, so a verifier and the update API accept it
+            io.mosip.certify.status.TokenStatusListService.Entry entry = service.allocate(purpose);
+            io.mosip.certify.entity.StatusListCredential row = statusListRepository.findById(
+                    entry.uri().substring(entry.uri().lastIndexOf('/') + 1)).orElseThrow();
+            Map<String, Object> claim = SignedJWT.parse(row.getVcDocument()).getJWTClaimsSet().getJSONObjectClaim("status_list");
+            byte[] bits = io.mosip.certify.status.TokenStatusListService.decode(String.valueOf(claim.get("lst")));
+            assertTrue(entry.idx() < (long) bits.length * 8, "the entry is readable from the list it names");
+            assertFalse(io.mosip.certify.status.TokenStatusListService.get(bits, entry.idx()), "a fresh entry is not revoked");
+        }
+    }
+
+    /** The rows of a list's free-index pool, assigned or not. */
+    private long indexRows(String listId) throws Exception {
+        try (java.sql.Connection c = dataSource.getConnection();
+             java.sql.PreparedStatement ps = c.prepareStatement("SELECT count(*) FROM " + SCHEMA
+                     + ".status_list_available_indices WHERE status_list_credential_id = ?")) {
+            ps.setString(1, listId);
+            try (java.sql.ResultSet rows = ps.executeQuery()) {
+                rows.next();
+                return rows.getLong(1);
+            }
+        }
+    }
+
     /** Stores the list signed again (same bits) by a service with another domain or clock, as an older deployment left it. */
     private void signAgain(String listId, String domain, java.time.Clock clock) {
         org.springframework.mock.env.MockEnvironment elsewhere = new org.springframework.mock.env.MockEnvironment()

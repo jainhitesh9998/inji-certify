@@ -87,16 +87,21 @@ public class TokenStatusListProvider implements StatusProvider {
     @Override
     public UnsignedCredential attach(UnsignedCredential credential, CredentialConfiguration configuration,
                                      IssuanceContext context, StatusBinding binding) {
+        java.util.Objects.requireNonNull(binding, "binding: the CWT path needs the credential's signing context and its"
+                + " formatter's status-list token format");
         if (configuration.status().purposes().isEmpty()) {
             return credential;
         }
-        if (!TokenStatusListProperties.Mdoc.FORMAT_CWT.equals(binding.statusListTokenFormat())
-                || !TokenStatusListProperties.Mdoc.FORMAT_CWT.equals(properties.mdoc().tokenFormat())) {
-            return attach(credential, configuration, context);
-        }
-        if (!MDOC_PURPOSES.equals(configuration.status().purposes())) {
+        // the mDoc purpose rule is decided by the formatter, not by this deployment's token-format setting: an mDL whose
+        // list is a JWT is still an mDoc list, and a wallet reads it for revoked/valid only. Checked before the JWT/CWT
+        // choice, so the escape hatch cannot carry a purpose the specification refuses (review round 1, major 3)
+        boolean mdocStatusList = TokenStatusListProperties.Mdoc.FORMAT_CWT.equals(binding.statusListTokenFormat());
+        if (mdocStatusList && !MDOC_PURPOSES.equals(configuration.status().purposes())) {
             throw new FormatException("status_list_unavailable", "ISO/IEC 18013-5 second edition 12.3.6.1: an mDoc"
                     + " status list carries only revoked/valid");
+        }
+        if (!mdocStatusList || !TokenStatusListProperties.Mdoc.FORMAT_CWT.equals(properties.mdoc().tokenFormat())) {
+            return attach(credential, configuration, context);
         }
         warnAboutAnUnversionedSigner(binding.signing());
         TokenStatusListService.Entry entry;
@@ -111,6 +116,28 @@ public class TokenStatusListProvider implements StatusProvider {
         return withStatusList(credential, entry);
     }
 
+    /**
+     * Gives back the index of an mDL that was never issued (M-11e, owner decision D-M11e-1): a failed listener, a
+     * Document Signer the format refuses at signing time or a signature that does not happen must not spend an entry of
+     * a CWT list.
+     *
+     * <p>Only a CWT list is touched ({@link TokenStatusListService#release} refuses a JWT row): the legacy JWT path of an
+     * SD-JWT VC, an {@code ldp_vc} or an mDoc with the escape hatch keeps exactly its previous behaviour, and a
+     * Bitstring list is not this provider's at all.
+     */
+    @Override
+    public void release(UnsignedCredential credential, CredentialConfiguration configuration, IssuanceContext context) {
+        if (credential == null) {
+            return;
+        }
+        Object status = credential.asMap().get("status");
+        Object statusList = status instanceof Map<?, ?> map ? map.get("status_list") : null;
+        if (!(statusList instanceof Map<?, ?> entry) || !(entry.get("idx") instanceof Number idx)) {
+            return;
+        }
+        lists.release(String.valueOf(entry.get("uri")), idx.longValue());
+    }
+
     private static UnsignedCredential withStatusList(UnsignedCredential credential, TokenStatusListService.Entry entry) {
         Map<String, Object> document = new LinkedHashMap<>(credential.asMap());
         document.put("status", Map.of("status_list", Map.of("idx", entry.idx(), "uri", entry.uri())));
@@ -118,11 +145,12 @@ public class TokenStatusListProvider implements StatusProvider {
     }
 
     /**
-     * Section 4.3's limitation, said once per alias: a Document Signer reference that keeps no version of itself cannot
-     * be resolved back after it rotates, so a list pinned to it can be re-signed by no {@code KeyRef} and is answered
-     * {@code STATUS_SIGNER_GONE} (503). Document-signer mode should be configured with {@code mdl-dsc@2026-11}, which
-     * {@code StatusListSigners.pin} records from the key's own {@code kid}. This is advisory: an owner question
-     * recorded in the plan (section 4.3), not a refusal.
+     * Section 4.3's limitation, said once per alias on the first mDL signed with it: a Document Signer reference that
+     * keeps no version of itself cannot be resolved back after it rotates, so a list pinned to it can be re-signed by no
+     * {@code KeyRef} and is answered {@code STATUS_SIGNER_GONE} (503). Document-signer mode should be configured with
+     * {@code mdl-dsc@2026-11}, which {@code StatusListSigners.pin} records from the key's own {@code kid}. This is
+     * advisory: an owner question recorded in the plan (section 4.3), not a refusal, and the WARN names the key it
+     * resolved so the operator can see which alias to version (owner decision D-M11e-2).
      */
     private void warnAboutAnUnversionedSigner(SigningContext signing) {
         KeyRef ref = signing.config() == null ? null : signing.config().keyRef();
@@ -135,9 +163,13 @@ public class TokenStatusListProvider implements StatusProvider {
         }
         if (warnedUnversioned.add(ref.toString())) {
             log.warn("CWT status lists are pinned to the Document Signer that signs their mDLs (D-M11-1), and {} names no"
-                    + " version of its key. If it rotates while its old certificate is still valid, its lists can be"
-                    + " re-signed by no key reference and are answered 503 STATUS_SIGNER_GONE (section 4.3). Configure a"
-                    + " versioned alias such as {}@2026-11", ref, ref.alias());
+                    + " version of its key: it resolved to {} (kid {}, certificate {}). If it rotates while its old"
+                    + " certificate is still valid, its lists can be re-signed by no key reference and are answered 503"
+                    + " STATUS_SIGNER_GONE (section 4.3). Configure a versioned alias such as {}@2026-11",
+                    ref, signing.key().ref(), kid == null ? "none" : kid,
+                    signing.key().chain() == null ? "none" : signing.key().chain().leaf()
+                            .map(certificate -> certificate.getSubjectX500Principal().getName()).orElse("none"),
+                    ref.alias());
         }
     }
 

@@ -283,7 +283,8 @@ public class TokenStatusListService {
             if (!pinned.x5tS256().equals(pinnedSigner(candidate.getId(), candidate.getVcDocument()))) {
                 continue; // another Document Signer's list: nothing on it indexes this signer's mDLs
             }
-            Optional<Long> index = indexProvider.acquireIndex(candidate.getId(), Map.of());
+            java.util.OptionalLong bits = capacity(TYPE_CWT, candidate.getVcDocument(), candidate.getId());
+            Optional<Long> index = acquireInside(candidate.getId(), bits);
             if (index.isPresent()) {
                 return new Entry(uri(candidate.getId()), index.get());
             }
@@ -292,9 +293,50 @@ public class TokenStatusListService {
             repository.updateCredentialStatus(candidate.getId(), StatusListCredential.CredentialStatus.FULL);
         }
         StatusListCredential created = createCwt(purpose, signing, pinned);
-        Optional<Long> index = indexProvider.acquireIndex(created.getId(), Map.of());
+        Optional<Long> index = acquireInside(created.getId(), capacity(created));
         return new Entry(uri(created.getId()), index.orElseThrow(
                 () -> new IllegalStateException("No free index in CWT token status list " + purpose)));
+    }
+
+    /**
+     * A free index of {@code listId} that its own document can carry: an index the pool holds outside the list's bit
+     * capacity — a pool sized from {@code capacity_in_kb} before M-11e (review round 1, major 2) — is given back and
+     * answered {@code empty}, so the caller closes that list and starts the next one rather than issuing a credential
+     * whose status entry no verifier accepts (M-11d's out-of-range rule would leave it unrevocable).
+     */
+    private Optional<Long> acquireInside(String listId, java.util.OptionalLong capacity) {
+        Optional<Long> index = indexProvider.acquireIndex(listId, Map.of());
+        if (index.isPresent() && capacity.isPresent() && index.get() >= capacity.getAsLong()) {
+            indexProvider.releaseIndex(listId, index.get());
+            log.warn("Token status list {} offers index {} but carries only {} status(es): its free-index pool was sized"
+                    + " from capacity_in_kb; the list is closed and a new one is started (M-11e)", listId, index.get(),
+                    capacity.getAsLong());
+            return Optional.empty();
+        }
+        return index;
+    }
+
+    /**
+     * Gives the index a credential that was never issued took back to its list's free pool (M-11e, owner decision
+     * D-M11e-1): a request that fails after its status entry was attached must not retire the index for a credential no
+     * wallet can reference.
+     *
+     * @param listUri the list the entry names (the {@code uri} of its {@code status_list})
+     * @param idx     the entry's {@code idx}
+     * @return whether the index was free to give back; a list or index this service does not know frees nothing
+     */
+    public boolean release(String listUri, long idx) {
+        if (listUri == null || idx < 0) {
+            return false;
+        }
+        String listId = listUri.substring(listUri.lastIndexOf('/') + 1);
+        // a JWT row keeps exactly its previous behaviour (M-11e: the legacy JWT and Bitstring paths are unchanged):
+        // releasing is part of the CWT binding, where the index belongs to a Document Signer's list that the mDL itself
+        // is pinned to
+        if (!repository.findById(listId).map(row -> TYPE_CWT.equals(row.getCredentialType())).orElse(false)) {
+            return false;
+        }
+        return indexProvider.releaseIndex(listId, idx);
     }
 
     /**
@@ -320,7 +362,7 @@ public class TokenStatusListService {
         list.setCredentialStatus(StatusListCredential.CredentialStatus.AVAILABLE);
         list.setCreatedDtimes(LocalDateTime.now());
         StatusListCredential saved = repository.saveAndFlush(list);
-        bitstringLists.initializeAvailableIndices(saved);
+        bitstringLists.initializeAvailableIndices(saved, (long) bits.length * 8);
         pinnedSigners.put(id, pinned.x5tS256());
         validUntils.put(id, signerValidity(pinned.x5tS256(), validUntil, now));
         log.info("Created CWT token status list {} for {} with {} bit(s), signed by {} ({}), exp {}", id, purpose,
@@ -333,13 +375,13 @@ public class TokenStatusListService {
     public Entry allocate(String purpose) {
         StatusListCredential list = repository.findFirstByCredentialTypeAndStatusPurposeAndCredentialStatusOrderByCreatedDtimesDesc(
                 TYPE, purpose, StatusListCredential.CredentialStatus.AVAILABLE).orElseGet(() -> create(purpose));
-        Optional<Long> index = indexProvider.acquireIndex(list.getId(), Map.of());
+        Optional<Long> index = acquireInside(list.getId(), capacity(list));
         if (index.isEmpty()) {
             // credential_status only: saving the entity read above would write back its vc_document and revert a
             // revocation committed between that read and this marking (review round 2, major 4; G39)
             repository.updateCredentialStatus(list.getId(), StatusListCredential.CredentialStatus.FULL);
             list = create(purpose);
-            index = indexProvider.acquireIndex(list.getId(), Map.of());
+            index = acquireInside(list.getId(), capacity(list));
         }
         long idx = index.orElseThrow(() -> new IllegalStateException("No free index in token status list " + purpose));
         return new Entry(uri(list.getId()), idx);
@@ -1050,7 +1092,7 @@ public class TokenStatusListService {
         list.setCredentialStatus(StatusListCredential.CredentialStatus.AVAILABLE);
         list.setCreatedDtimes(LocalDateTime.now());
         StatusListCredential saved = repository.saveAndFlush(list);
-        bitstringLists.initializeAvailableIndices(saved);
+        bitstringLists.initializeAvailableIndices(saved, (long) bits.length * 8);
         log.info("Created token status list {} for {} with {} bits", id, purpose, bits.length * 8);
         return saved;
     }
@@ -1133,16 +1175,28 @@ public class TokenStatusListService {
      *         with what is wrong with it)
      */
     public java.util.OptionalLong capacity(StatusListCredential list) {
-        if (list == null || list.getVcDocument() == null) {
+        return list == null ? java.util.OptionalLong.empty() : capacity(list.getCredentialType(), list.getVcDocument(), list.getId());
+    }
+
+    /**
+     * How many statuses a Token Status List row of {@code credentialType} and {@code vcDocument} holds, without the row
+     * itself: the same figure {@link #capacity(StatusListCredential)} answers, for a caller that holds only a projection
+     * (the index provider sizes a list's usable capacity from it, so a small {@code size-bits} never hands out an index
+     * outside the list; M-11e review round 1, major 2).
+     *
+     * @return empty for anything that is not a readable Token Status List row
+     */
+    public static java.util.OptionalLong capacity(String credentialType, String vcDocument, String id) {
+        if (vcDocument == null) {
             return java.util.OptionalLong.empty();
         }
         try {
-            if (TYPE_CWT.equals(list.getCredentialType())) {
-                TokenStatusListCwt.Decoded decoded = TokenStatusListCwt.decode(token(envelope(list.getVcDocument())));
+            if (TYPE_CWT.equals(credentialType)) {
+                TokenStatusListCwt.Decoded decoded = TokenStatusListCwt.decode(envelopeOf(vcDocument));
                 return entries(decoded.lst().length, decoded.bits());
             }
-            if (TYPE.equals(list.getCredentialType())) {
-                Map<String, Object> statusList = SignedJWT.parse(list.getVcDocument()).getJWTClaimsSet()
+            if (TYPE.equals(credentialType)) {
+                Map<String, Object> statusList = SignedJWT.parse(vcDocument).getJWTClaimsSet()
                         .getJSONObjectClaim("status_list");
                 if (statusList == null) {
                     return java.util.OptionalLong.empty();
@@ -1151,9 +1205,29 @@ public class TokenStatusListService {
                 return entries(decode(String.valueOf(statusList.get("lst"))).length, bitsPerStatus);
             }
         } catch (Exception e) {
-            log.debug("The size of token status list {} cannot be read: {}", list.getId(), e.getMessage());
+            log.debug("The size of token status list {} cannot be read: {}", id, e.getMessage());
         }
         return java.util.OptionalLong.empty();
+    }
+
+    /**
+     * The {@code capacity_in_kb} column of a Token Status List row is a whole-kilobyte figure, while the list holds
+     * exactly {@code size-bits} bits: a 256-bit list says 1 KB. Its real size, when the row's own document can be read.
+     */
+    public static java.util.OptionalLong tokenListBits(StatusListCredential list) {
+        if (list == null || !(TYPE.equals(list.getCredentialType()) || TYPE_CWT.equals(list.getCredentialType()))) {
+            return java.util.OptionalLong.empty();
+        }
+        return capacity(list.getCredentialType(), list.getVcDocument(), list.getId());
+    }
+
+    /** The token a {@link #TYPE_CWT} row's document holds, read without an injected mapper (a static caller asks). */
+    private static byte[] envelopeOf(String document) {
+        try {
+            return token(new ObjectMapper().readValue(document, StoredEnvelope.class));
+        } catch (Exception e) {
+            throw new IllegalStateException("Stored CWT token status list is not the section 4.4 envelope", e);
+        }
     }
 
     /** {@code bytes × 8 ÷ bitsPerStatus} for the sizes TSL section 4.1 allows (1, 2, 4 or 8 bits per status). */

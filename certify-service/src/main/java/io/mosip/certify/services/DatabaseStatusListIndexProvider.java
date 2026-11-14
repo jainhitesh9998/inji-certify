@@ -5,6 +5,7 @@ import io.mosip.certify.entity.StatusListAvailableIndices;
 import io.mosip.certify.entity.StatusListCredential;
 import io.mosip.certify.repository.StatusListAvailableIndicesRepository;
 import io.mosip.certify.repository.StatusListCredentialRepository;
+import io.mosip.certify.status.TokenStatusListService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -53,7 +54,11 @@ public class DatabaseStatusListIndexProvider implements StatusListIndexProvider 
             }
 
             StatusListCredential statusList = statusListOpt.get();
-            long physicalCapacity = statusList.getCapacityInKB()*1024L*8L; // Convert KB to bits
+            // a Token Status List holds exactly the statuses its own lst bits count: capacity_in_kb is a whole-kilobyte
+            // column, so a 256-bit list says 1 KB and a pool sized from it would hand out indices outside the list
+            // (M-11e review round 1, major 2)
+            long physicalCapacity = TokenStatusListService.tokenListBits(statusList)
+                    .orElse(statusList.getCapacityInKB() * 1024L * 8L); // Convert KB to bits
 
             // 2. Calculate effective threshold based on usable capacity
             long effectiveThresholdCount = (long) Math.floor(physicalCapacity * (usableCapacityPercentage / 100.0));
@@ -89,6 +94,39 @@ public class DatabaseStatusListIndexProvider implements StatusListIndexProvider 
         } catch (Exception e) {
             log.error("Error acquiring index for status list: {}", listId, e);
             return Optional.empty();
+        }
+    }
+
+    /**
+     * Gives an index back to its list's free pool (M-11e, D-M11e-1): the row is freed only while it is still assigned,
+     * so two releases of one index, or a release racing the list's own update, free one row and no other.
+     *
+     * <p>credential_status is untouched: a list that was closed as {@code FULL} (no free index at the time) stays closed,
+     * because the pool is handed out oldest list first and re-opening a list whose threshold was reached would put it
+     * back in front of the lists created after it.
+     */
+    @Override
+    @Transactional
+    public boolean releaseIndex(String listId, long index) {
+        try {
+            Query query = entityManager.createNativeQuery("""
+                    UPDATE status_list_available_indices
+                    SET is_assigned = false,
+                        upd_dtimes = NOW()
+                    WHERE status_list_credential_id = :listId
+                        AND list_index = :index
+                        AND is_assigned = true
+                    """);
+            query.setParameter("listId", listId);
+            query.setParameter("index", index);
+            int freed = query.executeUpdate();
+            if (freed > 0) {
+                log.info("Released index {} of status list {}: the credential it was taken for was not issued", index, listId);
+            }
+            return freed > 0;
+        } catch (Exception e) {
+            log.error("Could not release index {} of status list {}", index, listId, e);
+            return false;
         }
     }
 

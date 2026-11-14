@@ -144,6 +144,10 @@ public class Oid4vciCredentialController {
             default -> HttpStatus.BAD_REQUEST;
         };
         String error = status == HttpStatus.INTERNAL_SERVER_ERROR ? "server_error" : e.getErrorCode();
-        return ResponseEntity.status(status).body(Map.of("error", error, "error_description", e.getMessage()));
+        // OpenID4VCI 1.0 section 8.3.1.2 gives error_description the RFC 6749 appendix A.7 grammar: printable
+        // US-ASCII without the double quote and the backslash, so a description naming a certificate subject or an
+        // operator path is made safe here, at the protocol boundary (M-11e review round 1, minor 5)
+        return ResponseEntity.status(status).body(Map.of("error", error, "error_description",
+                Oid4vciErrorDescriptions.safe(e.getMessage())));
     }
 }

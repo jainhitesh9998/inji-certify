@@ -1,5 +1,7 @@
 package io.mosip.certify.spi;
 
+import java.util.Objects;
+
 /** Attaches a status entry to a credential before signing and applies later status updates. */
 public interface StatusProvider {
 
@@ -27,14 +29,31 @@ public interface StatusProvider {
      *
      * <p>The default method delegates to {@link #attach(UnsignedCredential, CredentialConfiguration, IssuanceContext)}:
      * every provider written before M-11e keeps working unchanged, and one that has nothing format-specific to do is
-     * never forced to look at the binding.
+     * never forced to look at the binding. A binding is required: a caller that has one passes it, and a caller that
+     * has nothing to bind calls the three-argument method, so the default method refuses {@code null} rather than
+     * binding silently to nothing.
      *
      * @param binding the signing context this credential will be signed with, and {@link
-     *                CredentialFormatter#statusListTokenFormat()}
+     *                CredentialFormatter#statusListTokenFormat()}; never {@code null}
      */
     default UnsignedCredential attach(UnsignedCredential credential, CredentialConfiguration configuration,
                                      IssuanceContext context, StatusBinding binding) {
+        Objects.requireNonNull(binding, "binding: an attach that is told what the credential is signed with"
+                + " cannot be called with no binding; implement the three-argument attach instead");
         return attach(credential, configuration, context);
+    }
+
+    /**
+     * Gives back the status entry {@link #attach} took for a credential that was never issued (M-11e, owner decision
+     * D-M11e-1). The core calls it when anything after the attachment fails — a listener, the format's own signing
+     * policy, the signature — so a failed request does not retire an index no wallet can ever reference.
+     *
+     * <p>{@code credential} is the credential exactly as {@link #attach} returned it, so a provider reads its own entry
+     * out of it; a provider whose attachment is not an index (or taken from a pool it must not hand back) leaves this
+     * default in place and nothing is released. Releasing is best effort: the core logs a provider's failure and answers
+     * the request with the failure that made it give the index back.
+     */
+    default void release(UnsignedCredential credential, CredentialConfiguration configuration, IssuanceContext context) {
     }
 
     /**

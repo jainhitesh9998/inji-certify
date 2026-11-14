@@ -257,7 +257,23 @@ class CredentialConfigurationV2Test {
         assertTrue(description.contains("status.purposes") && description.contains("12.3.6.1"), description);
         assertTrue(configurations.findByTenantIdAndCredentialConfigKeyId("default", id).isEmpty(), "nothing was saved");
 
-        // revocation itself is of course accepted, and the same rule holds on update
+        // the mechanism and the format decide it, not whether the body got round to listing purposes (review round 1,
+        // minor 4): a `TokenStatusList` block with no purpose at all is still an mDoc list, and it is refused instead of
+        // being stored as "no status" while the operator believes otherwise
+        body.put("status", Map.of("mechanism", "TokenStatusList", "purposes", List.of()));
+        MvcResult emptyPurposes = call(post(PATH), body);
+        assertEquals(400, emptyPurposes.getResponse().getStatus(), emptyPurposes.getResponse().getContentAsString());
+        assertEquals("invalid_configuration", error(emptyPurposes));
+        assertTrue(objectMapper.readTree(emptyPurposes.getResponse().getContentAsString()).get("error_description").asText()
+                .contains("status.purposes"));
+        body.put("status", Map.of("mechanism", "TokenStatusList"));
+        MvcResult omittedPurposes = call(post(PATH), body);
+        assertEquals(400, omittedPurposes.getResponse().getStatus(), omittedPurposes.getResponse().getContentAsString());
+        assertEquals("invalid_configuration", error(omittedPurposes));
+        assertTrue(configurations.findByTenantIdAndCredentialConfigKeyId("default", id).isEmpty(), "nothing was saved");
+
+        // revocation itself is of course accepted, and the same rule holds on update, for a wrong, an empty and an
+        // omitted purpose list alike
         body.put("status", Map.of("mechanism", "TokenStatusList", "purposes", List.of("revocation")));
         MvcResult created = call(post(PATH), body);
         assertEquals(201, created.getResponse().getStatus(), created.getResponse().getContentAsString());
@@ -265,6 +281,10 @@ class CredentialConfigurationV2Test {
         MvcResult update = call(put(PATH + "/" + id), body);
         assertEquals(400, update.getResponse().getStatus(), update.getResponse().getContentAsString());
         assertEquals("invalid_configuration", error(update));
+        body.put("status", Map.of("mechanism", "TokenStatusList", "purposes", List.of()));
+        assertEquals(400, call(put(PATH + "/" + id), body).getResponse().getStatus(), "an empty purpose list on update");
+        body.put("status", Map.of("mechanism", "TokenStatusList"));
+        assertEquals(400, call(put(PATH + "/" + id), body).getResponse().getStatus(), "an omitted purpose list on update");
         String stored = String.valueOf(configurations.findByTenantIdAndCredentialConfigKeyId("default", id).orElseThrow()
                 .getCredentialStatusPurposes());
         assertTrue(stored.contains("revocation") && !stored.contains("suspension"), "the refused update stored nothing: " + stored);
