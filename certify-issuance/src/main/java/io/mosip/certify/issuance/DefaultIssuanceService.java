@@ -20,6 +20,8 @@ import io.mosip.certify.spi.StatusProvider;
 import io.mosip.certify.spi.TemplateEngine;
 import io.mosip.certify.spi.TemplateRef;
 import io.mosip.certify.spi.UnsignedCredential;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.time.Clock;
 import java.time.Duration;
@@ -39,6 +41,8 @@ import java.util.stream.Collectors;
  * strategy, attach status, run listeners, sign, notify. It knows no protocol, no storage and no key store.
  */
 public class DefaultIssuanceService implements IssuanceService {
+
+    private static final Logger log = LoggerFactory.getLogger(DefaultIssuanceService.class);
 
     /** Attribute on {@link ClaimSet#provenance()} that marks a caller-supplied document. */
     public static final String PROVENANCE_SUPPLIED = "supplied";
@@ -102,6 +106,9 @@ public class DefaultIssuanceService implements IssuanceService {
         String correlationId = command.correlationId() == null ? UUID.randomUUID().toString() : command.correlationId();
         IssuanceContext base = new IssuanceContext(command.tenant(), command.authorization(), List.of(), command.protocol(),
                 correlationId, clock.instant(), command.protocolParams());
+        // every status entry this request took, so a failure anywhere after the attachment gives the indices back
+        // instead of retiring them for a credential no wallet will ever hold (M-11e, owner decision D-M11e-1)
+        List<Attachment> attachments = new ArrayList<>();
         try {
             authorizationPolicy.check(command.authorization(), configuration, command.protocol());
             List<HolderBinding> holders = holders(command, configuration, base);
@@ -110,7 +117,7 @@ public class DefaultIssuanceService implements IssuanceService {
             List<IssuedCredential> credentials = new ArrayList<>();
             ClaimSet lastClaims = null;
             for (HolderBinding holder : holders) {
-                Issued issued = issueOne(command, configuration, context, holder);
+                Issued issued = issueOne(command, configuration, context, holder, attachments);
                 credentials.add(issued.credential());
                 lastClaims = issued.claims();
             }
@@ -119,15 +126,39 @@ public class DefaultIssuanceService implements IssuanceService {
             listeners.forEach(l -> l.onIssued(event));
             return new IssuanceResult.Issued(credentials, transactionId);
         } catch (IssuanceException e) {
+            release(attachments);
             notifyFailure(base, configuration, e.getErrorCode(), e);
             throw e;
         } catch (RuntimeException e) {
+            release(attachments);
             notifyFailure(base, configuration, IssuanceException.ISSUANCE_FAILED, e);
             throw new IssuanceException(IssuanceException.ISSUANCE_FAILED, "Issuance failed: " + e.getMessage(), e);
         }
     }
 
     private record Issued(IssuedCredential credential, ClaimSet claims) {}
+
+    /** A status entry a provider attached to one credential of this request, and what it takes to give it back. */
+    private record Attachment(StatusProvider provider, UnsignedCredential credential,
+                              CredentialConfiguration configuration, IssuanceContext context) {}
+
+    /**
+     * Hands back every index this request took, newest first. A release is best effort and never replaces the failure
+     * that caused it: a provider that cannot give an index back has its exception logged, and the request still answers
+     * with what went wrong.
+     */
+    private void release(List<Attachment> attachments) {
+        for (int i = attachments.size() - 1; i >= 0; i--) {
+            Attachment attachment = attachments.get(i);
+            try {
+                attachment.provider().release(attachment.credential(), attachment.configuration(), attachment.context());
+            } catch (RuntimeException e) {
+                log.warn("Status provider {} could not give back the entry of a failed issuance ({})",
+                        attachment.provider().mechanism(), e.toString());
+            }
+        }
+        attachments.clear();
+    }
 
     private CredentialConfiguration resolve(IssuanceCommand command) {
         String tenantId = command.tenant().tenantId();
@@ -174,7 +205,8 @@ public class DefaultIssuanceService implements IssuanceService {
         return holders;
     }
 
-    private Issued issueOne(IssuanceCommand command, CredentialConfiguration configuration, IssuanceContext context, HolderBinding holder) {
+    private Issued issueOne(IssuanceCommand command, CredentialConfiguration configuration, IssuanceContext context,
+                            HolderBinding holder, List<Attachment> attachments) {
         CredentialFormatter formatter = formatters.require(configuration.format());
         ClaimSet claims;
         switch (configuration.strategy()) {
@@ -203,17 +235,34 @@ public class DefaultIssuanceService implements IssuanceService {
             }
         }
         UnsignedCredential unsigned = build(formatter, claims, configuration, context, holder);
+        // the key is resolved before the status step, not after it (M-11e): a status list for an mso_mdoc is signed by
+        // the Document Signer of the mDLs indexed in it, so the provider needs that key before it allocates an index, and
+        // an unusable key fails without consuming one. The same context signs the credential below, so one resolution
+        // serves both and nothing about the issued bytes changes.
+        SigningContext signing = keyProviders.signingContext(signingConfig(configuration, context));
         if (configuration.status().isEnabled()) {
             StatusProvider status = statusProviders.stream()
                     .filter(p -> p.mechanism().equals(configuration.status().mechanism()) && p.supports(configuration.format()))
                     .findFirst().orElseThrow(() -> new IssuanceException(IssuanceException.ISSUANCE_FAILED,
                             "No status provider for " + configuration.status().mechanism() + " and format " + configuration.format()));
-            unsigned = status.attach(unsigned, configuration, context);
+            // check first, then release (owner decision D-M11e-1): the format's own signing-key policy runs before an
+            // index is taken, so a key the format would refuse costs no index at all. The same resolved context signs
+            // the credential below, so this is the check sign() would run, not a second resolution.
+            checkSigningKey(formatter, signing, configuration, context);
+            try {
+                unsigned = status.attach(unsigned, configuration, context,
+                        new StatusProvider.StatusBinding(signing, formatter.statusListTokenFormat()));
+                attachments.add(new Attachment(status, unsigned, configuration, context));
+            } catch (FormatException e) {
+                // a provider refuses before anything is signed: no usable status list, a refused or retired signer, an
+                // index pool that is gone. The request itself is fine, so the answer stays OpenID4VCI's server_error;
+                // the description names the rule (status_list_unavailable and the reason), which an operator needs
+                throw statusFailure(e);
+            }
         }
         for (IssuanceListener listener : listeners) {
             unsigned = listener.beforeSign(unsigned, configuration, context);
         }
-        SigningContext signing = keyProviders.signingContext(signingConfig(configuration, context));
         try {
             return new Issued(formatter.sign(unsigned, signing, context), claims);
         } catch (FormatException e) {
@@ -221,11 +270,38 @@ public class DefaultIssuanceService implements IssuanceService {
         }
     }
 
+    /**
+     * A {@link StatusProvider} refusing to attach an entry: the credential cannot carry a status a verifier would accept
+     * (no free list, a Document Signer the signer policy refuses, a list whose signer is retired). The credential request
+     * is not at fault, so the code is {@link IssuanceException#ISSUANCE_FAILED} — and the provider's own code is kept in
+     * the description, so a wallet log names the rule ({@code status_list_unavailable}) rather than a bare
+     * "Issuance failed".
+     */
+    private static IssuanceException statusFailure(FormatException e) {
+        String code = e.getErrorCode();
+        return new IssuanceException(IssuanceException.ISSUANCE_FAILED,
+                "Issuance failed: " + (code == null || code.isBlank() ? "" : code + ": ") + e.getMessage(), e);
+    }
+
     /** A tenant with its own DID issues under it: the proof's verification method and the issuer must resolve together. */
     private static SigningConfig signingConfig(CredentialConfiguration configuration, IssuanceContext context) {
         String tenantDid = context.tenant() == null ? null : context.tenant().issuerDid();
         return tenantDid == null || tenantDid.isBlank() || tenantDid.equals(configuration.signing().issuerDid())
                 ? configuration.signing() : configuration.signing().withIssuerDid(tenantDid);
+    }
+
+    /**
+     * The format's dry run of the checks {@link CredentialFormatter#sign} makes on the key (M-11e, D-M11e-1), with the
+     * already-resolved signing context: a Document Signer the DSC policy refuses fails here, before a status index is
+     * allocated, and is mapped exactly as a refusal at signing time would be.
+     */
+    private static void checkSigningKey(CredentialFormatter formatter, SigningContext signing,
+                                        CredentialConfiguration configuration, IssuanceContext context) {
+        try {
+            formatter.checkSigningKey(() -> signing, configuration, context);
+        } catch (FormatException e) {
+            throw callerError(e);
+        }
     }
 
     private static UnsignedCredential build(CredentialFormatter formatter, ClaimSet claims, CredentialConfiguration configuration,

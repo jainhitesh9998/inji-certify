@@ -29,4 +29,16 @@ public interface StatusListIndexProvider {
      */
     Optional<Long> acquireIndex(String listId, Map<String, Object> options);
 
+    /**
+     * Gives an index {@link #acquireIndex} took back to its list's free pool, so a status entry that belongs to no
+     * credential is handed out again (M-11e, owner decision D-M11e-1). A provider that cannot do that keeps this
+     * default and the index is simply gone, as before.
+     *
+     * @param listId the list the index was acquired from
+     * @param index  the index to free; one that is already free, or unknown to the list, changes nothing
+     * @return whether a row was freed (so a caller can tell "given back" from "not a pool index")
+     */
+    default boolean releaseIndex(String listId, long index) {
+        return false;
+    }
 }

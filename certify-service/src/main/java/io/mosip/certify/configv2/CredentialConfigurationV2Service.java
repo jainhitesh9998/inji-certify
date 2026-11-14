@@ -26,6 +26,7 @@ import io.mosip.certify.spi.StatusProvider;
 import io.mosip.certify.spi.TemplateEngine;
 import io.mosip.certify.spi.TemplateRef;
 import io.mosip.certify.spi.UnsignedCredential;
+import io.mosip.certify.status.TokenStatusListProperties;
 import io.mosip.certify.tenancy.TenantContexts;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -60,6 +61,8 @@ public class CredentialConfigurationV2Service {
             ("{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\",\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"}")
                     .getBytes(java.nio.charset.StandardCharsets.UTF_8)), "jwt");
     static final String FORMAT_MSO_MDOC = "mso_mdoc";
+    /** The only status purposes an mDoc list may carry (ISO/IEC 18013-5 second edition 12.3.6.1, D-M11-5). */
+    static final List<String> MDOC_STATUS_PURPOSES = List.of("revocation");
 
     private final CredentialConfigRepository configurations;
     private final CredentialTemplateRepository templates;
@@ -305,6 +308,27 @@ public class CredentialConfigurationV2Service {
             }
         }
         CredentialConfigurationV2.Status status = body.getStatus();
+        // the mDoc purpose rule is about the mechanism-and-format pair, so it is checked whether or not the body lists
+        // purposes: `TokenStatusList` with no purpose ([] or omitted) on an mso_mdoc is still an mDoc list, and a row
+        // saved that way would be refused at issuance only after an operator believed it was stored (review round 1,
+        // minor 4). The format asks its own formatter what a list for it is, so nothing here compares the credential
+        // format (CLAUDE.md rule 5).
+        String statusListTokenFormat = formatters.forFormat(format)
+                .map(CredentialFormatter::statusListTokenFormat).orElse(TokenStatusListProperties.Mdoc.FORMAT_JWT);
+        if (TokenStatusListProperties.Mdoc.FORMAT_CWT.equals(statusListTokenFormat)
+                && status != null
+                && io.mosip.certify.status.TokenStatusListProvider.MECHANISM.equals(status.getMechanism())) {
+            List<String> purposes = status.getPurposes() == null ? List.of() : status.getPurposes();
+            if (!MDOC_STATUS_PURPOSES.equals(purposes)) {
+                // ISO/IEC 18013-5 second edition 12.3.6.1 and owner decision D-M11-5: an mDoc status list carries only
+                // revoked/valid, so a purpose no wallet can read is refused when the row is written, not at issuance
+                throw ConfigV2Exception.invalid("status.purposes must be exactly " + MDOC_STATUS_PURPOSES
+                        + " for an mso_mdoc entry whose status.mechanism is "
+                        + io.mosip.certify.status.TokenStatusListProvider.MECHANISM
+                        + ": ISO/IEC 18013-5 second edition 12.3.6.1 makes an mDoc status list carry only"
+                        + " revoked/valid (D-M11-5)");
+            }
+        }
         if (status != null && status.getPurposes() != null && !status.getPurposes().isEmpty()) {
             if (status.getPurposes().size() > 1) {
                 throw ConfigV2Exception.invalid("Only one status purpose is supported");

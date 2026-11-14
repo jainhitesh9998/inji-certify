@@ -19,10 +19,15 @@ classpath of `certify-service`.
 | `certify-service/IssuanceGoldenTest-oid4vci` | `POST /oid4vci/credential` |
 | `certify-service/IssuanceGoldenCoreTest-legacy`, `-oid4vci` | both paths with the compatibility path served by the core |
 | `certify-service/D13GoldenReplayTest-d13` | the draft-13 surface: a `Document {docType, issuerSigned}` with a tag-18 IssuerAuth (0.14.0 wire compatibility, decision log 2026-09-19) |
+| `certify-service/MdocStatusListSampleTest-oid4vci`, `-d13` | M-11e: an mDL that carries `status.status_list`, whose list is a CWT signed by its own Document Signer, through `/oid4vci` and through the draft-13 surface, against an `x509-file` dev-mode IACA |
+| `certify-service/MdocStatusListSampleTest-revoked` | the same mDL after `POST /credentials/status` and the batch job: the re-signed list reports `1` (INVALID) at its index |
 
 `VcIssuancePluginGoldenTest` is not a producer: its `mso_mdoc` credential is a plugin's opaque bytes, passed through.
 Each sample is `<name>.mdoc` (the credential as received) plus `<name>.holder.jwk`, `<name>.doctype`, `<name>.gaps`
-and, when the chain carries one, `<name>.iaca.pem`.
+and, when the chain carries one, `<name>.iaca.pem`. A sample whose MSO carries `status.status_list` also carries the list
+itself, `<name>.statuslist.cwt` (the body as served) with `<name>.statuslist.ct` (its `Content-Type`), and — when the list
+must report something other than VALID at its index — `<name>.statuslist.status` (`0` VALID, the default when absent,
+or `1` INVALID; ISO/IEC 18013-5 second edition 12.3.6.1 admits no other mDoc status).
 
 ## Run it after the tests that write the samples
 

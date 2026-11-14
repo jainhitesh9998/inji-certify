@@ -2,6 +2,7 @@ package io.mosip.certify.oid4vci.d13;
 
 import io.mosip.certify.core.dto.VCIssuanceTransaction;
 import io.mosip.certify.issuance.IssuanceException;
+import io.mosip.certify.oid4vci.Oid4vciErrorDescriptions;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.core.Ordered;
@@ -45,23 +46,23 @@ public class D13ErrorAdvice {
             }
             case IssuanceException.NOT_AUTHENTICATED -> {
                 body.put("error", e.getErrorCode());
-                body.put("error_description", e.getMessage());
+                body.put("error_description", Oid4vciErrorDescriptions.safe(e.getMessage()));
                 return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(body);
             }
             // draft 13 (OpenID4VCI draft-13 section 7.3.1) has no credential_request_denied: answer the code it does have
             case IssuanceException.CREDENTIAL_REQUEST_DENIED -> {
                 body.put("error", IssuanceException.INVALID_CREDENTIAL_REQUEST);
-                body.put("error_description", e.getMessage());
+                body.put("error_description", Oid4vciErrorDescriptions.safe(e.getMessage()));
                 return ResponseEntity.badRequest().body(body);
             }
             case IssuanceException.ISSUANCE_FAILED -> {
                 body.put("error", "server_error");
-                body.put("error_description", e.getMessage());
+                body.put("error_description", Oid4vciErrorDescriptions.safe(e.getMessage()));
                 return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(body);
             }
             default -> {
                 body.put("error", e.getErrorCode());
-                body.put("error_description", e.getMessage());
+                body.put("error_description", Oid4vciErrorDescriptions.safe(e.getMessage()));
                 return ResponseEntity.badRequest().body(body);
             }
         }

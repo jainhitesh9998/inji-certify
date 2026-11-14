@@ -65,6 +65,9 @@ class MdocSampleConformanceTest {
             "certify-format-mdoc/MdocIndependentVerificationTest-ed25519",
             "certify-format-mdoc/MdocIndependentVerificationTest-formatter",
             "certify-service/D13GoldenReplayTest-d13",
+            "certify-service/MdocStatusListSampleTest-d13",
+            "certify-service/MdocStatusListSampleTest-oid4vci",
+            "certify-service/MdocStatusListSampleTest-revoked",
             "certify-service/IssuanceGoldenCoreTest-legacy",
             "certify-service/IssuanceGoldenCoreTest-oid4vci",
             "certify-service/IssuanceGoldenTest-legacy",
@@ -155,7 +158,8 @@ class MdocSampleConformanceTest {
                 + MdocSamples.STATUSLIST_CWT + " and " + MdocSamples.STATUSLIST_CONTENT_TYPE + ")"));
         VerificationReport listReport = IndependentStatusListVerifier.verify(token.body(), token.contentType(),
                 statusList.uri(), statusList.idx(), sample.issuerAuthX5chain(), sample.iaca().orElse(null), Instant.now(),
-                IndependentStatusListVerifier.StatusListOptions.strictMode());
+                // the status the sample declares at its own idx (M-11e): 0 VALID, 1 INVALID for a revoked mDL
+                IndependentStatusListVerifier.StatusListOptions.strictMode(sample.statusListExpectedStatus()));
         assertEquals(IndependentStatusListVerifier.TOKEN_CHECKS,
                 listReport.checks().stream().map(VerificationReport.Check::name).toList(),
                 found.id() + ": the status-list verifier did not run every token check");

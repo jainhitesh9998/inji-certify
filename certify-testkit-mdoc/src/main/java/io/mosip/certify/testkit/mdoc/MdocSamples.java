@@ -61,6 +61,12 @@ public final class MdocSamples {
     public static final String STATUSLIST_CWT = ".statuslist.cwt";
     /** The {@code Content-Type} the status list was served with (M-11b: both sidecars are required together). */
     public static final String STATUSLIST_CONTENT_TYPE = ".statuslist.ct";
+    /**
+     * The status the list must report at the sample's {@code idx} (M-11e): {@code 0} VALID (absent file, the default) or
+     * {@code 1} INVALID for a revoked mDL. ISO/IEC 18013-5 second edition 12.3.6.1 allows no other status for an mDoc,
+     * and {@code bits} is 1 (12.3.6.5), so no other value is accepted.
+     */
+    public static final String STATUSLIST_EXPECTED_STATUS = ".statuslist.status";
 
     /** Producers whose earlier samples this JVM already removed. */
     private static final Set<String> CLEANED = ConcurrentHashMap.newKeySet();
@@ -75,7 +81,7 @@ public final class MdocSamples {
     public record Sample(String name, Path path, byte[] received, byte[] issuerSigned, Optional<String> documentDocType,
                          JWK holder, String docType, AcceptedGaps gaps, Optional<X509Certificate> iaca,
                          Optional<StatusListToken> statusList, StatusListReference statusListReference,
-                         List<X509Certificate> issuerAuthX5chain) {
+                         List<X509Certificate> issuerAuthX5chain, int statusListExpectedStatus) {
 
         /** The MSO's {@code {uri, idx}} when it is present and well formed. */
         public Optional<StatusListInfo> statusListInfo() {
@@ -235,7 +241,8 @@ public final class MdocSamples {
             }
             return new Sample(name, mdoc, received, issuerSigned, documentDocType, holder, docType, gaps,
                     Files.isRegularFile(iaca) ? Optional.of(readPem(iaca)) : Optional.empty(),
-                    statusList, statusListReferenceOf(issuerSigned), issuerAuthX5chainOf(issuerSigned));
+                    statusList, statusListReferenceOf(issuerSigned), issuerAuthX5chainOf(issuerSigned),
+                    expectedStatus(directory, name));
         } catch (IOException e) {
             throw new UncheckedIOException("cannot read the mDoc sample " + mdoc, e);
         } catch (ParseException e) {
@@ -247,10 +254,37 @@ public final class MdocSamples {
     public static List<Path> files(Path mdoc) {
         String file = mdoc.getFileName().toString();
         String name = file.substring(0, file.length() - MDOC.length());
-        return Stream.of(MDOC, HOLDER_JWK, DOCTYPE, GAPS, IACA_PEM, STATUSLIST_CWT, STATUSLIST_CONTENT_TYPE)
+        return Stream.of(MDOC, HOLDER_JWK, DOCTYPE, GAPS, IACA_PEM, STATUSLIST_CWT, STATUSLIST_CONTENT_TYPE,
+                        STATUSLIST_EXPECTED_STATUS)
                 .map(suffix -> mdoc.resolveSibling(name + suffix))
                 .filter(Files::isRegularFile)
                 .toList();
+    }
+
+    /**
+     * The status the list must report at the sample's {@code idx}: {@link #STATUSLIST_EXPECTED_STATUS} when the producer
+     * wrote one, {@code 0} (VALID) otherwise. Only 0 and 1 are meaningful for an mDoc (ISO/IEC 18013-5 second edition
+     * 12.3.6.1), so anything else is a producer error and refused rather than silently verified as 0.
+     */
+    private static int expectedStatus(Path directory, String name) {
+        Path path = directory.resolve(name + STATUSLIST_EXPECTED_STATUS);
+        if (!Files.isRegularFile(path)) {
+            return 0;
+        }
+        try {
+            int status = Integer.parseInt(Files.readString(path).trim());
+            if (status != 0 && status != 1) {
+                throw new IllegalArgumentException("the mDoc sample " + name + " declares " + STATUSLIST_EXPECTED_STATUS
+                        + " " + status + "; an mDoc status list reports 0 (VALID) or 1 (INVALID) only"
+                        + " (ISO/IEC 18013-5 second edition 12.3.6.1)");
+            }
+            return status;
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot read " + STATUSLIST_EXPECTED_STATUS + " next to " + name, e);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("the mDoc sample " + name + " has an unreadable "
+                    + STATUSLIST_EXPECTED_STATUS + " sidecar: it holds 0 or 1", e);
+        }
     }
 
     private static Path sidecar(Path directory, String name, String suffix) {

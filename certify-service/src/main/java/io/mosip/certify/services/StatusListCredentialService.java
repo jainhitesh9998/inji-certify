@@ -221,18 +221,34 @@ public class StatusListCredentialService {
     /**
      * Initialize available indices for a newly created status list using Database Query Approach
      *
+     * <p>A Bitstring list is sized in kilobytes, so its pool is {@code capacity_in_kb × 1024 × 8} indices. A Token Status
+     * List is not: its bit array is as long as the configured {@code size-bits}, which need not be a whole kilobyte, so
+     * its pool is created with {@link #initializeAvailableIndices(StatusListCredential, long)} and the exact count.
+     *
      * @param statusListCredential the status list credential
      */
     @Transactional
     public void initializeAvailableIndices(StatusListCredential statusListCredential) {
+        initializeAvailableIndices(statusListCredential, statusListCredential.getCapacityInKB() * 1024L * 8L);
+    }
+
+    /**
+     * Initializes the free-index pool of a list of {@code count} statuses: indices {@code 0} to {@code count - 1}, the
+     * ones the list's own document can carry.
+     *
+     * @param statusListCredential the status list credential, saved already
+     * @param count                how many statuses the list holds; a Token Status List passes its {@code lst} bits
+     */
+    @Transactional
+    public void initializeAvailableIndices(StatusListCredential statusListCredential, long count) {
         log.info("Initializing available indices for status list: {}", statusListCredential.getId());
 
         try {
 
             Query checkQuery = entityManager.createNativeQuery("SELECT COUNT(*) FROM status_list_credential WHERE id = ?");
             checkQuery.setParameter(1, statusListCredential.getId());
-            Object count = checkQuery.getSingleResult();
-            log.info("StatusListCredential with ID {} exists in DB: {}", statusListCredential.getId(), count);
+            Object exists = checkQuery.getSingleResult();
+            log.info("StatusListCredential with ID {} exists in DB: {}", statusListCredential.getId(), exists);
 
             String insertSql = """
                     INSERT INTO status_list_available_indices
@@ -242,7 +258,7 @@ public class StatusListCredentialService {
 
             Query nativeQuery = entityManager.createNativeQuery(insertSql);
             nativeQuery.setParameter(1, statusListCredential.getId());
-            nativeQuery.setParameter(2, statusListCredential.getCapacityInKB() * 1024L * 8L); // Convert KB to bits
+            nativeQuery.setParameter(2, count);
 
             int rowsInserted = nativeQuery.executeUpdate();
             log.info("Successfully initialized {} available indices for status list: {}", rowsInserted, statusListCredential.getId());

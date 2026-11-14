@@ -36,6 +36,18 @@ public interface CredentialFormatter {
     IssuedCredential sign(UnsignedCredential credential, SigningContext signing, IssuanceContext context);
 
     /**
+     * How a credential of this format carries a status list, as the token format identifier a {@link StatusProvider}
+     * understands: {@code jwt} (a Token Status List JWT) unless the format says otherwise.
+     *
+     * <p>This is a property of the credential format, not of any deployment setting, so it is answered here: ISO/IEC
+     * 18013-5 second edition 12.3.6.3 makes an {@code mso_mdoc}'s status list a CWT, so {@code MdocFormatter} answers
+     * {@code cwt}; nothing else in Certify has to switch on the credential format to know it (CLAUDE.md rule 5).
+     */
+    default String statusListTokenFormat() {
+        return "jwt";
+    }
+
+    /**
      * The checks {@link #sign} runs on the signing key, without signing anything: a configuration's dry run and preview
      * call it so that a key this format would refuse is named before a wallet asks for a credential. The supplier
      * resolves the key; a format with nothing to check never calls it, so a preview stays key-free for it. Throws

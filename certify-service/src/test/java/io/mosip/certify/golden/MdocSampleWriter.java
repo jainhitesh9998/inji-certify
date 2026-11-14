@@ -96,8 +96,21 @@ final class MdocSampleWriter {
     /**
      * Writes the sample {@code <producer>-<surface>}. The first write of a producer in this JVM deletes that producer's
      * earlier samples, so a renamed or dropped sample cannot linger from an older build.
+     *
+     * @return the {@code .mdoc} file, so a producer can attach the status list the sample's MSO points at
      */
-    static void write(Class<?> producer, String surface, String credential, JWK holder, String docType, List<Gap> gaps)
+    static Path write(Class<?> producer, String surface, String credential, JWK holder, String docType, List<Gap> gaps)
+            throws IOException, java.security.cert.CertificateEncodingException {
+        return write(producer, surface, credential, holder, docType, gaps, null);
+    }
+
+    /**
+     * As {@link #write(Class, String, String, JWK, String, List)}, with the trust anchor the verifier is given: an
+     * {@code x5chain} without its anchor ({@code without-anchor}, HAIP) does not carry the IACA, so a producer that knows
+     * it — the configured {@code mdoc-iaca} — writes it for the chain-to-anchor check (M-06, M-11b).
+     */
+    static Path write(Class<?> producer, String surface, String credential, JWK holder, String docType, List<Gap> gaps,
+                      X509Certificate trustAnchor)
             throws IOException, java.security.cert.CertificateEncodingException {
         String name = producer.getSimpleName() + "-" + surface;
         Files.createDirectories(DIRECTORY);
@@ -119,12 +132,30 @@ final class MdocSampleWriter {
         gapsFor(received, gaps).forEach(gap -> sidecar.append(gap.line()).append('\n'));
         Files.writeString(DIRECTORY.resolve(name + ".gaps"), sidecar.toString());
         List<X509Certificate> chain = x5chain(received);
-        X509Certificate anchor = chain.size() < 2 ? null : chain.get(chain.size() - 1); // a lone leaf is not an anchor
+        X509Certificate anchor = trustAnchor != null ? trustAnchor
+                : chain.size() < 2 ? null : chain.get(chain.size() - 1); // a lone leaf is not an anchor
+        Path mdoc = DIRECTORY.resolve(name + ".mdoc");
         if (anchor != null && anchor.getSubjectX500Principal().equals(anchor.getIssuerX500Principal())) {
             Files.writeString(DIRECTORY.resolve(name + ".iaca.pem"), "-----BEGIN CERTIFICATE-----\n"
                     + Base64.getMimeEncoder(64, new byte[] {'\n'}).encodeToString(anchor.getEncoded())
                     + "\n-----END CERTIFICATE-----\n");
         }
+        return mdoc;
+    }
+
+    /**
+     * The status list a sample's MSO points at, written beside its {@code .mdoc} exactly as the endpoint answered it:
+     * {@code <name>.statuslist.cwt} (the body) and {@code <name>.statuslist.ct} (its {@code Content-Type}), plus
+     * {@code <name>.statuslist.status} — the status the list must report at the sample's {@code idx} (0 VALID, 1
+     * INVALID), which is the one thing the verifier cannot read from the credential (M-11b's
+     * {@code StatusListOptions.expectedStatus}; M-11e's revoked sample declares 1).
+     */
+    static void writeStatusList(Path mdoc, byte[] body, String contentType, int expectedStatus) throws IOException {
+        String file = mdoc.getFileName().toString();
+        String name = file.substring(0, file.length() - ".mdoc".length());
+        Files.write(mdoc.resolveSibling(name + ".statuslist.cwt"), body);
+        Files.writeString(mdoc.resolveSibling(name + ".statuslist.ct"), contentType);
+        Files.writeString(mdoc.resolveSibling(name + ".statuslist.status"), Integer.toString(expectedStatus));
     }
 
     /**

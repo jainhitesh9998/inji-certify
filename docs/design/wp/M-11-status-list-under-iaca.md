@@ -1224,6 +1224,12 @@ Branch `wp/m-11e-status-binding`. Depends on M-11d and M-11b. About 550 lines.
    - Sign with that same `signing`.
    - Nothing else moves. An unresolvable key now fails before an index is consumed, with the same exception mapping as
      before (`FormatException` → `callerError`, others unchanged); test it.
+   - **Owner decision D-M11e-1 (2026-11-14), "check first, then release"** (review round 1, major 1): the formatter's
+     signing-key check (`formatter.checkSigningKey(() -> signing, configuration, context)`, the dry run `preview` already
+     runs) is called **before** the status step takes an index, and if anything after the attachment fails — a listener,
+     the format at signing time, the signature, a later credential of the same batch — the entry is given back through
+     `StatusProvider.release(...)` (a new default method, so the SPI stays additive). Internal order only, no wire
+     change; the legacy JWT and Bitstring paths keep their behaviour.
 3. `TokenStatusListProvider` overrides the 4-argument `attach`:
    - If `binding.statusListTokenFormat()` is `cwt` and `properties.mdoc().tokenFormat()` is `cwt`, call
      `lists.allocateCwt(purpose, binding.signing())`.
@@ -1233,8 +1239,10 @@ Branch `wp/m-11e-status-binding`. Depends on M-11d and M-11b. About 550 lines.
      carries only revoked/valid")`.
    - Document-signer mode should sign with a **versioned** DSC alias (`x509-file:mdl-dsc` resolving to
      `mdl-dsc@2026-11`): an unversioned alias that rotates while the old certificate is still valid leaves lists
-     pinned to it re-signable by no `KeyRef` (4.3's limitation), so log one startup WARN naming the alias — an owner
-     question recorded, not decided here.
+     pinned to it re-signable by no `KeyRef` (4.3's limitation), so log one WARN — **owner decision D-M11e-2
+     (2026-11-14), "first issuance"**: on the first mDL signed with that alias, once per alias, naming the reference,
+     the key it resolved, the certificate and the versioned form to configure; never for a versioned reference such as
+     `mdl-dsc@2026-11`.
 4. The v2 configuration API refuses on create and update, with `400 invalid_configuration` naming `status.purposes`,
    any `mso_mdoc` configuration whose `status.mechanism` is `TokenStatusList` and whose `purposes` is not
    `["revocation"]` (D-M11-5). The v1 API is untouched; rows stored through it are caught at issuance (point 3).
@@ -1266,6 +1274,12 @@ Branch `wp/m-11e-status-binding`. Depends on M-11d and M-11b. About 550 lines.
 - [ ] Two DSC versions: an mDL signed before a rotation and one after reference different lists; each list's `x5chain`
   equals its mDL's.
 - [ ] I1-I7 hold; the full suite is green, also in reverse order (as F-10 did).
+- [ ] A failure after the attachment gives its index back — a signing failure, a listener failure, the format's own DSC
+  policy and a partly failed batch each leave the free-index count where it was (D-M11e-1;
+  `MdocStatusListSampleTest.aSigningFailureGivesTheIndexBack`, `…aListenerFailureGivesTheIndexBackAndItsMessageIsAsciiSafe`,
+  `…everyEntryOfAFailedBatchIsGivenBack`, `…aRefusalOfTheFormatsOwnKeyPolicyTakesNoIndex`).
+- [ ] A Token Status List hands out only indices inside itself, whatever `size-bits` says (G48;
+  `StatusListPostgresTest.aSmallTokenStatusListHandsOutOnlyIndicesItCarries`).
 
 **Negative tests.**
 
