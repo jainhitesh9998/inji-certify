@@ -12,6 +12,7 @@ import io.mosip.certify.issuance.IssuanceException;
 import io.mosip.certify.issuance.IssuanceResult;
 import io.mosip.certify.issuance.IssuanceService;
 import io.mosip.certify.repository.LedgerRepository;
+import io.mosip.certify.core.exception.StatusListBusyException;
 import io.mosip.certify.spi.Authorization;
 import io.mosip.certify.spi.CredentialConfiguration;
 import io.mosip.certify.spi.IssuanceStrategy;
@@ -20,6 +21,7 @@ import io.mosip.certify.spi.TenantContext;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -162,6 +164,14 @@ public class VcApiController {
         update.setStatus(revoked);
         try {
             credentialStatusService.updateCredentialStatus(update);
+        } catch (StatusListBusyException e) {
+            // the list's lock was not available within certify.status.update.lock-wait (the batch job is signing it):
+            // nothing was queued, and the same request can succeed later (M-11d review round 5, finding 1)
+            log.warn("VC-API status update deferred ({}): {}", e.getErrorCode(), e.getMessage());
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .header(HttpHeaders.RETRY_AFTER, Long.toString(e.retryAfterSeconds()))
+                    .contentType(MediaType.APPLICATION_PROBLEM_JSON).body(problemBody(e.getErrorCode(), "The status list is being updated; nothing was changed. Retry after "
+                            + e.retryAfterSeconds() + " s."));
         } catch (CertifyException e) {
             log.warn("VC-API status update refused ({}): {}", e.getErrorCode(), e.getMessage());
             boolean notFound = e.getErrorCode() != null && e.getErrorCode().toLowerCase().contains("not_found");

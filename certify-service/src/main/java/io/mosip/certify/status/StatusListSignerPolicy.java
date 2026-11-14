@@ -233,9 +233,7 @@ public final class StatusListSignerPolicy {
         List<TrustAnchorRegistry.Anchor> anchors = registry.entries(TrustAnchorRegistry.MDOC_IACA);
         int top = topmostNonAnchor(certificates, anchors);
         X509Certificate candidate = certificates.get(top);
-        TrustAnchorRegistry.Anchor anchor = anchors.stream()
-                .filter(candidateAnchor -> CertificateLinks.issuedBy(candidate, candidateAnchor.certificate()))
-                .findFirst()
+        TrustAnchorRegistry.Anchor anchor = issuingAnchor(candidate, anchors, now)
                 .orElseThrow(() -> refuse(NO_TRUSTED_IACA, "the certificate " + candidate.getSubjectX500Principal()
                         + " (issuer " + candidate.getIssuerX500Principal() + ", at the top of the signer's chain) was"
                         + " not issued by any configured IACA " + anchors.stream().map(TrustAnchorRegistry.Anchor::id).toList()
@@ -262,23 +260,42 @@ public final class StatusListSignerPolicy {
     }
 
     /**
-     * The latest instant a token this signer signs may stay valid: the earliest {@code notAfter} among the certificates
-     * of the signer's chain and, once {@link #enforced()}, of the IACA that issued the chain's top. A verifier builds the
-     * path from the token's {@code x5chain} to the IACA it holds, and that path is only as valid as its shortest-lived
-     * certificate, so a token whose {@code exp} passed it would outlive its own verification path (section 4.1).
+     * The latest instant a token this signer signs at {@code at} may stay valid: the earliest {@code notAfter} among the
+     * certificates of the signer's chain and, once {@link #enforced()}, of the IACA that issued the chain's top — the one
+     * {@link #check} holds the signer to at the same instant ({@link #issuingAnchor}). A verifier builds the path from
+     * the token's {@code x5chain} to the IACA it holds, and that path is only as valid as its shortest-lived certificate,
+     * so a token whose {@code exp} passed it would outlive its own verification path (section 4.1).
      * {@link TokenStatusListCwt#encode} refuses an {@code exp} after it; the caller computes
      * {@code exp = min(iat + 2·ttl, validUntil)}.
      *
+     * @param at the signing instant, the one {@link #check} judges the signer at
      * @throws IllegalStateException {@value #NO_CHAIN} when the signing key has no certificate
      */
-    public Instant validUntil(SigningContext signing) {
+    public Instant validUntil(SigningContext signing, Instant at) {
         Objects.requireNonNull(signing, "signing");
         CertificateChain chain = signing.key().chain();
         if (chain == null || chain.isEmpty() || chain.leaf().isEmpty()) {
             throw refuse(NO_CHAIN, "the key " + signing.key().ref() + " has no certificate, so no token it signs has"
                     + " a validity to be bounded by");
         }
-        List<X509Certificate> certificates = chain.leafFirst();
+        return validUntil(chain.leafFirst(), at);
+    }
+
+    /**
+     * {@link #validUntil(SigningContext, Instant)} over a chain already in hand, leaf first: a stored token's protected
+     * {@code x5chain} (which never carries the IACA) plus, once {@link #enforced()}, the configured IACA that issued its
+     * top. Serving a list judges its freshness from this, so no request has to ask the key provider for the signer
+     * (M-11d review round 2, minor 8). It equals the signing context's value except when the provider's chain carries an
+     * anchor the registry does not, which can only end earlier; the service caches the exact value whenever it signs.
+     *
+     * @param at the instant the issuing IACA is chosen at ({@link #issuingAnchor})
+     * @throws IllegalStateException {@value #NO_CHAIN} when the chain is empty
+     */
+    public Instant validUntil(List<X509Certificate> certificates, Instant at) {
+        Objects.requireNonNull(at, "at");
+        if (certificates == null || certificates.isEmpty()) {
+            throw refuse(NO_CHAIN, "an empty certificate chain bounds no token's validity");
+        }
         Instant earliest = Instant.MAX;
         for (X509Certificate certificate : certificates) {
             earliest = min(earliest, certificate.getNotAfter().toInstant());
@@ -286,14 +303,77 @@ public final class StatusListSignerPolicy {
         if (enforced()) {
             List<TrustAnchorRegistry.Anchor> anchors = registry.entries(TrustAnchorRegistry.MDOC_IACA);
             X509Certificate top = certificates.get(topmostNonAnchor(certificates, anchors));
-            for (TrustAnchorRegistry.Anchor anchor : anchors) {
-                if (CertificateLinks.issuedBy(top, anchor.certificate())) {
-                    earliest = min(earliest, anchor.certificate().getNotAfter().toInstant());
-                    break;
-                }
+            Optional<TrustAnchorRegistry.Anchor> anchor = issuingAnchor(top, anchors, at);
+            if (anchor.isPresent()) {
+                earliest = min(earliest, anchor.get().certificate().getNotAfter().toInstant());
             }
         }
         return earliest;
+    }
+
+    /**
+     * Until when a {@link #validUntil(List, Instant) validUntil} computed at {@code at} stays what it would be if computed
+     * again: the earlier of that value itself and the first {@code notBefore} of a configured IACA after {@code at} (the
+     * value itself when no IACA starts later, or when the policy is not enforced). The anchor {@link #issuingAnchor}
+     * chooses changes only when an anchor becomes valid — a re-issue staged ahead of time that ends later than the one in
+     * use — or when the chosen one ends, which bounds the value itself; an anchor that ends earlier than the chosen one was
+     * never chosen, so its end changes nothing. The configured anchors themselves are fixed for the application's life
+     * (only their CRLs are re-read, and a CRL does not move {@code validUntil}). A cache of {@code validUntil} keyed on the
+     * signer is therefore exact while the clock is before this instant (G45 on the serving path, M-11d review round 5,
+     * finding 2).
+     *
+     * @param at        the instant {@code validUntil} was computed at
+     * @param validUntil the value computed at {@code at}
+     */
+    public Instant validUntilHoldsUntil(Instant at, Instant validUntil) {
+        Objects.requireNonNull(at, "at");
+        Instant holds = Objects.requireNonNull(validUntil, "validUntil");
+        if (!enforced()) {
+            return holds;
+        }
+        for (TrustAnchorRegistry.Anchor anchor : registry.entries(TrustAnchorRegistry.MDOC_IACA)) {
+            Instant notBefore = anchor.certificate().getNotBefore().toInstant();
+            if (notBefore.isAfter(at)) {
+                holds = min(holds, notBefore);
+            }
+        }
+        return holds;
+    }
+
+    /**
+     * The configured IACA that issued {@code top}, chosen as a verifier holding all of them would build the path at
+     * {@code at}: of the anchors that issued it — an IACA re-issued with the same name and key is a second one — the one
+     * valid at {@code at} that ends last; when none is valid then, the one that ends last, whose refusal
+     * ({@value #IACA_EXPIRED} or {@value #IACA_NOT_YET_VALID}) names what the operator must fix. The configuration order
+     * does not matter: an expired IACA listed before its valid re-issue no longer holds a list's renewal back (G45, M-11d
+     * review round 4). {@link #check} and {@link #validUntil} both choose through here, so the anchor a signer is held to
+     * is the one its tokens' {@code exp} is capped by.
+     */
+    private static Optional<TrustAnchorRegistry.Anchor> issuingAnchor(X509Certificate top,
+                                                                    List<TrustAnchorRegistry.Anchor> anchors, Instant at) {
+        TrustAnchorRegistry.Anchor valid = null;
+        TrustAnchorRegistry.Anchor any = null;
+        for (TrustAnchorRegistry.Anchor anchor : anchors) {
+            if (!CertificateLinks.issuedBy(top, anchor.certificate())) {
+                continue;
+            }
+            if (any == null || endsLater(anchor, any)) {
+                any = anchor;
+            }
+            if (validAt(anchor.certificate(), at) && (valid == null || endsLater(anchor, valid))) {
+                valid = anchor;
+            }
+        }
+        return Optional.ofNullable(valid != null ? valid : any);
+    }
+
+    private static boolean endsLater(TrustAnchorRegistry.Anchor first, TrustAnchorRegistry.Anchor second) {
+        return first.certificate().getNotAfter().after(second.certificate().getNotAfter());
+    }
+
+    /** RFC 5280 section 4.1.2.5: both bounds inclusive, as {@link #requireAnchorValid} judges them. */
+    private static boolean validAt(X509Certificate certificate, Instant at) {
+        return !at.isBefore(certificate.getNotBefore().toInstant()) && !at.isAfter(certificate.getNotAfter().toInstant());
     }
 
     private static Instant min(Instant first, Instant second) {

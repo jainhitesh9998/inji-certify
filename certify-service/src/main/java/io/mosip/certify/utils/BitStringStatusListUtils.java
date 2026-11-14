@@ -67,6 +67,17 @@ public final class BitStringStatusListUtils {
     }
 
     /**
+     * How many statuses a Bitstring Status List of {@code capacityInKB} holds: the size {@link #updateEncodedList} and
+     * {@link #createEmptyEncodedList} give it (at least 131,072). The status-update API and the batch job hold an index
+     * to it (M-11d review round 4, finding 2).
+     *
+     * @throws CertifyException {@code status_list_capacity_misconfigured} for a negative or oversized capacity
+     */
+    public static long capacityInBits(long capacityInKB) {
+        return safeConvertKBToBits(capacityInKB);
+    }
+
+    /**
      * Creates an empty encoded list (all bits set to 0) according to W3C Bitstring Status List v1.0.
      *
      * @param capacityInKB Capacity of the status list in kilobytes (KB).

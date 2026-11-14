@@ -57,6 +57,8 @@ import static io.mosip.certify.status.StatusListTestKeys.NOT_YET_VALID;
 import static io.mosip.certify.status.StatusListTestKeys.NOT_YET_VALID_KEYS;
 import static io.mosip.certify.status.StatusListTestKeys.OTHER_CA;
 import static io.mosip.certify.status.StatusListTestKeys.PATHLEN_ZERO;
+import static io.mosip.certify.status.StatusListTestKeys.REISSUED_IACA;
+import static io.mosip.certify.status.StatusListTestKeys.STAGED_IACA;
 import static io.mosip.certify.status.StatusListTestKeys.ROLLOVER;
 import static io.mosip.certify.status.StatusListTestKeys.ROLLOVER_DSC;
 import static io.mosip.certify.status.StatusListTestKeys.ROLLOVER_DSC_KEYS;
@@ -362,18 +364,85 @@ class StatusListSignerPolicyTest {
     void validUntilIsTheEarliestNotAfterOfTheChainAndItsAnchor() {
         // the leaf, when it ends first
         assertEquals(DSC.getNotAfter().toInstant(),
-                StatusListSignerPolicy.notEnforced().validUntil(context(DSC_KEYS, DSC, IACA)));
+                StatusListSignerPolicy.notEnforced().validUntil(context(DSC_KEYS, DSC, IACA), NOW));
         // an intermediate that ends before the leaf
         assertEquals(SHORT_INTERMEDIATE.getNotAfter().toInstant(), StatusListSignerPolicy.notEnforced().validUntil(
-                context(BEHIND_SHORT_INTERMEDIATE_KEYS, BEHIND_SHORT_INTERMEDIATE, SHORT_INTERMEDIATE, MULTI_TIER_ROOT)));
+                context(BEHIND_SHORT_INTERMEDIATE_KEYS, BEHIND_SHORT_INTERMEDIATE, SHORT_INTERMEDIATE, MULTI_TIER_ROOT), NOW));
         // the IACA the registry supplies, when it ends before the leaf it issued; without anchors it is unknown
         assertTrue(SHORT_IACA.getNotAfter().before(UNDER_SHORT_IACA.getNotAfter()));
         assertEquals(SHORT_IACA.getNotAfter().toInstant(),
-                enforcedBy(SHORT_IACA).validUntil(context(UNDER_SHORT_IACA_KEYS, UNDER_SHORT_IACA)));
+                enforcedBy(SHORT_IACA).validUntil(context(UNDER_SHORT_IACA_KEYS, UNDER_SHORT_IACA), NOW));
         assertEquals(UNDER_SHORT_IACA.getNotAfter().toInstant(),
-                StatusListSignerPolicy.notEnforced().validUntil(context(UNDER_SHORT_IACA_KEYS, UNDER_SHORT_IACA)));
+                StatusListSignerPolicy.notEnforced().validUntil(context(UNDER_SHORT_IACA_KEYS, UNDER_SHORT_IACA), NOW));
         refused(StatusListSignerPolicy.NO_CHAIN, () -> StatusListSignerPolicy.notEnforced()
-                .validUntil(context(DSC_KEYS, CertificateChain.EMPTY)));
+                .validUntil(context(DSC_KEYS, CertificateChain.EMPTY), NOW));
+    }
+
+    /**
+     * G45 (M-11d review round 4): an IACA re-issued with the same name and key is a second anchor that issued the same
+     * signer. The policy holds the signer to the one valid now, whatever the configuration order, and caps a token's
+     * {@code exp} at that same anchor. Before, the first configured match decided: with the expired IACA listed first
+     * the signer was refused {@code IACA_EXPIRED} and the cap lay in the past, so a quarantined list could never recover.
+     */
+    @Test
+    void aReissuedIacaIsChosenOverItsExpiredPredecessorInEitherOrder() {
+        assertTrue(REISSUED_IACA.getNotAfter().before(UNDER_EXPIRED_IACA.getNotAfter()), "the re-issue ends first: its cap shows");
+        for (List<X509Certificate> order : List.of(List.of(EXPIRED_IACA, REISSUED_IACA), List.of(REISSUED_IACA, EXPIRED_IACA))) {
+            StatusListSignerPolicy policy = new StatusListSignerPolicy(registry(order, Map.of()));
+            assertDoesNotThrow(() -> policy.check(context(UNDER_EXPIRED_IACA_KEYS, UNDER_EXPIRED_IACA), NOW,
+                    StatusListSignerPolicy.Mode.DOCUMENT_SIGNER), "anchors " + order);
+            assertEquals(REISSUED_IACA.getNotAfter().toInstant(),
+                    policy.validUntil(context(UNDER_EXPIRED_IACA_KEYS, UNDER_EXPIRED_IACA), NOW), "anchors " + order);
+            assertEquals(REISSUED_IACA.getNotAfter().toInstant(),
+                    policy.validUntil(List.of(UNDER_EXPIRED_IACA), NOW), "the stored-chain form agrees, anchors " + order);
+        }
+        // the expired one alone is still refused
+        refused(StatusListSignerPolicy.IACA_EXPIRED, () -> enforcedBy(EXPIRED_IACA).check(
+                context(UNDER_EXPIRED_IACA_KEYS, UNDER_EXPIRED_IACA), NOW, StatusListSignerPolicy.Mode.DOCUMENT_SIGNER));
+    }
+
+    /**
+     * The anchor the signer is held to is the one its cap comes from: a re-issue staged ahead of time (not yet valid,
+     * ending last) is not chosen while a valid one exists, in either order, so the cap is never the later anchor's while
+     * the check judged the earlier one. With only expired and staged anchors, the staged one is chosen and its refusal is
+     * the transient {@code IACA_NOT_YET_VALID}, not {@code IACA_EXPIRED}.
+     */
+    @Test
+    void aStagedReissueIsNotChosenWhileAValidOneExists() {
+        for (List<X509Certificate> order : List.of(List.of(STAGED_IACA, REISSUED_IACA), List.of(REISSUED_IACA, STAGED_IACA))) {
+            StatusListSignerPolicy policy = new StatusListSignerPolicy(registry(order, Map.of()));
+            assertDoesNotThrow(() -> policy.check(context(UNDER_EXPIRED_IACA_KEYS, UNDER_EXPIRED_IACA), NOW,
+                    StatusListSignerPolicy.Mode.DOCUMENT_SIGNER), "anchors " + order);
+            assertEquals(REISSUED_IACA.getNotAfter().toInstant(),
+                    policy.validUntil(context(UNDER_EXPIRED_IACA_KEYS, UNDER_EXPIRED_IACA), NOW), "anchors " + order);
+        }
+        for (List<X509Certificate> order : List.of(List.of(EXPIRED_IACA, STAGED_IACA), List.of(STAGED_IACA, EXPIRED_IACA))) {
+            StatusListSignerPolicy policy = new StatusListSignerPolicy(registry(order, Map.of()));
+            refused(StatusListSignerPolicy.IACA_NOT_YET_VALID, () -> policy.check(context(UNDER_EXPIRED_IACA_KEYS,
+                    UNDER_EXPIRED_IACA), NOW, StatusListSignerPolicy.Mode.DOCUMENT_SIGNER));
+        }
+    }
+
+    /**
+     * Review round 5, finding 2: a {@code validUntil} computed now holds until the earlier of itself and the next IACA
+     * {@code notBefore} — the instant a staged re-issue can take over — whatever the configuration order; without a later
+     * anchor, or without enforcement, until itself.
+     */
+    @Test
+    void aComputedValidUntilHoldsUntilItEndsOrAStagedIacaStarts() {
+        for (List<X509Certificate> order : List.of(List.of(STAGED_IACA, REISSUED_IACA), List.of(REISSUED_IACA, STAGED_IACA))) {
+            StatusListSignerPolicy policy = new StatusListSignerPolicy(registry(order, Map.of()));
+            Instant validUntil = policy.validUntil(List.of(UNDER_EXPIRED_IACA), NOW);
+            assertEquals(REISSUED_IACA.getNotAfter().toInstant(), validUntil);
+            assertTrue(STAGED_IACA.getNotBefore().before(REISSUED_IACA.getNotAfter()), "the re-issue is staged before the end");
+            assertEquals(STAGED_IACA.getNotBefore().toInstant(), policy.validUntilHoldsUntil(NOW, validUntil), "anchors " + order);
+            // computed once the staged one is valid, nothing starts later: the value holds until itself
+            Instant later = STAGED_IACA.getNotBefore().toInstant().plusSeconds(1);
+            Instant afterSwitch = policy.validUntil(List.of(UNDER_EXPIRED_IACA), later);
+            assertEquals(afterSwitch, policy.validUntilHoldsUntil(later, afterSwitch));
+        }
+        Instant cap = NOW.plusSeconds(3600);
+        assertEquals(cap, StatusListSignerPolicy.notEnforced().validUntilHoldsUntil(NOW, cap));
     }
 
     // ---- the two layers fail alike ----------------------------------------------------------------------------

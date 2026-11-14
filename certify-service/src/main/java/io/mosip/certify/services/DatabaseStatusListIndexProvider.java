@@ -66,9 +66,11 @@ public class DatabaseStatusListIndexProvider implements StatusListIndexProvider 
                 log.warn("Status list {} has reached usable capacity limit ({}/{})",
                         listId, currentAssignedCount, effectiveThresholdCount);
 
-                // Mark status list as full
-                statusList.setCredentialStatus(StatusListCredential.CredentialStatus.FULL);
-                statusListCredentialRepository.save(statusList);
+                // Mark status list as full. credential_status only: saving the whole entity would write back the
+                // vc_document read here and revert a revocation committed in between (review round 1, M-11d major 2;
+                // the same lost update the CWT path had, pre-existing on the JWT path)
+                statusListCredentialRepository.updateCredentialStatus(listId,
+                        StatusListCredential.CredentialStatus.FULL);
 
                 return Optional.empty();
             }

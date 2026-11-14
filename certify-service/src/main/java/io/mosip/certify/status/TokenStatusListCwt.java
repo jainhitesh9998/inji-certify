@@ -6,11 +6,14 @@ import io.mosip.certify.signing.CertificateChain;
 import io.mosip.certify.signing.CoseEnvelope;
 import io.mosip.certify.signing.CoseHeaderPolicy;
 import io.mosip.certify.signing.CwtEnvelope;
+import io.mosip.certify.signing.SignatureAlgorithm;
 import io.mosip.certify.signing.SigningException;
 import io.mosip.certify.spi.SigningContext;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.security.GeneralSecurityException;
+import java.security.Signature;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
@@ -146,7 +149,7 @@ public final class TokenStatusListCwt {
         try {
             // mandatory, before anything is encoded or signed: no public path signs a status-list CWT without it
             policy.check(signing, now, mode);
-            Instant validUntil = policy.validUntil(signing);
+            Instant validUntil = policy.validUntil(signing, now);
             requireValidAfter(leaf(signing), validUntil, iat);
             if (exp.getEpochSecond() <= iat.getEpochSecond()) {
                 throw new IllegalArgumentException("exp " + exp + " must be later than iat " + iat
@@ -347,6 +350,103 @@ public final class TokenStatusListCwt {
             throw refuse("status_list.lst inflates to an empty bit array: a status list holds at least one status");
         }
         return new Decoded(sub.AsString(), iat, exp, ttl, BITS, bitArray, x5chain);
+    }
+
+    /**
+     * Verifies the token's COSE_Sign1 signature with {@code signer} — the certificate a list is pinned to — and nothing
+     * else: {@link #decode} still checks no signature. The service runs this before it serves, re-signs or updates the
+     * bits of a stored token, so a payload the pinned signer did not sign is refused instead of re-signed (review round
+     * 1, major 1: renewal would otherwise launder a tampered row into a valid token). Package-private on purpose: the
+     * class's public surface stays {@code encode} (the one signing path) and {@code decode} (the codec), which
+     * {@code TokenStatusListCwtTest.noPublicPathSignsWithoutThePolicy} holds by reflection.
+     *
+     * <p>{@code Sig_structure} is RFC 9052 section 4.4 with an empty external AAD, the algorithm is the protected
+     * header's {@code alg} (RFC 9053), and the ECDSA signature is converted from the wire's R||S to the DER form
+     * {@link Signature} takes. Anything unreadable — a tag other than 18, a non-map protected header, an algorithm this
+     * build does not implement — is {@code false}, never an exception: the caller's answer is one refusal.
+     */
+    static boolean verifies(byte[] token, X509Certificate signer) {
+        Objects.requireNonNull(token, "token");
+        Objects.requireNonNull(signer, "signer");
+        try {
+            CBORObject outer = CBORObject.DecodeFromBytes(token);
+            if (!outer.isTagged()
+                    || !String.valueOf(CoseEnvelope.TAG_COSE_SIGN1).equals(outer.getMostOuterTag().toString())) {
+                return false;
+            }
+            CBORObject sign1 = outer.UntagOne();
+            if (sign1.isTagged() || sign1.getType() != CBORType.Array || sign1.size() != 4) {
+                return false;
+            }
+            byte[] protectedBytes = bytes(sign1.get(0), "the protected header");
+            CBORObject protectedHeader = cbor(protectedBytes);
+            CBORObject alg = protectedHeader.get(CBORObject.FromObject(CoseEnvelope.LABEL_ALG));
+            if (alg == null || alg.getType() != CBORType.Integer) {
+                return false;
+            }
+            SignatureAlgorithm algorithm;
+            try {
+                algorithm = SignatureAlgorithm.fromCose(alg.AsInt32Value()).orElse(null);
+            } catch (ArithmeticException e) {
+                return false;
+            }
+            if (algorithm == null) {
+                return false;
+            }
+            byte[] payload = bytes(sign1.get(2), "the payload");
+            byte[] signature = bytes(sign1.get(3), "the signature");
+            Signature verifier = Signature.getInstance(algorithm.jcaName());
+            verifier.initVerify(signer.getPublicKey());
+            verifier.update(CoseEnvelope.sigStructure(protectedBytes, new byte[0], payload));
+            return verifier.verify(algorithm.isEc() ? der(signature) : signature);
+        } catch (GeneralSecurityException | RuntimeException e) {
+            return false;
+        }
+    }
+
+    /** The DER {@code SEQUENCE} of two {@code INTEGER}s, from the R||S wire form (RFC 7518 section 3.4). */
+    private static byte[] der(byte[] concat) {
+        if (concat.length == 0 || concat.length % 2 != 0) {
+            throw new IllegalArgumentException("An ECDSA signature is an even-length R||S concatenation, got "
+                    + concat.length + " bytes");
+        }
+        int half = concat.length / 2;
+        byte[] r = derInteger(java.util.Arrays.copyOfRange(concat, 0, half));
+        byte[] s = derInteger(java.util.Arrays.copyOfRange(concat, half, concat.length));
+        int length = r.length + s.length;
+        ByteArrayOutputStream out = new ByteArrayOutputStream(2 + length + 3);
+        out.write(0x30);
+        if (length < 0x80) {
+            out.write(length);
+        } else if (length < 0x100) {
+            out.write(0x81);
+            out.write(length);
+        } else {
+            out.write(0x82);
+            out.write(length >> 8);
+            out.write(length & 0xff);
+        }
+        out.write(r, 0, r.length);
+        out.write(s, 0, s.length);
+        return out.toByteArray();
+    }
+
+    private static byte[] derInteger(byte[] value) {
+        int start = 0;
+        while (start < value.length - 1 && value[start] == 0) {
+            start++;
+        }
+        boolean negative = (value[start] & 0x80) != 0;
+        int length = value.length - start + (negative ? 1 : 0);
+        byte[] out = new byte[2 + length];
+        out[0] = 0x02;
+        out[1] = (byte) length;
+        int offset = 2;
+        if (negative) {
+            out[offset++] = 0x00;
+        }
+        System.arraycopy(value, start, out, offset, value.length - start);
+        return out;
     }
 
     private static CBORObject claim(CBORObject payload, int label, String name) {

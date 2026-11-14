@@ -39,6 +39,7 @@ public class ErrorConstants {
     public static final String STATUS_LIST_GENERATION_JSON_ERROR = "status_list_generation_json_error";
     public static final String STATUS_LIST_GENERATION_FAILED = "status_list_generation_failed";
     public static final String STATUS_LIST_UPDATE_FAILED = "status_list_update_failed";
+    public static final String STATUS_LIST_BUSY = "status_list_busy_retry_later";
     public static final String TRANSACTION_FETCH_FAILED = "transaction_fetch_failed";
     public static final String ENCODED_LIST_UPDATE_FAILED = "encoded_list_update_failed";
     public static final String STATUS_LIST_CREDENTIAL_UPDATE_FAILED = "status_list_credential_update_failed";

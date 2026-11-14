@@ -243,6 +243,20 @@ final class StatusListTestKeys {
             List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true, Instant.now().minus(50, ChronoUnit.DAYS),
             Instant.now().plus(100, ChronoUnit.DAYS));
 
+    /**
+     * {@link #EXPIRED_IACA} re-issued with the same name and key, valid now and ending before the signer it issued
+     * ({@link #UNDER_EXPIRED_IACA}), so a cap at its {@code notAfter} is visible (G45, M-11d review round 4).
+     */
+    static final X509Certificate REISSUED_IACA = IsoMdocProfiles.iaca(EXPIRED_IACA_KEYS).country("IN")
+            .commonName("Status List Test Expired IACA").issuerAltUri("https://expired.example.test")
+            .crlDistributionPoint("https://expired.example.test/iaca.crl")
+            .notBefore(Instant.now().minus(60, ChronoUnit.DAYS)).validity(Duration.ofDays(110)).build();
+    /** The same IACA re-issued again ahead of time: not yet valid, and ending after every other one. */
+    static final X509Certificate STAGED_IACA = IsoMdocProfiles.iaca(EXPIRED_IACA_KEYS).country("IN")
+            .commonName("Status List Test Expired IACA").issuerAltUri("https://expired.example.test")
+            .crlDistributionPoint("https://expired.example.test/iaca.crl")
+            .notBefore(Instant.now().plus(30, ChronoUnit.DAYS)).validity(Duration.ofDays(400)).build();
+
     /** An IACA that is not yet valid, and a signer it issued that is valid now. */
     static final KeyPair FUTURE_IACA_KEYS = p256();
     static final X509Certificate FUTURE_IACA = IsoMdocProfiles.iaca(FUTURE_IACA_KEYS).country("IN")
