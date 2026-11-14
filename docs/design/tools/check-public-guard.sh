@@ -267,6 +267,9 @@ pass public POST /oid4vci/credential
 403  public GET  /v1/certify/offer/mdoc.js.map
 403  public POST /v1/certify/offer/wallet.js
 403  public GET  /v1/certify/offer/wallet.js.map
+403  public GET  /v1/certify/offer/wallet-store.js.map
+403  public GET  /v1/certify/offer/wallet.html
+403  public GET  /v1/certify/offer/index.html
 403  public POST /v1/certify/offer/wallet
 403  public GET  /v1/certify/offer/wallet/
 403  public POST /v1/certify/offer/wallet/config

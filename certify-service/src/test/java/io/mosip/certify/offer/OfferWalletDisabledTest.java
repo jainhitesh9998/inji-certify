@@ -47,6 +47,17 @@ class OfferWalletDisabledTest {
     }
 
     @Test
+    void theWalletPageHasNoStaticSpelling() throws Exception {
+        // P5-03a review round 2: static/offer/wallet.html is an ordinary classpath resource, so without a mapping of its
+        // own the resource handler served it at /offer/wallet.html - with the wallet switched off, and without the
+        // headers of plan 4.13. The controller answers that spelling 404 whatever the switch says.
+        var answer = mockMvc.perform(get("/offer/wallet.html")).andReturn().getResponse();
+        assertEquals(404, answer.getStatus(), "the wallet page's file name is not a second way to the page");
+        assertEquals(0, answer.getContentAsByteArray().length, "and it answers no bytes of the page");
+        assertNull(answer.getHeader("Content-Security-Policy"));
+    }
+
+    @Test
     void theWalletConfigDoesNotExist() throws Exception {
         var answer = mockMvc.perform(get("/offer/wallet/config")).andReturn().getResponse();
         assertEquals(404, answer.getStatus(), "the config endpoint is gated with the wallet");
@@ -62,8 +73,9 @@ class OfferWalletDisabledTest {
         assertEquals("no-referrer", answer.getHeader("Referrer-Policy"));
         assertNull(answer.getHeader("Set-Cookie"), "the offer page sets no cookie");
         // The wallet's modules are ordinary static resources under the same chain, so they stay reachable with the
-        // wallet off. That is harmless: a script writes nothing by being served, the page keeps nothing while the switch
-        // is off, and no path but the two above is gated. The guard (check-public-guard.sh) tests what nginx exposes.
+        // wallet off. That is harmless: a script writes nothing by being served, and neither page opens a store until
+        // /offer/wallet/config answers 200 (check-offer-wallet.mjs sections 10 and 15). Only the wallet page, under
+        // both spellings, and its config are gated. The guard (check-public-guard.sh) tests what nginx exposes.
         var script = mockMvc.perform(get("/offer/wallet-store.js")).andReturn().getResponse();
         assertEquals(200, script.getStatus());
         assertTrue(new String(script.getContentAsByteArray(), StandardCharsets.UTF_8).contains("deleteEverything"),

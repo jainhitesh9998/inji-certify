@@ -672,9 +672,9 @@ proxy.
 
 ### 4.12 Fixtures
 
-`WalletFixtureRecorder` (certify-format-mdoc test scope; runs only with `-Dwallet.fixture.record=true`, like the golden
-recorders) writes `docs/design/tools/fixtures/wallet/` through Certify's own `MdocFormatter`, with an Annex B IACA and
-DSC built by `certify-pki`. The bytes are Certify's.
+`WalletFixtureRecorderTest` (certify-format-mdoc test scope; writes the committed copy only with
+`-Dwallet.fixture.record=true`, like the golden recorders) writes `docs/design/tools/fixtures/wallet/` through Certify's
+own `MdocFormatter`, with an Annex B IACA and DSC built by `certify-pki`. The bytes are Certify's.
 
 | File | What |
 | --- | --- |

@@ -104,6 +104,17 @@ public class OfferPageController {
     }
 
     /**
+     * The wallet page's file name. {@code static/offer/wallet.html} is an ordinary classpath resource, so without this
+     * mapping the static resource handler would serve it here - with the wallet switched off and without the headers
+     * above. The page has one address, {@code /offer/wallet}; this spelling answers 404 whatever the switch says. (The
+     * offer page's {@code /offer/index.html} keeps today's static answer, which existing tests and links rely on.)
+     */
+    @GetMapping("/offer/wallet.html")
+    public ResponseEntity<Void> walletPageFile() {
+        return ResponseEntity.notFound().build();
+    }
+
+    /**
      * What the wallet page needs from this deployment: the relay's host allow-list (P5-03f; empty until it exists). The
      * page links the wallet only when this answers 200, so with the wallet off the offer page shows no link.
      */

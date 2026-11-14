@@ -216,6 +216,14 @@ jobs:
         run: node docs/design/tools/check-offer-wallet.mjs
         shell: bash
 
+      - name: Demo wallet storage against a spec IndexedDB (node)
+        # P5-03a review round 2: the storage scenarios of check-offer-wallet.mjs (the connection queue, `blocked`,
+        # transaction lifetime, "Delete everything" against other tabs) also run on fake-indexeddb, an IndexedDB 3.0
+        # implementation pinned in wallet-probe/package-lock.json. Test-only: nothing here reaches the runtime classpath.
+        working-directory: docs/design/tools/wallet-probe
+        run: npm ci --ignore-scripts --no-audit --no-fund && node idb-crosscheck.mjs
+        shell: bash
+
       - uses: actions/setup-python@v5
         # verify_mdoc.py and its pinned requirements are tested on this interpreter, not whatever the runner ships
         with:

@@ -103,6 +103,11 @@ class OfferPageTest {
             assertEquals(200, served.getResponse().getStatus(), script);
             assertTrue(served.getResponse().getContentAsString().length() > 100, script + " is the bundled script");
         }
+        // review round 2: the page has one address. Its file name would otherwise be served by the static resource
+        // handler, bypassing the switch and the headers of plan 4.13
+        MvcResult file = mockMvc.perform(get("/offer/wallet.html")).andReturn();
+        assertEquals(404, file.getResponse().getStatus(), "the wallet page is not served under its file name");
+        assertEquals(0, file.getResponse().getContentAsByteArray().length);
     }
 
     @Test

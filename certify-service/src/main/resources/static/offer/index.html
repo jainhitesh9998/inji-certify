@@ -550,6 +550,9 @@
     el("wallet").disabled = true;
     // and no other offer is created while this one is redeemed (the button comes back when the run ends)
     el("create").disabled = true;
+    // P5-03a: what the last run kept (or why it kept nothing) is not news about this one
+    el("keepNote").hidden = true;
+    el("keepNote").textContent = "";
     try {
       // OpenID4VCI 1.0 sections 4.1.1, 7, 8.2 and 12.2.2/12.2.4: the offer names its credential issuer, and everything
       // else comes from that issuer's metadata and its authorization server's metadata, each at its well-known

@@ -1,0 +1,15 @@
+{
+  "name": "certify-wallet-probe",
+  "private": true,
+  "description": "Test-only Node tools for the demo wallet (P5-03): an IndexedDB 3.0 implementation to cross-check the wallet's storage harness against. Never part of the runtime classpath (plan invariant I6).",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "crosscheck": "node idb-crosscheck.mjs"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "6.2.4"
+  }
+}

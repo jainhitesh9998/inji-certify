@@ -503,46 +503,90 @@ const markupElements = (markup) => parseMarkup(markup).ids;
 
 /* ---------------------------------------------------------------- fake IndexedDB (P5-03a) */
 
-/** One request of the fake IndexedDB: asynchronous, like the real one, with its result or error. */
-class FakeRequest {
-    constructor() {
-        this.onsuccess = null;
-        this.onerror = null;
-        this.result = undefined;
-        this.error = null;
-    }
+/*
+ * A small IndexedDB, enough for wallet-store.js, that follows the parts of IndexedDB 3.0 the page's correctness depends
+ * on. A fake that skipped them hid real bugs: one that answered an open at once while a delete was pending let the
+ * wallet page await an open that a browser leaves queued forever, and one that dropped a request on a finished
+ * transaction hid a request that a browser refuses. Modelled, with the section:
+ *
+ * - Events are tasks (5.x "queue a task"): a request's handlers run in a later turn of the event loop than the call,
+ *   and the promise reactions they trigger run before the next task. `setImmediate` is that turn here.
+ * - The connection queue (5.1, 5.3): `open` and `deleteDatabase` for one name run one at a time in request order, so an
+ *   open made while a delete is pending answers only after the delete finishes.
+ * - Deleting (5.3) and upgrading (5.1): `versionchange` goes to every other connection without a pending close; if one
+ *   is still open after those events, `blocked` fires at the request, and the request stays queued until the last
+ *   connection closes. `blocked` is not an outcome: `success` (or `error`) still follows.
+ * - Closing (2.6, 4.4 close()): a connection with transactions running is "close pending" - it refuses new
+ *   transactions at once, and closes only when they finish.
+ * - Transaction lifetime (2.7, 2.7.1): a transaction is active in the task that created it and while a request's
+ *   success or error event is dispatched, together with the promise reactions that dispatch triggers; it turns inactive
+ *   when the next task starts, and commits once it is inactive with no request outstanding. A request on a transaction
+ *   that is not active - finished included - throws `TransactionInactiveError` (4.5, 4.6).
+ * - Scheduling (2.7.2): a readonly transaction waits for earlier overlapping readwrite ones, a readwrite one for every
+ *   earlier overlapping one. That is what makes "at most 50 credentials" atomic: a count and a put in one transaction
+ *   cannot interleave with another tab's.
+ * - Records are cloned with the platform's own `structuredClone`, in and out, as a browser's structured clone does: a
+ *   `CryptoKey` stays a `CryptoKey` (Node 24 clones a non-extractable one into a working key that still signs and still
+ *   refuses `exportKey`). An out-of-line key never edits the record. An aborted readwrite transaction rolls back.
+ *
+ * docs/design/tools/wallet-probe/idb-crosscheck.mjs runs the same scenarios against fake-indexeddb, a spec-conformant
+ * implementation, so this model and the page are held to what an implementation of the standard does.
+ */
 
-    succeed(result) {
-        this.result = result;
-        queueMicrotask(() => { if (this.onsuccess) this.onsuccess({ target: this }); });
-    }
+const idbError = (name, message) => new DOMException(message, name);
 
-    fail(error) {
-        this.error = error;
-        queueMicrotask(() => { if (this.onerror) this.onerror({ target: this }); });
+/** Transactions left active by the current task: the next task of this fake turns them inactive first (2.7.1). */
+const activeUntilNextTask = new Set();
+
+function idbTask(work) {
+    setImmediate(() => {
+        endActiveTask();
+        work();
+    });
+}
+
+function endActiveTask() {
+    for (const transaction of [...activeUntilNextTask]) {
+        activeUntilNextTask.delete(transaction);
+        if (transaction.state === "active") transaction.state = "inactive";
+        transaction.maybeCommit();
     }
 }
 
-/**
- * A small IndexedDB, enough for wallet-store.js: `open`/`deleteDatabase`, one connection per open with its own
- * `onversionchange`, stores with a keyPath or an auto-increment key, and get/put/getAll/getAllKeys/delete/clear/count.
- *
- * Three browser behaviours the page depends on are modelled, because a fake that skipped them hid real bugs:
- *
- * - Records are cloned with the platform's own `structuredClone`, in and out, exactly as a browser's structured clone
- *   does. A `CryptoKey` stays a `CryptoKey` (Node 24 clones a non-extractable one into a working key that still signs
- *   and still refuses `exportKey`), and a `Uint8Array` from the page's realm stays a `Uint8Array`.
- * - An out-of-line key never edits the record: a store with `autoIncrement` and no `keyPath` keeps its key beside the
- *   value, as a browser does, so `getAll()` returns the values with no `id` the page did not put there.
- * - Readwrite transactions on one database run one at a time in the order they were created, as the IndexedDB standard
- *   requires for transactions whose scopes overlap: a count and a put in two transactions can interleave with another
- *   tab's, and a count and a put in one cannot. (That is what makes "at most 50 credentials" atomic.)
- */
+function activeForThisTask(transaction) {
+    transaction.state = "active";
+    activeUntilNextTask.add(transaction);
+    idbTask(() => {}); // the next task, should nothing else be queued
+}
+
+/** One request of the fake IndexedDB: its result or error arrive with its event, in a task of their own. */
+class FakeRequest {
+    constructor(transaction = null) {
+        this.transaction = transaction;
+        this.readyState = "pending";
+        this.result = undefined;
+        this.error = null;
+        this.onsuccess = null;
+        this.onerror = null;
+        this.onblocked = null;
+        this.onupgradeneeded = null;
+    }
+
+    fire(type, extra = {}) {
+        const handler = this["on" + type];
+        if (typeof handler === "function") handler.call(this, Object.assign({ type, target: this }, extra));
+    }
+}
+
 class FakeIndexedDB {
     constructor() {
         this.databases = new Map();
+        // the connection queue of each database name (5.1): open and delete requests, run one at a time in order
+        this.queues = new Map();
         // every connection handed out, so a check can say that no store was opened at all
         this.opens = 0;
+        // every open() called, answered or still queued, so a check can see an open waiting behind a delete
+        this.openRequests = 0;
         // every delete that completed, so a check can tell "the page reopened what it deleted" from "nothing happened"
         this.deletions = 0;
     }
@@ -566,44 +610,120 @@ class FakeIndexedDB {
     }
 
     open(name, version) {
+        if (version !== undefined && (!Number.isInteger(version) || version < 1)) {
+            throw new TypeError("the version must be a positive integer");
+        }
         const request = new FakeRequest();
-        queueMicrotask(() => {
-            const existing = this.databases.get(name);
-            const database = this.database(name, version || 1);
-            const connection = database.connect();
-            this.opens++;
-            request.result = connection;
-            if (existing === undefined && request.onupgradeneeded) {
-                request.onupgradeneeded({ target: request, oldVersion: 0, newVersion: database.version });
-            }
-            request.succeed(connection);
-        });
+        this.openRequests++;
+        this.enqueue(name, (done) => this.runOpen(name, version, request, done));
         return request;
     }
 
-    /**
-     * Deletes the database. Every other connection is asked to close (`versionchange`); if one does not, the request
-     * reports `blocked` and finishes only once the last connection closes, as a browser does.
-     */
     deleteDatabase(name) {
         const request = new FakeRequest();
-        queueMicrotask(() => {
-            const database = this.databases.get(name);
-            if (database === undefined) {
-                request.succeed(undefined);
-                return;
-            }
-            for (const connection of [...database.connections]) connection.versionChange(null);
-            if (database.connections.size === 0) {
-                this.databases.delete(name);
-                this.deletions++;
-                request.succeed(undefined);
-                return;
-            }
-            database.pendingDeletes.push({ indexedDB: this, request });
-            if (request.onblocked) request.onblocked({ target: request });
-        });
+        this.enqueue(name, (done) => this.runDelete(name, request, done));
         return request;
+    }
+
+    /** Adds a request to the name's connection queue; it runs once every request before it has been processed. */
+    enqueue(name, step) {
+        if (!this.queues.has(name)) this.queues.set(name, []);
+        const queue = this.queues.get(name);
+        queue.push(step);
+        if (queue.length === 1) idbTask(() => this.runHead(name));
+    }
+
+    runHead(name) {
+        const queue = this.queues.get(name);
+        if (!queue.length) return;
+        queue[0](() => {
+            queue.shift();
+            if (queue.length) idbTask(() => this.runHead(name));
+        });
+    }
+
+    /** 5.1 open a database connection: a version error, an upgrade (asking the others to close first) or a connection. */
+    runOpen(name, version, request, done) {
+        let database = this.databases.get(name);
+        const current = database === undefined ? 0 : database.version;
+        const wanted = version === undefined ? Math.max(current, 1) : version;
+        if (current > wanted) {
+            request.readyState = "done";
+            request.error = idbError("VersionError", "the database is at version " + current);
+            done();
+            idbTask(() => request.fire("error"));
+            return;
+        }
+        const connect = () => {
+            const connection = database.connect();
+            this.opens++;
+            request.readyState = "done";
+            request.result = connection;
+            return connection;
+        };
+        if (current === wanted) {
+            connect();
+            done();
+            idbTask(() => request.fire("success"));
+            return;
+        }
+        if (database === undefined) {
+            database = new FakeDatabase(name, 0);
+            this.databases.set(name, database);
+        }
+        this.closeOthers(database, wanted, request, () => {
+            database.version = wanted;
+            const connection = connect();
+            idbTask(() => {
+                request.fire("upgradeneeded", { oldVersion: current, newVersion: wanted });
+                idbTask(() => {
+                    done();
+                    if (connection.closePending) {
+                        request.result = undefined;
+                        request.error = idbError("AbortError", "the connection was closed during its upgrade");
+                        request.fire("error");
+                    } else {
+                        request.fire("success");
+                    }
+                });
+            });
+        });
+    }
+
+    /** 5.3 delete a database: the others are asked to close; the request waits, `blocked`, until they have. */
+    runDelete(name, request, done) {
+        const database = this.databases.get(name);
+        if (database === undefined) {
+            request.readyState = "done";
+            done();
+            idbTask(() => request.fire("success", { oldVersion: 0, newVersion: null }));
+            return;
+        }
+        this.closeOthers(database, null, request, () => {
+            const oldVersion = database.version;
+            this.databases.delete(name);
+            this.deletions++;
+            request.readyState = "done";
+            request.result = undefined;
+            done();
+            idbTask(() => request.fire("success", { oldVersion, newVersion: null }));
+        });
+    }
+
+    /**
+     * Steps shared by 5.1 (an upgrade) and 5.3: `versionchange` to every connection without a pending close, each in a
+     * task; once those ran, `blocked` at the request if any connection is still open; then wait until all are closed.
+     */
+    closeOthers(database, newVersion, request, then) {
+        const others = [...database.connections];
+        const oldVersion = database.version;
+        for (const connection of others) {
+            if (!connection.closePending) idbTask(() => connection.fireVersionChange(oldVersion, newVersion));
+        }
+        idbTask(() => {
+            if (others.some((connection) => !connection.closed)) request.fire("blocked", { oldVersion, newVersion });
+            database.whenClosed(others, then);
+        });
     }
 }
 
@@ -613,9 +733,10 @@ class FakeDatabase {
         this.version = version;
         this.stores = new Map();
         this.connections = new Set();
-        this.pendingDeletes = [];
-        this.writeQueue = [];
-        this.activeWrite = null;
+        this.closeWaiters = [];
+        // the transactions not yet finished, in the order they were created (2.7.2)
+        this.live = [];
+        this.created = 0;
         const stores = this.stores;
         this.objectStoreNames = { contains: (storeName) => stores.has(storeName) };
     }
@@ -636,37 +757,39 @@ class FakeDatabase {
         return store;
     }
 
-    transaction(names, mode = "readonly") {
-        const list = Array.isArray(names) ? names : [names];
-        for (const storeName of list) if (!this.stores.has(storeName)) throw new Error("NotFoundError: " + storeName);
-        return new FakeTransaction(this, list, mode);
-    }
-
-    /** Queues a readwrite transaction behind the ones already running, and starts it when its turn comes. */
-    runWhenFree(transaction) {
-        this.writeQueue.push(transaction);
-        this.startNextWrite();
-    }
-
-    startNextWrite() {
-        if (this.activeWrite !== null || this.writeQueue.length === 0) return;
-        this.activeWrite = this.writeQueue.shift();
-        this.activeWrite.start();
-    }
-
-    releaseWrite(transaction) {
-        if (this.activeWrite === transaction) this.activeWrite = null;
-        this.startNextWrite();
-    }
-
-    /** The last connection closed: a delete that was blocked on it can finish now. */
-    afterConnectionClosed() {
-        if (this.connections.size) return;
-        for (const pending of this.pendingDeletes.splice(0)) {
-            pending.indexedDB.databases.delete(this.name);
-            pending.indexedDB.deletions++;
-            pending.request.succeed(undefined);
+    /** Calls `then` once every connection of `list` has closed (now, if they all have). */
+    whenClosed(list, then) {
+        if (list.every((connection) => connection.closed)) {
+            then();
+            return;
         }
+        this.closeWaiters.push({ list, then });
+    }
+
+    connectionClosed(connection) {
+        this.connections.delete(connection);
+        for (const waiter of this.closeWaiters.slice()) {
+            if (waiter.list.every((entry) => entry.closed)) {
+                this.closeWaiters.splice(this.closeWaiters.indexOf(waiter), 1);
+                waiter.then();
+            }
+        }
+    }
+
+    /** 2.7.2: starts every transaction whose turn has come. */
+    schedule() {
+        for (const transaction of this.live) {
+            if (transaction.started) continue;
+            const waits = this.live.some((other) => other.order < transaction.order && other.state !== "finished"
+                && other.names.some((name) => transaction.names.includes(name))
+                && (transaction.mode === "readwrite" || other.mode === "readwrite"));
+            if (!waits) transaction.start();
+        }
+    }
+
+    finished(transaction) {
+        this.live.splice(this.live.indexOf(transaction), 1);
+        this.schedule();
     }
 }
 
@@ -674,32 +797,56 @@ class FakeDatabase {
 class FakeConnection {
     constructor(database) {
         this.db = database;
+        this.closePending = false;
         this.closed = false;
+        this.transactions = new Set();
         this.onversionchange = null;
+        this.onclose = null;
         this.objectStoreNames = database.objectStoreNames;
         database.connections.add(this);
     }
 
     transaction(names, mode = "readonly") {
-        if (this.closed) throw new Error("InvalidStateError: the database is closed");
-        return this.db.transaction(names, mode);
+        if (this.closePending) throw idbError("InvalidStateError", "the connection is closed or closing");
+        const list = Array.isArray(names) ? names : [names];
+        for (const storeName of list) {
+            if (!this.db.stores.has(storeName)) throw idbError("NotFoundError", "no object store " + storeName);
+        }
+        return new FakeTransaction(this, list, mode);
     }
 
     createObjectStore(name, options = {}) {
         return this.db.createObjectStore(name, options);
     }
 
+    /** 4.4 close(): pending at once (no new transaction), closed once the running ones have finished. */
     close() {
-        if (this.closed) return;
-        this.closed = true;
-        this.db.connections.delete(this);
-        this.db.afterConnectionClosed();
+        if (this.closePending) return;
+        this.closePending = true;
+        this.closeIfIdle();
     }
 
-    /** The browser's `versionchange` event: the page's own handler decides whether to close. */
-    versionChange(newVersion) {
+    closeIfIdle() {
+        if (!this.closePending || this.closed || this.transactions.size) return;
+        this.closed = true;
+        this.db.connectionClosed(this);
+    }
+
+    /** The browser closing the connection itself (2.6: storage cleared): its transactions abort, `close` fires. */
+    forceClose() {
+        if (this.closed) return;
+        this.closePending = true;
+        for (const transaction of [...this.transactions]) transaction.abort(idbError("AbortError", "the connection was closed"));
+        idbTask(() => {
+            this.closeIfIdle();
+            if (typeof this.onclose === "function") this.onclose({ type: "close", target: this });
+        });
+    }
+
+    fireVersionChange(oldVersion, newVersion) {
+        if (this.closePending) return;
         if (typeof this.onversionchange === "function") {
-            this.onversionchange({ target: this, oldVersion: this.db.version, newVersion });
+            this.onversionchange({ type: "versionchange", target: this, oldVersion, newVersion });
         }
     }
 }
@@ -718,14 +865,14 @@ class FakeObjectStore {
     keyOf(record, givenKey) {
         if (givenKey !== undefined && givenKey !== null) return givenKey;
         if (this.keyPath !== null) return record[this.keyPath];
-        if (!this.autoIncrement) throw new Error("DataError: the object store has no key");
+        if (!this.autoIncrement) throw idbError("DataError", "the object store has no key");
         return this.nextKey++;
     }
 
     putClone(record, givenKey) {
         const clone = structuredClone(record);
         const key = this.keyOf(clone, givenKey);
-        if (key === undefined || key === null) throw new Error("DataError: the object store has no key");
+        if (key === undefined || key === null) throw idbError("DataError", "the object store has no key");
         this.records.set(key, clone);
         return key;
     }
@@ -736,29 +883,44 @@ class FakeObjectStore {
 }
 
 class FakeTransaction {
-    constructor(database, names, mode) {
-        this.db = database;
+    constructor(connection, names, mode) {
+        this.connection = connection;
+        this.db = connection.db;
         this.names = names;
         this.mode = mode;
+        this.order = this.db.created++;
         this.oncomplete = null;
         this.onerror = null;
         this.onabort = null;
+        this.error = null;
+        // the requests not yet processed, and whether one is being processed now
         this.queue = [];
-        this.pending = 0;
-        this.started = mode !== "readwrite";
-        this.done = false;
-        if (this.started) this.drain();
-        else database.runWhenFree(this);
+        this.processing = false;
+        this.started = false;
+        this.snapshot = null;
+        connection.transactions.add(this);
+        this.db.live.push(this);
+        // 2.7.1: active in the task that created it
+        activeForThisTask(this);
+        this.db.schedule();
     }
 
-    /** A queued readwrite transaction's turn has come. */
+    /** 2.7.2: its turn has come. A readwrite transaction keeps what its stores held, to roll back on abort. */
     start() {
         this.started = true;
-        this.drain();
+        if (this.mode === "readwrite") {
+            this.snapshot = this.names.map((name) => {
+                const store = this.db.stores.get(name);
+                return { store, records: new Map(store.records), nextKey: store.nextKey };
+            });
+        }
+        this.processNext();
+        this.maybeCommit();
     }
 
     objectStore(name) {
-        if (!this.names.includes(name)) throw new Error("NotFoundError: " + name);
+        if (this.state === "finished") throw idbError("InvalidStateError", "the transaction has finished");
+        if (!this.names.includes(name)) throw idbError("NotFoundError", "the object store is not in this transaction's scope");
         const store = this.db.stores.get(name);
         const transaction = this;
         return {
@@ -766,66 +928,93 @@ class FakeTransaction {
             getAll: () => transaction.request(() => [...store.records.values()].map((record) => structuredClone(record))),
             getAllKeys: () => transaction.request(() => [...store.records.keys()]),
             count: () => transaction.request(() => store.records.size),
-            put: (record, key) => transaction.request(() => store.putClone(record, key)),
-            delete: (key) => transaction.request(() => { store.records.delete(key); return undefined; }),
-            clear: () => transaction.request(() => { store.records.clear(); return undefined; }),
+            put: (record, key) => transaction.request(() => store.putClone(record, key), true),
+            delete: (key) => transaction.request(() => { store.records.delete(key); return undefined; }, true),
+            clear: () => transaction.request(() => { store.records.clear(); return undefined; }, true),
         };
     }
 
-    request(work) {
-        const request = new FakeRequest();
-        this.pending++;
+    /** 4.5/4.6: a request is accepted only while the transaction is active; readonly ones cannot write. */
+    request(work, writes = false) {
+        if (this.state !== "active") {
+            throw idbError("TransactionInactiveError", this.state === "finished"
+                ? "the transaction has finished" : "the transaction is not active");
+        }
+        if (writes && this.mode !== "readwrite") throw idbError("ReadOnlyError", "the transaction is read-only");
+        const request = new FakeRequest(this);
         this.queue.push({ work, request });
-        this.drain();
+        this.processNext();
         return request;
     }
 
-    /** Runs the queued requests one at a time, as a browser runs a transaction's requests. */
-    drain() {
-        if (!this.started || this.done) return;
-        queueMicrotask(() => {
-            if (!this.started || this.done) return;
+    /** Processes the next request in a task of its own, then fires its event with the transaction active. */
+    processNext() {
+        if (!this.started || this.processing || this.state === "finished" || !this.queue.length) return;
+        this.processing = true;
+        idbTask(() => {
+            this.processing = false;
+            if (this.state === "finished") return;
             const next = this.queue.shift();
-            if (next === undefined) {
-                this.maybeComplete();
-                return;
-            }
+            let failed = null;
             try {
                 next.request.result = next.work();
-                this.pending--;
-                next.request.succeed(next.request.result);
-                this.maybeComplete();
             } catch (error) {
-                next.request.error = error;
-                this.fail(error);
+                failed = error;
             }
-            if (this.queue.length) this.drain();
+            next.request.readyState = "done";
+            activeForThisTask(this);
+            if (failed === null) {
+                next.request.fire("success");
+            } else {
+                next.request.error = failed;
+                next.request.fire("error");
+                if (typeof this.onerror === "function") this.onerror({ type: "error", target: next.request });
+                this.abort(failed);
+                return;
+            }
+            this.processNext();
         });
     }
 
-    /**
-     * Completes once nothing is queued and nothing is pending, checked after the success handlers have run: a request
-     * the page issues from a success handler (the `put` after a `count`, both in one readwrite transaction) extends the
-     * transaction instead of being refused as "too late".
-     */
-    maybeComplete() {
-        if (this.pending > 0 || this.queue.length || this.done) return;
-        queueMicrotask(() => {
-            if (this.pending > 0 || this.queue.length || this.done) return;
-            this.done = true;
-            this.db.releaseWrite(this);
-            if (this.oncomplete) this.oncomplete({ target: this });
+    /** 2.7.1 auto-commit: inactive, started, and nothing outstanding. */
+    maybeCommit() {
+        if (this.state !== "inactive" || !this.started || this.processing || this.queue.length) return;
+        this.state = "committing";
+        idbTask(() => {
+            if (this.state !== "committing") return;
+            this.finish();
+            if (typeof this.oncomplete === "function") this.oncomplete({ type: "complete", target: this });
         });
     }
 
-    fail(error) {
-        if (this.done) return;
-        this.done = true;
-        queueMicrotask(() => {
-            this.db.releaseWrite(this);
-            if (this.onerror) this.onerror({ target: this, error });
-            if (this.onabort) this.onabort({ target: this, error });
-        });
+    abort(error = idbError("AbortError", "the transaction was aborted")) {
+        if (this.state === "finished") return;
+        if (this.snapshot !== null) {
+            for (const entry of this.snapshot) {
+                entry.store.records = entry.records;
+                entry.store.nextKey = entry.nextKey;
+            }
+        }
+        this.error = error;
+        const pending = this.queue.splice(0);
+        this.finish();
+        for (const { request } of pending) {
+            request.readyState = "done";
+            request.error = idbError("AbortError", "the transaction was aborted");
+            idbTask(() => {
+                request.fire("error");
+                if (typeof this.onerror === "function") this.onerror({ type: "error", target: request });
+            });
+        }
+        idbTask(() => { if (typeof this.onabort === "function") this.onabort({ type: "abort", target: this }); });
+    }
+
+    finish() {
+        this.state = "finished";
+        activeUntilNextTask.delete(this);
+        this.connection.transactions.delete(this);
+        this.db.finished(this);
+        this.connection.closeIfIdle();
     }
 }
 

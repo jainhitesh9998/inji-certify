@@ -68,29 +68,90 @@ var Mdoc = (function () {
     return mso;
   }
 
-  /**
-   * The certificates of an {@code x5chain} header (RFC 9360 section 2: `COSE_X509 = bstr / [2*certs: bstr]`), always as
-   * a list of DER byte strings. The bstr form is one certificate, which is what Certify emits for a DSC-only chain;
-   * reading it as a list must not make it unreadable.
-   */
-  function x5chainOf(value) {
-    if (value === undefined) return [];
-    var certificates = value instanceof Uint8Array ? [value] : value;
-    if (!Array.isArray(certificates) || !certificates.length
-        || !certificates.every(function (der) { return der instanceof Uint8Array; })) {
-      throw new Error("the issuerAuth x5chain is not a certificate or a non-empty array of certificates (RFC 9360 section 2)");
-    }
-    return certificates;
+  /** The major type of the data item a range starts with (RFC 8949 3.1); a tag is 6, whatever it carries. */
+  function majorAt(bytes, range) {
+    return bytes[range.start] >> 5;
   }
 
-  /** A COSE header label's value from the protected header, else from the unprotected one. */
-  function headerValue(protectedBytes, unprotected, label) {
-    if (protectedBytes && protectedBytes.length) {
-      var header = Cbor.decode(protectedBytes);
-      if (header && typeof header === "object" && header[label] !== undefined) return header[label];
+  var MAJOR_NAMES = ["an unsigned integer", "a negative integer", "a byte string", "a text string", "an array", "a map",
+    "a tag", "a simple value"];
+
+  /**
+   * Requires the data item at a range to be of one major type, so a tag around it is refused: the decoder resolves most
+   * tags to the value they carry (`#6.24(bstr)` decodes as the embedded item, any unknown tag as its content), so the
+   * decoded value alone cannot say whether the bytes were tagged.
+   */
+  function requireMajor(bytes, range, major, what) {
+    if (range === undefined) throw new Error(what + " is missing");
+    var found = majorAt(bytes, range);
+    if (found !== major) throw new Error(what + " is " + MAJOR_NAMES[found] + ", not " + MAJOR_NAMES[major]);
+  }
+
+  /**
+   * The ranges of a `Cbor.spans` walk by path. Two items at one path would leave a reader holding one range while the
+   * checks ran on the other, so a second one is refused rather than kept.
+   */
+  function rangesByPath(walked) {
+    var ranges = new Map();
+    walked.ranges.forEach(function (range) {
+      var key = pathKey(range.path);
+      if (ranges.has(key)) throw new Error("two data items sit at " + key + "; the reader cannot tell which one was checked");
+      ranges.set(key, range);
+    });
+    return ranges;
+  }
+
+  /** The keys `Cbor.spans` recorded for the map at {@code path}. */
+  function keysAt(walked, path) {
+    var at = pathKey(path);
+    return walked.keys.filter(function (entry) { return pathKey(entry.path) === at; });
+  }
+
+  /**
+   * One COSE header map, walked so its labels keep their types (RFC 9052 section 3: `label = int / tstr`; the decoder
+   * renders the integer 33 and the text "33" alike, and only the key's major type tells them apart).
+   */
+  function headerOf(bytes, what) {
+    var walked = Cbor.spans(bytes, 2);
+    if (bytes[0] >> 5 !== 5) throw new Error("the issuerAuth " + what + " is not a map (RFC 9052 section 3)");
+    return { bytes: bytes, walked: walked, ranges: rangesByPath(walked) };
+  }
+
+  /** The value of an integer label in one header, with its range there; `undefined` when the label is absent. */
+  function intLabel(header, label) {
+    if (header === null) return undefined;
+    var entry = keysAt(header.walked, []).filter(function (key) { return key.key === String(label); })[0];
+    // a text label that happens to read "33" is another label (RFC 9052 section 3), not x5chain
+    if (entry === undefined || entry.major !== (label < 0 ? 1 : 0)) return undefined;
+    return { header: header, value: header.walked.value[String(label)], range: header.ranges.get(pathKey([String(label)])) };
+  }
+
+  /** A header label from the protected header, else from the unprotected one (RFC 9052 section 3). */
+  function headerValue(protectedHeader, unprotectedHeader, label) {
+    var found = intLabel(protectedHeader, label);
+    return found !== undefined ? found : intLabel(unprotectedHeader, label);
+  }
+
+  /**
+   * The certificates of an {@code x5chain} header (RFC 9360 section 2: `COSE_X509 = bstr / [2*certs: bstr]`), always as
+   * a list of DER byte strings. The bstr form is one certificate, which is what Certify emits for a DSC-only chain. The
+   * array form carries two or more: a one-element array is not a COSE_X509, so it is refused rather than read. Each
+   * certificate's major type is read from its bytes, so a tag around one is refused too.
+   */
+  function x5chainOf(found) {
+    if (found === undefined) return [];
+    var bytes = found.header.bytes;
+    var major = majorAt(bytes, found.range);
+    if (major === 2) return [found.value];
+    if (major === 4 && Array.isArray(found.value) && found.value.length >= 2) {
+      found.value.forEach(function (der, index) {
+        requireMajor(bytes, found.header.ranges.get(pathKey(["33", index])), 2,
+          "x5chain certificate " + index + " (RFC 9360 section 2)");
+      });
+      return found.value;
     }
-    if (unprotected && typeof unprotected === "object" && unprotected[label] !== undefined) return unprotected[label];
-    return undefined;
+    throw new Error("the issuerAuth x5chain is not a certificate (a bstr) or an array of two or more certificates"
+      + " (RFC 9360 section 2: COSE_X509 = bstr / [2*certs: bstr])");
   }
 
   /**
@@ -98,38 +159,79 @@ var Mdoc = (function () {
    * `{nameSpaces: {ns: [{elementIdentifier, digestID, elementValue, raw}]}, issuerAuth: {raw, alg, x5chain, mso}}`.
    * `raw` is the exact `[start, end)` slice of `input`, so the tag-24 IssuerSignedItemBytes and the IssuerAuth can be
    * carried into a DeviceResponse exactly as issued. Throws a message naming what is wrong.
+   *
+   * Every structural check reads the bytes a `raw` slice is cut from, not only the decoded value: the decoder resolves
+   * tags to what they carry and renders keys of different types alike, so a value can look right while its bytes are a
+   * tagged item, a map key's contents or a second item at the same path. Each of those is refused:
+   * - the IssuerSigned and `nameSpaces` keys are text strings (`IssuerSigned = {? "nameSpaces": IssuerNameSpaces,
+   *   "issuerAuth": IssuerAuth}`, `NameSpace = tstr`), and IssuerSigned has no other key;
+   * - no path carries two data items;
+   * - `issuerAuth` is a COSE_Sign1 array, untagged or tag 18 (RFC 9052 section 4.2), whose four elements are a bstr, a
+   *   map, a bstr and a bstr, each untagged; the protected header's content is empty or a map (RFC 9052 section 3);
+   * - each IssuerSignedItemBytes is tag 24 (ISO/IEC 18013-5 8.3.2.1.2).
    */
   function readIssuerSigned(input) {
     var bytes = bytesOf(input);
     var walked = Cbor.spans(bytes, 3);
     var value = walked.value;
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
+    if (!bytes.length || majorAt(bytes, { start: 0 }) !== 5 || !value || typeof value !== "object" || Array.isArray(value)) {
       throw new Error("the credential is not an IssuerSigned map");
     }
-    var ranges = new Map();
-    walked.ranges.forEach(function (range) { ranges.set(pathKey(range.path), range); });
+    keysAt(walked, []).forEach(function (key) {
+      if (key.major !== 3) {
+        throw new Error("an IssuerSigned key is " + MAJOR_NAMES[key.major] + ", not a text string (ISO/IEC 18013-5 8.3.2.1.2)");
+      }
+      if (key.key !== "nameSpaces" && key.key !== "issuerAuth") {
+        throw new Error("IssuerSigned carries the key " + JSON.stringify(key.key) + ", which ISO/IEC 18013-5 8.3.2.1.2"
+          + " does not define");
+      }
+    });
+    keysAt(walked, ["nameSpaces"]).forEach(function (key) {
+      if (key.major !== 3) {
+        throw new Error("a nameSpaces key is " + MAJOR_NAMES[key.major] + ", not a text string (NameSpace = tstr,"
+          + " ISO/IEC 18013-5 8.3.2.1.2)");
+      }
+    });
+    var ranges = rangesByPath(walked);
 
+    // RFC 9052 4.2: COSE_Sign1 = [protected, unprotected, payload, signature], untagged or #6.18 (COSE_Sign1_Tagged).
+    // `raw` keeps whichever of the two arrived.
     var issuerAuthRange = ranges.get(pathKey(["issuerAuth"]));
     if (issuerAuthRange === undefined) throw new Error("the credential has no issuerAuth");
+    var outer = Cbor.tagged(bytes.subarray(issuerAuthRange.start, issuerAuthRange.end));
+    if (outer !== null && outer.tag !== 18) {
+      throw new Error("issuerAuth is wrapped in tag " + String(outer.tag) + "; a COSE_Sign1 is untagged or tag 18"
+        + " (RFC 9052 section 4.2)");
+    }
+    var arrayMajor = outer === null ? majorAt(bytes, issuerAuthRange) : outer.content[0] >> 5;
     var issuerAuth = value.issuerAuth;
-    if (!Array.isArray(issuerAuth) || issuerAuth.length !== 4) {
+    if (arrayMajor !== 4 || !Array.isArray(issuerAuth) || issuerAuth.length !== 4) {
       throw new Error("issuerAuth is not a COSE_Sign1 array of four elements");
     }
-    // ISO/IEC 18013-5 9.1.2.4 and RFC 9052 4.2: element 2 is the payload, a bstr holding #6.24(bstr .cbor MSO). An
-    // untagged COSE_Sign1 and one tagged #6.18 (the envelope Certify may carry) read the same way, and `raw` keeps
-    // whichever bytes arrived.
+    [[2, "the protected header"], [5, "the unprotected header"], [2, "the payload"], [2, "the signature"]]
+      .forEach(function (expected, index) {
+        requireMajor(bytes, ranges.get(pathKey(["issuerAuth", index])), expected[0],
+          "issuerAuth element " + index + " (" + expected[1] + ", RFC 9052 section 4.2)");
+      });
+    // ISO/IEC 18013-5 9.1.2.4: element 2 is the payload, a bstr holding #6.24(bstr .cbor MSO)
     var mso = msoOf(issuerAuth[2]);
-
-    var x5chain = x5chainOf(headerValue(issuerAuth[0], issuerAuth[1], "33"));
+    // RFC 9052 3: protected = bstr .cbor header_map / bstr .size 0
+    var protectedHeader = issuerAuth[0].length ? headerOf(issuerAuth[0], "protected header") : null;
+    var unprotectedRange = ranges.get(pathKey(["issuerAuth", 1]));
+    var unprotectedHeader = headerOf(bytes.subarray(unprotectedRange.start, unprotectedRange.end), "unprotected header");
+    var x5chain = x5chainOf(headerValue(protectedHeader, unprotectedHeader, 33));
+    var alg = headerValue(protectedHeader, unprotectedHeader, 1);
 
     var nameSpaces = {};
     var decoded = value.nameSpaces === undefined ? {} : value.nameSpaces;
+    if (value.nameSpaces !== undefined) requireMajor(bytes, ranges.get(pathKey(["nameSpaces"])), 5, "IssuerSigned nameSpaces");
     if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
       throw new Error("IssuerSigned nameSpaces is not a map");
     }
     Object.keys(decoded).forEach(function (namespace) {
       var items = decoded[namespace];
       if (!Array.isArray(items)) throw new Error("the namespace " + namespace + " is not an array of IssuerSignedItems");
+      requireMajor(bytes, ranges.get(pathKey(["nameSpaces", namespace])), 4, "the namespace " + namespace);
       nameSpaces[namespace] = items.map(function (item, index) {
         if (!item || typeof item !== "object" || Array.isArray(item)
             || typeof item.elementIdentifier !== "string" || typeof item.digestID !== "number") {
@@ -149,12 +251,11 @@ var Mdoc = (function () {
       });
     });
 
-    var issuerAuthStart = issuerAuthRange.start, issuerAuthEnd = issuerAuthRange.end;
     return {
       nameSpaces: nameSpaces,
       issuerAuth: {
-        raw: bytes.subarray(issuerAuthStart, issuerAuthEnd),
-        alg: headerValue(issuerAuth[0], issuerAuth[1], "1"),
+        raw: bytes.subarray(issuerAuthRange.start, issuerAuthRange.end),
+        alg: alg === undefined ? undefined : alg.value,
         x5chain: x5chain,
         mso: mso,
       },

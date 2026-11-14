@@ -11,8 +11,9 @@
  * the only reference to it, so deleting the record deletes the key.
  *
  * The two operations that can race another tab are the ones that have to be careful: keeping a credential counts and
- * writes in one transaction, and deleting the database says so when another tab still holds it open instead of waiting
- * for it forever.
+ * writes in one transaction, and deleting the database reports `blocked` (another tab still holds it open) while it keeps
+ * waiting, because a blocked delete is still queued and still finishes (IndexedDB 3.0, 5.3). Anything opened meanwhile
+ * queues behind it (5.1), so nothing here opens the database while a delete is pending.
  */
 var WalletStore = (function () {
   "use strict";
@@ -45,8 +46,13 @@ var WalletStore = (function () {
   /**
    * Opens (creating on first use) the database. The connection gives itself up when another tab asks for a version
    * change - "Delete everything" in another tab - because a connection that stays open is what blocks that delete.
+   *
+   * `handlers` (optional) lets a page follow what happened to its connection: `onVersionChange(connection, event)` after
+   * it closed itself for another tab (`event.newVersion` is null for a delete), and `onClose(connection, event)` when the
+   * browser closed it (site data cleared, storage lost). Either way the connection is unusable from then on.
    */
-  function open() {
+  function open(handlers) {
+    var on = handlers || {};
     return new Promise(function (resolve, reject) {
       var request;
       try {
@@ -72,8 +78,12 @@ var WalletStore = (function () {
         var database = request.result;
         // the browser fires this on every other connection when one tab upgrades or deletes the database: closing here
         // is what lets that request complete rather than stay blocked on this tab
-        database.onversionchange = function () {
+        database.onversionchange = function (event) {
           try { database.close(); } catch (error) { /* already closed */ }
+          if (typeof on.onVersionChange === "function") on.onVersionChange(database, event);
+        };
+        database.onclose = function (event) {
+          if (typeof on.onClose === "function") on.onClose(database, event);
         };
         resolve(database);
       };
@@ -130,11 +140,17 @@ var WalletStore = (function () {
   }
 
   /**
-   * Deletes the whole database: "Delete everything". Resolves only once the browser reports the database gone. Another
-   * tab that still holds a connection is asked to close it (see open); if it does not, the browser reports `blocked`,
-   * which is refused here with what the visitor can do about it rather than left waiting forever.
+   * Deletes the whole database: "Delete everything". Resolves once the browser reports the database gone, rejects only
+   * when it reports an error: those are the delete's only outcomes.
+   *
+   * Every other connection is asked to close first (see open). One that does not close at once - another tab of an older
+   * build, a frozen tab, a tab whose transaction is still running - makes the browser fire `blocked`. That is news, not
+   * an outcome: the delete stays queued and finishes by itself once the last connection closes (IndexedDB 3.0, 5.3), so
+   * `onBlocked` is called (synchronously, so a page can say so before it awaits anything) and the promise keeps waiting.
+   * Rejecting there would report a failure for a delete that then succeeds, and an `open()` made after it would queue
+   * behind the delete (5.1) instead of answering.
    */
-  function deleteEverything() {
+  function deleteEverything(onBlocked) {
     return new Promise(function (resolve, reject) {
       var request;
       try {
@@ -145,9 +161,8 @@ var WalletStore = (function () {
       }
       request.onsuccess = function () { resolve(); };
       request.onerror = function () { reject(request.error || new Error("IndexedDB could not be deleted")); };
-      request.onblocked = function () {
-        reject(new Error("another tab of this wallet still has the credential store open; close every other wallet tab"
-          + " and try again"));
+      request.onblocked = function (event) {
+        if (typeof onBlocked === "function") onBlocked(event);
       };
     });
   }

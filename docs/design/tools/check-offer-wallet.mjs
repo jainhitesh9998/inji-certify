@@ -5,28 +5,36 @@
  *
  * Plain Node (24, the version CI pins), no npm dependencies, no browser, no server:
  *   node docs/design/tools/check-offer-wallet.mjs
- * It shares the fake DOM, the fake fetch and the check helpers with check-offer-page.mjs, and evaluates the page's own
- * `src` scripts (cbor.js, mdoc.js, wallet-store.js; `scripts: "real"`), so `Cbor.encode`, `Mdoc.readIssuerSigned` and
- * `WalletStore` are the shipped files, not stubs.
+ * It shares the fake DOM, the fake fetch, the fake IndexedDB and the check helpers with check-offer-page.mjs, and
+ * evaluates the page's own `src` scripts (cbor.js, mdoc.js, wallet-store.js, wallet.js; `scripts: "real"`), so
+ * `Cbor.encode`, `Mdoc.readIssuerSigned`, `WalletStore` and the wallet page are the shipped files, not stubs.
+ *
+ * The storage scenarios (`storageConformance`, `walletDeleteScenarios`) are exported and take the IndexedDB factory
+ * they run on: run directly they use the harness's fake, and docs/design/tools/wallet-probe/idb-crosscheck.mjs runs
+ * the same ones on fake-indexeddb, an implementation of IndexedDB 3.0, so the fake and the page are both held to what
+ * the standard does.
  *
  * The fixtures are of two kinds, on purpose:
  *
- * - one recorded from **Certify's own `MdocFormatter`** (`certify-format-mdoc`'s WalletFixtureRecorder, plan 4.12),
- *   committed under docs/design/tools/fixtures/wallet/ with the holder key it was issued to. This is the layout the
- *   issuer really writes - an IssuerAuth whose payload is a bstr holding `#6.24(bstr .cbor MSO)`, and a DSC-only
- *   x5chain as a single bstr (RFC 9360 section 2) - and it is what a self-built fixture got wrong.
+ * - `mdl-a`, recorded from **Certify's own `MdocFormatter`** (`certify-format-mdoc`'s WalletFixtureRecorderTest, plan
+ *   4.12): the 15 elements the demo issues to `mdl-demo-1`, committed under docs/design/tools/fixtures/wallet/ with the
+ *   holder key it was issued to. This is the layout the issuer really writes - an IssuerAuth whose payload is a bstr
+ *   holding `#6.24(bstr .cbor MSO)`, and a DSC-only x5chain as a single bstr (RFC 9360 section 2) - and it is what a
+ *   self-built fixture got wrong.
  * - built here, byte part by byte part, in the same ISO/IEC 18013-5 8.3.2.1.2 shape, plus the encodings a reader must
  *   also accept: a non-preferred tag head (`d9 00 18`), indefinite lengths, a `#6.18`-tagged COSE_Sign1. Each part's
  *   expected [start, end) is recorded as it is concatenated, so the slices and digests are computed independently of
  *   `Cbor.spans`, the reader under test.
  *
- * What it cannot check: a real browser's IndexedDB (the fake below is the storage model), a rendered layout, and the
- * HTTP headers (check-offer-page.mjs is offline; OfferPageTest recomputes the inline script's hash from the bytes the
- * controller serves and finds it in the Content-Security-Policy).
+ * What it cannot check: a real browser's IndexedDB (the fake is the storage model, cross-checked against
+ * fake-indexeddb by wallet-probe/idb-crosscheck.mjs), a rendered layout, and the HTTP headers (check-offer-page.mjs is
+ * offline; OfferPageTest recomputes the inline script's hash from the bytes the controller serves and finds it in the
+ * Content-Security-Policy).
  */
 import { createHash, createPublicKey, verify, webcrypto } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
 import { openPage, parseMarkup, check, equal, section, counts, Element, Text, FakeIndexedDB, REPO,
@@ -120,6 +128,12 @@ function coseKey(jwk, override) {
  * must also accept (`nonPreferredTagHead`, `indefiniteLengths`, `taggedCose`); `options.tamper` re-encodes one element's
  * value after its digest was computed (check 4); `options.payloadWithoutTag` writes the bare MSO map as the payload's
  * content, which is the "not tag 24" refusal (check 1).
+ *
+ * The shapes a decoder hides, each one a refusal (review round 2): `coseWrap` puts issuerAuth inside another tag than 18
+ * (tag 24 as `#6.24(bstr .cbor COSE_Sign1)`); `payloadWrap` tags element 2 (tag 24 as `#6.24(bstr .cbor bstr)`, which
+ * decodes to the very bstr a payload is); `protectedAsMap` writes element 0 as a map; `itemForms` writes an element as
+ * a bare map (`"bare"`) or `#6.55799(map)` (`"tag55799"`), its digest taken over exactly those bytes so that only the
+ * tag-24 check can refuse it.
  */
 function buildIssuerSigned(options) {
     const forms = options.forms || {};
@@ -140,7 +154,10 @@ function buildIssuerSigned(options) {
                 ["elementIdentifier", identifier],
                 ["elementValue", elementValue],
             ]));
-            const signed = Buffer.concat([Buffer.from(msoTag), bstr(itemMap(value))]);
+            const form = (options.itemForms || {})[identifier];
+            const signed = form === "bare" ? Buffer.from(itemMap(value))
+                : form === "tag55799" ? Buffer.concat([Buffer.from(head(6, 55799)), Buffer.from(itemMap(value))])
+                : Buffer.concat([Buffer.from(msoTag), bstr(itemMap(value))]);
             const written = options.tamper === identifier
                 ? Buffer.concat([Buffer.from(msoTag), bstr(itemMap("changed after signing"))])
                 : signed;
@@ -176,14 +193,20 @@ function buildIssuerSigned(options) {
     // issuerAuth: [protected, unprotected, payload, signature] (RFC 9052 4.2); element 2 is a bstr either way
     const issuerAuth = new Bytes();
     issuerAuth.add(forms.indefiniteLengths ? Uint8Array.of(0x9f) : head(4, 4));
-    issuerAuth.add(bstr(Cbor.encode(new Map([[1, -7]]))));
+    const protectedMap = Cbor.encode(new Map([[1, -7]]));
+    issuerAuth.add(options.protectedAsMap ? protectedMap : bstr(protectedMap));
     issuerAuth.add(Buffer.concat([Buffer.from(head(5, 1)), head(0, 33),
         Buffer.from(options.x5chainRaw === undefined ? x5chainValue : options.x5chainRaw)]));
-    issuerAuth.add(bstr(payload));
+    issuerAuth.add(options.payloadWrap === undefined ? bstr(payload)
+        : Buffer.concat([Buffer.from(head(6, options.payloadWrap)), options.payloadWrap === 24 ? bstr(bstr(payload)) : bstr(payload)]));
     issuerAuth.add(bstr(new Uint8Array(64))); // a placeholder signature: the page checks structure, not this signature
     if (forms.indefiniteLengths) issuerAuth.add(Uint8Array.of(0xff));
     let issuerAuthBytes = Buffer.from(issuerAuth.bytes());
     if (forms.taggedCose) issuerAuthBytes = Buffer.concat([Buffer.from(coseTag), issuerAuthBytes]);
+    if (options.coseWrap !== undefined) {
+        issuerAuthBytes = Buffer.concat([Buffer.from(head(6, options.coseWrap)),
+            options.coseWrap === 24 ? bstr(issuerAuthBytes) : issuerAuthBytes]);
+    }
 
     // the IssuerSigned map, its parts' ranges recorded as they are written
     const out = new Bytes();
@@ -242,11 +265,16 @@ const MDL_TWO_CERTIFICATES = buildIssuerSigned({ docType: DOC_TYPE, holder: HOLD
     x5chain: [DUMMY_DER, SECOND_DER], chainForm: "array" });
 
 /**
- * The IssuerSigned Certify's own MdocFormatter produced, and the holder key it was issued to (plan 4.12). Recorded with
- * `mvn -pl certify-format-mdoc test -Dwallet.fixture.record=true`; see docs/design/tools/fixtures/wallet/README.md.
+ * `mdl-a`: the IssuerSigned Certify's own MdocFormatter produced for `mdl-demo-1`'s 15 elements, and the holder key it
+ * was issued to (plan 4.12). Recorded by WalletFixtureRecorderTest with `-Dwallet.fixture.record=true`; see
+ * docs/design/tools/fixtures/wallet/README.md.
  */
-const CERTIFY_ISSUER_SIGNED = bytesOf(readFileSync(resolve(FIXTURES, "certify-mdl.issuersigned")));
-const CERTIFY_HOLDER = JSON.parse(readFileSync(resolve(FIXTURES, "certify-mdl.holder.jwk"), "utf8"));
+const CERTIFY_ISSUER_SIGNED = bytesOf(readFileSync(resolve(FIXTURES, "mdl-a.issuersigned")));
+const CERTIFY_HOLDER = JSON.parse(readFileSync(resolve(FIXTURES, "mdl-a.holder.jwk"), "utf8"));
+/** The elements the demo issues to mdl-demo-1 (config/mdl/holders.json, config/mdl/mdl.vm), in the template's order. */
+const MDL_DEMO_1_ELEMENTS = ["family_name", "given_name", "birth_date", "issue_date", "expiry_date", "issuing_country",
+    "issuing_authority", "document_number", "portrait", "driving_privileges", "sex", "age_over_18", "nationality",
+    "resident_city", "un_distinguishing_sign"];
 const CERTIFY_PUBLIC_JWK = { kty: CERTIFY_HOLDER.kty, crv: CERTIFY_HOLDER.crv, x: CERTIFY_HOLDER.x, y: CERTIFY_HOLDER.y };
 
 /** The page's WebCrypto with `generateKey` answering the fixture holder's key, imported non-extractable. */
@@ -357,8 +385,12 @@ const credentialsIn = (fake) => {
 const summary = (fake) => credentialsIn(fake).map((record) => [record.format, record.docType, record.credentialConfigurationId,
     record.issuerSigned.length, record.privateKey && record.privateKey.type, record.privateKey && record.privateKey.extractable]);
 
-/** Opens the wallet page against the same fake database, with the shipped scripts. */
-function openWallet(indexedDB) {
+/**
+ * Opens the wallet page against an IndexedDB factory (the harness's fake, or another implementation), with the shipped
+ * scripts. `walletConfig: false` makes `wallet/config` answer 404, as it does with the wallet switched off. Every fetch
+ * the page makes is recorded in `requests` (I9).
+ */
+function openWallet(indexedDB, options = {}) {
     const source = readFileSync(resolve(STATIC, "wallet.html"), "utf8");
     const { ids: elements, scripts } = parseMarkup(source);
     const document = {
@@ -366,8 +398,21 @@ function openWallet(indexedDB) {
         createElement: (tag) => new Element(String(tag).toLowerCase()),
         createTextNode: (data) => new Text(data),
     };
+    const requests = [];
+    const pageUrl = new URL("https://credentials.example/v1/certify/offer/wallet");
+    const fetch = async (url, init = {}) => {
+        const target = new URL(String(url), pageUrl).href;
+        requests.push({ method: (init.method || "GET").toUpperCase(), url: target });
+        const enabled = options.walletConfig === undefined ? true : options.walletConfig;
+        if (target === "https://credentials.example/v1/certify/offer/wallet/config") {
+            return enabled ? { status: 200, text: async () => "{\"relay\":{\"hosts\":[]}}" } : { status: 404, text: async () => "" };
+        }
+        return { status: 404, text: async () => "" };
+    };
     const context = vm.createContext({
         document,
+        location: { href: pageUrl.href, origin: pageUrl.origin, pathname: pageUrl.pathname },
+        fetch,
         console: { log: () => {}, warn: () => {}, error: () => {} },
         setTimeout, clearTimeout, URL, URLSearchParams, Blob, crypto: webcrypto,
         TextEncoder, TextDecoder, btoa, atob, structuredClone, indexedDB,
@@ -382,11 +427,73 @@ function openWallet(indexedDB) {
             scriptError = scriptError || error;
         }
     }
-    return { elements, document, scriptError, el: (id) => elements.get(id) ?? null };
+    return { elements, document, scriptError, requests, el: (id) => elements.get(id) ?? null };
 }
 
 async function settle() {
-    for (let i = 0; i < 60; i++) await new Promise((done) => setImmediate(done));
+    for (let i = 0; i < 200; i++) await new Promise((done) => setImmediate(done));
+}
+
+/**
+ * Turns of the event loop until `predicate()` holds, with a timer turn now and then so an implementation that queues
+ * with timers rather than `setImmediate` gets its turn too. Bounded: a page that never gets there fails its check
+ * instead of hanging the run.
+ */
+async function waitFor(predicate, turns = 2000) {
+    for (let i = 0; i < turns; i++) {
+        if (predicate()) return true;
+        await new Promise((done) => (i % 50 === 49 ? setTimeout(done, 1) : setImmediate(done)));
+    }
+    return predicate();
+}
+
+/** The shipped WalletStore, bound to one IndexedDB factory. */
+const storeOn = (indexedDB) => shipped("wallet-store.js", { indexedDB }, "WalletStore");
+
+/** Keeps `count` records through the shipped store (no CryptoKey: the list, the details and the deletes need none). */
+async function seedRecords(indexedDB, count) {
+    const store = storeOn(indexedDB);
+    const db = await store.open();
+    for (let index = 0; index < count; index++) {
+        await store.putWithinLimit(db, { id: "seed-" + index, format: "mso_mdoc", docType: DOC_TYPE,
+            issuerSigned: MDL_A.bytes, storedAt: index + 1, label: "Seeded " + index }, Mdoc.MAX_CREDENTIALS);
+    }
+    db.close();
+}
+
+/** How many credentials the store holds, read through the shipped store on a connection of its own. */
+async function keptCount(indexedDB) {
+    const store = storeOn(indexedDB);
+    const db = await store.open();
+    const count = await store.count(db);
+    db.close();
+    return count;
+}
+
+/** Every text the page wrote into its storage status, in order: a message that was shown and replaced still counts. */
+function statusHistory(wallet) {
+    const node = wallet.el("storageStatus");
+    const history = [];
+    const descriptor = Object.getOwnPropertyDescriptor(Element.prototype, "textContent");
+    Object.defineProperty(node, "textContent", {
+        configurable: true,
+        get() { return descriptor.get.call(node); },
+        set(value) { history.push(String(value)); descriptor.set.call(node, value); },
+    });
+    return history;
+}
+
+const listButtons = (wallet) => wallet.el("records").children.map((item) => item.children[0]);
+
+/** A call that must throw, with a message matching `pattern`. */
+function refusedWith(label, attempt, pattern) {
+    let error = null;
+    try {
+        attempt();
+    } catch (caught) {
+        error = caught;
+    }
+    check(`refused: ${label}`, error !== null && pattern.test(error.message), error ? error.message : "it was read");
 }
 
 /** The extractable flag and an export attempt on a kept key, and its signature over a challenge. */
@@ -407,8 +514,187 @@ async function checkKeptKey(record, publicJwk, label = "") {
         verify("sha256", challenge, { key, dsaEncoding: "ieee-p1363" }, Buffer.from(signature)) === true);
 }
 
+/* ---------------------------------------------------------------- storage scenarios (shared with wallet-probe) */
+
+/**
+ * The parts of IndexedDB 3.0 the wallet's correctness rests on, checked on one factory: the harness's fake or a
+ * spec-conformant implementation (wallet-probe/idb-crosscheck.mjs). Both must pass the same checks.
+ */
+async function storageConformance(makeIndexedDB, label) {
+    await section(`IndexedDB 3.0 (${label}): the connection queue and transaction lifetime`, async () => {
+        const indexedDB = makeIndexedDB();
+        const store = storeOn(indexedDB);
+        const holder = await store.open();
+        holder.onversionchange = null; // stays open: the delete below is blocked by it
+        const events = [];
+        const deleting = indexedDB.deleteDatabase(DB_NAME);
+        deleting.onblocked = (event) => events.push("delete blocked " + event.newVersion);
+        deleting.onsuccess = () => events.push("delete success");
+        deleting.onerror = () => events.push("delete error");
+        const reopening = indexedDB.open(DB_NAME, 1);
+        reopening.onupgradeneeded = (event) => {
+            events.push("open upgradeneeded " + event.oldVersion);
+            reopening.result.createObjectStore("credentials", { keyPath: "id" });
+        };
+        reopening.onsuccess = () => { events.push("open success"); reopening.result.close(); };
+        reopening.onerror = () => events.push("open error");
+        await waitFor(() => events.length > 0);
+        await settle();
+        equal(`${label}: blocked, the delete stays pending, and an open made after it waits behind it (5.1, 5.3)`, events,
+            ["delete blocked null"]);
+        holder.close();
+        await waitFor(() => events.length >= 4);
+        equal(`${label}: once the last connection closes the delete succeeds, then the open answers on a new database`, events,
+            ["delete blocked null", "delete success", "open upgradeneeded 0", "open success"]);
+
+        const db = await store.open();
+        const finished = db.transaction(store.CREDENTIALS, "readonly");
+        const finishedStore = finished.objectStore(store.CREDENTIALS);
+        await new Promise((done) => { finished.oncomplete = done; });
+        let late = null;
+        try {
+            finishedStore.count();
+        } catch (error) {
+            late = error;
+        }
+        equal(`${label}: a request on a finished transaction throws TransactionInactiveError (4.5)`, late && late.name,
+            "TransactionInactiveError");
+
+        const writing = db.transaction(store.CREDENTIALS, "readwrite");
+        const writingStore = writing.objectStore(store.CREDENTIALS);
+        let fromHandler = null;
+        const counting = writingStore.count();
+        counting.onsuccess = () => { fromHandler = writingStore.put({ id: "from-handler", storedAt: 1 }); };
+        const outcome = await new Promise((done) => {
+            writing.oncomplete = () => done("complete");
+            writing.onabort = () => done("abort");
+        });
+        equal(`${label}: a request made from a success handler extends its transaction, which then commits (2.7.1)`,
+            [outcome, fromHandler !== null, await store.count(db)], ["complete", true, 1]);
+
+        db.close();
+        let closing = null;
+        try {
+            db.transaction(store.CREDENTIALS, "readonly");
+        } catch (error) {
+            closing = error;
+        }
+        equal(`${label}: a closed connection refuses a new transaction (InvalidStateError)`, closing && closing.name, "InvalidStateError");
+    });
+}
+
+/**
+ * "Delete everything" against other tabs, on one factory (review round 2, major 1 and minor 6). Every check reads what
+ * the visitor sees - the status line, the list, the controls - and the store itself afterwards, never the factory's
+ * internals, so the same checks hold the page to a spec implementation.
+ *
+ * `closeWaitsForTransactions` (default true) is IndexedDB 3.0 2.6 and 5.3 steps 8-9: a connection whose close is
+ * pending is closed only once its transactions complete, so a delete is `blocked` by a tab mid-transaction and waits for
+ * it. fake-indexeddb 6.2.4 counts a close-pending connection as closed (its `waitForOthersClosedDelete`), so on it the
+ * delete neither reports `blocked` nor waits for that transaction; the outcome the page reports must be the same either
+ * way, and only the two checks that depend on the wait are skipped there.
+ */
+async function walletDeleteScenarios(makeIndexedDB, label, { closeWaitsForTransactions = true } = {}) {
+    await section(`Delete everything (${label}): another tab that does not close`, async () => {
+        const indexedDB = makeIndexedDB();
+        await seedRecords(indexedDB, 1);
+        const stubborn = await storeOn(indexedDB).open();
+        stubborn.onversionchange = null; // an older build, a frozen tab: it never closes by itself
+        const wallet = openWallet(indexedDB);
+        check(`${label}: the wallet page's scripts ran`, wallet.scriptError === null, wallet.scriptError && String(wallet.scriptError.stack));
+        await waitFor(() => wallet.el("records").children.length === 1);
+        equal(`${label}: the wallet lists the kept credential`, wallet.el("records").children.length, 1);
+        let finished = false;
+        const pressed = wallet.el("deleteAll").fire("click").then(() => { finished = true; });
+        const told = await waitFor(() => wallet.el("storageStatus").textContent.includes("Waiting for other wallet tabs to close"));
+        check(`${label}: blocked, the page says it is waiting for the other tabs - before it awaits anything`, told,
+            wallet.el("storageStatus").textContent);
+        await settle();
+        check(`${label}: and it keeps waiting rather than reporting an outcome`, finished === false
+            && !wallet.el("storageStatus").textContent.includes("could not"), wallet.el("storageStatus").textContent);
+        equal(`${label}: every control is disabled while it waits`, [wallet.el("deleteAll").disabled, wallet.el("delete").disabled,
+            listButtons(wallet).every((button) => button.disabled)], [true, true, true]);
+        stubborn.close();
+        const done = await waitFor(() => finished);
+        check(`${label}: the delete finishes by itself once the other tab closes`, done);
+        check(`${label}: and the page reports the real outcome: deleted`,
+            wallet.el("storageStatus").textContent === "Everything kept in this browser was deleted.", wallet.el("storageStatus").textContent);
+        equal(`${label}: the list follows`, wallet.el("records").children.length, 0);
+        equal(`${label}: the controls come back (Delete everything stays off for an empty list)`,
+            [wallet.el("deleteAll").disabled, wallet.el("delete").disabled], [true, false]);
+        equal(`${label}: nothing is kept any more`, await keptCount(indexedDB), 0);
+        await pressed;
+    });
+
+    await section(`Delete everything (${label}): another tab still running a transaction`, async () => {
+        const indexedDB = makeIndexedDB();
+        await seedRecords(indexedDB, 1);
+        // a tab that closes itself on versionchange (WalletStore's own handler), but is in the middle of a transaction:
+        // its connection closes only once that transaction finishes, so the delete is blocked for a moment
+        const busyTab = await storeOn(indexedDB).open();
+        const wallet = openWallet(indexedDB);
+        await waitFor(() => wallet.el("records").children.length === 1);
+        const history = statusHistory(wallet);
+        let reads = 0;
+        const reading = busyTab.transaction("credentials", "readonly").objectStore("credentials");
+        const readOn = () => {
+            const request = reading.count();
+            request.onsuccess = () => { reads++; if (reads < 150) readOn(); };
+        };
+        readOn();
+        let finished = false;
+        const pressed = wallet.el("deleteAll").fire("click").then(() => { finished = true; });
+        const done = await waitFor(() => finished, 5000);
+        check(`${label}: the delete completes`, done);
+        if (closeWaitsForTransactions) {
+            equal(`${label}: once the other tab's transaction has run to its end (2.6)`, reads, 150);
+            check(`${label}: the page said it was waiting while the other tab finished`,
+                history.some((text) => text.includes("Waiting for other wallet tabs to close")), JSON.stringify(history));
+        }
+        check(`${label}: and reports the delete it did, never a failure`,
+            wallet.el("storageStatus").textContent === "Everything kept in this browser was deleted."
+            && !history.some((text) => text.includes("could not")), JSON.stringify(history));
+        equal(`${label}: nothing is kept any more`, await keptCount(indexedDB), 0);
+        await pressed;
+    });
+
+    await section(`Delete everything (${label}): a wallet tab follows a delete made in another`, async () => {
+        const indexedDB = makeIndexedDB();
+        await seedRecords(indexedDB, 2);
+        const first = openWallet(indexedDB);
+        const second = openWallet(indexedDB);
+        await waitFor(() => first.el("records").children.length === 2 && second.el("records").children.length === 2);
+        // the first tab is looking at a credential when the second deletes everything
+        await listButtons(first)[0].fire("click");
+        equal(`${label}: the first tab shows a credential's details`, first.el("details").hidden, false);
+        await second.el("deleteAll").fire("click");
+        check(`${label}: the second tab deletes without waiting on the first`,
+            second.el("storageStatus").textContent === "Everything kept in this browser was deleted.", second.el("storageStatus").textContent);
+        const followed = await waitFor(() => first.el("storageStatus").textContent.includes("Another wallet tab deleted everything"));
+        check(`${label}: the first tab says another tab deleted everything`, followed, first.el("storageStatus").textContent);
+        equal(`${label}: its list and details follow`, [first.el("records").children.length, first.el("details").hidden], [0, true]);
+        // its next action meets a live connection, not the closed one: nothing to delete, and no InvalidStateError
+        await first.el("delete").fire("click");
+        await settle();
+        check(`${label}: pressing Delete in the first tab reports no error`, !first.el("detailsStatus").textContent.includes("could not")
+            && !first.el("storageStatus").textContent.includes("could not"),
+            first.el("detailsStatus").textContent + " | " + first.el("storageStatus").textContent);
+        // and its new connection gives way to the next delete too, so that one is not blocked by it
+        const blocked = [];
+        await storeOn(indexedDB).deleteEverything(() => blocked.push("blocked"));
+        equal(`${label}: a later delete from elsewhere is not blocked by either tab`, blocked, []);
+        await waitFor(() => first.el("storageStatus").textContent.includes("Another wallet tab deleted everything")
+            && second.el("storageStatus").textContent.includes("Another wallet tab deleted everything"));
+        check(`${label}: and both tabs follow it`, second.el("storageStatus").textContent.includes("Another wallet tab deleted everything"),
+            second.el("storageStatus").textContent);
+    });
+}
+
 /* ---------------------------------------------------------------- checks */
 
+const isMain = process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isMain) {
 try {
 
 // 1. RFC 8949 Appendix A, for every type the encoder supports
@@ -446,6 +732,14 @@ await section("1. Cbor.encode", async () => {
         check(`Cbor.Raw refuses ${label}`, refused);
     }
     equal("Cbor.Raw emits exactly the item it was given", hex(Cbor.encode(new Cbor.Raw(new Uint8Array([0x82, 0x01, 0x02])))), "820102");
+
+    // review round 2 (nit): nesting is capped with a message, not left to exhaust the stack - also across tag-24 content
+    const nested = (depth) => new Uint8Array([...new Array(depth).fill(0x81), 0x00]);
+    equal("64 nested arrays decode", JSON.stringify(Cbor.decode(nested(64))).length, 129);
+    refusedWith("65 nested arrays", () => Cbor.decode(nested(65)), /nests deeper than 64/);
+    refusedWith("a deep item hidden in tag-24 content", () => Cbor.decode(new Uint8Array([...new Array(40).fill(0x81),
+        ...Cbor.encode(new Cbor.Tagged(24, nested(30)))])), /nests deeper than 64/);
+    refusedWith("200 000 nested arrays (no stack overflow)", () => Cbor.decode(new Uint8Array(200000).fill(0x81)), /nests deeper than 64/);
 });
 
 // 2. Mdoc.readIssuerSigned: the raw slices are the issued items, exactly as the bytes carry them
@@ -481,9 +775,15 @@ await section("2. readIssuerSigned", async () => {
     equal("and it is the certificate the fixture carries", hex(read.issuerAuth.x5chain[0]), hex(DUMMY_DER));
     const two = Mdoc.readIssuerSigned(MDL_TWO_CERTIFICATES.bytes);
     equal("the array form keeps both certificates, in order", two.issuerAuth.x5chain.map(hex), [hex(DUMMY_DER), hex(SECOND_DER)]);
-    const oneInArray = Mdoc.readIssuerSigned(buildIssuerSigned({ docType: DOC_TYPE, holder: HOLDER_A_JWK,
-        elements: MDL_ELEMENTS, x5chain: [DUMMY_DER], chainForm: "array" }).bytes);
-    equal("a one-entry array is read as one certificate too", oneInArray.issuerAuth.x5chain.map(hex), [hex(DUMMY_DER)]);
+    // RFC 9360 section 2: the array form is [2*certs: bstr]. A one-entry array is not a COSE_X509 (the single bstr is),
+    // so it is refused rather than read as if it were one
+    refusedWith("a one-entry x5chain array (RFC 9360 section 2: two or more)", () => Mdoc.readIssuerSigned(buildIssuerSigned({
+        docType: DOC_TYPE, holder: HOLDER_A_JWK, elements: MDL_ELEMENTS, x5chain: [DUMMY_DER], chainForm: "array" }).bytes),
+        /two or more/);
+    refusedWith("a tagged certificate inside an x5chain array", () => Mdoc.readIssuerSigned(buildIssuerSigned({
+        docType: DOC_TYPE, holder: HOLDER_A_JWK, elements: MDL_ELEMENTS,
+        x5chainRaw: Buffer.concat([Buffer.from(head(4, 2)), Buffer.from(head(6, 99)), bstr(DUMMY_DER), bstr(SECOND_DER)]) }).bytes),
+        /x5chain certificate 0/);
     let refusedChain = null;
     try {
         Mdoc.readIssuerSigned(buildIssuerSigned({ docType: DOC_TYPE, holder: HOLDER_A_JWK, elements: MDL_ELEMENTS,
@@ -566,6 +866,84 @@ await section("2. readIssuerSigned", async () => {
     }
     check("a payload with bytes after the tag-24 item is refused", refusedTrailing !== null && /exactly one/.test(refusedTrailing.message),
         refusedTrailing && refusedTrailing.message);
+
+    // review round 2, minor 1: the COSE_Sign1 shape is read from the bytes. The decoder resolves tags to what they carry,
+    // so each of these decoded to a value the old checks accepted.
+    const shaped = (extra) => buildIssuerSigned(Object.assign({ docType: DOC_TYPE, holder: HOLDER_A_JWK, elements: MDL_ELEMENTS }, extra));
+    for (const [tag, why] of [[1, "an epoch date"], [24, "embedded CBOR, as #6.24(bstr .cbor COSE_Sign1)"], [55799, "self-described CBOR"]]) {
+        refusedWith(`issuerAuth wrapped in tag ${tag} (${why}); only tag 18 may wrap a COSE_Sign1`,
+            () => Mdoc.readIssuerSigned(shaped({ coseWrap: tag }).bytes), new RegExp(`wrapped in tag ${tag}`));
+    }
+    refusedWith("a payload that is #6.24(bstr .cbor bstr) - decoding to the very bstr - instead of a bstr",
+        () => Mdoc.readIssuerSigned(shaped({ payloadWrap: 24 }).bytes), /issuerAuth element 2 .* is a tag/);
+    refusedWith("a payload that is a bstr inside another tag (21)",
+        () => Mdoc.readIssuerSigned(shaped({ payloadWrap: 21 }).bytes), /issuerAuth element 2 .* is a tag/);
+    refusedWith("a protected header that is a map rather than a bstr (RFC 9052 section 4.2)",
+        () => Mdoc.readIssuerSigned(shaped({ protectedAsMap: true }).bytes), /issuerAuth element 0 .* is a map/);
+    for (const [label, extra] of [["issuerAuth wrapped in tag 1", { coseWrap: 1 }], ["a tag-24 payload", { payloadWrap: 24 }],
+        ["a map as the protected header", { protectedAsMap: true }]]) {
+        const verdict = await Mdoc.checkKeepable({ issuerSigned: shaped(extra).bytes, doctype: DOC_TYPE, publicJwk: HOLDER_A_JWK });
+        check(`checkKeepable refuses ${label}`, verdict.ok === false && verdict.code === "issuer-signed", JSON.stringify(verdict));
+    }
+
+    // the same for the containers above the items: a tag around the IssuerSigned, its nameSpaces or a namespace's array
+    const selfDescribed = Buffer.from(head(6, 55799));
+    const nsArrayAt = MDL_A.nameSpacesRange.start + 1 + tstr(MDL_NAMESPACE).length;
+    for (const [label, at, pattern] of [["the IssuerSigned map", 0, /not an IssuerSigned map/],
+        ["the nameSpaces map", MDL_A.nameSpacesRange.start, /IssuerSigned nameSpaces is a tag, not a map/],
+        ["a namespace's array", nsArrayAt, /the namespace org.iso.18013.5.1 is a tag, not an array/]]) {
+        const wrapped = new Uint8Array(Buffer.concat([Buffer.from(MDL_A.bytes.subarray(0, at)), selfDescribed,
+            Buffer.from(MDL_A.bytes.subarray(at))]));
+        refusedWith(`${label} wrapped in tag 55799`, () => Mdoc.readIssuerSigned(wrapped), pattern);
+    }
+
+    // review round 2, minor 5: an IssuerSignedItem that is not tag 24 is refused even when its digest matches - its
+    // digest is taken over exactly the bytes written, so the tag-24 check is the only one that can refuse it
+    for (const form of ["bare", "tag55799"]) {
+        const untagged = shaped({ itemForms: { given_name: form } });
+        refusedWith(`an IssuerSignedItem written as ${form === "bare" ? "a bare map" : "#6.55799(map)"}, its digest matching`,
+            () => Mdoc.readIssuerSigned(untagged.bytes), /given_name is not a tag-24 IssuerSignedItemBytes/);
+        const verdict = await Mdoc.checkKeepable({ issuerSigned: untagged.bytes, doctype: DOC_TYPE, publicJwk: HOLDER_A_JWK });
+        check(`checkKeepable refuses an IssuerSignedItem written as ${form}`, verdict.ok === false && /tag-24/.test(verdict.message),
+            JSON.stringify(verdict));
+    }
+
+    // review round 2, major 2: a map key's contents are never a range. The decoy below is a key of the nameSpaces map,
+    // {"org.iso.18013.5.1": [decoy item]}; recorded, its item would sit at ["nameSpaces", ns, 0] after the real one
+    const nsStart = MDL_A.nameSpacesRange.start;
+    const nsEnd = MDL_A.nameSpacesRange.end;
+    const decoyItem = Buffer.concat([Buffer.from(head(6, 24)), bstr(Cbor.encode(new Map([["digestID", 0],
+        ["random", new Uint8Array(16)], ["elementIdentifier", "family_name"], ["elementValue", "Decoy"]])))]);
+    const decoyKey = Buffer.concat([Buffer.from(head(5, 1)), tstr(MDL_NAMESPACE), Buffer.from(head(4, 1)), decoyItem]);
+    const itemProbe = new Uint8Array(Buffer.concat([Buffer.from(MDL_A.bytes.subarray(0, nsStart)), Buffer.from([head(5, 2)[0]]),
+        Buffer.from(MDL_A.bytes.subarray(nsStart + 1, nsEnd)), decoyKey, Buffer.from([0xf6]), Buffer.from(MDL_A.bytes.subarray(nsEnd))]));
+    equal("probe: the nameSpaces map of the item probe starts as the fixture's did", MDL_A.bytes[nsStart], head(5, 1)[0]);
+    const itemWalk = Cbor.spans(itemProbe, 3);
+    MDL_A.items.get(MDL_NAMESPACE).forEach((expected, index) => {
+        const at = itemWalk.ranges.filter((range) => JSON.stringify(range.path) === JSON.stringify(["nameSpaces", MDL_NAMESPACE, index]));
+        equal(`Cbor.spans records exactly the real item at ["nameSpaces", ns, ${index}], never the key's decoy`,
+            at.map((range) => [range.start, range.end]), [[expected.start, expected.end]]);
+    });
+    const insideKey = (range) => range.start >= nsEnd && range.end <= nsEnd + decoyKey.length;
+    check("Cbor.spans records nothing inside the decoy key", !itemWalk.ranges.some(insideKey),
+        JSON.stringify(itemWalk.ranges.filter(insideKey)));
+    refusedWith("a nameSpaces key that is a map (NameSpace = tstr)", () => Mdoc.readIssuerSigned(itemProbe),
+        /a nameSpaces key is a map, not a text string/);
+    const itemVerdict = await Mdoc.checkKeepable({ issuerSigned: itemProbe, doctype: DOC_TYPE, publicJwk: HOLDER_A_JWK });
+    check("checkKeepable refuses the item probe", itemVerdict.ok === false && itemVerdict.code === "issuer-signed", JSON.stringify(itemVerdict));
+    // an integer namespace key is not a NameSpace either
+    const intKeyProbe = new Uint8Array(Buffer.concat([Buffer.from(MDL_A.bytes.subarray(0, nsStart)), Buffer.from([head(5, 2)[0]]),
+        Buffer.from(MDL_A.bytes.subarray(nsStart + 1, nsEnd)), Buffer.from(head(0, 7)), Buffer.from(head(4, 1)), decoyItem,
+        Buffer.from(MDL_A.bytes.subarray(nsEnd))]));
+    refusedWith("an integer nameSpaces key", () => Mdoc.readIssuerSigned(intKeyProbe), /a nameSpaces key is an unsigned integer/);
+
+    // and the reader's own guard, should a walk ever hand it two items at one path: refused, never "the last one wins"
+    const doubled = shipped("mdoc.js", { Cbor: Object.assign({}, Cbor, { spans: (input, depth) => {
+        const walked = Cbor.spans(input, depth);
+        const real = walked.ranges.find((range) => JSON.stringify(range.path) === "[\"issuerAuth\"]");
+        return Object.assign({}, walked, { ranges: walked.ranges.concat([Object.assign({}, real, { start: real.start + 1 })]) });
+    } }), crypto: webcrypto, btoa }, "Mdoc");
+    refusedWith("a walk with two items at one path", () => doubled.readIssuerSigned(MDL_A.bytes), /two data items sit at \["issuerAuth"\]/);
 });
 
 // 3. the IssuerSigned Certify's own MdocFormatter produced (plan 4.12): the layout real mDLs arrive in
@@ -584,7 +962,8 @@ await section("3. Certify's own IssuerSigned", async () => {
     check("and it is a real DER certificate, not a placeholder", read.issuerAuth.x5chain[0].length > 300,
         String(read.issuerAuth.x5chain[0].length));
     const items = read.nameSpaces[MDL_NAMESPACE];
-    check("every element the formatter salted is read", items.length >= 12, String(items.length));
+    equal("mdl-a carries the 15 elements the demo issues to mdl-demo-1 (plan 4.12)",
+        items.map((item) => item.elementIdentifier).sort(), MDL_DEMO_1_ELEMENTS.slice().sort());
     for (const item of items) {
         const expected = read.issuerAuth.mso.valueDigests[MDL_NAMESPACE][String(item.digestID)];
         equal(`Certify fixture: ${item.elementIdentifier} hashes to its valueDigest`, hex(hash("sha256", item.raw)), hex(expected));
@@ -593,6 +972,37 @@ await section("3. Certify's own IssuerSigned", async () => {
         publicJwk: CERTIFY_PUBLIC_JWK });
     check("Certify's own credential passes every keep check", verdict.ok === true, JSON.stringify(verdict));
     equal("and it reports the formatter's docType", verdict.docType, DOC_TYPE);
+
+    // review round 2, major 2: the real Certify credential plus one more IssuerSigned entry whose key is the map
+    // {"issuerAuth": <10-byte decoy>}. Were the key's contents recorded, the reader would return the decoy as
+    // issuerAuth.raw while every check ran on the real MSO.
+    const issuerAuthKey = tstr("issuerAuth");
+    const nameSpacesKey = tstr("nameSpaces");
+    equal("probe: Certify writes a two-entry IssuerSigned with issuerAuth first", hex(CERTIFY_ISSUER_SIGNED.subarray(0, 12)),
+        "a2" + hex(issuerAuthKey));
+    const realEnd = Buffer.from(CERTIFY_ISSUER_SIGNED).indexOf(nameSpacesKey, 12);
+    const decoy = Uint8Array.from([0x4a, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    const rootProbe = new Uint8Array(Buffer.concat([Buffer.from([0xa3]), Buffer.from(CERTIFY_ISSUER_SIGNED.subarray(1)),
+        Buffer.from(head(5, 1)), issuerAuthKey, Buffer.from(decoy), Buffer.from([0xf6])]));
+    const rootWalk = Cbor.spans(rootProbe, 3);
+    equal("Cbor.spans records one issuerAuth, the real one, and nothing of the key's decoy",
+        rootWalk.ranges.filter((range) => JSON.stringify(range.path) === "[\"issuerAuth\"]").map((range) => [range.start, range.end]),
+        [[12, realEnd]]);
+    const rootKeyStart = CERTIFY_ISSUER_SIGNED.length;
+    const rootKeyEnd = rootKeyStart + head(5, 1).length + issuerAuthKey.length + decoy.length;
+    const insideRootKey = (range) => range.start >= rootKeyStart && range.end <= rootKeyEnd;
+    check("no range lies inside the decoy key", !rootWalk.ranges.some(insideRootKey),
+        JSON.stringify(rootWalk.ranges.filter(insideRootKey)));
+    equal("the key is recorded as what it is: a map at the IssuerSigned's top level",
+        rootWalk.keys.filter((key) => key.path.length === 0).map((key) => key.major), [3, 3, 5]);
+    refusedWith("an IssuerSigned key that is a map", () => Mdoc.readIssuerSigned(rootProbe), /an IssuerSigned key is a map, not a text string/);
+    const probeVerdict = await Mdoc.checkKeepable({ issuerSigned: rootProbe, doctype: DOC_TYPE, publicJwk: CERTIFY_PUBLIC_JWK });
+    check("checkKeepable refuses the decoy-key probe", probeVerdict.ok === false && probeVerdict.code === "issuer-signed",
+        JSON.stringify(probeVerdict));
+    // a text key IssuerSigned does not define is refused too (its CDDL map is closed)
+    const extraKey = new Uint8Array(Buffer.concat([Buffer.from([0xa3]), Buffer.from(CERTIFY_ISSUER_SIGNED.subarray(1)),
+        tstr("deviceSigned"), Buffer.from([0xa0])]));
+    refusedWith("an IssuerSigned key the structure does not define", () => Mdoc.readIssuerSigned(extraKey), /"deviceSigned"/);
 
     // the same bytes through the page: kept exactly once, byte for byte, with the key the fixture was issued to
     const crypto = cryptoForFixture({ publicJwk: CERTIFY_PUBLIC_JWK, privateJwk: CERTIFY_HOLDER });
@@ -739,6 +1149,18 @@ await section("9. nothing kept", async () => {
     equal("unticked: nothing is kept", credentialsIn(unticked.indexedDB).length, 0);
     check("unticked: issuance is as today", unticked.el("walletStatus").textContent.includes("Credential issued"));
 
+    // review round 2 (nit): a run's note about keeping belongs to that run. The first run keeps and says so; a second
+    // run with the box unticked keeps nothing and must not leave the first run's "Kept" on screen
+    const twice = openOffer();
+    await issue(twice);
+    check("first run: the page says it kept the credential", twice.el("keepNote").hidden === false
+        && twice.el("keepNote").textContent.includes("Kept in this browser"), twice.el("keepNote").textContent);
+    twice.el("keep").checked = false;
+    await twice.runWallet();
+    await twice.settle();
+    equal("second run, unticked: the first run's note is gone", [twice.el("keepNote").hidden, twice.el("keepNote").textContent], [true, ""]);
+    equal("and still only the first run's credential is kept", credentialsIn(twice.indexedDB).length, 1);
+
     const other = openOffer({ configurations: { demo: { format: "ldp_vc" } }, configurationId: "demo",
         credential: { status: 200, body: { credentials: [{ credential: "ldp-credential" }] } } });
     await issue(other);
@@ -846,15 +1268,15 @@ await section("12. the wallet page", async () => {
     equal("the delete request completed", fake.deletions, 1);
 });
 
-// 13. Delete everything with another wallet tab open: never hangs, and asks for the one thing that unblocks it
-await section("13. Delete everything with another tab open", async () => {
+// 13. Delete everything with other tabs open (the harness's fake: its own bookkeeping says what happened underneath)
+await section("13. Delete everything with other tabs open", async () => {
     const fake = new FakeIndexedDB();
     const keepOne = openOffer({ indexedDB: fake });
     await issue(keepOne);
     equal("a credential is kept", credentialsIn(fake).length, 1);
 
     // two more connections, as two open wallet tabs would hold: the page's own delete closes its own first
-    const WalletStore = shipped("wallet-store.js", { indexedDB: fake }, "WalletStore");
+    const WalletStore = storeOn(fake);
     const tabA = await WalletStore.open();
     const tabB = await WalletStore.open();
     let versionChangesA = 0;
@@ -877,24 +1299,61 @@ await section("13. Delete everything with another tab open", async () => {
     check("the page says so", wallet.el("storageStatus").textContent.includes("was deleted"), wallet.el("storageStatus").textContent);
     equal("and the closed tabs did close", [tabA.closed, tabB.closed], [true, true]);
 
-    // a tab that ignores the request blocks the delete; the page must say what to do about it instead of waiting
+    // a tab that does not close: the delete stays queued (blocked is not an outcome) and the store stays until it does
     const blocking = new FakeIndexedDB();
-    const keepsOne = openOffer({ indexedDB: blocking });
-    await issue(keepsOne);
-    const stubborn = await (shipped("wallet-store.js", { indexedDB: blocking }, "WalletStore")).open();
+    await seedRecords(blocking, 1);
+    const stubborn = await storeOn(blocking).open();
     stubborn.onversionchange = null; // a tab that does not close (an older build, a frozen tab)
     const blockedWallet = openWallet(blocking);
+    await waitFor(() => blockedWallet.el("records").children.length === 1);
+    const openRequestsBefore = blocking.openRequests;
+    let finished = false;
+    const pressed = blockedWallet.el("deleteAll").fire("click").then(() => { finished = true; });
+    await waitFor(() => blockedWallet.el("storageStatus").textContent.includes("Waiting for other wallet tabs"));
     await settle();
-    await blockedWallet.el("deleteAll").fire("click");
-    await settle();
-    check("a blocked delete is reported, not left hanging",
-        blockedWallet.el("storageStatus").textContent.includes("could not be deleted")
-        && blockedWallet.el("storageStatus").textContent.includes("close every other wallet tab"),
-        blockedWallet.el("storageStatus").textContent);
-    equal("and the store is still there", blocking.databases.has(DB_NAME), true);
-    equal("the page's own list still works after the refusal", blockedWallet.el("records").children.length, 1);
+    equal("while blocked, the delete has not completed", [blocking.deletions, blocking.databases.has(DB_NAME), finished], [0, true, false]);
+    equal("and the page has asked for no open behind it (an open would queue behind the delete)",
+        blocking.openRequests, openRequestsBefore);
     stubborn.close();
+    await pressed;
     await settle();
+    equal("once the other tab closes, the delete completes, and only then the page reopens (an empty store)",
+        [blocking.deletions, blocking.openRequests - openRequestsBefore, blocking.databases.has(DB_NAME)], [1, 1, true]);
+
+    // the browser closing the page's connection (site data cleared): the page says so instead of failing later
+    const closing = new FakeIndexedDB();
+    await seedRecords(closing, 1);
+    const closedWallet = openWallet(closing);
+    await waitFor(() => closedWallet.el("records").children.length === 1);
+    [...closing.databases.get(DB_NAME).connections].forEach((connection) => connection.forceClose());
+    await waitFor(() => closedWallet.el("storageStatus").textContent.includes("closed the credential store"));
+    check("a connection the browser closed is reported, with what to do", closedWallet.el("storageStatus").textContent.includes("reload"),
+        closedWallet.el("storageStatus").textContent);
+    equal("and the list and the controls no longer offer a closed store", [closedWallet.el("records").children.length,
+        closedWallet.el("deleteAll").disabled, closedWallet.el("delete").disabled], [0, true, true]);
+});
+
+// 14. the storage model itself, and the page's deletes, held to IndexedDB 3.0 (the same scenarios run on fake-indexeddb)
+await storageConformance(() => new FakeIndexedDB(), "harness fake");
+await walletDeleteScenarios(() => new FakeIndexedDB(), "harness fake");
+
+// 15. I4 on the wallet page: with the wallet switched off, wallet/config answers 404 and the page opens no store at all,
+// whatever path served it; with it on, the only request the page makes is that one (I9)
+await section("15. the wallet page asks the switch before it stores anything", async () => {
+    const off = new FakeIndexedDB();
+    const offWallet = openWallet(off, { walletConfig: false });
+    await settle();
+    equal("switched off: no connection was opened", off.opens, 0);
+    equal("and no database exists", off.databases.size, 0);
+    check("the page says the wallet is off", offWallet.el("storageStatus").textContent.includes("switched off"),
+        offWallet.el("storageStatus").textContent);
+    equal("and offers nothing to delete", [offWallet.el("deleteAll").disabled, offWallet.el("delete").disabled], [true, true]);
+    const on = new FakeIndexedDB();
+    const onWallet = openWallet(on);
+    await settle();
+    equal("switched on: one connection", on.opens, 1);
+    equal("the wallet page's only request is its own config (I9)", onWallet.requests.map((request) => [request.method, request.url]),
+        [["GET", "https://credentials.example/v1/certify/offer/wallet/config"]]);
 });
 
 } finally {
@@ -908,3 +1367,6 @@ await section("13. Delete everything with another tab open", async () => {
     }
     process.exitCode = failures ? 1 : 0;
 }
+}
+
+export { storageConformance, walletDeleteScenarios };

@@ -2,6 +2,10 @@
  * The demo wallet page's controller (P5-03a): DOM only. It lists the credentials kept in this browser (WalletStore),
  * shows one credential's IssuerSigned elements the way the offer page renders an issued mDL, and deletes one record or
  * the whole database. No protocol logic lives here; the naming and the modules are the plan's (section 4.1).
+ *
+ * The page holds one connection (`db`) and gives it up when another tab deletes or upgrades the store, or when the
+ * browser closes it; the list then follows. While a delete or a reconnect is under way (`busy`) every control is
+ * disabled, so nothing is attempted on a connection that is closing or a store that is being deleted.
  */
 (function () {
   "use strict";
@@ -10,6 +14,7 @@
   var db = null;
   var records = [];
   var selected = null;
+  var busy = false;
   // the blob URL of the portrait the details view last rendered, released when another one replaces it
   var portraitObjectUrls = [];
 
@@ -41,7 +46,8 @@
     var list = el("records");
     list.textContent = ""; // clearing the page's own list only; every value below is set as text
     el("empty").hidden = records.length > 0;
-    el("deleteAll").disabled = records.length === 0;
+    el("deleteAll").disabled = busy || db === null || records.length === 0;
+    el("delete").disabled = busy || db === null;
     if (selected !== null && !records.some(function (record) { return record.id === selected.id; })) {
       selected = null;
       el("details").hidden = true;
@@ -51,6 +57,7 @@
       var open = document.createElement("button");
       open.className = "secondary";
       open.textContent = labelOf(record);
+      open.disabled = busy;
       open.addEventListener("click", function () { show(record); });
       var meta = document.createElement("span");
       meta.className = "hint";
@@ -143,70 +150,159 @@
   }
 
   async function refresh() {
-    records = await WalletStore.list(db);
+    records = db === null ? [] : await WalletStore.list(db);
     renderList();
   }
 
-  el("delete").addEventListener("click", async function () {
-    if (selected === null || db === null) return;
+  function setBusy(value) {
+    busy = value;
+    renderList();
+  }
+
+  /** Forgets what the page showed: the list, the selection and the details view. */
+  function forget() {
+    records = [];
+    selected = null;
+    el("details").hidden = true;
+    renderList();
+  }
+
+  /**
+   * This page's connection, which follows what happens to the store elsewhere. When another tab deletes everything,
+   * this connection closes itself (WalletStore) and the page forgets its list, says why, and reconnects: that open
+   * queues behind the other tab's delete (IndexedDB 3.0, 5.1), so it answers once the delete is done and the list is
+   * then the store as it is. An upgrade by a newer page, or a connection the browser closed, asks for a reload instead.
+   */
+  function connect() {
+    return WalletStore.open({
+      onVersionChange: function (connection, event) {
+        if (connection !== db) return; // a connection this page already gave up
+        db = null;
+        forget();
+        if (event && event.newVersion !== null && event.newVersion !== undefined) {
+          status("storageStatus", "Another tab upgraded the credential store; reload this page to see what is kept.", false);
+          return;
+        }
+        status("storageStatus", "Another wallet tab is deleting everything kept in this browser; this list follows"
+          + " once that delete is done.", false);
+        reconnect("Another wallet tab deleted everything kept in this browser.");
+      },
+      onClose: function (connection) {
+        if (connection !== db) return;
+        db = null;
+        forget();
+        status("storageStatus", "The browser closed the credential store (its site data may have been cleared); reload"
+          + " this page to see what is kept.", false);
+      },
+    });
+  }
+
+  async function reconnect(message) {
+    setBusy(true);
     try {
-      await WalletStore.remove(db, selected.id);
+      db = await connect();
+      await refresh();
+      status("storageStatus", message, false);
+    } catch (e) {
+      status("storageStatus", "The credential store could not be reopened: " + e.message + ". Reload this page.", false);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  el("delete").addEventListener("click", async function () {
+    if (busy || selected === null || db === null) return;
+    var record = selected;
+    setBusy(true);
+    try {
+      await WalletStore.remove(db, record.id);
       // the details section is hidden on success, so the confirmation goes where the visitor can still see it
-      status("storageStatus", "Deleted " + labelOf(selected) + ". Its key went with it.", true);
+      status("storageStatus", "Deleted " + labelOf(record) + ". Its key went with it.", true);
       status("detailsStatus", "");
       selected = null;
       el("details").hidden = true;
       await refresh();
     } catch (e) {
       status("detailsStatus", "The credential could not be deleted: " + e.message, false);
+    } finally {
+      setBusy(false);
     }
   });
 
   el("deleteAll").addEventListener("click", async function () {
-    if (db === null) return;
+    if (busy || db === null) return;
+    setBusy(true);
+    status("storageStatus", "Deleting everything kept in this browser…");
+    // this page's own connection goes first, or it would block its own delete
+    var connection = db;
+    db = null;
+    try { connection.close(); } catch (e) { /* already closed */ }
+    var failure = null;
     try {
-      db.close();
-      db = null;
-      await WalletStore.deleteEverything();
+      await WalletStore.deleteEverything(function () {
+        // said before anything is awaited: the delete stays queued, and finishes by itself once the other tabs close
+        status("storageStatus", "Waiting for other wallet tabs to close… Close every other tab of this wallet (or reload"
+          + " it) and the delete finishes by itself.", false);
+      });
     } catch (e) {
-      // another tab still holds the store open (WalletStore reports `blocked` instead of waiting): reopen this page's
-      // own connection so the list keeps working, and say what the visitor can do about it
-      try {
-        db = await WalletStore.open();
-        await refresh();
-      } catch (ignored) {
-        // the status below is what the visitor reads; a store that cannot reopen says so on the next action
-      }
-      status("storageStatus", "The store could not be deleted: " + e.message, false);
-      return;
+      failure = e;
     }
+    // the delete has finished, one way or the other: only now can this page open the store without queueing behind it
+    forget();
     try {
-      db = await WalletStore.open();
-      selected = null;
-      el("details").hidden = true;
+      db = await connect();
       await refresh();
-      status("storageStatus", "Everything kept in this browser was deleted.", true);
+      if (failure === null) status("storageStatus", "Everything kept in this browser was deleted.", true);
+      else status("storageStatus", "The store could not be deleted: " + failure.message, false);
     } catch (e) {
-      status("storageStatus", "The store was deleted, but could not be reopened: " + e.message, false);
+      status("storageStatus", failure === null
+        ? "Everything kept in this browser was deleted, but the store could not be reopened: " + e.message
+        : "The store could not be deleted (" + failure.message + "), nor reopened: " + e.message, false);
+    } finally {
+      setBusy(false);
     }
   });
 
+  /**
+   * I4: the wallet's own switch decides whether this browser stores anything. The page is meant to be reached at
+   * `offer/wallet`, which answers 404 with the switch off; asking `wallet/config` (the endpoint the offer page asks
+   * too) before opening the store keeps that true whatever path served these bytes.
+   */
+  async function walletEnabled() {
+    try {
+      var answer = await fetch("wallet/config", { cache: "no-store", credentials: "same-origin", redirect: "error" });
+      return answer.status === 200;
+    } catch (e) {
+      return false;
+    }
+  }
+
   (async function start() {
+    renderList();
     if (typeof WalletStore === "undefined" || !WalletStore.available()) {
       status("storageStatus", "This browser cannot keep credentials: IndexedDB is unavailable.", false);
       el("empty").hidden = false;
       return;
     }
+    if (!(await walletEnabled())) {
+      status("storageStatus", "The demo wallet is switched off on this deployment, so nothing is kept in this browser.", false);
+      el("empty").hidden = false;
+      return;
+    }
+    setBusy(true);
     try {
-      db = await WalletStore.open();
+      db = await connect();
     } catch (e) {
       status("storageStatus", "This browser could not open its credential store: " + e.message, false);
+      setBusy(false);
       return;
     }
     try {
       await refresh();
     } catch (e) {
       status("storageStatus", "The kept credentials could not be read: " + e.message, false);
+    } finally {
+      setBusy(false);
     }
   })();
 })();

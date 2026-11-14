@@ -7,8 +7,11 @@
  *
  * Byte ranges (`Cbor.spans`) come from the input's own offsets, never from a re-encoding, and a tag is transparent to
  * them: `#6.24(item)` and `#6.18([...])` are walked like the item they carry, so a tagged COSE_Sign1 keeps the ranges of
- * its own array elements. `Cbor.tagged` reports a tag by its numeric value, whatever head carries it (`d8 18` and the
- * non-preferred `d9 00 18` are both tag 24) and returns the tagged item's content bytes unchanged.
+ * its own array elements. A map key is never walked for ranges, however deep it nests: a key is not a value, so nothing
+ * inside it can be recorded under a value's path. `Cbor.tagged` reports a tag by its numeric value, whatever head carries
+ * it (`d8 18` and the non-preferred `d9 00 18` are both tag 24) and returns the tagged item's content bytes unchanged.
+ * An item nesting deeper than 64 arrays, maps and tags (tag-24 content counted with its container) is refused with a
+ * message rather than left to exhaust the stack.
  *
  * Integers are exact. A value that fits a JavaScript number (|n| <= Number.MAX_SAFE_INTEGER) decodes to a number;
  * anything larger, in either direction, decodes to a BigInt so no digit is silently lost, and the page renders it as the
@@ -34,12 +37,17 @@
  *   hex 0102                        -> throws       (trailing bytes after the top-level item)
  *   hex d818420102                  -> throws       (trailing bytes inside tag-24 content)
  *   hex d8184101                    -> 1            (tag 24 around exactly one item)
+ *   64 x 0x81 then 0x00             -> [[...[0]...]] (64 nested arrays are read)
+ *   65 x 0x81 then 0x00             -> throws       (nested deeper than 64 levels: a message, not a stack overflow)
+ *   spans(hex a2 6161 01 a1616100 02, 1) -> ranges only at ["a"] and ["{a:0}"]: the key map's own value 0 is no range
  */
 var Cbor = (function () {
   "use strict";
 
   var MAX_SAFE = 9007199254740991n; // Number.MAX_SAFE_INTEGER
   var HEX = "0123456789abcdef";
+  /** The deepest nesting of arrays, maps and tags the decoder reads; an mDL nests about ten levels. */
+  var MAX_DEPTH = 64;
 
   function Reader(bytes) {
     this.bytes = bytes;
@@ -49,6 +57,12 @@ var Cbor = (function () {
     this.found = null;
     this.limit = 0;
     this.path = [];
+    // every map key down to `limit` levels, with the major type of its first byte (a tag is 6, whatever it carries)
+    this.keys = null;
+    // above zero while a map key is decoded: nothing inside a key is recorded, at any depth (P5-03a review round 2)
+    this.muted = 0;
+    // how many arrays, maps and tags enclose the next item to decode, tag-24 content included (MAX_DEPTH)
+    this.depth = 0;
   }
   Reader.prototype.byte = function () {
     if (this.offset >= this.bytes.length) throw new Error("CBOR: unexpected end of input");
@@ -164,18 +178,46 @@ var Cbor = (function () {
 
   /**
    * One data item. With a recording reader ({@code reader.found} set) the item's `[start, end)` is appended under the
-   * path it was reached by, down to {@code reader.limit} levels below the root. `record` is passed false for a map's
-   * key and a tag's content: neither is a value of the container the caller asked about (a tag adds no level, RFC 8949
-   * 3.4), so neither gets an entry of its own.
+   * path it was reached by, down to {@code reader.limit} levels below the root. `record` is passed false for a tag's
+   * content: it is not a value of the container the caller asked about (a tag adds no level, RFC 8949 3.4), so it gets
+   * no entry of its own, while the items inside it keep theirs. A map key is decoded muted (see `decodeKey`), so neither
+   * the key nor anything inside it is ever recorded.
    */
   function decode(reader, record) {
+    // reader.depth is how many arrays, maps and tags enclose this item
+    if (reader.depth > MAX_DEPTH) {
+      throw new Error("CBOR: the data item nests deeper than " + MAX_DEPTH + " arrays, maps and tags");
+    }
+    reader.depth++;
     var start = reader.offset;
     var level = reader.path.length;
     var value = decodeValue(reader);
-    if (record !== false && reader.found !== null && level > 0 && level <= reader.limit) {
+    if (record !== false && reader.found !== null && reader.muted === 0 && level > 0 && level <= reader.limit) {
       reader.found.push({ path: reader.path.slice(), start: start, end: reader.offset });
     }
+    reader.depth--;
     return value;
+  }
+
+  /**
+   * One map key, decoded with recording switched off for its whole subtree. A key that is itself a map or an array
+   * holds values of its own; recorded, they would sit under the same paths as the map's real values (the key
+   * `{"issuerAuth": h'..'}` would record a range at `["issuerAuth"]`), and a reader keeping one range per path could
+   * then carry bytes that were never checked. The key's own major type is recorded instead, so a reader can refuse a
+   * key that is not the type its structure defines.
+   */
+  function decodeKey(reader) {
+    var start = reader.offset;
+    var major = reader.peek() >> 5;
+    var level = reader.path.length;
+    reader.muted++;
+    var key = decode(reader, false);
+    reader.muted--;
+    var rendered = keyOf(key);
+    if (reader.keys !== null && reader.muted === 0 && level < reader.limit) {
+      reader.keys.push({ path: reader.path.slice(), key: rendered, major: major, start: start, end: reader.offset });
+    }
+    return rendered;
   }
 
   function decodeValue(reader) {
@@ -234,7 +276,7 @@ var Cbor = (function () {
         // no prototype: a decoded "__proto__" key is data, not an assignment to Object.prototype
         var map = Object.create(null);
         var put = function () {
-          var rendered = keyOf(decode(reader, false)); // a key is not a value: it gets no range entry
+          var rendered = decodeKey(reader); // a key is not a value: neither it nor anything inside it gets a range
           // RFC 8949 5.6: duplicate keys make a map invalid; keys that only render alike (1 and "1") are refused too, never overwritten
           if (Object.prototype.hasOwnProperty.call(map, rendered)) throw new Error("CBOR: duplicate or ambiguous map key " + rendered);
           reader.path.push(rendered);
@@ -254,7 +296,7 @@ var Cbor = (function () {
         var tagged = decode(reader, false); // the tagged value is the item at this path, not a child of it
         if (tag === 24) { // embedded CBOR: exactly one data item, no padding around it
           if (!(tagged instanceof Uint8Array)) throw new Error("CBOR: tag 24 content is not a byte string");
-          return decodeItem(tagged);
+          return decodeItem(tagged, reader.depth); // the embedded item nests inside this one
         }
         if (tag === 2 || tag === 3) { // bignum: an unsigned magnitude in big-endian bytes, exact as a BigInt
           if (!(tagged instanceof Uint8Array)) throw new Error("CBOR: tag " + tag + " content is not a byte string");
@@ -274,9 +316,13 @@ var Cbor = (function () {
     }
   }
 
-  /** Decodes exactly one data item from {@code bytes}: anything left over means the input is not just that item. */
-  function decodeItem(bytes) {
+  /**
+   * Decodes exactly one data item from {@code bytes}: anything left over means the input is not just that item.
+   * {@code depth} is how deep the bytes already sit (tag-24 content inside another item), so the cap holds across them.
+   */
+  function decodeItem(bytes, depth) {
     var reader = new Reader(bytes);
+    reader.depth = depth || 0;
     var item = decode(reader);
     if (!reader.done()) {
       throw new Error("CBOR: " + (bytes.length - reader.offset) + " trailing byte(s) after the data item");
@@ -290,17 +336,23 @@ var Cbor = (function () {
    * The decoded item and the `[start, end)` range of every array element and map value down to {@code depth} levels
    * below the root (the root's own children are depth 1). The ranges are recorded by `decode` as it reads, so they are
    * the input's own offsets: nothing is re-encoded, and a definite- or an indefinite-length item is read the same way.
-   * Each entry is `{path, start, end}`, the path being the rendered map keys and array indexes from the root.
+   * Each entry is `{path, start, end}`, the path being the rendered map keys and array indexes from the root. Nothing
+   * inside a map key is ever an entry.
+   *
+   * `keys` lists the keys of every map whose values are recorded (`{path, key, major, start, end}`: the map's own path,
+   * the rendered key, and the major type of the key's first byte), so a reader can refuse a key of the wrong type: the
+   * text key "33" and the integer key 33 render alike, and only `major` tells them apart.
    */
   function ranges(bytes, depth) {
     var reader = new Reader(bytes);
     reader.found = [];
+    reader.keys = [];
     reader.limit = typeof depth === "number" ? depth : 0;
     var value = decode(reader);
     if (!reader.done()) {
       throw new Error("CBOR: " + (bytes.length - reader.offset) + " trailing byte(s) after the data item");
     }
-    return { value: value, ranges: reader.found };
+    return { value: value, ranges: reader.found, keys: reader.keys };
   }
 
   /**
@@ -448,7 +500,8 @@ var Cbor = (function () {
 
     /**
      * The decoded item and the byte range of every array element and map value down to {@code depth} levels below the
-     * root, as `{path, start, end}` entries. Nothing is re-encoded: the ranges are the input's own offsets.
+     * root, as `{path, start, end}` entries, and those maps' keys with their major types (`keys`). Nothing is
+     * re-encoded: the ranges are the input's own offsets, and nothing inside a map key is ever a range.
      */
     spans: function (input, depth) {
       var bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
