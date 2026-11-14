@@ -87,7 +87,10 @@
       <li>Sign a <code>jwt</code> proof of possession with a fresh P-256 key in this browser and request the credential.</li>
     </ol>
     <button id="wallet" disabled>Run the pre-authorized code flow here</button>
+    <label id="keepLabel" hidden><input type="checkbox" id="keep" checked style="width:auto"> Keep this credential in this browser</label>
     <div id="walletStatus" class="status"></div>
+    <div id="keepNote" hidden></div>
+    <p><a id="walletLink" href="wallet" hidden>Open the demo wallet</a></p>
     <pre id="credential" hidden></pre>
     <div id="mdocView" hidden>
       <h3 style="font-size:0.95rem;margin:16px 0 6px">IssuerSigned (ISO/IEC 18013-5) elements</h3>
@@ -99,6 +102,8 @@
 
 <script src="qrcode.min.js"></script>
 <script src="cbor.js"></script>
+<script src="mdoc.js"></script>
+<script src="wallet-store.js"></script>
 <script>
 (function () {
   // Same origin as the issuer: the servlet path is everything before /offer/
@@ -111,6 +116,13 @@
   let activeOffer = null;
   // an offer is being created / redeemed: each keeps the other's button disabled while it runs
   let creating = false, redeeming = false;
+  // P5-03a (I4): whether this deployment's wallet answered 200. Until it does, nothing is kept and no Keep box is
+  // shown: with certify.offer-page.wallet.enabled=false the config endpoint answers 404 and this browser stores nothing.
+  let walletEnabled = false;
+  // P5-03a review round 4: how many wallet runs have started (each keep is tagged with its run's number), and one note
+  // per keep whose outcome is on screen, so a keep that ends after a newer run started reports as the earlier one's
+  let walletRuns = 0;
+  const keepNotes = [];
   // the blob URL of the last portrait this page rendered, released when the next one replaces it
   let portraitObjectUrls = [];
 
@@ -169,8 +181,20 @@
     // ISO/IEC 18013-5 credentials are only issued on the OpenID4VCI 1.0 surface (D5), so for them that surface is forced;
     // every other format defaults to the compatibility surface the page has always used.
     syncSurface();
+    syncKeep();
     // the operator's demo subjects, when there are any; a fetch that fails is not an error the visitor needs to see
     try { await loadDemoSubjects(); } catch (e) { /* no dropdown: the typed id and the claims field work as before */ }
+    // the wallet page, when this deployment serves it: its config endpoint exists only with
+    // certify.offer-page.wallet.enabled, so a 404 leaves no link - and no Keep box, because the switch that answers here
+    // is the switch that allows storing anything at all (I4)
+    try {
+      const walletConfig = await api("GET", WALLET_CONFIG);
+      walletEnabled = walletConfig.status === 200;
+      if (walletEnabled) el("walletLink").hidden = false;
+    } catch (e) {
+      walletEnabled = false; // no wallet on this deployment: nothing is kept
+    }
+    syncKeep();
   }
 
   function formatOf(configurationId) {
@@ -197,10 +221,64 @@
     el("surface").value = mdoc ? "oid4vci" : "legacy";
   }
 
+  /**
+   * P5-03a (plan 4.2, D-P5-03-6, I4): only an mso_mdoc credential can be kept, and only where the wallet is switched on.
+   * So the checkbox is shown for an mso_mdoc configuration of a deployment whose wallet answers 200 (ticked by default),
+   * and hidden everywhere else.
+   */
+  function syncKeep() {
+    el("keepLabel").hidden = !walletEnabled || selectedFormat() !== "mso_mdoc";
+  }
+
+  /**
+   * The note of one keep: a line under the wallet button, about what that keep kept (or why it kept nothing). The line
+   * is made on its keep's first message, and says which credential it is about: once a newer run has started, it is
+   * "Earlier credential: …", so a keep that waited behind another tab's delete never reports as the newer run's.
+   */
+  function keepNoteFor(run) {
+    const note = { run: run, pending: true, node: null, message: "", ok: undefined };
+    note.say = (message, ok) => {
+      note.message = message;
+      note.ok = ok;
+      if (note.node === null) {
+        note.node = document.createElement("p");
+        el("keepNote").appendChild(note.node);
+        keepNotes.push(note);
+      }
+      renderKeepNote(note);
+      el("keepNote").hidden = false;
+    };
+    return note;
+  }
+
+  function renderKeepNote(note) {
+    note.node.textContent = (note.run === walletRuns ? "" : "Earlier credential: ") + note.message;
+    note.node.className = "status " + (note.ok === undefined ? "" : note.ok ? "ok" : "bad");
+  }
+
+  /**
+   * A new run starts: what the finished keeps said is not news about it, so their notes go; a keep that is still
+   * pending keeps its note, now labelled as the earlier credential's, and reports there when it ends.
+   */
+  function startKeepNotes() {
+    for (let i = keepNotes.length - 1; i >= 0; i--) {
+      if (keepNotes[i].pending) {
+        renderKeepNote(keepNotes[i]);
+      } else {
+        el("keepNote").removeChild(keepNotes[i].node);
+        keepNotes.splice(i, 1);
+      }
+    }
+    el("keepNote").hidden = keepNotes.length === 0;
+  }
+
   // ---- demo subjects (F-15): the subjects the operator configured (certify.offer-page.demo-subjects), offered in a
   // dropdown instead of a typed record id. A deployment that configures none keeps the free-text field and the claims
   // path exactly as they were: no dropdown, no error.
   const DEMO_SUBJECTS = "/offer/demo-subjects";
+  // P5-03a: the wallet page's own config endpoint. It exists only with certify.offer-page.wallet.enabled, which is
+  // also how this page learns whether to link the wallet at all.
+  const WALLET_CONFIG = "/offer/wallet/config";
   // the shape the endpoint promises (OfferPageProperties): one malformed entry makes the whole list untrustworthy
   const SUBJECT_ID = /^[A-Za-z0-9._:-]{1,128}$/;
   const SUBJECT_LABEL_MAX = 128;
@@ -291,7 +369,7 @@
     refreshSubjectChoice();
   }
 
-  el("configuration").addEventListener("change", () => { syncSurface(); refreshSubjectChoice(); });
+  el("configuration").addEventListener("change", () => { syncSurface(); syncKeep(); refreshSubjectChoice(); });
   el("subjectChoice").addEventListener("change", syncSubjectInput);
 
   /**
@@ -419,7 +497,9 @@
   const b64urlText = (text) => b64url(new TextEncoder().encode(text));
 
   async function proofJwt(audience, nonce) {
-    const key = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign"]);
+    // P5-03a (plan 4.2): the private key is never extractable, because a kept credential's key must stay in this
+    // browser. The proof is unchanged: its jwk header comes from the public key, which WebCrypto always exports.
+    const key = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
     const jwk = await crypto.subtle.exportKey("jwk", key.publicKey);
     const header = { alg: "ES256", typ: "openid4vci-proof+jwt", jwk: { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y } };
     // OpenID4VCI 1.0 Appendix F.1: the anonymous pre-authorized code flow sends no iss, and nonce is present exactly when
@@ -428,7 +508,7 @@
     if (nonce) claims.nonce = nonce;
     const signingInput = b64urlText(JSON.stringify(header)) + "." + b64urlText(JSON.stringify(claims));
     const signature = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key.privateKey, new TextEncoder().encode(signingInput));
-    return signingInput + "." + b64url(signature); // WebCrypto's ECDSA signature is already the JOSE R||S form
+    return { jwt: signingInput + "." + b64url(signature), keyPair: key, publicJwk: jwk }; // WebCrypto's ECDSA signature is already the JOSE R||S form
   }
 
   /**
@@ -504,10 +584,16 @@
     // those of the offer that was on screen when the button was pressed, whatever happens while the run waits
     const offer = activeOffer;
     if (!offer) return;
+    const run = ++walletRuns;
     redeeming = true;
     el("wallet").disabled = true;
     // and no other offer is created while this one is redeemed (the button comes back when the run ends)
     el("create").disabled = true;
+    // P5-03a: what an earlier run kept (or why it kept nothing) is not news about this one; a keep still pending stays
+    startKeepNotes();
+    // the keep this run starts once its own controls are back (review round 3): a store that is waiting behind another
+    // tab's "Delete everything" must not hold Redeem and Create disabled after the credential was issued
+    let keep = null;
     try {
       // OpenID4VCI 1.0 sections 4.1.1, 7, 8.2 and 12.2.2/12.2.4: the offer names its credential issuer, and everything
       // else comes from that issuer's metadata and its authorization server's metadata, each at its well-known
@@ -595,7 +681,8 @@
       const request = identifiers.length ? { credential_identifier: identifiers[0] }
         : { credential_configuration_id: offer.credentialConfigurationId };
       // Appendix F.1: aud is the credential issuer the offer named, whatever surface that is
-      request.proofs = { jwt: [await proofJwt(credentialIssuer, nonce)] };
+      const proof = await proofJwt(credentialIssuer, nonce);
+      request.proofs = { jwt: [proof.jwt] };
       const credential = await walletApi("POST", credentialEndpoint, request,
         { Authorization: (token.body.token_type || "Bearer") + " " + token.body.access_token });
       el("credential").textContent = JSON.stringify(credential.body, null, 2); el("credential").hidden = false;
@@ -610,6 +697,7 @@
         } catch (e) {
           status("walletStatus", "Credential issued, but the IssuerSigned view could not be rendered: " + e.message, false);
         }
+        keep = (note) => keepCredential(credential.body.credentials, offer, issuerMetadata, proof, note);
       }
     } catch (e) {
       status("walletStatus", "The flow failed: " + e.message, false);
@@ -617,6 +705,17 @@
       redeeming = false;
       el("wallet").disabled = !activeOffer;
       el("create").disabled = creating;
+    }
+    // after the run: keeping is local, and its outcome is reported in its own note whenever the store answers
+    if (keep !== null) {
+      const note = keepNoteFor(run);
+      try {
+        await keep(note);
+      } catch (e) {
+        note.say("The credential was not kept: " + e.message, false);
+      } finally {
+        note.pending = false;
+      }
     }
   });
 
@@ -693,6 +792,97 @@
       });
     });
     view.hidden = false;
+  }
+
+  // ---- P5-03a: keep the first credential in this browser (plan 4.2)
+  /** How long the store may take to answer before the page says it is waiting for another tab's delete. */
+  const STORE_WAIT_NOTE_MS = 500;
+
+  /**
+   * Keeps the first credential of a 200 response when the visitor asked for it, the configuration is an mso_mdoc one and
+   * this browser has IndexedDB. Every check must pass (Mdoc.checkKeepable); a refusal keeps nothing and names the check.
+   * Nothing here leaves the browser, and a failure never changes what the issuance run reported. Every outcome goes to
+   * {@code note}, this keep's own note (keepNoteFor).
+   */
+  async function keepCredential(credentials, offer, issuerMetadata, proof, note) {
+    const keepNote = note.say;
+    // I4: the wallet's own switch decides whether anything is stored. Without it the page would not even show the box,
+    // so a store is opened only after /offer/wallet/config answered 200.
+    if (!walletEnabled) return;
+    if (formatOf(offer.configurationId) !== "mso_mdoc") return;
+    if (!el("keep").checked) return;
+    // the harness's stub page has neither module; nothing is kept without them
+    if (typeof WalletStore === "undefined" || typeof Mdoc === "undefined") return;
+    const kept = credentials[0];
+    const configuration = (issuerMetadata.credential_configurations_supported || {})[offer.configurationId] || {};
+    const display = (configuration.credential_metadata && configuration.credential_metadata.display || [])[0];
+    if (!WalletStore.available()) {
+      keepNote("This browser cannot keep credentials (IndexedDB is unavailable), so this one was not kept; issuance works as before.", false);
+      return;
+    }
+    let db;
+    // the store answers at once unless another tab's "Delete everything" is pending: an open queues behind a delete
+    // until every other tab has closed the store (IndexedDB 3.0, 5.1 and 5.3), and nothing tells the open it waits.
+    // Say so, then report the outcome when the store answers.
+    const waiting = setTimeout(() => keepNote("Waiting for the credential store (another tab is deleting it). This"
+      + " credential is checked and kept once that delete is done.", undefined), STORE_WAIT_NOTE_MS);
+    try {
+      db = await WalletStore.open();
+    } catch (e) {
+      keepNote("This browser could not open its credential store (" + e.message + "); nothing was kept.", false);
+      return;
+    } finally {
+      clearTimeout(waiting);
+    }
+    try {
+      let issuerSigned;
+      try {
+        issuerSigned = base64urlBytes(kept.credential);
+      } catch (e) {
+        keepNote("The credential was not kept: its credential value is not base64url (" + e.message + ").", false);
+        return;
+      }
+      const result = await Mdoc.checkKeepable({
+        issuerSigned: issuerSigned,
+        doctype: configuration.doctype,
+        publicJwk: proof.publicJwk,
+        stored: await WalletStore.count(db),
+      });
+      if (!result.ok) {
+        keepNote("The credential was not kept. " + result.message, false);
+        return;
+      }
+      const record = {
+        id: crypto.randomUUID(),
+        format: "mso_mdoc",
+        docType: result.docType,
+        issuerSigned: issuerSigned,
+        privateKey: proof.keyPair.privateKey,
+        publicJwk: { kty: proof.publicJwk.kty, crv: proof.publicJwk.crv, x: proof.publicJwk.x, y: proof.publicJwk.y },
+        credentialIssuer: offer.issuer,
+        credentialConfigurationId: offer.configurationId,
+        storedAt: Date.now(),
+        validFrom: result.validFrom,
+        validUntil: result.validUntil,
+        label: display && display.name ? display.name : result.docType,
+      };
+      await WalletStore.putWithinLimit(db, record, Mdoc.MAX_CREDENTIALS).then(function (stored) {
+        if (!stored) {
+          // the count and the write share one transaction, so this holds even if another tab kept its own credential a
+          // moment ago (plan 4.2 check 5)
+          keepNote("The credential was not kept. This browser already keeps " + Mdoc.MAX_CREDENTIALS
+            + " credentials; delete one first.", false);
+          return;
+        }
+        keepNote("Kept in this browser: " + record.label + "."
+          + (credentials.length > 1 ? " This response carried " + credentials.length
+            + " credentials; only the first was kept, the rest were shown." : ""), true);
+      });
+    } catch (e) {
+      keepNote("The credential was not kept: " + e.message, false);
+    } finally {
+      try { db.close(); } catch (e) { /* already closed */ }
+    }
   }
 
   load().catch((e) => status("offerStatus", "Could not load the issuer metadata: " + e.message, false));

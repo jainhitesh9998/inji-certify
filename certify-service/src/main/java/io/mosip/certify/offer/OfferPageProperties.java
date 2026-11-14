@@ -27,10 +27,12 @@ import java.util.regex.Pattern;
  * @param enabled       serve the page (and its dropdown) at {@code /offer/}
  * @param demoSubjects  the subjects the page offers, at most {@value #MAX_DEMO_SUBJECTS}; empty (the default) turns the
  *                      dropdown off
+ * @param wallet        the demo wallet at {@code /offer/wallet} (P5-03a; off by default)
  */
 @ConfigurationProperties(prefix = OfferPageProperties.PREFIX)
 public record OfferPageProperties(@DefaultValue("false") boolean enabled,
-                                  @DefaultValue List<DemoSubject> demoSubjects) {
+                                  @DefaultValue List<DemoSubject> demoSubjects,
+                                  Wallet wallet) {
 
     public static final String PREFIX = "certify.offer-page";
     /** More than a demo needs, and small enough to keep the page's dropdown usable. */
@@ -43,6 +45,7 @@ public record OfferPageProperties(@DefaultValue("false") boolean enabled,
 
     public OfferPageProperties {
         demoSubjects = demoSubjects == null ? List.of() : List.copyOf(demoSubjects);
+        wallet = wallet == null ? new Wallet(false) : wallet;
         if (demoSubjects.size() > MAX_DEMO_SUBJECTS) {
             throw new IllegalArgumentException("certify.offer-page.demo-subjects lists " + demoSubjects.size()
                     + " subjects; at most " + MAX_DEMO_SUBJECTS + " are allowed");
@@ -76,6 +79,20 @@ public record OfferPageProperties(@DefaultValue("false") boolean enabled,
                         + " ids must be unique");
             }
         }
+    }
+
+    /**
+     * The demo wallet the offer page links to and keeps issued mDLs in (P5-03a). Off by default: without it
+     * {@code /offer/wallet} and {@code /offer/wallet/config} answer 404, and nothing is stored in the browser.
+     *
+     * @param enabled serve the wallet page and its config endpoint
+     */
+    public record Wallet(@DefaultValue("false") boolean enabled) {
+    }
+
+    /** Whether the demo wallet is served ({@code certify.offer-page.wallet.enabled}). */
+    public boolean walletEnabled() {
+        return wallet != null && wallet.enabled();
     }
 
     /**

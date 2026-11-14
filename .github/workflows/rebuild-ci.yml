@@ -194,15 +194,34 @@ jobs:
         shell: bash
 
       - uses: actions/setup-node@v4
-        # F-15: the offer page's behaviour check is plain Node with no npm install, so only the interpreter is set up
+        # F-15: the offer page's behaviour check is plain Node with no npm install, so only the interpreter is set up.
+        # P5-03a moves it to Node 24 (D-P5-03-13): Node 20 reached end of life on 2026-04-30, and the wallet harness's
+        # fake IndexedDB stores records with the platform's `structuredClone`, which on Node 24 clones a non-extractable
+        # CryptoKey into a clone that still signs and still refuses `exportKey` - the behaviour a browser's clone has.
         with:
-          node-version: '20'
+          node-version: '24'
 
       - name: Offer page behaviour (node)
         # F-15: the real certify-service/src/main/resources/static/offer/index.html is evaluated with a fake DOM and
         # asserted by behaviour (the demo-subject dropdown, its "Other" option, text-only labels, the POST body), which
         # is the regression test for the two defects review round 1 found in the page's script. No npm dependencies.
         run: node docs/design/tools/check-offer-page.mjs
+        shell: bash
+
+      - name: Demo wallet behaviour (node)
+        # P5-03a: the offer page keeps an issued mDL (non-extractable key, IndexedDB, the five checks of plan 4.2) and
+        # the wallet page lists, shows and deletes it. The page's own scripts are evaluated (cbor.js, mdoc.js,
+        # wallet-store.js); the fixtures include one recorded from Certify's own MdocFormatter (certify-format-mdoc, plan
+        # 4.12), so no issuer and no npm install are needed.
+        run: node docs/design/tools/check-offer-wallet.mjs
+        shell: bash
+
+      - name: Demo wallet storage against a spec IndexedDB (node)
+        # P5-03a review round 2: the storage scenarios of check-offer-wallet.mjs (the connection queue, `blocked`,
+        # transaction lifetime, "Delete everything" against other tabs) also run on fake-indexeddb, an IndexedDB 3.0
+        # implementation pinned in wallet-probe/package-lock.json. Test-only: nothing here reaches the runtime classpath.
+        working-directory: docs/design/tools/wallet-probe
+        run: npm ci --ignore-scripts --no-audit --no-fund && node idb-crosscheck.mjs
         shell: bash
 
       - uses: actions/setup-python@v5

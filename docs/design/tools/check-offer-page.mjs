@@ -74,7 +74,7 @@
  */
 import { createPublicKey, verify, webcrypto } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
@@ -344,6 +344,24 @@ class Element {
         this.listeners.get(type).push(listener);
     }
 
+    // a canvas, enough for a `src` script to run when the page's own scripts are evaluated (`scripts: "real"`): the
+    // QR library draws into a 2d context and reads the result back as a data URL. Nothing here renders anything.
+    getContext() {
+        return {
+            clearRect: () => {}, fillRect: () => {}, strokeRect: () => {}, drawImage: () => {},
+            beginPath: () => {}, moveTo: () => {}, lineTo: () => {},
+            fillStyle: "", strokeStyle: "", lineWidth: 1,
+        };
+    }
+
+    toDataURL() {
+        return "data:image/png;base64,";
+    }
+
+    setAttribute() {}
+
+    setAttributeNS() {}
+
     // the page only ever clears a container with innerHTML; anything else would be a way for server text to become
     // markup, so every assignment is recorded and the checks below look for a non-empty one
     set innerHTML(value) {
@@ -483,6 +501,586 @@ function parseMarkup(markup) {
 /** The declared ids of a piece of markup (see parseMarkup). */
 const markupElements = (markup) => parseMarkup(markup).ids;
 
+/* ---------------------------------------------------------------- fake IndexedDB (P5-03a) */
+
+/*
+ * A small IndexedDB, enough for wallet-store.js, that follows the parts of IndexedDB 3.0 the page's correctness depends
+ * on. A fake that skipped them hid real bugs: one that answered an open at once while a delete was pending let the
+ * wallet page await an open that a browser leaves queued forever, and one that dropped a request on a finished
+ * transaction hid a request that a browser refuses. Modelled, with the section:
+ *
+ * - Events are tasks (5.x "queue a task"): a request's handlers run in a later turn of the event loop than the call,
+ *   and the promise reactions they trigger run before the next task. `setImmediate` is that turn here.
+ * - The connection queue (5.1, 5.3): `open` and `deleteDatabase` for one name run one at a time in request order, so an
+ *   open made while a delete is pending answers only after the delete finishes.
+ * - Deleting (5.3) and upgrading (5.1): `versionchange` goes to every other connection without a pending close; if one
+ *   is still open after those events, `blocked` fires at the request, and the request stays queued until the last
+ *   connection closes. `blocked` is not an outcome: `success` (or `error`) still follows.
+ * - Closing (2.6, 4.4 close()): a connection with transactions running is "close pending" - it refuses new
+ *   transactions at once, and closes only when they finish.
+ * - Transaction lifetime (2.7, 2.7.1): a transaction is active in the task that created it and while a request's
+ *   success or error event is dispatched, together with the promise reactions that dispatch triggers; it turns inactive
+ *   when the next task starts, and commits once it is inactive with no request outstanding. A request on a transaction
+ *   that is not active - finished included - throws `TransactionInactiveError` (4.5, 4.6). The next task is this fake's
+ *   own next event or a page timer (`taskTimers`, which the page contexts get as `setTimeout`): a timer callback is a
+ *   task of its own, so it never sees a transaction of an earlier task as active.
+ * - Scheduling (2.7.2): a readonly transaction waits for earlier overlapping readwrite ones, a readwrite one for every
+ *   earlier overlapping one. That is what makes "at most 50 credentials" atomic: a count and a put in one transaction
+ *   cannot interleave with another tab's.
+ * - Records are cloned with the platform's own `structuredClone`, in and out, as a browser's structured clone does: a
+ *   `CryptoKey` stays a `CryptoKey` (Node 24 clones a non-extractable one into a working key that still signs and still
+ *   refuses `exportKey`). An out-of-line key never edits the record. An aborted readwrite transaction rolls back.
+ *
+ * docs/design/tools/wallet-probe/idb-crosscheck.mjs runs the same scenarios against fake-indexeddb, a spec-conformant
+ * implementation, so this model and the page are held to what an implementation of the standard does.
+ */
+
+const idbError = (name, message) => new DOMException(message, name);
+
+/** Transactions left active by the current task: the next task of this fake turns them inactive first (2.7.1). */
+const activeUntilNextTask = new Set();
+
+function idbTask(work) {
+    setImmediate(() => {
+        endActiveTask();
+        work();
+    });
+}
+
+function endActiveTask() {
+    for (const transaction of [...activeUntilNextTask]) {
+        activeUntilNextTask.delete(transaction);
+        if (transaction.state === "active") transaction.state = "inactive";
+        transaction.maybeCommit();
+    }
+}
+
+function activeForThisTask(transaction) {
+    transaction.state = "active";
+    activeUntilNextTask.add(transaction);
+    idbTask(() => {}); // the next task, should nothing else be queued
+}
+
+/**
+ * The page's timers (review round 3, nit): a `setTimeout` callback starts a task, so the transactions active in the task
+ * that is ending turn inactive first, as they would in a browser. Node runs timers before `setImmediate` callbacks, so
+ * with the bare `setTimeout` a timer's callback could still use a transaction of an earlier task.
+ */
+const taskTimers = {
+    setTimeout: (callback, delay, ...args) => setTimeout(() => {
+        endActiveTask();
+        callback(...args);
+    }, delay),
+    clearTimeout: (handle) => clearTimeout(handle),
+};
+
+/** One request of the fake IndexedDB: its result or error arrive with its event, in a task of their own. */
+class FakeRequest {
+    constructor(transaction = null) {
+        this.transaction = transaction;
+        this.readyState = "pending";
+        this.result = undefined;
+        this.error = null;
+        this.onsuccess = null;
+        this.onerror = null;
+        this.onblocked = null;
+        this.onupgradeneeded = null;
+    }
+
+    fire(type, extra = {}) {
+        const handler = this["on" + type];
+        if (typeof handler === "function") handler.call(this, Object.assign({ type, target: this }, extra));
+    }
+}
+
+class FakeIndexedDB {
+    constructor() {
+        this.databases = new Map();
+        // the connection queue of each database name (5.1): open and delete requests, run one at a time in order
+        this.queues = new Map();
+        // every connection handed out, so a check can say that no store was opened at all
+        this.opens = 0;
+        // every open() called, answered or still queued, so a check can see an open waiting behind a delete
+        this.openRequests = 0;
+        // every delete that completed, so a check can tell "the page reopened what it deleted" from "nothing happened"
+        this.deletions = 0;
+        // requests a check holds back (see hold)
+        this.holds = [];
+    }
+
+    /**
+     * An ordering knob for a check (review round 3): the next `operation` request (`"getAll"`, `"count"`, ...) made on
+     * `storeName` is accepted and queued as usual, but is not processed until `release()`. Its transaction stays alive
+     * meanwhile, as one does while a browser is still reading, so a connection closing behind it stays close-pending.
+     * `reached` resolves once such a request was made. One hold catches one request.
+     */
+    hold(operation, storeName) {
+        let arrived;
+        const hold = {
+            operation,
+            storeName,
+            request: null,
+            released: false,
+            resumes: [],
+            reached: new Promise((resolve) => { arrived = resolve; }),
+        };
+        hold.arrive = (request) => {
+            hold.request = request;
+            arrived(request);
+        };
+        hold.release = () => {
+            hold.released = true;
+            for (const resume of hold.resumes.splice(0)) idbTask(resume);
+        };
+        this.holds.push(hold);
+        return hold;
+    }
+
+    /** The hold, if any, that catches this request (it then catches no other). */
+    catchRequest(operation, storeName, request) {
+        const hold = this.holds.find((entry) => entry.request === null && entry.operation === operation
+            && entry.storeName === storeName);
+        if (hold === undefined) return null;
+        hold.arrive(request);
+        return hold;
+    }
+
+    database(name, version = 1) {
+        let database = this.databases.get(name);
+        if (database === undefined) {
+            database = new FakeDatabase(name, version, this);
+            this.databases.set(name, database);
+        }
+        return database;
+    }
+
+    /** Fills a store before a page opens the database (the 51st-credential check), creating it as an upgrade would. */
+    seed(storeName, records) {
+        const database = this.database("certify-demo-wallet", 1);
+        database.ensureStores();
+        const store = database.stores.get(storeName);
+        for (const record of records) store.putClone(record);
+        return database;
+    }
+
+    open(name, version) {
+        if (version !== undefined && (!Number.isInteger(version) || version < 1)) {
+            throw new TypeError("the version must be a positive integer");
+        }
+        const request = new FakeRequest();
+        this.openRequests++;
+        this.enqueue(name, (done) => this.runOpen(name, version, request, done));
+        return request;
+    }
+
+    deleteDatabase(name) {
+        const request = new FakeRequest();
+        this.enqueue(name, (done) => this.runDelete(name, request, done));
+        return request;
+    }
+
+    /** Adds a request to the name's connection queue; it runs once every request before it has been processed. */
+    enqueue(name, step) {
+        if (!this.queues.has(name)) this.queues.set(name, []);
+        const queue = this.queues.get(name);
+        queue.push(step);
+        if (queue.length === 1) idbTask(() => this.runHead(name));
+    }
+
+    runHead(name) {
+        const queue = this.queues.get(name);
+        if (!queue.length) return;
+        queue[0](() => {
+            queue.shift();
+            if (queue.length) idbTask(() => this.runHead(name));
+        });
+    }
+
+    /** 5.1 open a database connection: a version error, an upgrade (asking the others to close first) or a connection. */
+    runOpen(name, version, request, done) {
+        let database = this.databases.get(name);
+        const current = database === undefined ? 0 : database.version;
+        const wanted = version === undefined ? Math.max(current, 1) : version;
+        if (current > wanted) {
+            request.readyState = "done";
+            request.error = idbError("VersionError", "the database is at version " + current);
+            done();
+            idbTask(() => request.fire("error"));
+            return;
+        }
+        const connect = () => {
+            const connection = database.connect();
+            this.opens++;
+            request.readyState = "done";
+            request.result = connection;
+            return connection;
+        };
+        if (current === wanted) {
+            connect();
+            done();
+            idbTask(() => request.fire("success"));
+            return;
+        }
+        if (database === undefined) {
+            database = new FakeDatabase(name, 0, this);
+            this.databases.set(name, database);
+        }
+        this.closeOthers(database, wanted, request, () => {
+            database.version = wanted;
+            const connection = connect();
+            idbTask(() => {
+                request.fire("upgradeneeded", { oldVersion: current, newVersion: wanted });
+                idbTask(() => {
+                    done();
+                    if (connection.closePending) {
+                        request.result = undefined;
+                        request.error = idbError("AbortError", "the connection was closed during its upgrade");
+                        request.fire("error");
+                    } else {
+                        request.fire("success");
+                    }
+                });
+            });
+        });
+    }
+
+    /** 5.3 delete a database: the others are asked to close; the request waits, `blocked`, until they have. */
+    runDelete(name, request, done) {
+        const database = this.databases.get(name);
+        if (database === undefined) {
+            request.readyState = "done";
+            done();
+            idbTask(() => request.fire("success", { oldVersion: 0, newVersion: null }));
+            return;
+        }
+        this.closeOthers(database, null, request, () => {
+            const oldVersion = database.version;
+            this.databases.delete(name);
+            this.deletions++;
+            request.readyState = "done";
+            request.result = undefined;
+            done();
+            idbTask(() => request.fire("success", { oldVersion, newVersion: null }));
+        });
+    }
+
+    /**
+     * Steps shared by 5.1 (an upgrade) and 5.3: `versionchange` to every connection without a pending close, each in a
+     * task; once those ran, `blocked` at the request if any connection is still open; then wait until all are closed.
+     */
+    closeOthers(database, newVersion, request, then) {
+        const others = [...database.connections];
+        const oldVersion = database.version;
+        for (const connection of others) {
+            if (!connection.closePending) idbTask(() => connection.fireVersionChange(oldVersion, newVersion));
+        }
+        idbTask(() => {
+            if (others.some((connection) => !connection.closed)) request.fire("blocked", { oldVersion, newVersion });
+            database.whenClosed(others, then);
+        });
+    }
+}
+
+class FakeDatabase {
+    constructor(name, version, factory) {
+        this.name = name;
+        this.version = version;
+        this.factory = factory;
+        this.stores = new Map();
+        this.connections = new Set();
+        this.closeWaiters = [];
+        // the transactions not yet finished, in the order they were created (2.7.2)
+        this.live = [];
+        this.created = 0;
+        const stores = this.stores;
+        this.objectStoreNames = { contains: (storeName) => stores.has(storeName) };
+    }
+
+    connect() {
+        return new FakeConnection(this);
+    }
+
+    ensureStores() {
+        if (!this.stores.has("credentials")) this.createObjectStore("credentials", { keyPath: "id" });
+        if (!this.stores.has("answered")) this.createObjectStore("answered", { keyPath: "key" });
+        if (!this.stores.has("log")) this.createObjectStore("log", { autoIncrement: true });
+    }
+
+    createObjectStore(name, options = {}) {
+        const store = new FakeObjectStore(name, options);
+        this.stores.set(name, store);
+        return store;
+    }
+
+    /** Calls `then` once every connection of `list` has closed (now, if they all have). */
+    whenClosed(list, then) {
+        if (list.every((connection) => connection.closed)) {
+            then();
+            return;
+        }
+        this.closeWaiters.push({ list, then });
+    }
+
+    connectionClosed(connection) {
+        this.connections.delete(connection);
+        for (const waiter of this.closeWaiters.slice()) {
+            if (waiter.list.every((entry) => entry.closed)) {
+                this.closeWaiters.splice(this.closeWaiters.indexOf(waiter), 1);
+                waiter.then();
+            }
+        }
+    }
+
+    /** 2.7.2: starts every transaction whose turn has come. */
+    schedule() {
+        for (const transaction of this.live) {
+            if (transaction.started) continue;
+            const waits = this.live.some((other) => other.order < transaction.order && other.state !== "finished"
+                && other.names.some((name) => transaction.names.includes(name))
+                && (transaction.mode === "readwrite" || other.mode === "readwrite"));
+            if (!waits) transaction.start();
+        }
+    }
+
+    finished(transaction) {
+        this.live.splice(this.live.indexOf(transaction), 1);
+        this.schedule();
+    }
+}
+
+/** One connection to a database: what `open()` hands the page, and what `versionchange` is delivered to. */
+class FakeConnection {
+    constructor(database) {
+        this.db = database;
+        this.closePending = false;
+        this.closed = false;
+        this.transactions = new Set();
+        this.onversionchange = null;
+        this.onclose = null;
+        this.objectStoreNames = database.objectStoreNames;
+        database.connections.add(this);
+    }
+
+    transaction(names, mode = "readonly") {
+        if (this.closePending) throw idbError("InvalidStateError", "the connection is closed or closing");
+        const list = Array.isArray(names) ? names : [names];
+        for (const storeName of list) {
+            if (!this.db.stores.has(storeName)) throw idbError("NotFoundError", "no object store " + storeName);
+        }
+        return new FakeTransaction(this, list, mode);
+    }
+
+    createObjectStore(name, options = {}) {
+        return this.db.createObjectStore(name, options);
+    }
+
+    /** 4.4 close(): pending at once (no new transaction), closed once the running ones have finished. */
+    close() {
+        if (this.closePending) return;
+        this.closePending = true;
+        this.closeIfIdle();
+    }
+
+    closeIfIdle() {
+        if (!this.closePending || this.closed || this.transactions.size) return;
+        this.closed = true;
+        this.db.connectionClosed(this);
+    }
+
+    /** The browser closing the connection itself (2.6: storage cleared): its transactions abort, `close` fires. */
+    forceClose() {
+        if (this.closed) return;
+        this.closePending = true;
+        for (const transaction of [...this.transactions]) transaction.abort(idbError("AbortError", "the connection was closed"));
+        idbTask(() => {
+            this.closeIfIdle();
+            if (typeof this.onclose === "function") this.onclose({ type: "close", target: this });
+        });
+    }
+
+    fireVersionChange(oldVersion, newVersion) {
+        if (this.closePending) return;
+        if (typeof this.onversionchange === "function") {
+            this.onversionchange({ type: "versionchange", target: this, oldVersion, newVersion });
+        }
+    }
+}
+
+class FakeObjectStore {
+    constructor(name, options) {
+        this.name = name;
+        this.keyPath = options.keyPath === undefined ? null : options.keyPath;
+        this.autoIncrement = !!options.autoIncrement;
+        // key -> value, with out-of-line keys kept beside the value rather than written into it
+        this.records = new Map();
+        this.nextKey = 1;
+    }
+
+    /** The key a record is stored under: its keyPath's value, the key it was given, or the next generated number. */
+    keyOf(record, givenKey) {
+        if (givenKey !== undefined && givenKey !== null) return givenKey;
+        if (this.keyPath !== null) return record[this.keyPath];
+        if (!this.autoIncrement) throw idbError("DataError", "the object store has no key");
+        return this.nextKey++;
+    }
+
+    putClone(record, givenKey) {
+        const clone = structuredClone(record);
+        const key = this.keyOf(clone, givenKey);
+        if (key === undefined || key === null) throw idbError("DataError", "the object store has no key");
+        this.records.set(key, clone);
+        return key;
+    }
+
+    getClone(key) {
+        return this.records.has(key) ? structuredClone(this.records.get(key)) : undefined;
+    }
+}
+
+class FakeTransaction {
+    constructor(connection, names, mode) {
+        this.connection = connection;
+        this.db = connection.db;
+        this.names = names;
+        this.mode = mode;
+        this.order = this.db.created++;
+        this.oncomplete = null;
+        this.onerror = null;
+        this.onabort = null;
+        this.error = null;
+        // the requests not yet processed, and whether one is being processed now
+        this.queue = [];
+        this.processing = false;
+        this.started = false;
+        this.snapshot = null;
+        this.resume = () => this.processNext();
+        connection.transactions.add(this);
+        this.db.live.push(this);
+        // 2.7.1: active in the task that created it
+        activeForThisTask(this);
+        this.db.schedule();
+    }
+
+    /** 2.7.2: its turn has come. A readwrite transaction keeps what its stores held, to roll back on abort. */
+    start() {
+        this.started = true;
+        if (this.mode === "readwrite") {
+            this.snapshot = this.names.map((name) => {
+                const store = this.db.stores.get(name);
+                return { store, records: new Map(store.records), nextKey: store.nextKey };
+            });
+        }
+        this.processNext();
+        this.maybeCommit();
+    }
+
+    objectStore(name) {
+        if (this.state === "finished") throw idbError("InvalidStateError", "the transaction has finished");
+        if (!this.names.includes(name)) throw idbError("NotFoundError", "the object store is not in this transaction's scope");
+        const store = this.db.stores.get(name);
+        const transaction = this;
+        const op = (operation, work, writes = false) => transaction.request(work, writes, operation, name);
+        return {
+            get: (key) => op("get", () => store.getClone(key)),
+            getAll: () => op("getAll", () => [...store.records.values()].map((record) => structuredClone(record))),
+            getAllKeys: () => op("getAllKeys", () => [...store.records.keys()]),
+            count: () => op("count", () => store.records.size),
+            put: (record, key) => op("put", () => store.putClone(record, key), true),
+            delete: (key) => op("delete", () => { store.records.delete(key); return undefined; }, true),
+            clear: () => op("clear", () => { store.records.clear(); return undefined; }, true),
+        };
+    }
+
+    /** 4.5/4.6: a request is accepted only while the transaction is active; readonly ones cannot write. */
+    request(work, writes = false, operation = "request", storeName = "") {
+        if (this.state !== "active") {
+            throw idbError("TransactionInactiveError", this.state === "finished"
+                ? "the transaction has finished" : "the transaction is not active");
+        }
+        if (writes && this.mode !== "readwrite") throw idbError("ReadOnlyError", "the transaction is read-only");
+        const request = new FakeRequest(this);
+        const hold = this.db.factory ? this.db.factory.catchRequest(operation, storeName, request) : null;
+        this.queue.push({ work, request, hold });
+        this.processNext();
+        return request;
+    }
+
+    /** Processes the next request in a task of its own, then fires its event with the transaction active. */
+    processNext() {
+        if (!this.started || this.processing || this.state === "finished" || !this.queue.length) return;
+        const head = this.queue[0];
+        if (head.hold && !head.hold.released) { // held by a check: processed once released, the transaction alive till then
+            if (!head.hold.resumes.includes(this.resume)) head.hold.resumes.push(this.resume);
+            return;
+        }
+        this.processing = true;
+        idbTask(() => {
+            this.processing = false;
+            if (this.state === "finished") return;
+            const next = this.queue.shift();
+            let failed = null;
+            try {
+                next.request.result = next.work();
+            } catch (error) {
+                failed = error;
+            }
+            next.request.readyState = "done";
+            activeForThisTask(this);
+            if (failed === null) {
+                next.request.fire("success");
+            } else {
+                next.request.error = failed;
+                next.request.fire("error");
+                if (typeof this.onerror === "function") this.onerror({ type: "error", target: next.request });
+                this.abort(failed);
+                return;
+            }
+            this.processNext();
+        });
+    }
+
+    /** 2.7.1 auto-commit: inactive, started, and nothing outstanding. */
+    maybeCommit() {
+        if (this.state !== "inactive" || !this.started || this.processing || this.queue.length) return;
+        this.state = "committing";
+        idbTask(() => {
+            if (this.state !== "committing") return;
+            this.finish();
+            if (typeof this.oncomplete === "function") this.oncomplete({ type: "complete", target: this });
+        });
+    }
+
+    abort(error = idbError("AbortError", "the transaction was aborted")) {
+        if (this.state === "finished") return;
+        if (this.snapshot !== null) {
+            for (const entry of this.snapshot) {
+                entry.store.records = entry.records;
+                entry.store.nextKey = entry.nextKey;
+            }
+        }
+        this.error = error;
+        const pending = this.queue.splice(0);
+        this.finish();
+        for (const { request } of pending) {
+            request.readyState = "done";
+            request.error = idbError("AbortError", "the transaction was aborted");
+            idbTask(() => {
+                request.fire("error");
+                if (typeof this.onerror === "function") this.onerror({ type: "error", target: request });
+            });
+        }
+        idbTask(() => { if (typeof this.onabort === "function") this.onabort({ type: "abort", target: this }); });
+    }
+
+    finish() {
+        this.state = "finished";
+        activeUntilNextTask.delete(this);
+        this.connection.transactions.delete(this);
+        this.db.finished(this);
+        this.connection.closeIfIdle();
+    }
+}
+
 /* ---------------------------------------------------------------- fixtures: the documents the live stack serves */
 
 const GRANT = "urn:ietf:params:oauth:grant-type:pre-authorized_code";
@@ -579,6 +1177,18 @@ const SUBJECTS = [
 ];
 
 /**
+ * The text of one of the page's own `src` scripts, read from static/offer. A `src` that resolves anywhere else is
+ * refused, so `scripts: "real"` can never load a page script from outside the directory the server serves.
+ */
+function realScript(pageDirectory, staticDirectory, src) {
+    const path = resolve(pageDirectory, String(src));
+    if (path !== staticDirectory && !path.startsWith(staticDirectory + sep)) {
+        throw new Error(`the page's src script ${src} resolves outside static/offer (${path})`);
+    }
+    return readFileSync(path, "utf8");
+}
+
+/**
  * Opens the page: the markup's elements, the inline scripts evaluated against them, and the requests it makes on load
  * (the configuration document and the demo-subject list; the wallet's metadata is read when it redeems an offer).
  * Never throws: a page whose script throws reports it in `scriptError`, as a browser reports it in the console.
@@ -601,8 +1211,16 @@ function openPage(demo, options = {}) {
     const created = [];
     const requests = [];
     const missingIds = [];
+    const indexedDBInstance = options.indexedDB === undefined ? new FakeIndexedDB() : options.indexedDB;
 
     const document = {
+        // the markup's root element (the QR library reads its tagName to choose a renderer)
+        documentElement: new Element("html"),
+        createElementNS(namespace, tag) {
+            const element = new Element(String(tag).toLowerCase());
+            created.push(element);
+            return element;
+        },
         // a browser has no element for an id the markup does not declare; returning an invented one let page bugs pass
         getElementById(id) {
             const element = elements.get(String(id));
@@ -683,6 +1301,10 @@ function openPage(demo, options = {}) {
             if (options.offerGate) await options.offerGate;
             return answer(200, nextOffer());
         }
+        // P5-03a: the wallet page's config endpoint. The offer page links the wallet only when this answers 200.
+        if (method === "GET" && target === "/v1/certify/offer/wallet/config") {
+            return options.walletConfig ? answer(200, { relay: { hosts: [] } }) : answer(404, "not found");
+        }
         if (method === "POST" && tokenEndpoints.has(target)) return answer(tokenAnswer.status, tokenAnswer.body);
         if (method === "POST" && nonceEndpoints.has(target)) return answer(nonceAnswer.status, nonceAnswer.body);
         if (method === "POST" && credentialEndpoints.has(target)) return answer(credentialAnswer.status, credentialAnswer.body);
@@ -757,26 +1379,38 @@ function openPage(demo, options = {}) {
         Cbor: { decode: () => ({}) },
         navigator: { clipboard: { writeText: async () => {} } },
         console: { log: () => {}, warn: () => {}, error: () => {} },
-        setTimeout,
-        clearTimeout,
+        // a timer callback is a task of its own: the fake IndexedDB's transactions of the task before are inactive in it
+        setTimeout: taskTimers.setTimeout,
+        clearTimeout: taskTimers.clearTimeout,
         // the page's wallet: URL/URLSearchParams for the documents and links, WebCrypto for the proof, and the base64
         // helpers it encodes with
         URL,
         URLSearchParams,
         Blob,
-        crypto: webcrypto,
+        crypto: options.crypto || webcrypto,
         TextEncoder,
         TextDecoder,
         btoa,
         atob,
+        // P5-03a: the demo wallet's storage. `indexedDB: null` is a browser without it (some private modes).
+        indexedDB: options.indexedDB === null ? undefined : indexedDBInstance,
+        structuredClone,
+        // the QR library renders through a canvas when the interface exists; the fake canvas records nothing
+        CanvasRenderingContext2D: function CanvasRenderingContext2D() {},
     });
-    // a browser runs every inline script (no src) in document order; the `src` scripts are the QRCode and Cbor stubs
-    const inline = scripts.filter((script) => !script.attributes.has("src"));
+    // a browser runs the page's scripts in document order: the inline one always, and (with `scripts: "real"`) the
+    // `src` scripts the page names, read from static/offer; otherwise the `src` scripts stay the QRCode and Cbor stubs
+    const real = options.scripts === "real";
+    const pageDirectory = dirname(resolve(options.pagePath || PAGE));
+    const staticDirectory = resolve(REPO, "certify-service/src/main/resources/static/offer");
+    const runnable = real ? scripts : scripts.filter((script) => !script.attributes.has("src"));
     // a page that looks up an id the markup does not declare throws here, as it does in a browser; the checks report it
-    let scriptError = inline.length ? null : new Error("the page has no inline script");
-    for (const script of inline) {
+    let scriptError = runnable.length ? null : new Error("the page has no script");
+    for (const script of runnable) {
+        const src = script.attributes.get("src");
         try {
-            vm.runInContext(script.textContent, context, { filename: "static/offer/index.html" });
+            const source = src === undefined ? script.textContent : realScript(pageDirectory, staticDirectory, src);
+            vm.runInContext(source, context, { filename: src === undefined ? "static/offer/index.html" : src });
         } catch (error) {
             if (scriptError === null) scriptError = error;
         }
@@ -790,6 +1424,8 @@ function openPage(demo, options = {}) {
         requests,
         missingIds,
         scriptError,
+        // P5-03a: the fake database the page used (a later page can share it, as two pages of one origin do)
+        indexedDB: indexedDBInstance,
         /** Lets every pending promise of the page's load finish. */
         async settle() {
             for (let i = 0; i < 20; i++) await new Promise((done) => setImmediate(done));
@@ -976,6 +1612,11 @@ async function refusedRedemption(label, setup) {
 
 /* ---------------------------------------------------------------- checks */
 
+// this file is also a module: check-offer-wallet.mjs imports openPage, parseMarkup and the check helpers, and only a
+// direct run evaluates the page's own sections
+const isMain = process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isMain) {
 process.on("unhandledRejection", (reason) => {
     check("no promise of the page or the harness rejects unhandled", false, String(reason && reason.stack ? reason.stack : reason));
     process.exitCode = 1;
@@ -2333,3 +2974,29 @@ await section("31. parser newlines", async () => {
     }
     process.exitCode = failures ? 1 : 0;
 }
+}
+
+const counts = () => ({ checks, failures });
+
+export {
+    openPage,
+    parseMarkup,
+    check,
+    equal,
+    equalFields,
+    section,
+    Element,
+    Text,
+    FakeIndexedDB,
+    taskTimers,
+    realScript,
+    counts,
+    REPO,
+    PAGE,
+    DOMAIN,
+    OID4VCI_ISSUER,
+    OID4VCI_DOCUMENT,
+    DEFAULT_AS_METADATA,
+    offerByValue,
+    offerDocument,
+};

@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Demo wallet</title>
+<style>
+  :root { color-scheme: light; --ink: #1c1c1c; --muted: #6b6b6b; --line: #ddd; --accent: #1a5fb4; --ok: #2e7d32; --bad: #b3261e; --bg: #fafaf8; --card: #fff; }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; padding: 24px 16px 48px; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  h2 { font-size: 1.05rem; margin: 16px 0 8px; }
+  .sub, .hint { color: var(--muted); }
+  .sub { margin: 0 0 20px; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 18px; }
+  button { margin-top: 10px; padding: 8px 14px; border: 0; border-radius: 6px; background: var(--accent); color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+  button.secondary { background: #fff; color: var(--accent); border: 1px solid var(--accent); }
+  button[disabled] { opacity: 0.5; cursor: default; }
+  ul#records { list-style: none; padding: 0; margin: 0; }
+  ul#records li { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 6px 0; border-top: 1px solid #eee; }
+  ul#records li:first-child { border-top: 0; }
+  ul#records button { margin-top: 0; }
+  table#detailsTable { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  .status { margin-top: 10px; font-size: 0.9rem; }
+  .status.ok { color: var(--ok); } .status.bad { color: var(--bad); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Demo wallet</h1>
+  <p class="sub">Credentials kept in this browser only, for the demo. Nothing is uploaded, and a private key never leaves this browser. Safari may clear site storage after seven days without a visit.</p>
+
+  <section>
+    <h2>Kept credentials</h2>
+    <div class="row">
+      <button id="deleteAll" class="secondary" disabled>Delete everything</button>
+      <a class="hint" href="./">Back to the offer page</a>
+    </div>
+    <div id="storageStatus" class="status"></div>
+    <p id="empty" class="hint" hidden>No credential is kept in this browser yet.</p>
+    <ul id="records"></ul>
+  </section>
+
+  <section id="details" hidden>
+    <h2 id="detailsTitle">Credential</h2>
+    <table id="detailsTable"></table>
+    <button id="delete" class="secondary">Delete this credential</button>
+    <div id="detailsStatus" class="status"></div>
+  </section>
+</main>
+<script src="cbor.js"></script>
+<script src="mdoc.js"></script>
+<script src="wallet-store.js"></script>
+<script src="wallet.js"></script>
+</body>
+</html>
