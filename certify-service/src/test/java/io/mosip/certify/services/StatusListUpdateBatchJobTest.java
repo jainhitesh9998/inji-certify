@@ -63,7 +63,8 @@ public class StatusListUpdateBatchJobTest {
     @Before
     public void setup() {
         LockAssert.TestHelper.makeAllAssertsPass(true);
-        applier = new StatusListTransactionApplier(transactionRepository, statusListRepository, null, statusListCredentialService);
+        applier = new StatusListTransactionApplier(transactionRepository, statusListRepository, null, statusListCredentialService,
+                StatusListLockWait.withoutDatabase());
         ReflectionTestUtils.setField(batchJob, "applier", applier);
         ReflectionTestUtils.setField(batchJob, "batchJobEnabled", true);
         ReflectionTestUtils.setField(batchJob, "batchSize", 1000);

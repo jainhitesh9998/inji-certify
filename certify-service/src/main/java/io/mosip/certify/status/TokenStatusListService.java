@@ -161,12 +161,19 @@ public class TokenStatusListService {
      * Per CWT list, the {@code validUntil} of its pinned signer's path (section 4.1): what serving needs to tell a list
      * whose {@code exp} is already capped from one due for renewal, without asking the key provider on every request in
      * a list's last {@code ttl} (review round 2, minor 8). Set from the signing context whenever this instance signs the
-     * list, and from the stored token's own {@code x5chain} otherwise.
+     * list, and from the stored token's own {@code x5chain} otherwise. An entry is used only before its
+     * {@code recheckAt}: the value moves when the IACA it was capped by ends or a re-issue staged ahead of time becomes
+     * valid, and a cached cap of an expired IACA would keep a list another instance re-signed under its successor from
+     * ever being renewed early (review round 5, finding 2, G45).
      */
     private final ConcurrentMap<String, SignerValidity> validUntils = new ConcurrentHashMap<>();
 
-    /** The {@code validUntil} of the signer a list pins, by the SHA-256 of its leaf. */
-    private record SignerValidity(String x5tS256, Instant validUntil) {}
+    /**
+     * The {@code validUntil} of the signer a list pins, by the SHA-256 of its leaf, and the instant from which it has to
+     * be computed again ({@link StatusListSignerPolicy#validUntilHoldsUntil}).
+     */
+    private record SignerValidity(String x5tS256, Instant validUntil, Instant recheckAt) {}
+
     /** Per CWT list that is retired, the instant its stored token expires: no lock, no resolve, no repeated log. */
     private final ConcurrentMap<String, Instant> retired = new ConcurrentHashMap<>();
 
@@ -315,7 +322,7 @@ public class TokenStatusListService {
         StatusListCredential saved = repository.saveAndFlush(list);
         bitstringLists.initializeAvailableIndices(saved);
         pinnedSigners.put(id, pinned.x5tS256());
-        validUntils.put(id, new SignerValidity(pinned.x5tS256(), validUntil));
+        validUntils.put(id, signerValidity(pinned.x5tS256(), validUntil, now));
         log.info("Created CWT token status list {} for {} with {} bit(s), signed by {} ({}), exp {}", id, purpose,
                 bits.length * 8, pinned.keyRef(), signing.key().chain().leaf().map(X509Certificate::getSubjectX500Principal).orElse(null), exp);
         return saved;
@@ -516,19 +523,27 @@ public class TokenStatusListService {
         return cap(clock.instant().plus(properties.ttl()).plus(properties.ttl()), validUntil(listId, stored, decoded));
     }
 
+    /** A cache entry for {@code validUntil} computed at {@code at}: used until the policy says it may move. */
+    private SignerValidity signerValidity(String x5tS256, Instant validUntil, Instant at) {
+        return new SignerValidity(x5tS256, validUntil, signerPolicy.validUntilHoldsUntil(at, validUntil));
+    }
+
     /**
      * The {@code validUntil} of the list's pinned signer path: the value cached when this instance last signed the list
      * (computed from the signing context, exactly what {@code encode} caps {@code exp} at), else computed from the
-     * stored token's protected {@code x5chain} and the configured IACA, and cached.
+     * stored token's protected {@code x5chain} and the configured IACA, and cached. A cached value is used only while the
+     * clock is before its {@code recheckAt} — before it passes and before a staged IACA becomes valid — so a list
+     * another instance re-signed under a re-issued IACA is renewed early here too (review round 5, finding 2, G45).
      */
     private Instant validUntil(String listId, StoredEnvelope stored, TokenStatusListCwt.Decoded decoded) {
         String pin = stored.signer().x5tS256();
+        Instant now = clock.instant();
         SignerValidity cached = validUntils.get(listId);
-        if (cached != null && cached.x5tS256().equals(pin)) {
+        if (cached != null && cached.x5tS256().equals(pin) && now.isBefore(cached.recheckAt())) {
             return cached.validUntil();
         }
-        Instant computed = signerPolicy.validUntil(decoded.x5chain(), clock.instant());
-        validUntils.put(listId, new SignerValidity(pin, computed));
+        Instant computed = signerPolicy.validUntil(decoded.x5chain(), now);
+        validUntils.put(listId, signerValidity(pin, computed, now));
         return computed;
     }
 
@@ -724,7 +739,7 @@ public class TokenStatusListService {
         byte[] token = TokenStatusListCwt.encode(uri(listId), now, exp, ttl, bits, signing, signerPolicy, now,
                 modeOf(stored));
         // the exact cap encode used, from the signing context: serving judges freshness against it without the provider
-        validUntils.put(listId, new SignerValidity(stored.signer().x5tS256(), validUntil));
+        validUntils.put(listId, signerValidity(stored.signer().x5tS256(), validUntil, now));
         return new StoredEnvelope(ENVELOPE_VERSION, stored.signer(), tokenBase64(token));
     }
 

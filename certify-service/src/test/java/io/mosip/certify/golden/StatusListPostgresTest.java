@@ -221,6 +221,7 @@ class StatusListPostgresTest {
     @Autowired org.springframework.transaction.PlatformTransactionManager transactionManager;
     @Autowired io.mosip.certify.core.spi.CredentialStatusService credentialStatusService;
     @Autowired io.mosip.certify.services.StatusListTransactionApplier applier;
+    @Autowired io.mosip.certify.services.StatusListLockWait statusListLockWait;
     @Autowired org.springframework.context.ApplicationContext applicationContext;
     @MockBean DataProviderPlugin dataProviderPlugin;
     @Value("${mosip.certify.identifier}") String issuerIdentifier;
@@ -894,6 +895,174 @@ class StatusListPostgresTest {
         run(org.springframework.test.util.AopTestUtils.getTargetObject(batchJob));
         assertTrue(cwtBit(listId, entry.idx()));
         assertEquals(0, pendingOn(listId));
+    }
+
+    /**
+     * Review round 5, finding 1 (PostgreSQL): the status-change path waits for a list's row lock at most
+     * {@code certify.status.update.lock-wait}. Another connection holds the lock the batch job signs under
+     * ({@code FOR NO KEY UPDATE}); a status change for that list through the service, {@code /credentials/status} and
+     * the VC-API is refused within the bound as retryable — the MOSIP error wrapper with {@code status_list_busy_retry_later},
+     * VC-API {@code 503} with {@code Retry-After} — and queues nothing, while a status change for another list goes
+     * through meanwhile. Without the {@code lock_timeout} the three wait until the holder lets go, and this test fails.
+     */
+    @Test
+    void aStatusChangeOnALockedListIsRefusedRetryablyWithinTheBoundAndQueuesNothing() throws Exception {
+        closeEveryPendingTransaction();
+        io.mosip.certify.status.TokenStatusListService.Entry lockedEntry = tokenStatusLists.allocate("revocation");
+        String locked = listIdOf(lockedEntry);
+        io.mosip.certify.status.TokenStatusListService.Entry otherEntry = tokenStatusLists.allocateCwt("revocation", dscSigning());
+        String other = listIdOf(otherEntry);
+        assertNotEquals(locked, other);
+        java.time.Duration bound = statusListLockWait.lockWait();
+        assertEquals(java.time.Duration.ofSeconds(5), bound, "the default certify.status.update.lock-wait");
+        String basic = "Basic " + Base64.getEncoder().encodeToString("coordinator:s3cret".getBytes(StandardCharsets.UTF_8));
+        String legacyBody = objectMapper.writeValueAsString(Map.of("credentialStatus", Map.of("id", locked,
+                "type", "TokenStatusListEntry", "statusPurpose", "revocation", "statusListIndex", lockedEntry.idx(),
+                "statusListCredential", locked), "status", true));
+        String vcApiBody = objectMapper.writeValueAsString(Map.of("credentialId", "urn:uuid:not-needed",
+                "credentialStatus", Map.of("type", "TokenStatusListEntry", "statusPurpose", "revocation",
+                        "statusListCredential", locked, "statusListIndex", lockedEntry.idx()), "status", true));
+
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(3);
+        try (Connection holder = dataSource.getConnection()) {
+            holder.setAutoCommit(false);
+            try {
+                lockListRow(holder, locked);
+                java.util.concurrent.Future<Timed<Throwable>> service = pool.submit(() -> timed(() -> {
+                    try {
+                        queue(locked, lockedEntry.idx(), true);
+                        return null;
+                    } catch (Throwable refused) {
+                        return refused;
+                    }
+                }));
+                java.util.concurrent.Future<Timed<MvcResult>> legacy = pool.submit(() -> timed(() -> mockMvc.perform(
+                        post("/credentials/status").contentType(MediaType.APPLICATION_JSON).content(legacyBody)).andReturn()));
+                java.util.concurrent.Future<Timed<MvcResult>> vcApi = pool.submit(() -> timed(() -> mockMvc.perform(
+                        post("/vc-api/credentials/status").header("Authorization", basic)
+                                .contentType(MediaType.APPLICATION_JSON).content(vcApiBody)).andReturn()));
+                awaitLockWaiters(3, bound);
+
+                // meanwhile: another list is not held up
+                long started = System.nanoTime();
+                queue(other, otherEntry.idx(), true);
+                java.time.Duration otherTook = java.time.Duration.ofNanos(System.nanoTime() - started);
+                assertTrue(otherTook.compareTo(java.time.Duration.ofSeconds(2)) < 0, "another list's change took " + otherTook);
+                assertFalse(service.isDone() || legacy.isDone() || vcApi.isDone(),
+                        "the other list's change completed while the locked list's changes were still waiting");
+                assertEquals(1, pendingOn(other));
+
+                long limit = bound.plusSeconds(10).toMillis();
+                Timed<Throwable> refused = service.get(limit, java.util.concurrent.TimeUnit.MILLISECONDS);
+                Timed<MvcResult> legacyResult = legacy.get(limit, java.util.concurrent.TimeUnit.MILLISECONDS);
+                Timed<MvcResult> vcApiResult = vcApi.get(limit, java.util.concurrent.TimeUnit.MILLISECONDS);
+                for (Timed<?> call : List.of(refused, legacyResult, vcApiResult)) {
+                    assertTrue(call.took().compareTo(bound.minusMillis(500)) >= 0, "waited for the lock: " + call.took());
+                    assertTrue(call.took().compareTo(bound.plusSeconds(3)) < 0, "and no longer than the bound: " + call.took());
+                }
+                assertTrue(refused.value() instanceof io.mosip.certify.services.StatusListBusyException, String.valueOf(refused.value()));
+                assertEquals("status_list_busy_retry_later",
+                        ((io.mosip.certify.services.StatusListBusyException) refused.value()).getErrorCode());
+                assertEquals(200, legacyResult.value().getResponse().getStatus(), "the legacy surface's error wrapper");
+                assertTrue(legacyResult.value().getResponse().getContentAsString().contains("status_list_busy_retry_later"),
+                        legacyResult.value().getResponse().getContentAsString());
+                assertEquals(503, vcApiResult.value().getResponse().getStatus(), vcApiResult.value().getResponse().getContentAsString());
+                assertEquals("5", vcApiResult.value().getResponse().getHeader("Retry-After"));
+                assertTrue(vcApiResult.value().getResponse().getContentAsString().contains("status_list_busy_retry_later"));
+                assertEquals(0, pendingOn(locked), "nothing was queued for the locked list");
+            } finally {
+                holder.rollback();
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+        queue(locked, lockedEntry.idx(), true); // the lock released: the same change goes through
+        assertEquals(1, pendingOn(locked));
+        closeEveryPendingTransaction();
+    }
+
+    /**
+     * Review round 5, finding 1, the batch path (PostgreSQL): a run waits for a list's row lock at most
+     * {@code certify.status.update.lock-wait}, then leaves that list's transactions pending and applies the other lists;
+     * the next run, once the lock is free, applies the skipped list.
+     */
+    @Test
+    void aBatchRunSkipsALockedListWithinTheBoundAndAppliesTheOthers() throws Exception {
+        closeEveryPendingTransaction();
+        io.mosip.certify.status.TokenStatusListService.Entry lockedEntry = tokenStatusLists.allocateCwt("revocation", dscSigning());
+        String locked = listIdOf(lockedEntry);
+        io.mosip.certify.status.TokenStatusListService.Entry freeEntry = tokenStatusLists.allocate("revocation");
+        String free = listIdOf(freeEntry);
+        queue(locked, lockedEntry.idx(), true); // the older: the run visits the locked list first
+        queue(free, freeEntry.idx(), true);
+        java.time.Duration bound = statusListLockWait.lockWait();
+        StatusListUpdateBatchJob job = org.springframework.test.util.AopTestUtils.getTargetObject(batchJob);
+
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newSingleThreadExecutor();
+        try (Connection holder = dataSource.getConnection()) {
+            holder.setAutoCommit(false);
+            try {
+                lockListRow(holder, locked);
+                Timed<Object> run = pool.submit(() -> timed(() -> {
+                    run(job);
+                    return null;
+                })).get(bound.plusSeconds(30).toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS);
+                assertTrue(run.took().compareTo(bound.minusMillis(500)) >= 0, "the run waited for the lock: " + run.took());
+                assertEquals(1, pendingOn(locked), "the locked list's transaction stays pending");
+                assertFalse(cwtBit(locked, lockedEntry.idx()));
+                assertEquals(0, pendingOn(free), "the list behind it is applied in the same run");
+                byte[] bits = io.mosip.certify.status.TokenStatusListService.decode(SignedJWT.parse(
+                        statusListRepository.findDocumentById(free).orElseThrow()).getJWTClaimsSet()
+                        .getJSONObjectClaim("status_list").get("lst").toString());
+                assertTrue(io.mosip.certify.status.TokenStatusListService.get(bits, freeEntry.idx()));
+            } finally {
+                holder.rollback();
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+        run(job);
+        assertEquals(0, pendingOn(locked), "the next run applies the skipped list");
+        assertTrue(cwtBit(locked, lockedEntry.idx()));
+    }
+
+    /** Takes a list's row lock as the batch job does ({@code for no key update}), in {@code holder}'s transaction. */
+    private static void lockListRow(Connection holder, String listId) throws Exception {
+        try (PreparedStatement ps = holder.prepareStatement("SELECT id FROM " + SCHEMA
+                + ".status_list_credential WHERE id = ? FOR NO KEY UPDATE")) {
+            ps.setString(1, listId);
+            try (java.sql.ResultSet rs = ps.executeQuery()) {
+                assertTrue(rs.next(), "the list's row");
+            }
+        }
+    }
+
+    /** Waits until {@code count} sessions wait for a lock, so what follows happens while they wait. */
+    private void awaitLockWaiters(int count, java.time.Duration within) throws Exception {
+        long deadline = System.nanoTime() + within.toNanos();
+        int waiting = 0;
+        while (System.nanoTime() < deadline) {
+            try (Connection c = dataSource.getConnection(); PreparedStatement ps = c.prepareStatement(
+                    "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND datname = current_database()");
+                 java.sql.ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                waiting = rs.getInt(1);
+            }
+            if (waiting >= count) {
+                return;
+            }
+            Thread.sleep(25);
+        }
+        throw new AssertionError(waiting + " session(s) wait for a lock, expected " + count);
+    }
+
+    private record Timed<T>(T value, java.time.Duration took) {
+    }
+
+    private static <T> Timed<T> timed(java.util.concurrent.Callable<T> call) throws Exception {
+        long started = System.nanoTime();
+        T value = call.call();
+        return new Timed<>(value, java.time.Duration.ofNanos(System.nanoTime() - started));
     }
 
     /**

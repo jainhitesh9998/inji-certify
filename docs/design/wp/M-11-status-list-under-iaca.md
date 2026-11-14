@@ -1144,6 +1144,40 @@ decision log (2026-11-14, M-11d review round 4).
   `UpgradeFrom014Test`, `check-runtime-classpath.sh` and `check-bc169-linkage.sh` green; JWT and Bitstring bytes unchanged
   for every index on the list.
 
+**Review round 4 (2026-11-14: Opus approved with minors; GPT-6.1 Sol one major; fix round 5 on `wp/m-11d-final`,
+Opus). Owner decisions of the same day ("Accept all four"):** a status change waits on the list lock while the job signs,
+only with a bounded wait; `lockAtMostFor` `10m`; `/credentials/status` refuses an index outside its list with its usual
+error wrapper (a behaviour change, recorded in `Releases.md`); bad queued rows are closed with an ERROR and the counter.
+The decision-log rows of round 4 now read as owner-confirmed. (1, major) the status-change path took the list's row lock
+with no deadline while the job held it through signing, so a hanging HSM or KMS pinned a request thread and a pooled
+connection per waiting request. `certify.status.update.lock-wait` (`PT5S`, typed `StatusUpdateProperties`) bounds it
+with `SET LOCAL lock_timeout` on PostgreSQL (Hibernate's lock-timeout hint renders only `NOWAIT` or `SKIP LOCKED` there),
+run only when the connection is PostgreSQL (an H2 test context with the `local` profile keeps its `PostgreSQLDialect`); SQLState `55P03` is
+`StatusListBusyException` (`status_list_busy_retry_later`): VC-API `503` + `Retry-After`, `/credentials/status` its
+error wrapper, nothing inserted. The batch job's per-list lock has the same bound and a busy list is skipped for the run
+(WARN, no back-off: another writer holds it, the list did not fail). (2, minor) the serving path's `validUntil` cache kept
+an ended IACA's cap: an entry is used only before `StatusListSignerPolicy.validUntilHoldsUntil` (the value itself or the
+next IACA `notBefore`). Nits: the `IDENTITY` id strategy is pinned by a test; `Releases.md` says the ordering holds once
+every node runs this build; a missing index is refused as `missing_credential_status_details`, saying so.
+
+- [x] A list's lock held by another connection: a status change through the service, `/credentials/status` and VC-API is
+  refused within the bound (wrapper with `status_list_busy_retry_later`; `503`, `Retry-After: 5`), queues nothing, and a
+  change on another list completes meanwhile; a batch run skips the locked list within the bound, applies the other, and
+  the next run applies the skipped one
+  (`StatusListPostgresTest.aStatusChangeOnALockedListIsRefusedRetryablyWithinTheBoundAndQueuesNothing`,
+  `aBatchRunSkipsALockedListWithinTheBoundAndAppliesTheOthers`; both time out with the `lock_timeout` removed). Unit:
+  `StatusListLockWaitTest`, `VcApiStatusBusyTest`, `CredentialStatusServiceImplTest.updateCredentialStatus_ListLockNotAvailable_*`,
+  `StatusListUpdateBatchJobStuckListsTest.aListWhoseLockIsNotAvailableIsSkippedForTheRunAndTheOthersAreApplied`. H2 (test
+  contexts): the statement is skipped and a change queues; a locked list is bounded by H2's own timeout and queues
+  nothing (`VcApiIssuanceTest.statusChangesQueueOnH2AndALockedListIsBoundedByH2sOwnTimeout`; H2's timeout is not mapped
+  to the refusal, Hikari evicts the connection on it).
+- [x] IACA A expiring, re-issue B staged: instances that cached A's cap renew a list another instance re-signed under B,
+  in its last `ttl`, before and after A ends
+  (`TokenStatusListCwtServiceTest.aCachedCapOfAnIacaThatEndedOrWasSupersededDoesNotStopAnEarlyRenewal`; `FRESH` with the
+  list-and-pin cache; `StatusListSignerPolicyTest.aComputedValidUntilHoldsUntilItEndsOrAStagedIacaStarts`).
+- [x] `CredentialStatusTransactionIdOrderTest` (fails on a `SEQUENCE` or table generator);
+  `CredentialStatusServiceImplTest.updateCredentialStatus_MissingIndex_SaysTheIndexIsMissing`.
+
 ### M-11e Issuance binding: the DSC that signs the mDL signs its list (certify-spi, certify-issuance, certify-format-mdoc, certify-service)
 
 Branch `wp/m-11e-status-binding`. Depends on M-11d and M-11b. About 550 lines.

@@ -65,6 +65,7 @@ class VcApiIssuanceTest {
     @Autowired MockMvc mockMvc;
     @Autowired ObjectMapper objectMapper;
     @Autowired StaticContextLoader staticContextLoader;
+    @Autowired javax.sql.DataSource dataSource;
     @MockBean DataProviderPlugin dataProviderPlugin;
 
     @BeforeEach
@@ -135,6 +136,60 @@ class VcApiIssuanceTest {
                         "credentialStatus", Map.of("type", "BitstringStatusList", "statusPurpose", "revocation"))))).andReturn();
         assertProblem(unknown, 404, "NOT_FOUND");
         assertEquals(401, mockMvc.perform(post("/vc-api/credentials/status").contentType(MediaType.APPLICATION_JSON).content("{}")).andReturn().getResponse().getStatus());
+    }
+
+    /**
+     * M-11d review round 5, finding 1, on H2 (the database of the test contexts): a status change takes the list's row
+     * lock without PostgreSQL's {@code SET LOCAL lock_timeout} — the statement is skipped on any other database — and
+     * queues the change; with the row locked by another connection, H2's own lock timeout bounds the wait and nothing is
+     * queued. (H2's timeout is not mapped to the retryable refusal: Hikari evicts the connection on it; PostgreSQL's is,
+     * {@code StatusListPostgresTest}.)
+     */
+    @Test
+    void statusChangesQueueOnH2AndALockedListIsBoundedByH2sOwnTimeout() throws Exception {
+        String listId = "h2-bitstring-" + java.util.UUID.randomUUID();
+        try (java.sql.Connection c = dataSource.getConnection(); java.sql.PreparedStatement ps = c.prepareStatement(
+                "INSERT INTO status_list_credential (id, vc_document, credential_type, status_purpose, capacity_in_kb,"
+                        + " credential_status) VALUES (?, '{}', 'BitstringStatusListCredential', 'revocation', 16, 'AVAILABLE')")) {
+            ps.setString(1, listId);
+            ps.executeUpdate();
+        }
+        String body = objectMapper.writeValueAsString(Map.of("credentialId", "urn:uuid:not-needed", "status", true,
+                "credentialStatus", Map.of("type", "BitstringStatusListEntry", "statusPurpose", "revocation",
+                        "statusListCredential", listId, "statusListIndex", 7)));
+
+        MvcResult queued = mockMvc.perform(post("/vc-api/credentials/status").header("Authorization", basic("coordinator", "s3cret"))
+                .contentType(MediaType.APPLICATION_JSON).content(body)).andReturn();
+        assertEquals(200, queued.getResponse().getStatus(), queued.getResponse().getContentAsString());
+        assertEquals(1, pendingOn(listId));
+
+        try (java.sql.Connection holder = dataSource.getConnection()) {
+            holder.setAutoCommit(false);
+            try (java.sql.PreparedStatement lock = holder.prepareStatement("SELECT id FROM status_list_credential WHERE id = ? FOR UPDATE")) {
+                lock.setString(1, listId);
+                lock.executeQuery().close();
+                long started = System.nanoTime();
+                MvcResult blocked = mockMvc.perform(post("/vc-api/credentials/status").header("Authorization", basic("coordinator", "s3cret"))
+                        .contentType(MediaType.APPLICATION_JSON).content(body)).andReturn();
+                java.time.Duration took = java.time.Duration.ofNanos(System.nanoTime() - started);
+                assertTrue(took.compareTo(java.time.Duration.ofSeconds(30)) < 0, "bounded by H2's lock timeout: " + took);
+                assertTrue(blocked.getResponse().getContentAsString().contains("error"), blocked.getResponse().getContentAsString());
+            } finally {
+                holder.rollback();
+            }
+        }
+        assertEquals(1, pendingOn(listId), "the refused change queued nothing");
+    }
+
+    private long pendingOn(String listId) throws Exception {
+        try (java.sql.Connection c = dataSource.getConnection(); java.sql.PreparedStatement ps = c.prepareStatement(
+                "SELECT count(*) FROM credential_status_transaction WHERE status_list_credential_id = ? AND is_processed = false")) {
+            ps.setString(1, listId);
+            try (java.sql.ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                return rs.getLong(1);
+            }
+        }
     }
 
     private void assertProblem(MvcResult result, int status, String title) throws Exception {

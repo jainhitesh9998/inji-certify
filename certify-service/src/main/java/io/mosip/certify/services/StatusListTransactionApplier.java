@@ -47,6 +47,10 @@ import java.util.OptionalLong;
  *   {@value StatusListUpdateBatchJob#METRIC_REJECTED_TRANSACTIONS} counter, and the list's valid transactions are
  *   applied (finding 2, G43).</li>
  * </ul>
+ * The wait for the row lock is bounded by {@code certify.status.update.lock-wait} ({@link StatusListLockWait}): a list
+ * whose lock another writer holds past it — an instance paused while it signs the list, a signer that hangs — fails
+ * with {@link StatusListBusyException}, nothing is written, and the job moves on to the next list instead of stalling
+ * the run behind it (review round 5, finding 1).
  * A separate bean because the job calling its own {@code @Transactional} method would bypass Spring's proxy.
  */
 @Slf4j
@@ -68,6 +72,8 @@ public class StatusListTransactionApplier {
     private final StatusListCredentialRepository statusListRepository;
     private final ObjectProvider<TokenStatusListService> tokenStatusLists;
     private final StatusListCredentialService statusListCredentialService;
+    /** Bounds the wait for a list's row lock. */
+    private final StatusListLockWait lockWait;
 
     /**
      * The clock a Bitstring list's {@code validFrom} is written from: {@code Clock.systemUTC()} in production, another
@@ -80,11 +86,13 @@ public class StatusListTransactionApplier {
     public StatusListTransactionApplier(CredentialStatusTransactionRepository transactionRepository,
                                         StatusListCredentialRepository statusListRepository,
                                         ObjectProvider<TokenStatusListService> tokenStatusLists,
-                                        StatusListCredentialService statusListCredentialService) {
+                                        StatusListCredentialService statusListCredentialService,
+                                        StatusListLockWait lockWait) {
         this.transactionRepository = transactionRepository;
         this.statusListRepository = statusListRepository;
         this.tokenStatusLists = tokenStatusLists;
         this.statusListCredentialService = statusListCredentialService;
+        this.lockWait = java.util.Objects.requireNonNull(lockWait, "lockWait");
     }
 
     /** For tests: the writer clock (production keeps {@code Clock.systemUTC()}). */
@@ -100,15 +108,18 @@ public class StatusListTransactionApplier {
      * @throws StatusListRetiredException     a CWT list whose pinned signer is past its {@code notAfter}: nothing is
      *                                        written; the job closes the list's transactions with {@link #closeRetired}
      * @throws TokenStatusListUpdateException a CWT list that cannot be updated now; nothing is written
+     * @throws StatusListBusyException        the list's row lock was not available within
+     *                                        {@code certify.status.update.lock-wait}; nothing is written
      * @throws CertifyException               any other failure ({@code status_list_update_failed}); nothing is written
      */
     @Transactional
     public Outcome apply(String listId, int limit) {
         try {
-            StatusListCredential list = statusListRepository.findByIdForUpdate(listId).orElseThrow(() -> {
-                log.error("Status list credential not found: {}", listId);
-                return new CertifyException(ErrorConstants.STATUS_LIST_NOT_FOUND);
-            });
+            StatusListCredential list = lockWait.bounded(listId, () -> statusListRepository.findByIdForUpdate(listId))
+                    .orElseThrow(() -> {
+                        log.error("Status list credential not found: {}", listId);
+                        return new CertifyException(ErrorConstants.STATUS_LIST_NOT_FOUND);
+                    });
             List<CredentialStatusTransaction> pending = transactionRepository.findPendingForList(listId,
                     PageRequest.of(0, Math.max(1, limit)));
             if (pending.isEmpty()) {
@@ -141,8 +152,9 @@ public class StatusListTransactionApplier {
             log.info("Status list {}: {} transaction(s) applied, {} closed as out of range", listId,
                     pending.size() - rejected.size(), rejected.size());
             return new Outcome(pending.size() - rejected.size(), rejected.size());
-        } catch (StatusListRetiredException | TokenStatusListUpdateException e) {
-            // the job closes a retired list's transactions, and holds back a CWT list by what its failure says
+        } catch (StatusListRetiredException | TokenStatusListUpdateException | StatusListBusyException e) {
+            // the job closes a retired list's transactions, holds back a CWT list by what its failure says, and moves on
+            // past a list whose lock another writer holds
             throw e;
         } catch (RuntimeException e) {
             log.error("Error occurred while updating status list with ID: {}", listId, e);
@@ -157,10 +169,11 @@ public class StatusListTransactionApplier {
      * transaction of its own, so a refusal of {@link #apply} (which writes nothing) never takes this write with it.
      *
      * @return how many transactions were closed
+     * @throws StatusListBusyException the list's row lock was not available within {@code certify.status.update.lock-wait}
      */
     @Transactional
     public int closeRetired(String listId, int limit) {
-        statusListRepository.findByIdForUpdate(listId);
+        lockWait.bounded(listId, () -> statusListRepository.findByIdForUpdate(listId));
         List<CredentialStatusTransaction> pending = transactionRepository.findPendingForList(listId,
                 PageRequest.of(0, Math.max(1, limit)));
         markProcessed(pending);

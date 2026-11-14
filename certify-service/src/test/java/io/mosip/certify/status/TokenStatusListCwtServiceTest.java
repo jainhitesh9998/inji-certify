@@ -731,6 +731,90 @@ class TokenStatusListCwtServiceTest {
         assertEquals(0, fixture.replaced.get());
     }
 
+    /** The IACA re-issue of the serving-path G45 case: one key and name, two validity windows. */
+    static final java.security.KeyPair REISSUE_IACA_KEYS = StatusListTestKeys.p256();
+    static final java.security.KeyPair UNDER_REISSUE_KEYS = StatusListTestKeys.p256();
+
+    static X509Certificate reissueIaca(Instant notBefore, Duration validity) {
+        return io.mosip.certify.pki.IsoMdocProfiles.iaca(REISSUE_IACA_KEYS).country("IN")
+                .commonName("Status List Test Reissue IACA").issuerAltUri("https://reissue.example.test")
+                .crlDistributionPoint("https://reissue.example.test/iaca.crl").notBefore(notBefore).validity(validity).build();
+    }
+
+    /**
+     * Review round 5, finding 2 (G45 on the serving path): an instance caches the {@code validUntil} of a list's signer
+     * path, capped by the IACA in use (A). Once A's re-issue B — same name and key, staged ahead of time — is valid,
+     * another instance re-signs the list under B with an {@code exp} past A's {@code notAfter}. Served in the token's last
+     * {@code ttl}, the instances that cached A's date must renew it early, both before A ends (the re-issue became valid
+     * after their cache was filled) and after it: with the cache keyed only on the list and the pin they kept the cap at
+     * A's {@code notAfter}, judged the list {@code FRESH}, and let it expire.
+     */
+    @Test
+    void aCachedCapOfAnIacaThatEndedOrWasSupersededDoesNotStopAnEarlyRenewal() {
+        X509Certificate iacaA = reissueIaca(T0.minus(Duration.ofDays(100)), Duration.ofDays(110)); // ends T0 + 10d
+        X509Certificate iacaB = reissueIaca(T0.plus(Duration.ofDays(5)), Duration.ofDays(400)); // staged: valid from T0 + 5d
+        X509Certificate dsc = StatusListTestKeys.signer(UNDER_REISSUE_KEYS, "Status List Test Under A Reissued IACA", iacaA,
+                REISSUE_IACA_KEYS, List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true,
+                T0.minus(Duration.ofDays(50)), T0.plus(Duration.ofDays(200)));
+        Instant endOfA = iacaA.getNotAfter().toInstant();
+        TrustAnchorRegistry anchors = new TrustAnchorRegistry() {
+            @Override
+            public List<Anchor> entries(String purpose) {
+                return MDOC_IACA.equals(purpose) ? List.of(new Anchor("iaca-a", MDOC_IACA, iacaA),
+                        new Anchor("iaca-b", MDOC_IACA, iacaB)) : List.of();
+            }
+
+            @Override
+            public Optional<X509CRL> crl(String anchorId) {
+                return Optional.empty();
+            }
+        };
+        Fixture fixture = new Fixture();
+        fixture.provider.add("mdl-dsc@2030-02", UNDER_REISSUE_KEYS.getPrivate(), CertificateChain.of(dsc),
+                SignatureAlgorithm.ES256, "mdoc-dsc");
+        MutableClock clock = new MutableClock(T0);
+        java.util.function.Supplier<TokenStatusListService> instance = () -> new TokenStatusListService(fixture.repository,
+                fixture.bitstringLists, fixture.indexProvider, fixture.counting(fixture.keys), fixture.properties,
+                fixture.objectMapper, fixture.environment(), clock, anchors);
+
+        // instance 1 creates the list under A (B is not valid yet): it caches A's notAfter as the cap
+        TokenStatusListService first = instance.get();
+        String listId = fixture.listId(first.allocateCwt("revocation", fixture.signing("x509-file:mdl-dsc@2030-02")));
+        // instance 2 judges the list in its last ttl, still before B is valid: it caches A's notAfter too
+        TokenStatusListService second = instance.get();
+        clock.advance(TTL.plusMinutes(1));
+        assertEquals(TokenStatusListService.Freshness.RENEW, freshness(second, fixture, listId));
+
+        // B is valid; instance 3 re-signs the expired list, under B: exp is past A's notAfter
+        clock.advance(Duration.between(clock.instant(), endOfA.minus(Duration.ofMinutes(90))));
+        TokenStatusListService third = instance.get();
+        third.served(listId).orElseThrow();
+        Instant exp = TokenStatusListCwt.decode(tokenOf(fixture, listId)).exp();
+        assertEquals(clock.instant().plus(TTL).plus(TTL).getEpochSecond(), exp.getEpochSecond(), "signed under B, not capped by A");
+        assertTrue(exp.isAfter(endOfA));
+
+        // in the token's last ttl, A still valid: the re-issue that became valid since instance 1's cache was filled counts
+        clock.advance(Duration.ofMinutes(70));
+        assertTrue(clock.instant().isBefore(endOfA));
+        assertEquals(TokenStatusListService.Freshness.RENEW, freshness(first, fixture, listId),
+                "renewed early before A ends: the cached cap was A's notAfter");
+        // and after A ended (the reviewer's case)
+        clock.advance(Duration.ofMinutes(21));
+        assertTrue(clock.instant().isAfter(endOfA));
+        assertEquals(TokenStatusListService.Freshness.RENEW, freshness(second, fixture, listId),
+                "renewed early after A ended: the cached cap was in the past");
+        Instant before = clock.instant();
+        second.served(listId).orElseThrow();
+        TokenStatusListCwt.Decoded renewed = TokenStatusListCwt.decode(tokenOf(fixture, listId));
+        assertEquals(before.getEpochSecond(), renewed.iat().getEpochSecond(), "signed again now");
+        assertEquals(before.plus(TTL).plus(TTL).getEpochSecond(), renewed.exp().getEpochSecond());
+        assertEquals(dsc, renewed.x5chain().get(0), "by the pinned signer");
+    }
+
+    private static TokenStatusListService.Freshness freshness(TokenStatusListService lists, Fixture fixture, String listId) {
+        return lists.freshnessCwt(listId, lists.envelope(fixture.rows.get(listId).getVcDocument()));
+    }
+
     private static byte[] tokenOf(Fixture fixture, String listId) {
         return TokenStatusListCwtBase.token(fixture.rows.get(listId).getVcDocument());
     }

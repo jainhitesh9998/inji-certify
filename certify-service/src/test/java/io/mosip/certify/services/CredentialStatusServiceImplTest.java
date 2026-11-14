@@ -37,6 +37,9 @@ public class CredentialStatusServiceImplTest {
     @Before
     public void setUp() {
         MockitoAnnotations.openMocks(this);
+        // the mocked repository is no database: the lock's wait is not bounded by a statement, a lock failure is mapped
+        org.springframework.test.util.ReflectionTestUtils.setField(credentialStatusService, "statusListLockWait",
+                StatusListLockWait.withoutDatabase());
     }
 
     @Test
@@ -216,6 +219,50 @@ public class CredentialStatusServiceImplTest {
         UpdateCredentialStatusRequest inside = createValidUpdateCredentialRequest(listId);
         inside.getCredentialStatus().setStatusListIndex(15L);
         assertEquals(15L, credentialStatusService.updateCredentialStatus(inside).getStatusListIndex());
+    }
+
+    /**
+     * Review round 5, finding 1: the list's row lock not available within {@code certify.status.update.lock-wait}
+     * (PostgreSQL {@code lock_not_available}, wrapped as Spring wraps it) is a retryable refusal and nothing is queued.
+     */
+    @Test
+    public void updateCredentialStatus_ListLockNotAvailable_IsRefusedRetryablyAndQueuesNothing() {
+        String listId = "busy-list";
+        org.mockito.Mockito.doThrow(new org.springframework.dao.PessimisticLockingFailureException("could not obtain lock",
+                        new java.sql.SQLException("canceling statement due to lock timeout", "55P03")))
+                .when(statusListCredentialRepository).findByIdForUpdate(listId);
+        UpdateCredentialStatusRequest request = createValidUpdateCredentialRequest(listId);
+
+        StatusListBusyException refused = assertThrows(StatusListBusyException.class,
+                () -> credentialStatusService.updateCredentialStatus(request));
+        assertEquals("status_list_busy_retry_later", refused.getErrorCode());
+        assertEquals(listId, refused.listId());
+        assertEquals(5L, refused.retryAfterSeconds(), "Retry-After: the lock wait");
+        org.mockito.Mockito.verify(credentialStatusTransactionRepository, org.mockito.Mockito.never()).save(any());
+
+        // any other database failure is not dressed up as retryable
+        org.mockito.Mockito.doThrow(new org.springframework.dao.DataAccessResourceFailureException("connection refused"))
+                .when(statusListCredentialRepository).findByIdForUpdate(listId);
+        RuntimeException other = assertThrows(RuntimeException.class, () -> credentialStatusService.updateCredentialStatus(request));
+        org.junit.jupiter.api.Assertions.assertFalse(other instanceof StatusListBusyException);
+    }
+
+    /** Review round 5, nit 5: a missing index is refused saying so, not as an index outside the list. */
+    @Test
+    public void updateCredentialStatus_MissingIndex_SaysTheIndexIsMissing() {
+        String listId = "bitstring-list";
+        StatusListCredential bitstring = new StatusListCredential();
+        bitstring.setId(listId);
+        bitstring.setCapacityInKB(16L);
+        when(statusListCredentialRepository.findByIdForUpdate(listId)).thenReturn(Optional.of(bitstring));
+        UpdateCredentialStatusRequest request = createValidUpdateCredentialRequest(listId);
+        request.getCredentialStatus().setStatusListIndex(null);
+
+        CertifyException refused = assertThrows(CertifyException.class, () -> credentialStatusService.updateCredentialStatus(request));
+        assertEquals("missing_credential_status_details", refused.getErrorCode());
+        assertEquals("Status list index is missing: a status change names the index of the credential on status list "
+                + listId, refused.getMessage());
+        org.mockito.Mockito.verify(credentialStatusTransactionRepository, org.mockito.Mockito.never()).save(any());
     }
 
     private UpdateCredentialStatusRequest createValidUpdateCredentialRequest(String statusListCredential) {

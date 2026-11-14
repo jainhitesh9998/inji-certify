@@ -280,7 +280,8 @@ class StatusListBatchJobCwtTest {
         when(properties.getIfAvailable()).thenReturn(fixture.properties);
         ReflectionTestUtils.setField(target, "transactionRepository", table.repository);
         ReflectionTestUtils.setField(target, "applier", new StatusListTransactionApplier(table.repository,
-                fixture.repository, service, mock(StatusListCredentialService.class)));
+                fixture.repository, service, mock(StatusListCredentialService.class),
+                io.mosip.certify.services.StatusListLockWait.withoutDatabase()));
         ReflectionTestUtils.setField(target, "tokenStatusLists", service);
         ReflectionTestUtils.setField(target, "tokenStatusListProperties", properties);
         ReflectionTestUtils.setField(target, "batchJobEnabled", true);

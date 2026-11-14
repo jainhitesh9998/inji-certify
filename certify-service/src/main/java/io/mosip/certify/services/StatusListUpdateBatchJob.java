@@ -49,6 +49,11 @@ import java.util.stream.Collectors;
  * nothing stale, the order is the database sequence's rather than any node's clock, and a transaction whose index is
  * not on its list is closed on its own ({@value #METRIC_REJECTED_TRANSACTIONS}) while the list's other transactions are
  * applied. ShedLock keeps two instances from doing the same work; correctness no longer depends on its lease.
+ *
+ * <p>The wait for a list's row lock is bounded by {@code certify.status.update.lock-wait}: a list whose lock another
+ * writer holds past it (an instance paused while it signs, a hanging HSM) is skipped for the rest of the run with a WARN
+ * and tried again on the next run, without a back-off — the list itself did not fail — so one stuck list never stalls
+ * the run for the others (M-11d review round 5, finding 1).
  */
 @Slf4j
 @Service
@@ -209,6 +214,13 @@ public class StatusListUpdateBatchJob {
                         recovered(statusListId);
                         log.info("Successfully updated status list: {} and marked {} transactions as processed ({} closed"
                                 + " as out of range)", statusListId, outcome.closed(), outcome.rejected());
+                    } catch (StatusListBusyException e) {
+                        // another writer holds the list's lock past the bound: transient, and not the list's own failure,
+                        // so no hold; excluded for the rest of the run so none of its newer transactions overtakes these
+                        excluded.add(statusListId);
+                        log.warn("Status list {} is skipped in this run: its lock was not available within {}"
+                                + " (certify.status.update.lock-wait); its transactions stay pending and it is tried again on"
+                                + " the next run", statusListId, e.waited());
                     } catch (StatusListRetiredException e) {
                         // D-M11-7: no re-sign is possible and none is wanted — every mDL that indexed the list has
                         // expired — so the transactions are closed rather than blocking the queue
@@ -349,6 +361,11 @@ public class StatusListUpdateBatchJob {
     private int closeRetired(String listId, int limit, Set<String> excluded) {
         try {
             return applier.closeRetired(listId, limit);
+        } catch (StatusListBusyException e) {
+            excluded.add(listId);
+            log.warn("The transactions of the retired status list {} are closed on a later run: its lock was not available"
+                    + " within {} (certify.status.update.lock-wait)", listId, e.waited());
+            return 0;
         } catch (RuntimeException e) {
             excluded.add(listId);
             log.error("The transactions of the retired status list {} could not be closed", listId, e);
@@ -378,6 +395,7 @@ public class StatusListUpdateBatchJob {
      * @param selected     what a selection found pending for the list; only its size is used
      * @throws StatusListRetiredException     a CWT list whose pinned signer has expired (nothing written)
      * @throws TokenStatusListUpdateException a CWT list that cannot be updated now (nothing written)
+     * @throws StatusListBusyException        the list's lock was not available within the bound (nothing written)
      * @throws CertifyException               any other failure (nothing written)
      */
     public StatusListTransactionApplier.Outcome updateStatusList(String statusListId, List<CredentialStatusTransaction> selected) {

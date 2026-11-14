@@ -312,6 +312,35 @@ public final class StatusListSignerPolicy {
     }
 
     /**
+     * Until when a {@link #validUntil(List, Instant) validUntil} computed at {@code at} stays what it would be if computed
+     * again: the earlier of that value itself and the first {@code notBefore} of a configured IACA after {@code at} (the
+     * value itself when no IACA starts later, or when the policy is not enforced). The anchor {@link #issuingAnchor}
+     * chooses changes only when an anchor becomes valid — a re-issue staged ahead of time that ends later than the one in
+     * use — or when the chosen one ends, which bounds the value itself; an anchor that ends earlier than the chosen one was
+     * never chosen, so its end changes nothing. The configured anchors themselves are fixed for the application's life
+     * (only their CRLs are re-read, and a CRL does not move {@code validUntil}). A cache of {@code validUntil} keyed on the
+     * signer is therefore exact while the clock is before this instant (G45 on the serving path, M-11d review round 5,
+     * finding 2).
+     *
+     * @param at        the instant {@code validUntil} was computed at
+     * @param validUntil the value computed at {@code at}
+     */
+    public Instant validUntilHoldsUntil(Instant at, Instant validUntil) {
+        Objects.requireNonNull(at, "at");
+        Instant holds = Objects.requireNonNull(validUntil, "validUntil");
+        if (!enforced()) {
+            return holds;
+        }
+        for (TrustAnchorRegistry.Anchor anchor : registry.entries(TrustAnchorRegistry.MDOC_IACA)) {
+            Instant notBefore = anchor.certificate().getNotBefore().toInstant();
+            if (notBefore.isAfter(at)) {
+                holds = min(holds, notBefore);
+            }
+        }
+        return holds;
+    }
+
+    /**
      * The configured IACA that issued {@code top}, chosen as a verifier holding all of them would build the path at
      * {@code at}: of the anchors that issued it — an IACA re-issued with the same name and key is a second one — the one
      * valid at {@code at} that ends last; when none is valid then, the one that ends last, whose refusal

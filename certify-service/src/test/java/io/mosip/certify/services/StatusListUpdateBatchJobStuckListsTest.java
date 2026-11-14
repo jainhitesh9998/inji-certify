@@ -74,7 +74,7 @@ class StatusListUpdateBatchJobStuckListsTest {
         when(tokenLists.trustMaterialVersion()).thenAnswer(inv -> trust.get());
         ReflectionTestUtils.setField(job, "transactionRepository", table.repository);
         ReflectionTestUtils.setField(job, "applier", new StatusListTransactionApplier(table.repository, lists, provider,
-                mock(StatusListCredentialService.class)));
+                mock(StatusListCredentialService.class), StatusListLockWait.withoutDatabase()));
         ReflectionTestUtils.setField(job, "tokenStatusLists", provider);
         ReflectionTestUtils.setField(job, "batchJobEnabled", true);
         ReflectionTestUtils.setField(job, "batchSize", 1);
@@ -90,6 +90,44 @@ class StatusListUpdateBatchJobStuckListsTest {
     void tearDown() {
         LockAssert.TestHelper.makeAllAssertsPass(false);
         ((Logger) LoggerFactory.getLogger(StatusListUpdateBatchJob.class)).detachAppender(logs);
+    }
+
+    /**
+     * Review round 5, finding 1: a list whose row lock another writer holds past {@code certify.status.update.lock-wait}
+     * (PostgreSQL {@code lock_not_available}, 55P03, as the repository raises it) is skipped for the rest of the run with
+     * a WARN — not an ERROR, no back-off, no quarantine: the list did not fail — and the list behind it is applied in the
+     * same run; the next run applies the skipped list, in order.
+     */
+    @Test
+    void aListWhoseLockIsNotAvailableIsSkippedForTheRunAndTheOthersAreApplied() {
+        ReflectionTestUtils.setField(job, "batchSize", 10);
+        table.add("cwt-locked", 1, true, T0.minusSeconds(30));
+        table.add("cwt-locked", 2, true, T0.minusSeconds(20));
+        table.add("cwt-free", 3, true, T0.minusSeconds(10));
+        java.util.concurrent.atomic.AtomicBoolean held = new java.util.concurrent.atomic.AtomicBoolean(true);
+        when(lists.findByIdForUpdate(anyString())).thenAnswer(inv -> {
+            String id = inv.getArgument(0);
+            if ("cwt-locked".equals(id) && held.get()) {
+                throw new org.springframework.dao.PessimisticLockingFailureException("could not obtain lock",
+                        new java.sql.SQLException("canceling statement due to lock timeout", "55P03"));
+            }
+            return Optional.of(row(id));
+        });
+        script((row, statuses) -> applied.add(row.getId() + statuses));
+
+        job.updateStatusLists();
+        assertEquals(List.of("cwt-free{3=true}"), applied, "the list behind the locked one is applied in the same run");
+        assertEquals(2, table.pending().size(), "the locked list's transactions stay pending");
+        assertTrue(logs.list.stream().anyMatch(event -> event.getLevel() == Level.WARN
+                && event.getFormattedMessage().contains("cwt-locked is skipped in this run")), messages());
+        assertEquals(0, logs.list.stream().filter(event -> event.getLevel() == Level.ERROR).count(), messages());
+        assertTrue(logs.list.stream().noneMatch(event -> event.getFormattedMessage().contains("backing off")
+                || event.getFormattedMessage().contains("quarantined")), "no hold: " + messages());
+
+        held.set(false);
+        job.updateStatusLists(); // the same instant: no back-off to wait out
+        assertEquals(List.of("cwt-free{3=true}", "cwt-locked{1=true, 2=true}"), applied);
+        assertTrue(table.pending().isEmpty());
     }
 
     @Test

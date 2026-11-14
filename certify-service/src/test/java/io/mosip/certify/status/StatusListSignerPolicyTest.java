@@ -423,6 +423,28 @@ class StatusListSignerPolicyTest {
         }
     }
 
+    /**
+     * Review round 5, finding 2: a {@code validUntil} computed now holds until the earlier of itself and the next IACA
+     * {@code notBefore} — the instant a staged re-issue can take over — whatever the configuration order; without a later
+     * anchor, or without enforcement, until itself.
+     */
+    @Test
+    void aComputedValidUntilHoldsUntilItEndsOrAStagedIacaStarts() {
+        for (List<X509Certificate> order : List.of(List.of(STAGED_IACA, REISSUED_IACA), List.of(REISSUED_IACA, STAGED_IACA))) {
+            StatusListSignerPolicy policy = new StatusListSignerPolicy(registry(order, Map.of()));
+            Instant validUntil = policy.validUntil(List.of(UNDER_EXPIRED_IACA), NOW);
+            assertEquals(REISSUED_IACA.getNotAfter().toInstant(), validUntil);
+            assertTrue(STAGED_IACA.getNotBefore().before(REISSUED_IACA.getNotAfter()), "the re-issue is staged before the end");
+            assertEquals(STAGED_IACA.getNotBefore().toInstant(), policy.validUntilHoldsUntil(NOW, validUntil), "anchors " + order);
+            // computed once the staged one is valid, nothing starts later: the value holds until itself
+            Instant later = STAGED_IACA.getNotBefore().toInstant().plusSeconds(1);
+            Instant afterSwitch = policy.validUntil(List.of(UNDER_EXPIRED_IACA), later);
+            assertEquals(afterSwitch, policy.validUntilHoldsUntil(later, afterSwitch));
+        }
+        Instant cap = NOW.plusSeconds(3600);
+        assertEquals(cap, StatusListSignerPolicy.notEnforced().validUntilHoldsUntil(NOW, cap));
+    }
+
     // ---- the two layers fail alike ----------------------------------------------------------------------------
 
     @Test
