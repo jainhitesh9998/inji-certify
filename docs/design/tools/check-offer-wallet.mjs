@@ -1238,8 +1238,13 @@ await section("2e. key equivalence and value types in readIssuerSigned and check
         const verdict = await verdictOf(built);
         check(`checkKeepable keeps ${label}`, verdict.ok === true, JSON.stringify(verdict));
     };
-    const refuses = async (label, built, code, pattern) => {
-        const verdict = await verdictOf(built);
+    const refuses = async (label, built, code, pattern, options = {}) => {
+        let verdict;
+        try {
+            verdict = await verdictOf(built, options.publicJwk);
+        } catch (error) {
+            verdict = { thrown: String(error) };
+        }
         check(`checkKeepable refuses ${label}`, verdict.ok === false && verdict.code === code && pattern.test(verdict.message),
             JSON.stringify(verdict));
     };
@@ -1313,6 +1318,16 @@ await section("2e. key equivalence and value types in readIssuerSigned and check
     await keeps("a deviceKey compressed to x and the bool sign of the holder's y", shaped({ deviceKey: keyWith([[-3, holderYOdd]]) }));
     await refuses("a deviceKey compressed to x and the opposite sign", shaped({ deviceKey: keyWith([[-3, !holderYOdd]]) }),
         "device-key", /not this browser's key/);
+    // a bstr y is still compared in full: the holder's x with another y of the same sign is another key
+    const sameSignOtherY = Buffer.from(HOLDER_A_JWK.y, "base64url");
+    sameSignOtherY[31] ^= 0x02;
+    await refuses("a deviceKey with the holder's x and another bstr y of the same sign", shaped({ deviceKey: keyWith([[-3,
+        new Uint8Array(sameSignOtherY)]]) }), "device-key", /not this browser's key/);
+    // and a held y that is not a 32-byte base64url coordinate gives no sign: refused, never thrown
+    for (const badY of ["A", "AAAAA", "AA", HOLDER_A_JWK.y + "="]) {
+        await refuses(`a compressed deviceKey checked against a held y of ${JSON.stringify(badY.slice(0, 8))}… (${badY.length} chars)`,
+            shaped({ deviceKey: keyWith([[-3, true]]) }), "device-key", /not this browser's key/, { publicJwk: { ...HOLDER_A_JWK, y: badY } });
+    }
     await refuses("a deviceKey compressed to another x and the holder's sign", shaped({ deviceKey: keyWith([[-2, new Uint8Array(32).fill(7)],
         [-3, holderYOdd]]) }), "device-key", /not this browser's key/);
     await refuses("a docType that is #6.99(tstr)", shaped({ docType: new Cbor.Tagged(99, DOC_TYPE) }), "issuer-signed", /docType, a tstr, is a tag/);

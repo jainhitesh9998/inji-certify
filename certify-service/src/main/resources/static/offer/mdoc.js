@@ -371,6 +371,24 @@ var Mdoc = (function () {
   }
 
   /**
+   * The sign bit of a base64url P-256 y coordinate (its last byte's lowest bit), as a compressed COSE_Key carries it
+   * in label -3 (RFC 9053 section 7.1.1: true for an odd y); null unless `y` is an unpadded 43-character base64url
+   * encoding of 32 bytes.
+   */
+  function ySign(y) {
+    if (typeof y !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(y)) {
+      return null;
+    }
+    var binary;
+    try {
+      binary = atob(y.replace(/-/g, "+").replace(/_/g, "/") + "=");
+    } catch (error) {
+      return null;
+    }
+    return binary.length === 32 ? (binary.charCodeAt(31) & 1) === 1 : null;
+  }
+
+  /**
    * The checks of plan 4.2 that decide whether a just-issued credential may be kept, in order, each with its own
    * message. Returns `{ok: true, ...}` with what the record stores, or `{ok: false, code, message}`; a refusal keeps
    * nothing.
@@ -379,18 +397,6 @@ var Mdoc = (function () {
    * the issuer metadata the run fetched, this browser's holder public JWK (`{kty, crv, x, y}` base64url) and how many
    * credentials are already kept.
    */
-  /**
-   * The sign bit of a base64url P-256 y coordinate (its last byte's lowest bit), as a compressed COSE_Key carries it
-   * in label -3 (RFC 9053 section 7.1.1: true for an odd y); null when `y` is not base64url.
-   */
-  function ySign(y) {
-    if (typeof y !== "string" || !/^[A-Za-z0-9_-]+$/.test(y)) {
-      return null;
-    }
-    var binary = atob(y.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((y.length + 3) % 4));
-    return binary.length > 0 ? (binary.charCodeAt(binary.length - 1) & 1) === 1 : null;
-  }
-
   async function checkKeepable(options) {
     var bytes = bytesOf(options.issuerSigned);
     var stored = typeof options.stored === "number" ? options.stored : 0;
