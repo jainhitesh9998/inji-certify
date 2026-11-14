@@ -138,6 +138,11 @@ function coseKey(jwk, override) {
  * The COSE headers and the MSO's typed maps (review round 3): `protectedRaw` is the protected header's map content (the
  * builder wraps it in the bstr), `unprotectedRaw(x5chainValue)` writes the whole unprotected header map, and
  * `valueDigests(digests)` replaces the MSO's valueDigests (a text DigestID, say).
+ *
+ * Review round 4: `rawItems[identifier](digestId, random)` writes that element's IssuerSignedItem map bytes by hand (the
+ * bstr's content; its digest is taken over the tag-24 item that wraps them), for a key or a digestID `Cbor.encode`
+ * would never write; `itemForms` also takes `"tag24tagged"` (`#6.24(#6.99(bstr))`); `msoTag` wraps the MSO map in a
+ * tag inside its bstr, and `msoContentTag` wraps that bstr in a tag inside the tag 24.
  */
 function buildIssuerSigned(options) {
     const forms = options.forms || {};
@@ -158,10 +163,14 @@ function buildIssuerSigned(options) {
                 ["elementIdentifier", identifier],
                 ["elementValue", elementValue],
             ]));
+            const rawItem = (options.rawItems || {})[identifier];
+            const content = rawItem !== undefined ? Buffer.from(rawItem(digestId, new Uint8Array(16).fill(digestId + 1)))
+                : itemMap(value);
             const form = (options.itemForms || {})[identifier];
-            const signed = form === "bare" ? Buffer.from(itemMap(value))
-                : form === "tag55799" ? Buffer.concat([Buffer.from(head(6, 55799)), Buffer.from(itemMap(value))])
-                : Buffer.concat([Buffer.from(msoTag), bstr(itemMap(value))]);
+            const signed = form === "bare" ? Buffer.from(content)
+                : form === "tag55799" ? Buffer.concat([Buffer.from(head(6, 55799)), Buffer.from(content)])
+                : form === "tag24tagged" ? Buffer.concat([Buffer.from(msoTag), Buffer.from(head(6, 99)), bstr(content)])
+                : Buffer.concat([Buffer.from(msoTag), bstr(content)]);
             const written = options.tamper === identifier
                 ? Buffer.concat([Buffer.from(msoTag), bstr(itemMap("changed after signing"))])
                 : signed;
@@ -187,12 +196,15 @@ function buildIssuerSigned(options) {
         ["validityInfo", new Map([["signed", "2026-11-01T00:00:00Z"], ["validFrom", "2026-11-01T00:00:00Z"],
             ["validUntil", "2026-12-01T00:00:00Z"]])],
     ]);
-    const msoBytes = Cbor.encode(mso);
+    const msoMap = Buffer.from(Cbor.encode(mso));
+    const msoBytes = options.msoTag === undefined ? msoMap : Buffer.concat([Buffer.from(head(6, options.msoTag)), msoMap]);
+    const msoContent = options.msoContentTag === undefined ? bstr(msoBytes)
+        : Buffer.concat([Buffer.from(head(6, options.msoContentTag)), bstr(msoBytes)]);
     const trailing = Buffer.from(options.payloadTrailing || []);
     // ISO/IEC 18013-5 9.1.2.4: the payload's content is #6.24(bstr .cbor MSO), tag head and all - and nothing else
     const payload = options.payloadWithoutTag
         ? Buffer.concat([msoBytes, trailing])
-        : Buffer.concat([Buffer.from(msoTag), bstr(msoBytes), trailing]);
+        : Buffer.concat([Buffer.from(msoTag), msoContent, trailing]);
 
     // issuerAuth: [protected, unprotected, payload, signature] (RFC 9052 4.2); element 2 is a bstr either way
     const issuerAuth = new Bytes();
@@ -992,6 +1004,8 @@ const cat = (...parts) => new Uint8Array(Buffer.concat(parts.map((part) => Buffe
 const verdictOf = (built, publicJwk = HOLDER_A_JWK) => Mdoc.checkKeepable({ issuerSigned: built.bytes, doctype: DOC_TYPE,
     publicJwk });
 const shapedMdl = (extra) => buildIssuerSigned(Object.assign({ docType: DOC_TYPE, holder: HOLDER_A_JWK, elements: MDL_ELEMENTS }, extra));
+/** A typed map key as a check prints it: a text or an integer key as itself, a float its value, another key "#" + identity. */
+const keyName = (key) => key instanceof Cbor.OtherKey ? (typeof key.value === "number" ? String(key.value) : "#" + key.identity) : key;
 // {1: -7, "1": "private extension"}: RFC 9052 1.5, label = int / tstr, so these are two labels
 const TWO_LABELS = cat(head(5, 2), head(0, 1), head(1, 6), tstr("1"), tstr("private extension"));
 
@@ -1028,14 +1042,88 @@ await section("2b. typed map keys in the decoder", async () => {
         refusedWith(`decodeTyped: ${label} is one key twice`, () => Cbor.decodeTyped(doubled), /duplicate map key/);
         refusedWith(`Cbor.spans: ${label} is one key twice`, () => Cbor.spans(doubled, 1), /duplicate map key/);
     }
-    // two text keys whose bytes differ but decode alike (invalid UTF-8, each one U+FFFD) are refused, never merged
-    refusedWith("two invalid UTF-8 text keys that decode to the same string", () => Cbor.decodeTyped(cat(head(5, 2),
-        [0x61, 0xff], head(0, 0), [0x61, 0xfe], head(0, 1))), /duplicate map key/);
+    // two text keys whose bytes differ but would decode alike (invalid UTF-8, each one U+FFFD) are never merged: review
+    // round 4 reads text strictly, so invalid UTF-8 is refused before any key is compared
+    refusedWith("two invalid UTF-8 text keys that a lenient decoder reads as one string", () => Cbor.decodeTyped(cat(head(5, 2),
+        [0x61, 0xff], head(0, 0), [0x61, 0xfe], head(0, 1))), /not valid UTF-8/);
     // ... while two distinct items of other types stay two keys (0 and 0.0, RFC 8949 5.6)
     equal("the integer 0 and the float 0.0 are two keys", Cbor.decodeTyped(cat(head(5, 2), head(0, 0), head(0, 1),
         [0xf9, 0x00, 0x00], head(0, 2))).size, 2);
     refusedWith("0.0 as a half and as a double is one float twice", () => Cbor.decodeTyped(cat(head(5, 2),
         [0xf9, 0x00, 0x00], head(0, 1), [0xfb, 0, 0, 0, 0, 0, 0, 0, 0], head(0, 2))), /duplicate map key/);
+});
+
+// 2d. review round 4: map keys compare as RFC 8949 5.6.1 says. Text keys compare by their UTF-8 bytes (a leading
+// U+FEFF is a character, never stripped), +0.0 and -0.0 are one key, NaNs are one key exactly when their significands
+// are, and a bignum is the integer it carries. Each probe runs on both typed entry points, decodeTyped and spans
+await section("2d. map key equivalence (RFC 8949 5.6.1)", async () => {
+    const BOM_X = Buffer.from("\ufeffx", "utf8"); // ef bb bf 78
+    const bothRead = (label, bytes, expected) => {
+        let typed;
+        let walked;
+        try {
+            typed = [...Cbor.decodeTyped(bytes).keys()].map(keyName);
+        } catch (error) {
+            typed = "refused: " + error.message;
+        }
+        try {
+            walked = Cbor.spans(bytes, 1).ranges.map((range) => JSON.stringify(range.path));
+        } catch (error) {
+            walked = "refused: " + error.message;
+        }
+        equal(`decodeTyped: ${label}`, typed, expected.keys);
+        equal(`Cbor.spans: ${label}`, walked, expected.paths);
+    };
+    const bothRefuse = (label, bytes, pattern) => {
+        refusedWith(`decodeTyped: ${label}`, () => Cbor.decodeTyped(bytes), pattern);
+        refusedWith(`Cbor.spans: ${label}`, () => Cbor.spans(bytes, 1), pattern);
+    };
+
+    // finding 1: a leading U+FEFF is kept, in a definite string and in every chunk of an indefinite one
+    equal("a text string with a leading U+FEFF reads as that string", Cbor.decodeTyped(cat(head(3, 4), BOM_X)), "\ufeffx");
+    equal("and so does a chunk that starts with one", Cbor.decodeTyped(cat([0x7f], tstr("x"), head(3, 4), BOM_X, [0xff])), "x\ufeffx");
+    equal("the display form keeps it too", Cbor.decode(cat(head(3, 4), BOM_X)), "\ufeffx");
+    bothRead("the texts \"x\" and \"\\ufeffx\" are two keys", cat(head(5, 2), tstr("x"), head(0, 1), head(3, 4), BOM_X, head(0, 2)),
+        { keys: ["x", "\ufeffx"], paths: ['["x"]', '["\ufeffx"]'] });
+    bothRead("\"x\" and the chunks \"\\ufeff\" \"x\" are two keys", cat(head(5, 2), tstr("x"), head(0, 1),
+        [0x7f, 0x63, 0xef, 0xbb, 0xbf], tstr("x"), [0xff], head(0, 2)), { keys: ["x", "\ufeffx"], paths: ['["x"]', '["\ufeffx"]'] });
+    bothRead("\"xy\" and the chunks \"x\" \"\\ufeffy\" are two keys", cat(head(5, 2), tstr("xy"), head(0, 1),
+        [0x7f], tstr("x"), tstr("\ufeffy"), [0xff], head(0, 2)), { keys: ["xy", "x\ufeffy"], paths: ['["xy"]', '["x\ufeffy"]'] });
+    equal("the display form keeps \"x\" and \"\\ufeffx\" apart", Object.keys(Cbor.decode(cat(head(5, 2), tstr("x"), head(0, 1),
+        head(3, 4), BOM_X, head(0, 2)))), ["x", "\ufeffx"]);
+    // and UTF-8 is read strictly: a code point split across two chunks is not two chunks of text (RFC 8949 3.2.3)
+    refusedWith("\"\u00fc\" split across two chunks", () => Cbor.decodeTyped(Uint8Array.of(0x7f, 0x61, 0xc3, 0x61, 0xbc, 0xff)),
+        /not valid UTF-8/);
+    refusedWith("an overlong encoding of \"/\"", () => Cbor.decodeTyped(Uint8Array.of(0x62, 0xc0, 0xaf)), /not valid UTF-8/);
+
+    // finding 2: +0.0 and -0.0 are one key, whatever their widths
+    bothRefuse("+0.0 and -0.0 (a2 f9 0000 01 f9 8000 02) are one key", Buffer.from("a2f9000001f9800002", "hex"), /duplicate map key/);
+    bothRefuse("+0.0 as a half and -0.0 as a double are one key", Buffer.from("a2f9000001fb800000000000000002", "hex"), /duplicate map key/);
+    // NaNs are one key exactly when their significands are, zero-extended at the right to 64 bits, sign aside
+    bothRead("two NaNs whose significands differ (a2 f9 7e00 01 f9 7e01 02) are two keys", Buffer.from("a2f97e0001f97e0102", "hex"),
+        { keys: ["NaN", "NaN"], paths: ['[{"key":"fNaN8000000000000000"}]', '[{"key":"fNaN8040000000000000"}]'] });
+    bothRefuse("one NaN significand as a half and as a single", Buffer.from("a2f97e0001fa7fc0000002", "hex"), /duplicate map key/);
+    bothRefuse("one NaN significand as a half and as a double", Buffer.from("a2f97e0001fb7ff800000000000002", "hex"), /duplicate map key/);
+    bothRefuse("one NaN significand with either sign", Buffer.from("a2f97e0001f9fe0002", "hex"), /duplicate map key/);
+    bothRead("a single-width NaN payload a half cannot hold is another key", Buffer.from("a2f97e0001fa7fc0000102", "hex"),
+        { keys: ["NaN", "NaN"], paths: ['[{"key":"fNaN8000000000000000"}]', '[{"key":"fNaN8000020000000000"}]'] });
+
+    // nit: a bignum key is the integer it carries (RFC 8949 3.4.3); one whose value an integer head holds is refused
+    bothRefuse("the integer 1 and the bignum #6.2(h'01')", cat(head(5, 2), head(0, 1), head(0, 0), [0xc2, 0x41, 0x01], head(0, 0)),
+        /bignum .* fits an integer head/);
+    bothRefuse("a lone bignum key #6.3(h'00'), which is -1", cat(head(5, 1), [0xc3, 0x41, 0x00], head(0, 0)), /bignum .* fits an integer head/);
+    bothRead("a bignum key beyond any integer head (2^64) is a key of its own",
+        cat(head(5, 1), [0xc2, 0x49, 0x01, 0, 0, 0, 0, 0, 0, 0, 0], head(0, 0)), { keys: ["#i18446744073709551616"],
+            paths: ['[{"key":"i18446744073709551616"}]'] });
+    bothRefuse("2^64 as a bignum with and without a leading zero byte", cat(head(5, 2), [0xc2, 0x49, 0x01, 0, 0, 0, 0, 0, 0, 0, 0],
+        head(0, 0), [0xc2, 0x4a, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0], head(0, 1)), /duplicate map key/);
+    bothRefuse("the key [1] and the key [#6.2(h'01')]", cat(head(5, 2), head(4, 1), head(0, 1), head(0, 0), head(4, 1),
+        [0xc2, 0x41, 0x01], head(0, 1)), /duplicate map key/);
+    // a tag's byte-string content is read from the bytes, never through another tag
+    refusedWith("a bignum around a tagged byte string (#6.2(#6.99(h'01')))", () => Cbor.decodeTyped(Uint8Array.of(0xc2, 0xd8, 0x63, 0x41, 0x01)),
+        /tag 2 content is not a byte string/);
+    refusedWith("a tag 24 around a tagged byte string (#6.24(#6.99(h'00')))", () => Cbor.decodeTyped(Uint8Array.of(0xd8, 0x18, 0xd8, 0x63, 0x41, 0x00)),
+        /tag 24 content is not a byte string/);
 });
 
 // 2c. review round 3, major 1 and minor 4: the reader looks labels up by type, takes only int / tstr labels, and no
@@ -1139,6 +1227,98 @@ await section("2c. COSE header labels and typed lookups in readIssuerSigned", as
     const protoVerdict = await verdictOf(proto);
     check("and checkKeepable checks its items: a changed one is refused", protoVerdict.ok === false && protoVerdict.code === "digest",
         JSON.stringify(protoVerdict));
+});
+
+// 2e. review round 4: the same equivalence where a credential is decided - COSE header labels, an element value whose
+// digest matches - and the major types of the values a decision reads (the MSO, the deviceKey, each item's digestID)
+await section("2e. key equivalence and value types in readIssuerSigned and checkKeepable", async () => {
+    const shaped = shapedMdl;
+    const BOM_X = Buffer.from("\ufeffx", "utf8");
+    const keeps = async (label, built) => {
+        const verdict = await verdictOf(built);
+        check(`checkKeepable keeps ${label}`, verdict.ok === true, JSON.stringify(verdict));
+    };
+    const refuses = async (label, built, code, pattern) => {
+        const verdict = await verdictOf(built);
+        check(`checkKeepable refuses ${label}`, verdict.ok === false && verdict.code === code && pattern.test(verdict.message),
+            JSON.stringify(verdict));
+    };
+
+    // finding 1, in a COSE header: the labels "x" and "\ufeffx" are two labels (RFC 9052 1.5: tstr labels are text)
+    const bomProtected = shaped({ protectedRaw: cat(head(5, 3), head(0, 1), head(1, 6), tstr("x"), head(0, 1), head(3, 4), BOM_X, head(0, 2)) });
+    let alg;
+    try {
+        alg = Mdoc.readIssuerSigned(bomProtected.bytes).issuerAuth.alg;
+    } catch (error) {
+        alg = "refused: " + error.message;
+    }
+    equal("a protected header {1: -7, \"x\": 1, \"\\ufeffx\": 2} is read, alg -7", alg, -7);
+    await keeps("a protected header carrying \"x\" and \"\\ufeffx\"", bomProtected);
+    const bomChunked = shaped({ unprotectedRaw: (chain) => cat(head(5, 3), head(0, 33), chain, tstr("x"), head(0, 1),
+        [0x7f, 0x63, 0xef, 0xbb, 0xbf], tstr("x"), [0xff], head(0, 2)) });
+    await keeps("an unprotected header carrying \"x\" and the chunks \"\\ufeff\" \"x\"", bomChunked);
+    const bomBuckets = shaped({ unprotectedRaw: (chain) => cat(head(5, 2), head(0, 33), chain, head(3, 4), BOM_X, head(0, 2)),
+        protectedRaw: cat(head(5, 2), head(0, 1), head(1, 6), tstr("x"), head(0, 1)) });
+    await keeps("\"x\" in the protected and \"\\ufeffx\" in the unprotected header (two labels, not one in both)", bomBuckets);
+
+    // finding 2, in an element value whose digest is computed over exactly these bytes: only the key rule can refuse it
+    const element = (valueBytes) => (digestId, random) => cat(head(5, 4), tstr("digestID"), head(0, digestId), tstr("random"),
+        bstr(random), tstr("elementIdentifier"), tstr("family_name"), tstr("elementValue"), valueBytes);
+    await refuses("an element value {+0.0: 1, -0.0: 2} (one key twice), its digest matching",
+        shaped({ rawItems: { family_name: element(Buffer.from("a2f9000001f9800002", "hex")) } }), "issuer-signed", /duplicate map key/);
+    const nans = shaped({ rawItems: { family_name: element(Buffer.from("a2f97e0001f97e0102", "hex")) } });
+    await keeps("an element value whose two NaN keys have distinct significands", nans);
+    equal("and reads both of its keys", Mdoc.readIssuerSigned(nans.bytes).nameSpaces[MDL_NAMESPACE][0].elementValue.size, 2);
+    await refuses("an element value {1: \"a\", #6.2(h'01'): \"b\"}", shaped({ rawItems: { family_name: element(cat(head(5, 2),
+        head(0, 1), tstr("a"), [0xc2, 0x41, 0x01], tstr("b"))) } }), "issuer-signed", /bignum/);
+
+    // nit: the values a decision reads are of their CDDL types, read from the bytes, not only from what they decode to
+    const item = (digestIdBytes) => (digestId, random) => cat(head(5, 4), tstr("digestID"), digestIdBytes, tstr("random"),
+        bstr(random), tstr("elementIdentifier"), tstr("family_name"), tstr("elementValue"), tstr("Ipsum"));
+    const notUint = /family_name digestID .* not an unsigned integer/;
+    for (const [label, digestId, pattern] of [["the float 0.0", [0xf9, 0x00, 0x00], notUint], ["#6.99(0)", [0xd8, 0x63, 0x00], notUint],
+        // a bignum decodes to a BigInt, which the value check refuses before the shape check is reached
+        ["a bignum #6.2(h'00')", [0xc2, 0x41, 0x00], /is not an element map/]]) {
+        await refuses(`a digestID that is ${label} (DigestID = uint), its digest matching`, shaped({ rawItems: { family_name: item(digestId) } }),
+            "issuer-signed", pattern);
+    }
+    await refuses("an elementIdentifier that is #6.99(tstr)", shaped({ rawItems: { family_name: (digestId, random) => cat(head(5, 4),
+        tstr("digestID"), head(0, digestId), tstr("random"), bstr(random), tstr("elementIdentifier"), [0xd8, 0x63], tstr("family_name"),
+        tstr("elementValue"), tstr("Ipsum")) } }), "issuer-signed", /elementIdentifier .* not a text string/);
+    await refuses("an IssuerSignedItem map inside #6.55799 within its tag-24 bstr", shaped({ rawItems: { family_name: (digestId, random) =>
+        cat(head(6, 55799), item(head(0, digestId))(digestId, random)) } }), "issuer-signed", /does not embed an IssuerSignedItem map/);
+    await refuses("an IssuerSignedItemBytes #6.24(#6.99(bstr))", shaped({ itemForms: { family_name: "tag24tagged" } }), "issuer-signed",
+        /tag 24 content is not a byte string/);
+
+    const keyWith = (overrides) => {
+        const key = coseKey(HOLDER_A_JWK);
+        for (const [label, value] of overrides) key.set(label, value);
+        return key;
+    };
+    const holderX = bytesOf(Buffer.from(HOLDER_A_JWK.x, "base64url"));
+    for (const [label, overrides, pattern] of [
+        ["kty is the float 2.0", [[1, Cbor.Raw([0xf9, 0x40, 0x00])]], /deviceKey kty .* is a simple value/],
+        ["kty is #6.99(2)", [[1, Cbor.Raw([0xd8, 0x63, 0x02])]], /deviceKey kty .* is a tag/],
+        ["crv is the float 1.0", [[-1, Cbor.Raw([0xf9, 0x3c, 0x00])]], /deviceKey crv .* is a simple value/],
+        ["x is #6.99(bstr)", [[-2, new Cbor.Tagged(99, holderX)]], /deviceKey x .* is a tag/],
+        ["y is null", [[-3, null]], /deviceKey y .* is a simple value/],
+    ]) {
+        await refuses(`a deviceKey whose ${label}`, shaped({ deviceKey: keyWith(overrides) }), "issuer-signed", pattern);
+    }
+    // the shapes COSE_Key allows still reach check 3, which names what this page holds
+    await refuses("a deviceKey whose kty is the text \"EC2\" at check 3, not as a shape", shaped({ deviceKey: keyWith([[1, "EC2"]]) }),
+        "device-key", /label 1 must be 2/);
+    await refuses("a deviceKey whose y is the bool true (compressed point) at check 3", shaped({ deviceKey: keyWith([[-3, true]]) }),
+        "device-key", /no P-256 coordinates/);
+    await refuses("a docType that is #6.99(tstr)", shaped({ docType: new Cbor.Tagged(99, DOC_TYPE) }), "issuer-signed", /docType, a tstr, is a tag/);
+    await refuses("a Digest that is #6.99(bstr)", shaped({ valueDigests: (digests) => new Map([...digests].map(([namespace, byId]) =>
+        [namespace, new Map([...byId].map(([id, digest]) => [id, new Cbor.Tagged(99, digest)]))])) }), "issuer-signed", /Digest 0 of .* is a tag/);
+    await refuses("a valueDigests namespace map inside #6.99", shaped({ valueDigests: (digests) => new Map([...digests].map(([namespace, byId]) =>
+        [namespace, new Cbor.Tagged(99, byId)])) }), "issuer-signed", /DigestIDs of .* is a tag/);
+    await refuses("an MSO map inside #6.55799 within its bstr", shaped({ msoTag: 55799 }), "issuer-signed", /not an MSO map/);
+    await refuses("an MSO bstr inside #6.99 within the tag 24", shaped({ msoContentTag: 99 }), "issuer-signed", /MSO content is not a byte string/);
+    // and Certify's own credential and the built one are still kept
+    await keeps("the built mDL", MDL_A);
 });
 
 // 3. the IssuerSigned Certify's own MdocFormatter produced (plan 4.12): the layout real mDLs arrive in
@@ -1592,6 +1772,76 @@ await section("16. a keep waiting for the store does not hold the run", async ()
     await run;
 });
 
+// 16b. review round 4, finding 3: a keep tagged with its run. Run 1's keep waits behind another tab's blocked delete;
+// the visitor unticks Keep and redeems again. Run 2 must not hide run 1's pending note, and when the blocker closes
+// run 1's outcome is reported as the earlier credential's, never as run 2's
+await section("16b. a late keep reports as the earlier run's, in a note of its own", async () => {
+    const blockedStore = async () => {
+        const fake = new FakeIndexedDB();
+        await seedRecords(fake, 1);
+        const stubborn = await storeOn(fake).open();
+        stubborn.onversionchange = null; // another wallet tab that does not close, so the delete stays pending
+        const blocked = [];
+        storeOn(fake).deleteEverything(() => blocked.push("blocked"));
+        await waitFor(() => blocked.length === 1);
+        return { fake, stubborn };
+    };
+    const notes = (page) => page.el("keepNote").children.map((note) => note.textContent);
+    const KEPT = "Kept in this browser: " + DOC_TYPE + ".";
+
+    const { fake, stubborn } = await blockedStore();
+    const page = openOffer({ indexedDB: fake });
+    await page.settle();
+    page.el("subject").value = "mdl-demo-1";
+    await page.createOffer();
+    const first = page.runWallet(); // ends only when its keep does
+    const waiting = await waitForMs(() => page.el("keepNote").textContent.includes("Waiting for the credential store")
+        && page.el("wallet").disabled === false, 3000);
+    check("run 1 has ended and its keep waits behind the other tab's delete", waiting, page.el("keepNote").textContent);
+
+    page.el("keep").checked = false;
+    await page.runWallet();
+    await page.settle();
+    check("run 2 (Keep unticked) has ended", page.el("walletStatus").textContent.includes("Credential issued"),
+        page.el("walletStatus").textContent);
+    equal("run 2 does not hide the note of run 1's keep, which is still pending", page.el("keepNote").hidden, false);
+    equal("and labels it as the earlier credential's", page.el("keepNote").textContent, "Earlier credential: Waiting for the"
+        + " credential store (another tab is deleting it). This credential is checked and kept once that delete is done.");
+
+    stubborn.close();
+    const reported = await waitForMs(() => page.el("keepNote").textContent.includes("Kept in this browser"), 3000);
+    check("once the blocker closes, run 1's keep reports its outcome", reported, page.el("keepNote").textContent);
+    equal("as the earlier credential's result, never as run 2's", page.el("keepNote").textContent, "Earlier credential: " + KEPT);
+    equal("in the one note on screen", notes(page), ["Earlier credential: " + KEPT]);
+    equal("run 1's credential was kept, run 2's was not", credentialsIn(fake).length, 1);
+    await first;
+
+    // the next run starts afresh: the finished earlier note goes, and its own note is unlabelled
+    page.el("keep").checked = true;
+    await page.runWallet();
+    await page.settle();
+    equal("run 3's note is its own, and only that", notes(page), [KEPT]);
+    equal("and it kept its credential", credentialsIn(fake).length, 2);
+
+    // two keeps pending at once: each has its own note, and neither result replaces the other's
+    const both = await blockedStore();
+    const twice = openOffer({ indexedDB: both.fake });
+    await twice.settle();
+    twice.el("subject").value = "mdl-demo-1";
+    await twice.createOffer();
+    const runOne = twice.runWallet();
+    await waitForMs(() => twice.el("keepNote").textContent.includes("Waiting") && twice.el("wallet").disabled === false, 3000);
+    const runTwo = twice.runWallet();
+    const twoWaiting = await waitForMs(() => notes(twice).length === 2 && notes(twice)[1].startsWith("Waiting"), 3000);
+    check("two pending keeps: two notes, the earlier one labelled", twoWaiting && notes(twice)[0].startsWith("Earlier credential: Waiting"),
+        JSON.stringify(notes(twice)));
+    both.stubborn.close();
+    await waitForMs(() => credentialsIn(both.fake).length === 2, 3000);
+    await Promise.all([runOne, runTwo]);
+    equal("each reports in its own note", notes(twice), ["Earlier credential: " + KEPT, KEPT]);
+    equal("and both were kept", credentialsIn(both.fake).length, 2);
+});
+
 // 17. review round 3, minor 3: a wallet tab whose first list read outlives its connection. Another tab deletes
 // everything while the startup getAll is outstanding (the fake's `hold` keeps that read pending)
 await section("17. a list read on a given-up connection is never shown", async () => {
@@ -1666,6 +1916,56 @@ await section("18. a page timer starts a task", async () => {
     });
     equal("a request from the next timer's callback meets an inactive transaction", seen, "TransactionInactiveError");
     db.close();
+});
+
+// 19. review round 4 (nit): an operation's closing message is written only while its connection is still the page's.
+// Another tab deletes everything while this tab's own "Delete everything" (or "Delete") is finishing; that tab's
+// message is the newer news, and the older confirmation must not be written over it
+await section("19. a closing message never overwrites another tab's newer one", async () => {
+    const DELETING = "Another wallet tab is deleting everything";
+    const after = (history, message) => history.slice(history.findIndex((entry) => entry.startsWith(DELETING)) + 1)
+        .filter((entry) => entry.startsWith(message));
+
+    // "Delete everything": its list read after reopening is held while the other tab's delete begins
+    const fake = new FakeIndexedDB();
+    await seedRecords(fake, 2);
+    const wallet = openWallet(fake);
+    check("the wallet page's scripts ran", wallet.scriptError === null, wallet.scriptError && String(wallet.scriptError.stack));
+    await settle();
+    const history = statusHistory(wallet);
+    const reopenList = fake.hold("getAll", "credentials");
+    const pressed = wallet.el("deleteAll").fire("click");
+    await reopenList.reached;
+    storeOn(fake).deleteEverything();
+    const told = await waitFor(() => history.some((entry) => entry.startsWith(DELETING)));
+    check("probe: the other tab's delete reached this tab while its own was finishing", told, JSON.stringify(history));
+    reopenList.release();
+    await pressed;
+    await waitFor(() => wallet.el("storageStatus").textContent.startsWith("Another wallet tab deleted everything"));
+    equal("this tab's \"was deleted\" is never written after the other tab's message", after(history,
+        "Everything kept in this browser was deleted"), []);
+    check("the status is the other tab's outcome", wallet.el("storageStatus").textContent.startsWith("Another wallet tab deleted everything"),
+        JSON.stringify(history));
+
+    // "Delete": its delete request is held while the other tab's delete begins
+    const single = new FakeIndexedDB();
+    await seedRecords(single, 2);
+    const one = openWallet(single);
+    await settle();
+    const oneHistory = statusHistory(one);
+    await listButtons(one)[0].fire("click");
+    const removal = single.hold("delete", "credentials");
+    const deleting = one.el("delete").fire("click");
+    await removal.reached;
+    storeOn(single).deleteEverything();
+    const heard = await waitFor(() => oneHistory.some((entry) => entry.startsWith(DELETING)));
+    check("probe: the other tab's delete reached this tab while its Delete was finishing", heard, JSON.stringify(oneHistory));
+    removal.release();
+    await deleting;
+    await waitFor(() => one.el("storageStatus").textContent.startsWith("Another wallet tab deleted everything"));
+    equal("this tab's \"Deleted …\" is never written after the other tab's message", after(oneHistory, "Deleted "), []);
+    check("the status is the other tab's outcome", one.el("storageStatus").textContent.startsWith("Another wallet tab deleted everything"),
+        JSON.stringify(oneHistory));
 });
 
 } finally {

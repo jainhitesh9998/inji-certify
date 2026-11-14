@@ -89,7 +89,7 @@
     <button id="wallet" disabled>Run the pre-authorized code flow here</button>
     <label id="keepLabel" hidden><input type="checkbox" id="keep" checked style="width:auto"> Keep this credential in this browser</label>
     <div id="walletStatus" class="status"></div>
-    <p id="keepNote" class="hint" hidden></p>
+    <div id="keepNote" hidden></div>
     <p><a id="walletLink" href="wallet" hidden>Open the demo wallet</a></p>
     <pre id="credential" hidden></pre>
     <div id="mdocView" hidden>
@@ -119,6 +119,10 @@
   // P5-03a (I4): whether this deployment's wallet answered 200. Until it does, nothing is kept and no Keep box is
   // shown: with certify.offer-page.wallet.enabled=false the config endpoint answers 404 and this browser stores nothing.
   let walletEnabled = false;
+  // P5-03a review round 4: how many wallet runs have started (each keep is tagged with its run's number), and one note
+  // per keep whose outcome is on screen, so a keep that ends after a newer run started reports as the earlier one's
+  let walletRuns = 0;
+  const keepNotes = [];
   // the blob URL of the last portrait this page rendered, released when the next one replaces it
   let portraitObjectUrls = [];
 
@@ -226,12 +230,46 @@
     el("keepLabel").hidden = !walletEnabled || selectedFormat() !== "mso_mdoc";
   }
 
-  /** One line under the wallet button, about what was kept (or why nothing was). */
-  function keepNote(message, ok) {
-    const note = el("keepNote");
-    note.textContent = message;
-    note.className = "status " + (ok === undefined ? "" : ok ? "ok" : "bad");
-    note.hidden = false;
+  /**
+   * The note of one keep: a line under the wallet button, about what that keep kept (or why it kept nothing). The line
+   * is made on its keep's first message, and says which credential it is about: once a newer run has started, it is
+   * "Earlier credential: …", so a keep that waited behind another tab's delete never reports as the newer run's.
+   */
+  function keepNoteFor(run) {
+    const note = { run: run, pending: true, node: null, message: "", ok: undefined };
+    note.say = (message, ok) => {
+      note.message = message;
+      note.ok = ok;
+      if (note.node === null) {
+        note.node = document.createElement("p");
+        el("keepNote").appendChild(note.node);
+        keepNotes.push(note);
+      }
+      renderKeepNote(note);
+      el("keepNote").hidden = false;
+    };
+    return note;
+  }
+
+  function renderKeepNote(note) {
+    note.node.textContent = (note.run === walletRuns ? "" : "Earlier credential: ") + note.message;
+    note.node.className = "status " + (note.ok === undefined ? "" : note.ok ? "ok" : "bad");
+  }
+
+  /**
+   * A new run starts: what the finished keeps said is not news about it, so their notes go; a keep that is still
+   * pending keeps its note, now labelled as the earlier credential's, and reports there when it ends.
+   */
+  function startKeepNotes() {
+    for (let i = keepNotes.length - 1; i >= 0; i--) {
+      if (keepNotes[i].pending) {
+        renderKeepNote(keepNotes[i]);
+      } else {
+        el("keepNote").removeChild(keepNotes[i].node);
+        keepNotes.splice(i, 1);
+      }
+    }
+    el("keepNote").hidden = keepNotes.length === 0;
   }
 
   // ---- demo subjects (F-15): the subjects the operator configured (certify.offer-page.demo-subjects), offered in a
@@ -546,13 +584,13 @@
     // those of the offer that was on screen when the button was pressed, whatever happens while the run waits
     const offer = activeOffer;
     if (!offer) return;
+    const run = ++walletRuns;
     redeeming = true;
     el("wallet").disabled = true;
     // and no other offer is created while this one is redeemed (the button comes back when the run ends)
     el("create").disabled = true;
-    // P5-03a: what the last run kept (or why it kept nothing) is not news about this one
-    el("keepNote").hidden = true;
-    el("keepNote").textContent = "";
+    // P5-03a: what an earlier run kept (or why it kept nothing) is not news about this one; a keep still pending stays
+    startKeepNotes();
     // the keep this run starts once its own controls are back (review round 3): a store that is waiting behind another
     // tab's "Delete everything" must not hold Redeem and Create disabled after the credential was issued
     let keep = null;
@@ -659,7 +697,7 @@
         } catch (e) {
           status("walletStatus", "Credential issued, but the IssuerSigned view could not be rendered: " + e.message, false);
         }
-        keep = () => keepCredential(credential.body.credentials, offer, issuerMetadata, proof);
+        keep = (note) => keepCredential(credential.body.credentials, offer, issuerMetadata, proof, note);
       }
     } catch (e) {
       status("walletStatus", "The flow failed: " + e.message, false);
@@ -670,10 +708,13 @@
     }
     // after the run: keeping is local, and its outcome is reported in its own note whenever the store answers
     if (keep !== null) {
+      const note = keepNoteFor(run);
       try {
-        await keep();
+        await keep(note);
       } catch (e) {
-        keepNote("The credential was not kept: " + e.message, false);
+        note.say("The credential was not kept: " + e.message, false);
+      } finally {
+        note.pending = false;
       }
     }
   });
@@ -760,9 +801,11 @@
   /**
    * Keeps the first credential of a 200 response when the visitor asked for it, the configuration is an mso_mdoc one and
    * this browser has IndexedDB. Every check must pass (Mdoc.checkKeepable); a refusal keeps nothing and names the check.
-   * Nothing here leaves the browser, and a failure never changes what the issuance run reported.
+   * Nothing here leaves the browser, and a failure never changes what the issuance run reported. Every outcome goes to
+   * {@code note}, this keep's own note (keepNoteFor).
    */
-  async function keepCredential(credentials, offer, issuerMetadata, proof) {
+  async function keepCredential(credentials, offer, issuerMetadata, proof, note) {
+    const keepNote = note.say;
     // I4: the wallet's own switch decides whether anything is stored. Without it the page would not even show the box,
     // so a store is opened only after /offer/wallet/config answered 200.
     if (!walletEnabled) return;

@@ -26,8 +26,15 @@
  * - `Cbor.decodeTyped`, `Cbor.spans` (and `Cbor.tagged`, `Cbor.Raw`) keep each key's type: a map is a `Map` whose keys
  *   are a number (or BigInt) for an integer key, a string for a text key, and a `Cbor.OtherKey` for any other key, so
  *   the integer 1 and the text "1" are two entries and a lookup names the type it means (`map.get(1)`, `map.get("1")`).
- *   A key that is the same data item twice (RFC 8949 5.6: the same integer under a longer head, the same text under a
- *   longer head or in indefinite-length chunks) is still a duplicate and refused.
+ *   A key that is the same data item twice (RFC 8949 5.6.1: the same integer under a longer head, the same text under a
+ *   longer head or in indefinite-length chunks, 0.0 and -0.0, two NaNs with one significand) is still a duplicate and
+ *   refused, and a bignum key (tag 2 or 3) whose value fits an integer head is refused as the integer it means
+ *   (RFC 8949 3.4.3) written another way (P5-03a review round 4).
+ *
+ * Text strings are UTF-8 read strictly (P5-03a review round 4): invalid UTF-8, a code point split across two chunks of
+ * an indefinite-length string, is refused (RFC 8949 3.2.3 and 5.3.1), and a leading U+FEFF is kept as the character it
+ * is, in a definite string and in every chunk alike - so a text key's string and its UTF-8 bytes name each other, and
+ * the texts "x" and "\ufeffx" are two keys, never one.
  *
  * A data item with bytes left over after it - at the top level or inside tag-24 content - is malformed and throws.
  *
@@ -42,6 +49,13 @@
  *   decodeTyped(a2 01 61 61 61 31 61 62) -> Map {1 => "a", "1" => "b"} (two keys of two types)
  *   decodeTyped(a2 01 00 18 01 00)       -> throws (the integer 1 twice, under two heads: a duplicate)
  *   decodeTyped(a2 61 61 00 7f 61 61 ff 00) -> throws (the text "a" twice, once in indefinite-length chunks)
+ *   decodeTyped(64 ef bb bf 78)          -> "\ufeffx" (a leading U+FEFF is a character, never stripped)
+ *   decodeTyped(a2 61 78 01 64 efbbbf78 02) -> Map {"x" => 1, "\ufeffx" => 2} (two keys, not one)
+ *   decodeTyped(61 ff) / (7f 61 c3 61 bc ff) -> throws (invalid UTF-8; "ü" split across two chunks)
+ *   decodeTyped(a2 f9 0000 01 f9 8000 02)   -> throws (0.0 and -0.0 are one key, RFC 8949 5.6.1)
+ *   decodeTyped(a2 f9 7e00 01 f9 7e01 02)   -> Map of two keys (two NaNs whose significands differ)
+ *   decodeTyped(a2 f9 7e00 01 fa 7fc00000 02) -> throws (one NaN significand, as a half and as a single)
+ *   decodeTyped(a2 01 00 c2 41 01 00)    -> throws (the bignum #6.2(h'01') is the integer 1, RFC 8949 3.4.3)
  *   bytes [0xf9]                    -> throws       (truncated half float)
  *   bytes [0x1f] / [0xff] / [0x7c]  -> throws       (indefinite integer, stray break, reserved additional information)
  *   hex 1b0020000000000001          -> 9007199254740993n  (2^53+1: a BigInt, not 9007199254740992)
@@ -163,6 +177,35 @@ var Cbor = (function () {
     return text;
   }
 
+  var UTF8_DECODER = null;
+
+  /**
+   * The string one definite-length text string (or one chunk of an indefinite-length one) carries. Strict (`fatal`):
+   * invalid UTF-8 is refused rather than turned into U+FFFD, so two different byte strings never read as one string
+   * (RFC 8949 3.2.3: a chunk ends on a code point; 5.3.1: invalid UTF-8 is not valid CBOR). `ignoreBOM`: a leading
+   * U+FEFF is the character the bytes carry, not a byte order mark to drop - without it "\ufeffx" read as "x".
+   */
+  function utf8Text(bytes) {
+    if (UTF8_DECODER === null) UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+    try {
+      return UTF8_DECODER.decode(bytes);
+    } catch (error) {
+      throw new Error("CBOR: a text string is not valid UTF-8 (RFC 8949 sections 3.2.3 and 5.3.1)");
+    }
+  }
+
+  /**
+   * The significand of a NaN at {@code at} (the bytes after its head), zero-extended at the right to 64 bits and printed
+   * in hex: RFC 8949 5.6.1 makes two NaN keys equivalent exactly when these are equal, whatever their widths and signs.
+   */
+  function nanSignificand(bytes, at, additional) {
+    var width = additional === 25 ? 2 : additional === 26 ? 4 : 8;
+    var fractionBits = additional === 25 ? 10n : additional === 26 ? 23n : 52n;
+    var bits = 0n;
+    for (var i = 0; i < width; i++) bits = bits * 256n + BigInt(bytes[at + i]);
+    return ((bits & ((1n << fractionBits) - 1n)) << (64n - fractionBits)).toString(16);
+  }
+
   /** The magnitude of a byte string, as a BigInt (tags 2 and 3). */
   function magnitude(bytes) {
     var value = 0n;
@@ -206,13 +249,16 @@ var Cbor = (function () {
   }
 
   /**
-   * The identity of the data item at {@code offset} as RFC 8949 5.6 compares map keys: the same data item, however it
+   * The identity of the data item at {@code offset} as RFC 8949 5.6.1 compares map keys: the same data item, however it
    * is serialized, has one identity, and items of different types never share one. An integer is "i" and its value
-   * whatever head carries it; a byte or text string is "b" or "t" and the hex of its content however it is chunked; an
-   * array its elements; a map its entries in any order; a tag "#" with its number and content; a float its value
-   * whatever its width; a simple value its number. So the integer 1 ("i1") and the text "1" ("t31") are two keys, and
-   * `61 61`, `78 01 61` and `7f 61 61 ff` are all the text "a" ("t61"). The bytes were already decoded once, so they are
-   * well formed and nest no deeper than the decoder allows.
+   * whatever head carries it; a byte or text string is "b" or "t" and the hex of its content however it is chunked (text
+   * strings compare bytewise); an array its elements; a map its entries in any order; a tag "#" with its number and
+   * content; a float its numeric value whatever its width, 0.0 and -0.0 alike, and a NaN its significand
+   * (`nanSignificand`); a simple value its number. A bignum (tag 2 or 3 around a byte string) is the integer it carries
+   * (RFC 8949 3.4.3: choosing it over an integer head has no meaning), so `#6.2(h'01')` and `#6.2(h'0001')` are "i1" like
+   * the integer 1. So the integer 1 ("i1") and the text "1" ("t31") are two keys, and `61 61`, `78 01 61` and
+   * `7f 61 61 ff` are all the text "a" ("t61"). The bytes were already decoded once, so they are well formed and nest
+   * no deeper than the decoder allows.
    */
   function identityAt(bytes, offset) {
     var reader = new Reader(bytes);
@@ -226,8 +272,12 @@ var Cbor = (function () {
     var additional = initial & 31;
     if (major === 7) {
       if (additional < 24) return "s" + additional; // false, true, null, undefined
+      var at = reader.offset;
       var number = float(reader, additional);
-      return "f" + (Object.is(number, -0) ? "-0" : String(number)); // -0.0 and 0.0 are two floats
+      // RFC 8949 5.6.1: NaNs are one key exactly when their significands are; any other float is its numeric value,
+      // and String(-0) is "0", so -0.0 and 0.0 are one key
+      if (number !== number) return "fNaN" + nanSignificand(reader.bytes, at, additional);
+      return "f" + String(number);
     }
     var length = argument(reader, major, additional);
     var parts = [];
@@ -262,8 +312,19 @@ var Cbor = (function () {
         }
         return "{" + parts.sort().join(",") + "}";
       default: // 6
+        if ((length === 2 || length === 3) && reader.peek() >> 5 === 2) {
+          var content = identityOf(reader).substring(1); // the magnitude's hex, however the byte string is chunked
+          var size = content ? BigInt("0x" + content) : 0n;
+          return "i" + String(length === 2 ? size : -1n - size);
+        }
         return "#" + String(length) + "(" + identityOf(reader) + ")";
     }
+  }
+
+  /** Whether an integer identity ("i" and the digits) fits a major type 0 or 1 head: -2^64 <= n < 2^64. */
+  function fitsIntegerHead(identity) {
+    var value = BigInt(identity.substring(1));
+    return value >= -18446744073709551616n && value < 18446744073709551616n;
   }
 
   /** A typed key as a message prints it: a text key quoted, an integer key bare, any other key by its identity. */
@@ -312,8 +373,14 @@ var Cbor = (function () {
     reader.muted--;
     var entry;
     if (reader.typed) {
-      // the key's identity is the data item its bytes are, so the type is never lost (RFC 8949 5.6)
+      // the key's identity is the data item its bytes are, so the type is never lost (RFC 8949 5.6.1)
       var identity = identityAt(reader.bytes, start);
+      // a bignum key whose value an integer head holds is that integer written another way (RFC 8949 3.4.3): read as a
+      // key of its own it would sit beside the integer key a reader that resolves bignums takes it for, so it is refused
+      if (major === 6 && identity.charAt(0) === "i" && fitsIntegerHead(identity)) {
+        throw new Error("CBOR: the map key " + identity.substring(1) + " is a bignum (tag 2 or 3) whose value fits an"
+          + " integer head; RFC 8949 3.4.3 makes the integer its only meaningful form");
+      }
       var plain = major === 0 || major === 1 || major === 3; // int or tstr: the key is the number or the string itself
       entry = { key: plain ? key : new OtherKey(key, identity), identity: identity, segment: segmentOf(key, major, identity) };
     } else {
@@ -366,13 +433,12 @@ var Cbor = (function () {
         length = argument(reader, major, additional);
         if (length < 0) { // indefinite: concatenate the definite-length text-string chunks
           var parts = [];
-          while (reader.peek() !== 0xff) {
-            parts.push(new TextDecoder("utf-8").decode(stringChunk(reader, 3, "text string")));
-          }
+          // each chunk is UTF-8 on its own (RFC 8949 3.2.3), and a leading U+FEFF in any of them is kept
+          while (reader.peek() !== 0xff) parts.push(utf8Text(stringChunk(reader, 3, "text string")));
           reader.byte();
           return parts.join("");
         }
-        return new TextDecoder("utf-8").decode(reader.take(length));
+        return utf8Text(reader.take(length));
       case 4:
         length = argument(reader, major, additional);
         var items = [];
@@ -398,8 +464,9 @@ var Cbor = (function () {
           var seen = new Set();
           put = function () {
             var key = decodeKey(reader); // a key is not a value: neither it nor anything inside it gets a range
-            // RFC 8949 5.6: the same data item twice is a duplicate, whatever heads or chunks carry it. A string key that
-            // decodes like another without being the same item (only invalid UTF-8 can) is refused as well.
+            // RFC 8949 5.6.1: the same data item twice is a duplicate, whatever heads or chunks carry it. Text keys compare
+            // by their UTF-8 bytes, and since text is read strictly with every U+FEFF kept, two keys whose bytes differ
+            // never share a string; the second test is a guard should that ever stop holding.
             if (seen.has(key.identity) || typedMap.has(key.key)) throw new Error("CBOR: duplicate map key " + keyText(key.key));
             seen.add(key.identity);
             reader.path.push(key.segment);
@@ -436,13 +503,14 @@ var Cbor = (function () {
         return map;
       case 6:
         var tag = argument(reader, major, additional);
+        var contentMajor = reader.peek() >> 5; // from the bytes: a tag around a byte string decodes to one too
         var tagged = decode(reader, false); // the tagged value is the item at this path, not a child of it
         if (tag === 24) { // embedded CBOR: exactly one data item, no padding around it
-          if (!(tagged instanceof Uint8Array)) throw new Error("CBOR: tag 24 content is not a byte string");
+          if (contentMajor !== 2) throw new Error("CBOR: tag 24 content is not a byte string");
           return decodeItem(tagged, reader.depth, reader.typed); // the embedded item nests inside this one
         }
         if (tag === 2 || tag === 3) { // bignum: an unsigned magnitude in big-endian bytes, exact as a BigInt
-          if (!(tagged instanceof Uint8Array)) throw new Error("CBOR: tag " + tag + " content is not a byte string");
+          if (contentMajor !== 2) throw new Error("CBOR: tag " + tag + " content is not a byte string");
           return tag === 2 ? magnitude(tagged) : -1n - magnitude(tagged);
         }
         if (tag === 1 && typeof tagged === "number") return new Date(tagged * 1000).toISOString(); // epoch-based date/time

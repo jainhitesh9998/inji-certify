@@ -7,7 +7,9 @@
  * browser closes it; the list then follows. While a start, a delete or a reconnect is under way (`busy`, a count of
  * them, so one finishing never re-enables the controls while another still waits) every control is disabled, so nothing
  * is attempted on a connection that is closing or a store that is being deleted. A list read on a connection the page
- * has since given up is dropped, never shown.
+ * has since given up is dropped, never shown, and so is the closing message of an operation whose connection was given up
+ * meanwhile: the handler that took the connection away has said what happened since, and its message is the newer one
+ * (P5-03a review round 4).
  */
 (function () {
   "use strict";
@@ -258,9 +260,12 @@
   el("delete").addEventListener("click", async function () {
     if (busy > 0 || selected === null || db === null) return;
     var record = selected;
+    var connection = db;
     setBusy(true);
     try {
-      await WalletStore.remove(db, record.id);
+      await WalletStore.remove(connection, record.id);
+      // another tab's delete may have taken the connection meanwhile: its own message, written since, is the news
+      if (connection !== db) return;
       // the details section is hidden on success, so the confirmation goes where the visitor can still see it
       status("storageStatus", "Deleted " + labelOf(record) + ". Its key went with it.", true);
       status("detailsStatus", "");
@@ -268,7 +273,7 @@
       el("details").hidden = true;
       await refresh();
     } catch (e) {
-      status("detailsStatus", "The credential could not be deleted: " + e.message, false);
+      if (connection === db) status("detailsStatus", "The credential could not be deleted: " + e.message, false);
     } finally {
       setBusy(false);
     }
@@ -295,8 +300,11 @@
     // the delete has finished, one way or the other: only now can this page open the store without queueing behind it
     forget();
     try {
-      db = await connect();
-      await refresh();
+      var reopened = await connect();
+      db = reopened;
+      // only while the reopened connection is still the page's: another tab's delete may have taken it during the list
+      // read, and that tab's handler has said so since - this older news must not overwrite it
+      if (!(await refresh()) || db !== reopened) return;
       if (failure === null) status("storageStatus", "Everything kept in this browser was deleted.", true);
       else status("storageStatus", "The store could not be deleted: " + failure.message, false);
     } catch (e) {

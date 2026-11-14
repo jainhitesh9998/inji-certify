@@ -53,7 +53,8 @@ var Mdoc = (function () {
    * string, and RFC 8949 3.4.5.1 makes its content `#6.24(bstr .cbor MobileSecurityObject)`: the tag is required here,
    * never inferred from the payload's shape, and the MSO is decoded from the bstr the tag wraps. This is the layout
    * Certify's own MdocFormatter writes (`CoseEnvelope` signs the tag-24 bytes, and the envelope carries them as a
-   * bstr), so a real Certify mDL reads exactly like a hand-built one.
+   * bstr), so a real Certify mDL reads exactly like a hand-built one. The tag's content and the MSO are read from their
+   * bytes too: a tag around the bstr or around the MSO map is refused, and so is a value `requireMsoShapes` refuses.
    */
   function msoOf(payload) {
     if (!(payload instanceof Uint8Array)) {
@@ -67,12 +68,66 @@ var Mdoc = (function () {
       throw new Error("the issuerAuth payload is not exactly one tag-24 MSO item");
     }
     var wrapped = Cbor.decodeTyped(tagged.content);
-    if (!(wrapped instanceof Uint8Array)) {
+    if (!(wrapped instanceof Uint8Array) || tagged.content[0] >> 5 !== 2) {
       throw new Error("the tag-24 MSO content is not a byte string (ISO/IEC 18013-5 9.1.2.4)");
     }
-    var mso = Cbor.decodeTyped(wrapped);
-    if (!(mso instanceof Map)) throw new Error("the issuerAuth payload is not an MSO map");
-    return mso;
+    if (!wrapped.length || wrapped[0] >> 5 !== 5) throw new Error("the issuerAuth payload is not an MSO map");
+    var walked = Cbor.spans(wrapped, 3);
+    requireMsoShapes(wrapped, rangesByPath(walked));
+    return walked.value;
+  }
+
+  /**
+   * The MSO values a decision reads, each of the major type ISO/IEC 18013-5 9.1.2.4 and COSE_Key give it, read from the
+   * bytes: the decoder resolves tags and reads a float 2.0 as 2, so `#6.99(2)` or `2.0` would otherwise pass for the
+   * EC2 kty, and a tagged digest for a Digest. `docType` and `digestAlgorithm` are a tstr; `valueDigests`, each
+   * namespace's DigestIDs, `deviceKeyInfo` and `deviceKey` a map; each Digest a bstr; the deviceKey's kty (1) and crv
+   * (-1) an int or a tstr (RFC 9052 section 7, RFC 9053 section 7.1.1), x (-2) a bstr and y (-3) a bstr or a bool. A
+   * field that is absent is left to `checkKeepable`, which names it.
+   */
+  function requireMsoShapes(bytes, ranges) {
+    var expect = function (path, majors, what) {
+      var range = ranges.get(pathKey(path));
+      if (range === undefined) return;
+      var found = majorAt(bytes, range);
+      var bool = found === 7 && (bytes[range.start] === 0xf4 || bytes[range.start] === 0xf5);
+      if (majors.indexOf(found) < 0 && !(bool && majors.indexOf("bool") >= 0)) {
+        throw new Error("the MSO's " + what + " is " + MAJOR_NAMES[found] + " (ISO/IEC 18013-5 9.1.2.4)");
+      }
+    };
+    expect(["docType"], [3], "docType, a tstr,");
+    expect(["digestAlgorithm"], [3], "digestAlgorithm, a tstr,");
+    expect(["valueDigests"], [5], "valueDigests, a map,");
+    ranges.forEach(function (range) {
+      if (range.path[0] !== "valueDigests") return;
+      if (range.path.length === 2) expect(range.path, [5], "DigestIDs of " + String(range.path[1]) + ", a map,");
+      if (range.path.length === 3) {
+        expect(range.path, [2], "Digest " + JSON.stringify(range.path[2]) + " of " + String(range.path[1]) + ", a bstr,");
+      }
+    });
+    expect(["deviceKeyInfo"], [5], "deviceKeyInfo, a map,");
+    expect(["deviceKeyInfo", "deviceKey"], [5], "deviceKey, a COSE_Key map,");
+    expect(["deviceKeyInfo", "deviceKey", 1], [0, 1, 3], "deviceKey kty (label 1, an int or a tstr: RFC 9052 section 7)");
+    expect(["deviceKeyInfo", "deviceKey", -1], [0, 1, 3], "deviceKey crv (label -1, an int or a tstr: RFC 9053 section 7.1.1)");
+    expect(["deviceKeyInfo", "deviceKey", -2], [2], "deviceKey x (label -2, a bstr: RFC 9053 section 7.1.1)");
+    expect(["deviceKeyInfo", "deviceKey", -3], [2, "bool"], "deviceKey y (label -3, a bstr or a bool: RFC 9053 section 7.1.1)");
+  }
+
+  /**
+   * The IssuerSignedItem an IssuerSignedItemBytes (already known to be tag 24) carries, read from its bytes:
+   * `#6.24(bstr .cbor IssuerSignedItem)` holds an untagged map whose `digestID` is a uint (DigestID = uint) and whose
+   * `elementIdentifier` is a tstr (ISO/IEC 18013-5 8.3.2.1.2). The decoder reads `1.0` and `#6.99(1)` as 1, so a value
+   * alone would let either pass for DigestID 1.
+   */
+  function requireItemShapes(raw, what) {
+    var embedded = Cbor.decodeTyped(Cbor.tagged(raw).content);
+    if (!embedded.length || embedded[0] >> 5 !== 5) {
+      throw new Error(what + " does not embed an IssuerSignedItem map (ISO/IEC 18013-5 8.3.2.1.2)");
+    }
+    var itemRanges = rangesByPath(Cbor.spans(embedded, 1));
+    requireMajor(embedded, itemRanges.get(pathKey(["digestID"])), 0, what + " digestID (DigestID = uint, ISO/IEC 18013-5 8.3.2.1.2)");
+    requireMajor(embedded, itemRanges.get(pathKey(["elementIdentifier"])), 3,
+      what + " elementIdentifier (DataElementIdentifier = tstr, ISO/IEC 18013-5 8.3.2.1.2)");
   }
 
   /** The major type of the data item a range starts with (RFC 8949 3.1); a tag is 6, whatever it carries. */
@@ -201,9 +256,13 @@ var Mdoc = (function () {
    *   map, a bstr and a bstr, each untagged; the protected header's content is empty or a map (RFC 9052 section 3);
    * - every header label is an int or a tstr, compared by type (RFC 9052 sections 1.5 and 3), and no label is in both
    *   the protected and the unprotected header (RFC 9052 section 3);
-   * - each IssuerSignedItemBytes is tag 24 (ISO/IEC 18013-5 8.3.2.1.2).
-   * Plan 4.2 (check 1) and the decision log's P5-03a review round 3 row record these refusals and the clauses behind
-   * them: each is a shape the CDDL or RFC 9052 / RFC 9360 does not allow, read from the bytes the page would carry.
+   * - each IssuerSignedItemBytes is tag 24 around a bstr holding an untagged map, whose `digestID` is a uint and whose
+   *   `elementIdentifier` is a tstr (ISO/IEC 18013-5 8.3.2.1.2);
+   * - the MSO is a bstr inside the tag 24, holding an untagged map, and the values it decides by are of their CDDL
+   *   types (`requireMsoShapes`: docType, digestAlgorithm, valueDigests and its Digests, the deviceKey's labels).
+   * Plan 4.2 (check 1) and the decision log's P5-03a review round 3 and 4 rows record these refusals and the clauses
+   * behind them: each is a shape the CDDL or RFC 9052 / RFC 9053 / RFC 9360 does not allow, read from the bytes the
+   * page would carry.
    *
    * Maps are read typed (`Map`), so `mso` and each `elementValue` that is a map are `Map`s; `nameSpaces` is an object
    * with no prototype, so a namespace named "__proto__" is a namespace like any other.
@@ -281,6 +340,8 @@ var Mdoc = (function () {
           throw new Error("the IssuerSignedItem " + namespace + "/" + elementIdentifier
             + " is not a tag-24 IssuerSignedItemBytes");
         }
+        requireItemShapes(bytes.subarray(itemRange.start, itemRange.end), "the IssuerSignedItem " + namespace + "/"
+          + elementIdentifier);
         return {
           elementIdentifier: elementIdentifier,
           digestID: digestID,

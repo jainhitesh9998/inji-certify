@@ -70,7 +70,7 @@ excluded.
 
 | WP | What | Size | After |
 | --- | --- | --- | --- |
-| P5-03a | keep issued mDLs: non-extractable key, IndexedDB, CBOR encoder and byte-exact reader, wallet page shell, CSP, harness infrastructure | ~750 | - |
+| P5-03a | keep issued mDLs: non-extractable key, IndexedDB, CBOR encoder and byte-exact reader, wallet page shell, CSP, harness infrastructure | ~750 planned, ~1,950 built (overrun noted in its section) | - |
 | P5-03b | DeviceResponse and the OpenID4VP 1.0 SessionTranscript; `@owf/mdoc` and Multipaz checks; fixtures | ~750 | a |
 | P5-03c | request intake and verifier authentication: links, request_uri GET/POST, JAR, `x509_hash`/`x509_san_dns`, X.509 reader, request checks panel | ~800 | a |
 | P5-03d | DCQL and consent: matching, `trusted_authorities` (aki), `claim_sets`, `credential_sets`, `values`, unticking, test mode | ~600 | b, c |
@@ -364,7 +364,7 @@ harness calls them directly and also drives them through the page.
 
   Check 1 reads the structure from the bytes the page will carry, not only from decoded values (a decoder resolves
   tags and, in a display form, renders keys of different types alike), so it also refuses what the CDDL and COSE do
-  not allow (P5-03a review rounds 1-3; decision log, P5-03a review round 3 row):
+  not allow (P5-03a review rounds 1-4; decision log, P5-03a review round 3 and 4 rows):
   - an IssuerSigned key other than the text keys `nameSpaces` and `issuerAuth`: `IssuerSigned = {? "nameSpaces":
     IssuerNameSpaces, "issuerAuth": IssuerAuth}` is a closed map (ISO5 8.3.2.1.2), and `NameSpace = tstr`;
   - a tag (55799 self-described CBOR, 1 epoch date, 24 embedded CBOR, or any other) around a field the CDDL leaves
@@ -375,7 +375,14 @@ harness calls them directly and also drives them through the page.
     bare bstr;
   - a header label that is not an `int` or a `tstr` (RFC 9052 §1.5 and §3: `label = int / tstr`; labels compare by
     type, so `1` and `"1"` are two labels and both are kept);
-  - a label in both the protected and the unprotected header (RFC 9052 §3: a label MUST NOT occur in both).
+  - a label in both the protected and the unprotected header (RFC 9052 §3: a label MUST NOT occur in both);
+  - a value a decision reads that is not of its CDDL type, read from its first byte (a decoder reads `#6.99(2)` and
+    `2.0` as 2): `docType` and `digestAlgorithm` a tstr; `valueDigests`, its DigestIDs maps, `deviceKeyInfo` and
+    `deviceKey` a map; each Digest a bstr; the deviceKey's `kty` (1) and `crv` (-1) an int or a tstr, `x` (-2) a bstr
+    and `y` (-3) a bstr or a bool (RFC 9052 §7, RFC 9053 §7.1.1); the MSO a bstr inside the tag 24 holding an untagged
+    map; and each IssuerSignedItemBytes a tag 24 around a bstr holding an untagged map whose `digestID` is a uint and
+    whose `elementIdentifier` is a tstr (ISO5 8.3.2.1.2). Other MSO and item values (`version`, `validityInfo`,
+    `random`, `elementValue`) decide nothing in P5-03a and are not checked.
 - **Deleting.** "Delete" removes a record and with it the only reference to its key. "Delete everything" calls
   `indexedDB.deleteDatabase("certify-demo-wallet")`. Nothing is stored server-side, ever.
 - **No storage.** If `indexedDB` is missing or `open` fails (some private modes), the page says so once and issuance
@@ -387,8 +394,14 @@ harness calls them directly and also drives them through the page.
   every array element and map value down to `depth`.
 - Map keys keep their types wherever a decision rests on them (P5-03a review round 3): `Cbor.spans` and
   `Cbor.decodeTyped` give each map as a `Map` keyed by a number for an integer key and a string for a text key, and a
-  path segment keeps that type (`[33]` and `["33"]` are two paths). A key that is the same data item twice (RFC 8949
-  §5.6: the same integer or text under a longer head or in chunks) is refused. `Cbor.decode` keeps its plain objects
+  path segment keeps that type (`[33]` and `["33"]` are two paths). A key that is the same data item twice is refused,
+  with keys compared as RFC 8949 §5.6.1 says (P5-03a review round 4): integers by value under any head, text strings
+  bytewise under any head or chunking, `+0.0` and `-0.0` as one key, NaNs as one key exactly when their significands
+  (zero-extended at the right to 64 bits) are equal, and a bignum (tag 2 or 3) as the integer it carries; a bignum key
+  whose value an integer head holds is refused (RFC 8949 §3.4.3: the integer is its only meaningful form). Text is
+  read strictly: invalid UTF-8, including a code point split across chunks, is refused (§3.2.3, §5.3.1), and a leading
+  U+FEFF is kept in a definite string and in every chunk, so `"x"` and `"\ufeffx"` are two keys. The content of tags
+  2, 3 and 24 is a byte string by its own first byte, never a tagged one. `Cbor.decode` keeps its plain objects
   for the offer page's display, and refuses a map whose keys render alike (`1` and `"1"`) rather than overwrite one.
 - `Mdoc.readIssuerSigned(bytes)` builds on it and returns `{nameSpaces: {ns: [{elementIdentifier, digestID,
   elementValue, raw}]}, issuerAuth: {raw, alg, x5chain: [der…], mso}}`. Each `raw` is the **exact** byte range of an
@@ -841,7 +854,18 @@ All packages share the invariants and brief below.
 
 ### P5-03a Keep issued mDLs in the browser
 
-Branch `wp/p5-03a-keep-mdl`. Depends on nothing. About 750 lines, of which the fake IndexedDB is about 150.
+Branch `wp/p5-03a-keep-mdl`. Depends on nothing. Planned at about 750 lines (the fake IndexedDB about 150); built at
+about 1,950 lines of production code (about 500 of them comments citing the clauses), 2,700 of harness and 400 of
+Java tests, fixtures and the lockfile excluded.
+
+**Overrun.** The plan sized a reader that checks decoded values and a store used by one tab. Four review rounds showed
+both were wrong: a decoded value can differ from the bytes the page later presents (tags resolve to what they carry,
+keys of different types render alike, floats and bignums read as integers), so the reader checks each structure a
+decision rests on from the bytes, keeps map keys' types and compares them as RFC 8949 §5.6.1 does (`cbor.js` grew from
+about 260 to 770 lines, `mdoc.js` is 480); and IndexedDB connections are shared across tabs, so "Delete everything"
+waits for other tabs, the wallet page follows deletes made elsewhere, and a keep waiting behind one reports per run.
+The harness grew with each refusal, since every one has a negative test. The later packages keep their estimates;
+P5-03b and P5-03c reuse this reader and store rather than adding to them.
 
 **Files.**
 
@@ -1007,6 +1031,10 @@ Branch `wp/p5-03c-request-intake`. Depends on P5-03a; runs in parallel with P5-0
   Their cards show the leaf subject, issuer and fingerprints. Multipaz shows the findings "no aud" and "no state".
 - [ ] Each of the four error cases of 4.5 offers "Send error response", and the POST it sends carries `error`,
   `error_description` and `state`.
+- [ ] A kept credential whose IssuerAuth carries `x5chain` only in the protected header is refused before its chain is
+  read or validated: ISO5 9.1.2.4 puts `x5chain` in the unprotected header. P5-03a still reads it from either bucket
+  (it validates no chain) and refuses a label in both; the deferral is the decision log's P5-03a review round 3 row.
+  P5-03d's `trusted_authorities` `aki` filter relies on this: it matches the chain this check has placed.
 - [ ] I1-I9 hold. In particular, no flow in this package sends anything to `response_uri` without a press.
 
 **Negative tests.** Each refuses, names the rule, and the fetch log shows no request to `response_uri`.
