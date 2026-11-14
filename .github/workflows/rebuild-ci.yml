@@ -224,6 +224,23 @@ jobs:
         run: npm ci --ignore-scripts --no-audit --no-fund && node idb-crosscheck.mjs
         shell: bash
 
+      - name: Demo wallet DeviceResponse, independently verified (node)
+        # P5-03b (plan 4.14, non-negotiable 2): every DeviceResponse check-offer-wallet.mjs writes under
+        # target/wallet-samples/ is verified by @owf/mdoc 0.9.3, the library Credo's OpenID4VP verifier uses, with the
+        # versions pinned in wallet-probe/package-lock.json. The probe computes the OpenID4VP 1.0 SessionTranscript
+        # itself, anchors the document signer to the fixture IACA, and holds every positive sample to the elements it
+        # must disclose and every negative one to the check that must reject it.
+        working-directory: docs/design/tools/wallet-probe
+        run: npm ci --ignore-scripts --no-audit --no-fund && node probe.mjs
+        shell: bash
+
+      - name: Demo wallet DeviceResponse, independently verified (Multipaz)
+        # The second library, in Java: certify-conformance-mdoc verifies the same samples with Multipaz 0.102.0
+        # (issuer signature, chain to the IACA, digests, device signature over the verifier's transcript, disclosed set).
+        # With CI set, no samples is a failure, so the harness above must have written them.
+        run: mvn -B -ntp -Dgpg.skip=true -pl certify-conformance-mdoc -am test -Dtest=WalletPresentationConformanceTest -Dsurefire.failIfNoSpecifiedTests=false
+        shell: bash
+
       - uses: actions/setup-python@v5
         # verify_mdoc.py and its pinned requirements are tested on this interpreter, not whatever the runner ships
         with:

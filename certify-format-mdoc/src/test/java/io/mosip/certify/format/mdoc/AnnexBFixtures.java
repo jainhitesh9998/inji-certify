@@ -7,6 +7,8 @@ import io.mosip.certify.signing.CertificateChain;
 import io.mosip.certify.signing.KeyRef;
 import io.mosip.certify.signing.SignatureAlgorithm;
 import io.mosip.certify.signing.SigningKey;
+import io.mosip.certify.spi.SigningConfig;
+import io.mosip.certify.spi.SigningContext;
 import io.mosip.certify.signing.TrustAnchorRegistry;
 import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
@@ -65,6 +67,13 @@ final class AnnexBFixtures {
 
     static SigningKey dsc() {
         return KEYS.resolve(KeyRef.parse("jca:annexb-dsc"));
+    }
+
+    /** The signing context for {@link #dsc()}: its own provider, because that is where the private key lives. */
+    static SigningContext signing() {
+        SigningKey key = dsc();
+        return new SigningContext(new SigningConfig(key.ref(), key.algorithm(), null, null, null,
+                "did:web:issuer.example"), key, KEYS);
     }
 
     static SigningKey otherDsc() {

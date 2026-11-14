@@ -7,8 +7,15 @@ order `config/mdl/mdl.vm` writes them). `mdl-a.holder.jwk` is the holder key it 
 secret). `docs/design/tools/check-offer-wallet.mjs` reads both: it decodes the credential, checks every element's digest
 against the MSO, keeps it through the offer page with that key, and signs with the kept key.
 
-The names are plan section 4.12's. `mdl-b`, `pid`, `iaca.*`, `clock.txt`, `verifier/` and `hosted/` come with the work
-packages that use them (P5-03b and later).
+`iaca.pem` is the trust anchor the recorded DSC chains to: the Annex B IACA `AnnexBFixtures` builds with
+`certify-pki` (subject key identifier, key usage, CA basic constraints, issuerAltName, CRL distribution point), so a
+verifier can match a trust point against it and `WalletPresentationConformanceTest` can anchor Multipaz's
+`TrustManager`. `clock.txt` is an instant inside the recorded fixture's validity: the MSO window follows the recording
+run's clock, and the certificates are valid from theirs, so the two are recorded together and a verifier pins the clock
+instead of failing a committed fixture months later.
+
+The rest of plan section 4.12's names (`mdl-b`, `pid`, `verifier/`, `hosted/`) come with the work packages that use
+them.
 
 ## How they were produced
 
@@ -39,6 +46,8 @@ interop job that needs a fresh MSO.
   one-entry array is refused, not read.
 - Every `IssuerSignedItemBytes` is a tag-24 item, and its SHA-256 is the MSO's `valueDigests` entry for its
   `digestID` (§9.1.2.5).
+- The DSC is signed by the Annex B IACA in `iaca.pem`, and its subject `C` equals the MSO's `issuing_country` (`IN`),
+  which ISO/IEC 18013-5 7.2.1 requires and every verifier the demo targets checks.
 
 A tag is recognised by its numeric value whatever head encodes it: `d9 00 18` is tag 24 as much as `d8 18` (RFC 8949
 §3.1). The harness checks that with its own byte-assembled fixtures, and this recorded one is the untagged,

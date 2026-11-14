@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 /*
- * P5-03a behaviour check: the offer page keeps an issued mDL in this browser, and the demo wallet lists, shows and
- * deletes what it kept (docs/design/wp/P5-03-demo-wallet-presentation.md, work package P5-03a).
+ * P5-03a and P5-03b behaviour check: the offer page keeps an issued mDL in this browser, the demo wallet lists, shows
+ * and deletes what it kept, and the presentation is built from it - the OpenID4VP 1.0 `SessionTranscript` and the
+ * `DeviceResponse` - with the samples both independent verifiers read
+ * (docs/design/wp/P5-03-demo-wallet-presentation.md, work packages P5-03a and P5-03b, plan sections 4.2, 4.7, 4.14).
  *
  * Plain Node (24, the version CI pins), no npm dependencies, no browser, no server:
  *   node docs/design/tools/check-offer-wallet.mjs
@@ -26,13 +28,20 @@
  *   expected [start, end) is recorded as it is concatenated, so the slices and digests are computed independently of
  *   `Cbor.spans`, the reader under test.
  *
+ * Sections 20-24 are P5-03b. The transcript vectors are the OpenID4VP 1.0 appendix's own, and everything they assert is
+ * written a second time here in the harness's own encoder (`transcriptOf`, `deviceAuthenticationOf`, `sigStructureOf`),
+ * so a defect in `cbor.js` or `mdoc.js` cannot hide behind itself: the device signature is verified with `node:crypto`
+ * over bytes this file assembles. Section 24 records the samples `docs/design/tools/wallet-probe/probe.mjs` (`@owf/mdoc`)
+ * and `certify-conformance-mdoc`'s `WalletPresentationConformanceTest` (Multipaz) verify: positives a verifier must
+ * accept with exactly the expected elements, negatives it must reject at the check they name.
+ *
  * What it cannot check: a real browser's IndexedDB (the fake is the storage model, cross-checked against
  * fake-indexeddb by wallet-probe/idb-crosscheck.mjs), a rendered layout, and the HTTP headers (check-offer-page.mjs is
  * offline; OfferPageTest recomputes the inline script's hash from the bytes the controller serves and finds it in the
  * Content-Security-Policy).
  */
 import { createHash, createPublicKey, verify, webcrypto } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
@@ -114,6 +123,7 @@ const HOLDER_B = await webcrypto.subtle.generateKey({ name: "ECDSA", namedCurve:
 const HOLDER_A_JWK = await webcrypto.subtle.exportKey("jwk", HOLDER_A.publicKey);
 const HOLDER_B_JWK = await webcrypto.subtle.exportKey("jwk", HOLDER_B.publicKey);
 const HOLDER_A_PRIVATE = await webcrypto.subtle.exportKey("jwk", HOLDER_A.privateKey);
+const HOLDER_B_PRIVATE = await webcrypto.subtle.exportKey("jwk", HOLDER_B.privateKey);
 
 /** A COSE_Key for a P-256 JWK, or the override a negative case needs. */
 function coseKey(jwk, override) {
@@ -536,6 +546,17 @@ function statusHistory(wallet) {
 }
 
 const listButtons = (wallet) => wallet.el("records").children.map((item) => item.children[0]);
+
+/** `refusedWith` for a call that returns a promise: the presentation builders are all async. */
+async function refusedAsync(label, attempt, pattern) {
+    let error = null;
+    try {
+        await attempt();
+    } catch (caught) {
+        error = caught;
+    }
+    check(`refused: ${label}`, error !== null && pattern.test(error.message), error ? error.message : "it was read");
+}
 
 /** A call that must throw, with a message matching `pattern`. */
 function refusedWith(label, attempt, pattern) {
@@ -1986,6 +2007,403 @@ await section("19. a closing message never overwrites another tab's newer one", 
     equal("this tab's \"Deleted …\" is never written after the other tab's message", after(oneHistory, "Deleted "), []);
     check("the status is the other tab's outcome", one.el("storageStatus").textContent.startsWith("Another wallet tab deleted everything"),
         JSON.stringify(oneHistory));
+});
+
+/* ---------------------------------------------------------------- presentation (P5-03b, plan 4.7 and 4.14) */
+
+/**
+ * The bowl of `mdoc.js`'s presentation half, held to the standards' own numbers. Everything a check needs is written
+ * here a second time, in the harness's own encoder, so a defect in `Cbor.encode`, `Mdoc.oid4vpSessionTranscript` or
+ * `Mdoc.deviceResponse` cannot hide behind itself: the OpenID4VP 1.0 B.2.6.1 transcript, the ISO/IEC 18013-5 9.1.3.4
+ * `DeviceAuthenticationBytes`, the RFC 9052 4.4 `Sig_structure`, and the raw-to-DER conversion node:crypto needs to
+ * verify the device signature. The samples written here (`$WALLET_SAMPLES_DIR`, default `target/wallet-samples/`) are
+ * what `docs/design/tools/wallet-probe/probe.mjs` (`@owf/mdoc`) and `certify-conformance-mdoc`'s
+ * `WalletPresentationConformanceTest` (Multipaz) read, so the two libraries Certify does not maintain verify every
+ * DeviceResponse the page can produce (non-negotiable 2).
+ */
+const CLOCK = readFileSync(resolve(FIXTURES, "clock.txt"), "utf8").trim();
+const IACA_PEM = readFileSync(resolve(FIXTURES, "iaca.pem"), "utf8");
+/** The IACA's DER, from the PEM the probe and Multipaz anchor to. */
+const IACA_DER = new Uint8Array(Buffer.from(IACA_PEM.replace(/-----[^-]+-----/g, "").replace(/\s+/g, ""), "base64"));
+/** The RFC 7638 thumbprint of the JWK in the VP B.2.6.1 vectors (plan section 1.1), 32 bytes. */
+const EXAMPLE_THUMBPRINT = new Uint8Array(Buffer.from("4283ec927ae0f208daaa2d026a814f2b22dca52cf85ffa8f3f8626c6bd669047", "hex"));
+/** Certify's own fixture, kept the way the page keeps it: a non-extractable key and the bytes as received. */
+const CERTIFY_PRIVATE_KEY = await webcrypto.subtle.importKey("jwk", CERTIFY_HOLDER,
+    { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+const CERTIFY_RECORD = { docType: DOC_TYPE, issuerSigned: CERTIFY_ISSUER_SIGNED, privateKey: CERTIFY_PRIVATE_KEY,
+    publicJwk: CERTIFY_PUBLIC_JWK };
+/** The verifier's inputs for the transcripts below: what a request object's client_id, nonce and response_uri are. */
+const REQUEST = { clientId: "x509_san_dns:verifier.example", nonce: "n-0S6_WzA2Mj",
+    responseUri: "https://verifier.example/response" };
+/** The elements plan 4.7's example query asks for, in the order the demo mDL keeps them. */
+const SHOWN = ["family_name", "birth_date", "portrait", "age_over_18"].map((identifier) => [MDL_NAMESPACE, identifier]);
+/** A 32-byte thumbprint for the encrypted-response form of the transcript (RFC 7638 over a P-256 JWK). */
+const RESPONSE_KEY_THUMBPRINT = hash("sha256", Buffer.from("{\"crv\":\"P-256\",\"kty\":\"EC\"}"));
+const SAMPLES = process.env.WALLET_SAMPLES_DIR === undefined ? resolve(REPO, "target/wallet-samples")
+    : resolve(process.env.WALLET_SAMPLES_DIR);
+
+/** A CBOR array of already-encoded items, written here rather than by `Cbor.encode`. */
+const encodedArray = (items) => cat(head(4, items.length), ...items);
+
+/** OpenID4VP 1.0 Appendix B.2.6.1, written from the text: [null, null, ["OpenID4VPHandover", SHA-256(info)]]. */
+function transcriptOf({ clientId, nonce, responseUri, thumbprint = null }) {
+    const info = encodedArray([tstr(clientId), tstr(nonce), thumbprint === null ? Uint8Array.of(0xf6) : bstr(thumbprint),
+        tstr(responseUri)]);
+    const handover = encodedArray([tstr("OpenID4VPHandover"), bstr(hash("sha256", info))]);
+    return encodedArray([Uint8Array.of(0xf6), Uint8Array.of(0xf6), handover]);
+}
+
+/** ISO/IEC 18013-5 9.1.3.4: #6.24(bstr .cbor ["DeviceAuthentication", SessionTranscript, docType, d8 18 41 a0]). */
+function deviceAuthenticationOf(transcript, docType) {
+    return cat(Uint8Array.of(0xd8, 0x18), bstr(encodedArray([tstr("DeviceAuthentication"), transcript, tstr(docType),
+        Uint8Array.of(0xd8, 0x18, 0x41, 0xa0)])));
+}
+
+/** RFC 9052 4.4: ["Signature1", protected, external_aad h'', payload], the payload detached in the COSE_Sign1. */
+const sigStructureOf = (protectedHeader, authentication) => encodedArray([tstr("Signature1"),
+    bstr(protectedHeader), Uint8Array.of(0x40), bstr(authentication)]);
+
+/** A COSE ES256 signature's raw r || s as the DER ECDSA-Sig-Value node:crypto verifies (RFC 9053 2.1, X.690 3.3). */
+function derOf(signature) {
+    const integer = (bytes) => {
+        let at = 0;
+        while (at < bytes.length - 1 && bytes[at] === 0) at += 1;
+        const value = bytes.subarray(at);
+        return value[0] & 0x80 ? cat(Uint8Array.of(0), value) : value;
+    };
+    const r = integer(signature.subarray(0, 32));
+    const s = integer(signature.subarray(32));
+    return cat(Uint8Array.of(0x30, 4 + r.length + s.length, 0x02, r.length), r, Uint8Array.of(0x02, s.length), s);
+}
+
+const firstDocument = (response) => Cbor.decodeTyped(response).get("documents")[0];
+const deviceSignatureOf = (response) => firstDocument(response).get("deviceSigned").get("deviceAuth")
+    .get("deviceSignature");
+/** The ranges of a produced DeviceResponse, so a slice is read from the bytes and not from a decoded value. */
+const responseSpans = (response) => Cbor.spans(response, 6);
+const sliceAt = (response, path) => {
+    const range = responseSpans(response).ranges.find((entry) => JSON.stringify(entry.path) === JSON.stringify(path));
+    return range === undefined ? null : response.subarray(range.start, range.end);
+};
+
+/** Whether the device signature verifies over `transcript`, built here rather than by mdoc.js. */
+function verifiesDeviceSignature(response, { transcript, docType = DOC_TYPE, jwk = CERTIFY_PUBLIC_JWK } = {}) {
+    const signature = deviceSignatureOf(response);
+    return verify("sha256", sigStructureOf(signature[0], deviceAuthenticationOf(transcript, docType)),
+        { key: createPublicKey({ key: { kty: "EC", crv: "P-256", x: jwk.x, y: jwk.y }, format: "jwk" }),
+            dsaEncoding: "der" },
+        derOf(signature[3]));
+}
+
+/** One recorded sample: the bytes, what the wallet signed over, and what an independent verifier must do with them. */
+function writeSample(name, response, { transcript, expected }) {
+    const directory = resolve(SAMPLES, name);
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(resolve(directory, "device-response.cbor"), Buffer.from(response));
+    writeFileSync(resolve(directory, "transcript.json"), JSON.stringify(transcript, null, 2) + "\n");
+    writeFileSync(resolve(directory, "expected.json"), JSON.stringify(expected, null, 2) + "\n");
+    writeFileSync(resolve(directory, "iaca.pem"), IACA_PEM);
+}
+
+/** The `transcript.json` shape: the handover's four inputs, the thumbprint as base64url or null. */
+const transcriptRecord = ({ clientId, nonce, responseUri, thumbprint = null }) => ({ clientId, nonce,
+    jwkThumbprint: thumbprint === null ? null : b64url(thumbprint), responseUri });
+
+/** The `expected.json` shape: the verifier's own inputs, what to expect, and what must come back. */
+function expectation({ expect = "accepted", rejectedBy, verifier, docType = DOC_TYPE, elements = [], alg = -7 }) {
+    return { expect, rejectedBy: rejectedBy === undefined ? null : rejectedBy, verifier,
+        docType, elements, alg, now: CLOCK, iacaSha256: createHash("sha256").update(IACA_DER).digest("hex") };
+}
+
+// 20. the OpenID4VP 1.0 SessionTranscript reproduces the appendix's own vectors
+await section("20. the OpenID4VP 1.0 SessionTranscript (VP B.2.6.1)", async () => {
+    const clientId = "x509_san_dns:example.com";
+    const nonce = "exc7gBkxjx1rdc9udRrveKvSsJIq80avlXeLHhGwqtA";
+    const responseUri = "https://example.com/response";
+    equal("the example JWK's RFC 7638 thumbprint is the one the appendix prints", hex(EXAMPLE_THUMBPRINT),
+        "4283ec927ae0f208daaa2d026a814f2b22dca52cf85ffa8f3f8626c6bd669047");
+    equal("OpenID4VPHandoverInfo is CBOR([client_id, nonce, jwkThumbprint, response_uri])", hex(encodedArray([tstr(clientId),
+        tstr(nonce), bstr(EXAMPLE_THUMBPRINT), tstr(responseUri)])),
+        "847818783530395f73616e5f646e733a6578616d706c652e636f6d782b6578633767426b786a7831726463397564527276654b"
+        + "7653734a4971383061766c58654c4868477771744158204283ec927ae0f208daaa2d026a814f2b22dca52cf85ffa8f3f8626c6bd"
+        + "669047781c68747470733a2f2f6578616d706c652e636f6d2f726573706f6e7365");
+    equal("SHA-256(OpenID4VPHandoverInfo) is the appendix's 048bc053…aad38ac",
+        hex(hash("sha256", encodedArray([tstr(clientId), tstr(nonce), bstr(EXAMPLE_THUMBPRINT), tstr(responseUri)]))),
+        "048bc053c00442af9b8eed494cefdd9d95240d254b046b11b68013722aad38ac");
+    equal("the handover is [\"OpenID4VPHandover\", h'…']", hex(encodedArray([tstr("OpenID4VPHandover"),
+        bstr(hash("sha256", encodedArray([tstr(clientId), tstr(nonce), bstr(EXAMPLE_THUMBPRINT), tstr(responseUri)])))])),
+        "82714f70656e494434565048616e646f7665725820048bc053c00442af9b8eed494cefdd9d95240d254b046b11b68013722aad38ac");
+    equal("the SessionTranscript is the appendix's 83f6f6 82 714f70656e…5820 048bc053…aad38ac",
+        hex(transcriptOf({ clientId, nonce, responseUri, thumbprint: EXAMPLE_THUMBPRINT })),
+        "83f6f682714f70656e494434565048616e646f7665725820048bc053c00442af9b8eed494cefdd9d95240d254b046b11b68013722aad38ac");
+    equal("Mdoc.oid4vpSessionTranscript reproduces the appendix byte for byte", hex(await Mdoc.oid4vpSessionTranscript(
+        { clientId, nonce, responseUri, jwkThumbprint: EXAMPLE_THUMBPRINT })),
+        "83f6f682714f70656e494434565048616e646f7665725820048bc053c00442af9b8eed494cefdd9d95240d254b046b11b68013722aad38ac");
+
+    // without a thumbprint the third element is null: the plaintext direct_post form
+    const plain = await Mdoc.oid4vpSessionTranscript({ clientId, nonce, responseUri });
+    equal("without a thumbprint the transcript is the null form", hex(plain), hex(transcriptOf({ clientId, nonce, responseUri })));
+    equal("DeviceEngagementBytes and EReaderKeyBytes are null (B.2.6.1)", hex(plain).slice(0, 6), "83f6f6");
+    check("the two forms differ", hex(plain) !== hex(await Mdoc.oid4vpSessionTranscript({ clientId, nonce, responseUri,
+        jwkThumbprint: EXAMPLE_THUMBPRINT })));
+    const third = Cbor.decodeTyped(plain);
+    equal("the handover names itself", third[2][0], "OpenID4VPHandover");
+    equal("and carries a 32-byte hash", third[2][1].length, 32);
+    equal("a null thumbprint is the CBOR null (0xf6), never an empty byte string", hex(Cbor.encode(new Map([[1, null]]))),
+        "a101f6");
+    equal("and the handover's hash is SHA-256 over the null form's info",
+        hex(Cbor.decodeTyped(plain)[2][1]), hex(hash("sha256", encodedArray([tstr(clientId), tstr(nonce),
+            Uint8Array.of(0xf6), tstr(responseUri)]))));
+
+    // the appendix's own warning: every input is in the hash, so each one changes the transcript
+    const inputs = [["clientId", { ...REQUEST, clientId: "x509_san_dns:other.example" }],
+        ["nonce", { ...REQUEST, nonce: "another-nonce" }], ["responseUri", { ...REQUEST, responseUri: "https://verifier.example/other" }],
+        ["thumbprint", { ...REQUEST, jwkThumbprint: EXAMPLE_THUMBPRINT }]];
+    for (const [label, options] of inputs) {
+        check(`a different ${label} is a different transcript`, hex(await Mdoc.oid4vpSessionTranscript(options))
+            !== hex(await Mdoc.oid4vpSessionTranscript(REQUEST)));
+    }
+    for (const [label, options, pattern] of [
+        ["no client_id", { nonce: "n", responseUri: "https://verifier.example/response" }, /client_id/],
+        ["no nonce", { clientId: "x509_san_dns:verifier.example", responseUri: "https://v.example/r" }, /nonce/],
+        ["no response_uri", { clientId: "x509_san_dns:verifier.example", nonce: "n" }, /response_uri/],
+        ["a 16-byte thumbprint", { ...REQUEST, jwkThumbprint: new Uint8Array(16) }, /32-byte/],
+        ["a thumbprint that is not bytes", { ...REQUEST, jwkThumbprint: "4283ec92" }, /32-byte/],
+    ]) {
+        await refusedAsync(`a transcript with ${label}`, () => Mdoc.oid4vpSessionTranscript(options), pattern);
+    }
+});
+
+// 21. the DeviceResponse carries the issued bytes and signs the transcript (ISO/IEC 18013-5 8.3.2.1.2.2, 9.1.3)
+const TRANSCRIPT = await Mdoc.oid4vpSessionTranscript(REQUEST);
+const RESPONSE = (await Mdoc.deviceResponse(CERTIFY_RECORD, SHOWN, TRANSCRIPT, { alg: -7 })).bytes;
+const KEPT = Mdoc.readIssuerSigned(CERTIFY_ISSUER_SIGNED);
+
+await section("21. the DeviceResponse (ISO/IEC 18013-5 8.3.2.1.2.2)", async () => {
+    const built = await Mdoc.deviceResponse(CERTIFY_RECORD, SHOWN, TRANSCRIPT, { alg: -7 });
+    const document = firstDocument(built.bytes);
+    const decoded = Cbor.decodeTyped(built.bytes);
+    equal("version is \"1.0\"", decoded.get("version"), "1.0");
+    equal("status is 0 (OK)", decoded.get("status"), 0);
+    equal("one document", decoded.get("documents").length, 1);
+    equal("the docType is the one the issuer signed in the MSO", document.get("docType"), KEPT.issuerAuth.mso.get("docType"));
+    equal("the disclosed set is the chosen set, in the credential's order", built.disclosed, SHOWN);
+    equal("and is reported by the builder", built.disclosed, SHOWN);
+
+    // every disclosed IssuerSignedItemBytes is the kept slice, byte for byte, and still hashes to the MSO's valueDigest
+    const nameSpaces = document.get("issuerSigned").get("nameSpaces");
+    equal("one namespace", [...nameSpaces.keys()], [MDL_NAMESPACE]);
+    const carried = nameSpaces.get(MDL_NAMESPACE);
+    equal("four items are carried", carried.length, SHOWN.length);
+    for (const [index, [namespace, identifier]] of SHOWN.entries()) {
+        const kept = KEPT.nameSpaces[namespace].find((item) => item.elementIdentifier === identifier);
+        const slice = sliceAt(built.bytes, ["documents", 0, "issuerSigned", "nameSpaces", namespace, index]);
+        check(`${identifier}: the DeviceResponse carries the kept IssuerSignedItemBytes byte for byte`,
+            slice !== null && sameBytes(slice, kept.raw), slice === null ? "no slice" : hex(slice).slice(0, 40));
+        const shownItem = Cbor.decodeTyped(Cbor.decodeTyped(Cbor.tagged(slice).content));
+        const keptItem = Cbor.decodeTyped(Cbor.decodeTyped(Cbor.tagged(kept.raw).content));
+        equal(`${identifier}: and its digestID and random are the issuer's`,
+            [shownItem.get("digestID"), hex(shownItem.get("random"))], [kept.digestID, hex(keptItem.get("random"))]);
+        equal(`${identifier}: it hashes to the MSO's valueDigest over the carried bytes`,
+            hex(hash("sha256", slice)), hex(KEPT.issuerAuth.mso.get("valueDigests").get(namespace).get(kept.digestID)));
+    }
+    const issuerAuth = sliceAt(built.bytes, ["documents", 0, "issuerSigned", "issuerAuth"]);
+    check("issuerAuth is the kept IssuerAuth byte for byte", issuerAuth !== null && sameBytes(issuerAuth, KEPT.issuerAuth.raw),
+        issuerAuth === null ? "no slice" : hex(issuerAuth).slice(0, 40));
+    equal("the IssuerAuth still carries one DSC", KEPT.issuerAuth.x5chain.length, 1);
+
+    // the device side: no device-signed element, so DeviceNameSpacesBytes is exactly #6.24(bstr .cbor {})
+    equal("deviceSigned.nameSpaces is exactly d8 18 41 a0", hex(sliceAt(built.bytes,
+        ["documents", 0, "deviceSigned", "nameSpaces"])), "d81841a0");
+    const signature = deviceSignatureOf(built.bytes);
+    equal("the deviceSignature is an untagged COSE_Sign1 with a detached payload", [signature.length, signature[2]], [4, null]);
+    equal("its protected header is {1: -7}: a1 01 26", hex(signature[0]), "a10126");
+    equal("its unprotected header is empty", signature[1].size, 0);
+    equal("an ES256 signature is 64 bytes of r || s (RFC 9053 2.1)", signature[3].length, 64);
+    check("the device signature verifies over DeviceAuthenticationBytes built by this harness", verifiesDeviceSignature(
+        built.bytes, { transcript: TRANSCRIPT }), hex(signature[3]));
+
+    // nothing of the eleven elements that were not chosen is anywhere in the bytes (plan 4.7, 4.14)
+    const responseHex = hex(built.bytes);
+    const absent = KEPT.nameSpaces[MDL_NAMESPACE].filter((item) => !SHOWN.some(([, identifier]) => identifier === item.elementIdentifier));
+    equal("eleven elements are not disclosed", absent.length, 11);
+    let leaks = 0;
+    let searched = 0;
+    for (const item of absent) {
+        const embedded = Cbor.decodeTyped(Cbor.tagged(item.raw).content);
+        const itemHex = hex(item.raw);
+        const randomHex = hex(Cbor.decodeTyped(embedded).get("random"));
+        const identifierHex = hex(Buffer.from(item.elementIdentifier, "utf8"));
+        for (const probe of [itemHex, randomHex, identifierHex]) {
+            searched += 1;
+            if (responseHex.includes(probe)) {
+                leaks += 1;
+                check(`${item.elementIdentifier}: absent from the response`, false, probe.slice(0, 40));
+            }
+        }
+        // the encoded value, when it is long enough to be unambiguous (`sex` is one byte, and occurs everywhere)
+        const valueRange = Cbor.spans(embedded, 1).ranges.find((range) => JSON.stringify(range.path) === "[\"elementValue\"]");
+        const valueHex = valueRange === undefined ? "" : hex(embedded.subarray(valueRange.start, valueRange.end));
+        if (valueHex.length >= 16) {
+            searched += 1;
+            if (responseHex.includes(valueHex)) {
+                leaks += 1;
+                check(`${item.elementIdentifier}: its value is absent from the response`, false, valueHex);
+            }
+        }
+    }
+    equal(`no absent element has its item, random, identifier or value in the response (${searched} probes)`, leaks, 0);
+    check("the probe really searched", searched >= 33);
+
+    // a DeviceResponse for another docType is refused before anything is built (plan 4.7; P5-03b negative tests)
+    await refusedAsync("a docType other than the kept one", () => Mdoc.deviceResponse(CERTIFY_RECORD, SHOWN, TRANSCRIPT,
+        { docType: PID_DOCTYPE }), /cannot be built/);
+    await refusedAsync("a record whose docType is not its MSO's", () => Mdoc.deviceResponse(
+        { ...CERTIFY_RECORD, docType: PID_DOCTYPE }, SHOWN, TRANSCRIPT, {}), /carries the docType the issuer signed/);
+    await refusedAsync("an element the credential does not carry", () => Mdoc.deviceResponse(CERTIFY_RECORD,
+        [[MDL_NAMESPACE, "eye_colour"]], TRANSCRIPT, {}), /no "org\.iso\.18013\.5\.1"\/"eye_colour" element/);
+    await refusedAsync("a namespace the credential does not carry", () => Mdoc.deviceResponse(CERTIFY_RECORD,
+        [["eu.europa.ec.eudi.pid.1", "family_name"]], TRANSCRIPT, {}), /no "eu\.europa\.ec\.eudi\.pid\.1"/);
+    await refusedAsync("a chosen element that is not a pair", () => Mdoc.deviceResponse(CERTIFY_RECORD,
+        [MDL_NAMESPACE], TRANSCRIPT, {}), /pair/);
+    await refusedAsync("an algorithm the page does not sign with", () => Mdoc.deviceResponse(CERTIFY_RECORD, SHOWN,
+        TRANSCRIPT, { alg: -35 }), /-7 \(ES256\) or -9/);
+    await refusedAsync("a record with no key", () => Mdoc.deviceResponse({ ...CERTIFY_RECORD, privateKey: null }, SHOWN,
+        TRANSCRIPT, {}), /no signing key/);
+    await refusedAsync("a transcript that is not one CBOR item", () => Mdoc.deviceResponse(CERTIFY_RECORD, SHOWN,
+        new Uint8Array([0x01, 0x02]), {}), /CBOR/);
+
+    // a query without claims presents the IssuerAuth and no nameSpaces at all (ISO/IEC 18013-5: {
+    // "nameSpaces": {ns: [+ IssuerSignedItemBytes]}, so an empty namespace is not a valid encoding)
+    const bare = await Mdoc.deviceResponse(CERTIFY_RECORD, [], TRANSCRIPT, {});
+    equal("with nothing chosen no nameSpaces key is written", firstDocument(bare.bytes).get("issuerSigned").has("nameSpaces"), false);
+    equal("the device signature is still there", deviceSignatureOf(bare.bytes).length, 4);
+    check("and it still verifies", verifiesDeviceSignature(bare.bytes, { transcript: TRANSCRIPT }));
+});
+
+// 22. the algorithm label follows the verifier's deviceauth_alg_values (plan 4.7; HAIP 1.0 section 7)
+const RESPONSE_ALG9 = (await Mdoc.deviceResponse(CERTIFY_RECORD, [SHOWN[0], SHOWN[3]], TRANSCRIPT, { alg: -9 })).bytes;
+/** Plan 4.14's "a key from another credential": signed with another key, forced past the page's own check. */
+const OTHER_KEY_RESPONSE = (await Mdoc.deviceResponse({ ...CERTIFY_RECORD,
+    privateKey: await webcrypto.subtle.importKey("jwk", HOLDER_B_PRIVATE, { name: "ECDSA", namedCurve: "P-256" }, false,
+        ["sign"]) }, SHOWN, TRANSCRIPT, {})).bytes;
+await section("22. {alg: -9} writes the ESP256 label and still signs the same payload", async () => {
+    const signature = deviceSignatureOf(RESPONSE_ALG9);
+    equal("the protected header is {1: -9}: a1 01 28", hex(signature[0]), "a10128");
+    const signature7 = deviceSignatureOf(RESPONSE);
+    equal("the payload is detached in both", [signature7[2], signature[2]], [null, null]);
+    check("the -9 response verifies with this harness's own Sig_structure", verifiesDeviceSignature(RESPONSE_ALG9,
+        { transcript: TRANSCRIPT }));
+    equal("the algorithm is reported by the builder", (await Mdoc.deviceResponse(CERTIFY_RECORD, [SHOWN[0]], TRANSCRIPT,
+        { alg: -9 })).alg, -9);
+});
+
+// 23. a key from another credential, and the device signature over a transcript that is not the verifier's
+await section("23. a refusals and tampered transcripts", async () => {
+    // 4.2 check 3 re-run before signing: the record's key must be the MSO's deviceKey
+    await refusedAsync("a record kept with another credential's public key", () => Mdoc.deviceResponse(
+        { ...CERTIFY_RECORD, publicJwk: HOLDER_B_JWK }, SHOWN, TRANSCRIPT, {}), /issued to another holder/);
+    await refusedAsync("a record whose public key is from another curve", () => Mdoc.deviceResponse(
+        { ...CERTIFY_RECORD, publicJwk: { kty: "EC", crv: "P-256", x: HOLDER_B_JWK.x, y: HOLDER_A_JWK.y } }, SHOWN,
+        TRANSCRIPT, {}), /issued to another holder/);
+
+    check("a device signature from another key does not verify", verifiesDeviceSignature(OTHER_KEY_RESPONSE,
+        { transcript: TRANSCRIPT }) === false);
+
+    // the transcript the verifier computes: each of its inputs is covered by the signature (VP B.2.6.1)
+    for (const [label, verifier] of [["client_id", { ...REQUEST, clientId: "x509_san_dns:other.example" }],
+        ["nonce", { ...REQUEST, nonce: "another-nonce" }], ["response_uri", { ...REQUEST, responseUri: "https://verifier.example/other" }],
+        ["thumbprint", { ...REQUEST, jwkThumbprint: RESPONSE_KEY_THUMBPRINT }]]) {
+        const wrong = await Mdoc.oid4vpSessionTranscript(verifier);
+        check(`a device signature over a transcript with another ${label} does not verify`,
+            verifiesDeviceSignature(RESPONSE, { transcript: wrong }) === false);
+    }
+    check("nor over another docType", verifiesDeviceSignature(RESPONSE, { transcript: TRANSCRIPT, docType: PID_DOCTYPE }) === false);
+});
+
+// 24. the recorded samples the two independent verifiers read (plan 4.14): @owf/mdoc and Multipaz
+await section("24. the samples for the independent verifiers", async () => {
+    rmSync(SAMPLES, { recursive: true, force: true });
+    const thumbprintTranscript = await Mdoc.oid4vpSessionTranscript({ ...REQUEST, jwkThumbprint: RESPONSE_KEY_THUMBPRINT });
+    const encrypted = (await Mdoc.deviceResponse(CERTIFY_RECORD, [SHOWN[0], SHOWN[2]], thumbprintTranscript, {})).bytes;
+    const alg9 = (await Mdoc.deviceResponse(CERTIFY_RECORD, [SHOWN[0], SHOWN[3]], TRANSCRIPT, { alg: -9 })).bytes;
+    const none = (await Mdoc.deviceResponse(CERTIFY_RECORD, [], TRANSCRIPT, {})).bytes;
+
+    // positives: a verifier with these inputs must accept them and read exactly these elements
+    writeSample("mdl-a-disclosed", RESPONSE, { transcript: transcriptRecord(REQUEST),
+        expected: expectation({ verifier: transcriptRecord(REQUEST), elements: SHOWN }) });
+    writeSample("mdl-a-thumbprint", encrypted, {
+        transcript: transcriptRecord({ ...REQUEST, thumbprint: RESPONSE_KEY_THUMBPRINT }),
+        expected: expectation({ verifier: transcriptRecord({ ...REQUEST, thumbprint: RESPONSE_KEY_THUMBPRINT }),
+            elements: [SHOWN[0], SHOWN[2]] }) });
+    writeSample("mdl-a-alg9", alg9, { transcript: transcriptRecord(REQUEST),
+        expected: expectation({ verifier: transcriptRecord(REQUEST), elements: [SHOWN[0], SHOWN[3]], alg: -9 }) });
+    writeSample("mdl-a-no-claims", none, { transcript: transcriptRecord(REQUEST),
+        expected: expectation({ verifier: transcriptRecord(REQUEST), elements: [] }) });
+
+    // negatives: the response was signed over something the verifier does not have, or by the wrong key
+    for (const [name, verifier, rejectedBy] of [
+        ["mdl-a-wrong-client-id", { ...REQUEST, clientId: "x509_san_dns:other.example" }, "deviceSignature"],
+        ["mdl-a-wrong-nonce", { ...REQUEST, nonce: "another-nonce" }, "deviceSignature"],
+        ["mdl-a-wrong-response-uri", { ...REQUEST, responseUri: "https://verifier.example/other" }, "deviceSignature"],
+        ["mdl-a-wrong-thumbprint", { ...REQUEST, jwkThumbprint: RESPONSE_KEY_THUMBPRINT }, "deviceSignature"],
+    ]) {
+        const wrong = await Mdoc.oid4vpSessionTranscript(verifier);
+        const bytes = (await Mdoc.deviceResponse(CERTIFY_RECORD, [SHOWN[0]], wrong, {})).bytes;
+        check(`${name}: the wallet signed a transcript the verifier does not have`, verifiesDeviceSignature(bytes,
+            { transcript: TRANSCRIPT }) === false);
+        writeSample(name, bytes, { transcript: transcriptRecord(verifier),
+            expected: expectation({ expect: "rejected", rejectedBy, verifier: transcriptRecord(REQUEST), elements: [] }) });
+    }
+
+    // one disclosed item re-encoded (same value, another map key order): the digest no longer covers it
+    const item = KEPT.nameSpaces[MDL_NAMESPACE].find((entry) => entry.elementIdentifier === "family_name");
+    const itemBytes = Cbor.decodeTyped(Cbor.tagged(item.raw).content);
+    const reordered = new Map([...Cbor.decodeTyped(itemBytes).entries()].reverse());
+    equal("the re-encoded item keeps every member", reordered.size, Cbor.decodeTyped(itemBytes).size);
+    const reencoded = Cbor.encode(new Cbor.Tagged(24, Cbor.encode(reordered)));
+    check("the re-encoded item is a different byte string", sameBytes(reencoded, item.raw) === false);
+    const rebuiltSignature = deviceSignatureOf(RESPONSE);
+    const rebuiltDocument = new Map([
+        ["docType", DOC_TYPE],
+        ["issuerSigned", new Map([
+            ["nameSpaces", new Map([[MDL_NAMESPACE, [new Cbor.Raw(reencoded)]]])],
+            ["issuerAuth", new Cbor.Raw(KEPT.issuerAuth.raw)],
+        ])],
+        ["deviceSigned", new Map([
+            ["nameSpaces", new Cbor.Tagged(24, Cbor.encode(new Map()))],
+            ["deviceAuth", new Map([["deviceSignature", [rebuiltSignature[0], new Map(), null, rebuiltSignature[3]]]])],
+        ])],
+    ]);
+    const rebuilt = Cbor.encode(new Map([["version", "1.0"], ["documents", [rebuiltDocument]], ["status", 0]]));
+    check("the re-encoded sample keeps a valid device signature (so only the digest can reject it)",
+        verifiesDeviceSignature(rebuilt, { transcript: TRANSCRIPT }));
+    equal("its item no longer hashes to the MSO's valueDigest",
+        hex(hash("sha256", reencoded)) === hex(KEPT.issuerAuth.mso.get("valueDigests").get(MDL_NAMESPACE).get(item.digestID)), false);
+    writeSample("mdl-a-reencoded-item", rebuilt, { transcript: transcriptRecord(REQUEST),
+        expected: expectation({ expect: "rejected", rejectedBy: "digest", verifier: transcriptRecord(REQUEST), elements: [] }) });
+
+    // a signature made with another credential's key
+    writeSample("mdl-a-other-key", OTHER_KEY_RESPONSE, { transcript: transcriptRecord(REQUEST),
+        expected: expectation({ expect: "rejected", rejectedBy: "deviceSignature", verifier: transcriptRecord(REQUEST),
+            elements: [] }) });
+
+    const directories = readdirSync(SAMPLES).sort();
+    equal("every sample is on disk", directories, ["mdl-a-alg9", "mdl-a-disclosed", "mdl-a-no-claims", "mdl-a-other-key",
+        "mdl-a-reencoded-item", "mdl-a-thumbprint", "mdl-a-wrong-client-id", "mdl-a-wrong-nonce", "mdl-a-wrong-response-uri",
+        "mdl-a-wrong-thumbprint"]);
+    for (const name of directories) {
+        for (const file of ["device-response.cbor", "transcript.json", "expected.json", "iaca.pem"]) {
+            check(`${name}/${file} is written`, existsSync(resolve(SAMPLES, name, file)));
+        }
+        const expected = JSON.parse(readFileSync(resolve(SAMPLES, name, "expected.json"), "utf8"));
+        check(`${name}: names what it expects`, ["accepted", "rejected"].includes(expected.expect));
+        check(`${name}: anchors to the fixture IACA`, sameBytes(new Uint8Array(Buffer.from(readFileSync(resolve(SAMPLES, name,
+            "iaca.pem"), "utf8").replace(/-----[^-]+-----/g, "").replace(/\s+/g, ""), "base64")), IACA_DER));
+        equal(`${name}: carries the clock the fixtures are valid at`, expected.now, CLOCK);
+    }
+    check("the samples are the page's own bytes, not a fixture", sameBytes(readFileSync(resolve(SAMPLES, "mdl-a-disclosed",
+        "device-response.cbor")), RESPONSE));
 });
 
 } finally {

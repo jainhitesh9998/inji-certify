@@ -1,8 +1,9 @@
 /*
  * ISO/IEC 18013-5 IssuerSigned reading and the checks a credential must pass before this browser keeps it (P5-03a,
- * plan section 4.2). Nothing here re-encodes an issued item: an IssuerSignedItemBytes is returned as the exact byte
- * range it arrived in, because the digest the issuer signed is computed over those bytes (ISO/IEC 18013-5 9.1.2.5), and
- * a DeviceResponse later carries the same slice.
+ * plan section 4.2), and the presentation the wallet builds from it: the OpenID4VP 1.0 `SessionTranscript` and the
+ * `DeviceResponse` (P5-03b, plan sections 4.7 and 4.14). Nothing here re-encodes an issued item: an IssuerSignedItemBytes
+ * is returned as the exact byte range it arrived in, because the digest the issuer signed is computed over those bytes
+ * (ISO/IEC 18013-5 9.1.2.5), and a DeviceResponse carries the same slice.
  *
  * Depends on cbor.js (the global `Cbor`): `Cbor.spans` supplies the byte ranges, `Cbor.tagged` the tag of a data item,
  * `Cbor.decodeTyped` the values. Every map is read typed (a `Map` whose integer keys are numbers and whose text keys are
@@ -366,6 +367,177 @@ var Mdoc = (function () {
     return { ok: false, code: code, message: message };
   }
 
+  /* ---------------------------------------------------------------- presentation (P5-03b, plan 4.7) */
+
+  /** The COSE algorithm identifiers a device signature may carry (HAIP 1.0 section 7 allows either). */
+  var DEVICE_SIGNATURE_ALGORITHMS = [-7, -9];
+
+  /**
+   * The OpenID4VP 1.0 `SessionTranscript` (VP 1.0 Appendix B.2.6.1):
+   *
+   *   SessionTranscript = [null, null, OpenID4VPHandover]
+   *   OpenID4VPHandover = ["OpenID4VPHandover", SHA-256(CBOR([client_id, nonce, jwkThumbprint, response_uri]))]
+   *
+   * `jwkThumbprint` is the 32-byte RFC 7638 SHA-256 thumbprint of the verifier's response-encryption key when the
+   * response is encrypted (`direct_post.jwt`), and null otherwise. DeviceEngagementBytes and EReaderKeyBytes are null
+   * because a browser redirect carries neither (B.2.6.1: "DeviceEngagementBytes MUST be null. EReaderKeyBytes MUST be
+   * null."). Returns the encoded `SessionTranscript` bytes.
+   */
+  async function oid4vpSessionTranscript(options) {
+    var nonce = (options || {}).nonce;
+    var responseUri = (options || {}).responseUri;
+    if (typeof (options || {}).clientId !== "string" || !options.clientId) {
+      throw new Error("the OpenID4VP handover needs the request object's client_id");
+    }
+    if (typeof nonce !== "string" || !nonce) {
+      throw new Error("the OpenID4VP handover needs the request object's nonce");
+    }
+    if (typeof responseUri !== "string" || !responseUri) {
+      throw new Error("the OpenID4VP handover needs the request object's response_uri");
+    }
+    var thumbprint = options.jwkThumbprint === undefined ? null : options.jwkThumbprint;
+    if (thumbprint !== null) {
+      if (!(thumbprint instanceof Uint8Array) || thumbprint.length !== 32) {
+        throw new Error("the OpenID4VP handover's jwkThumbprint is a 32-byte SHA-256 thumbprint (RFC 7638) or null");
+      }
+    }
+    var info = Cbor.encode([options.clientId, nonce, thumbprint === null ? null : thumbprint, responseUri]);
+    var hash = await digestOf("SHA-256", info);
+    return Cbor.encode([null, null, ["OpenID4VPHandover", hash]]);
+  }
+
+  /**
+   * Whether the MSO's `deviceKey` is the key a record holds (ISO/IEC 18013-5 9.1.2.4, plan 4.2 check 3): an EC2 P-256
+   * COSE_Key whose x and y are the record's public JWK's. Returns null when it is, and the reason when it is not.
+   * `-3` (y) may be a bool instead of a bstr, the compressed point whose sign is that bool (RFC 9053 7.1.1).
+   */
+  function deviceKeyProblem(mso, publicJwk) {
+    var deviceKey = field(field(mso, "deviceKeyInfo"), "deviceKey");
+    if (!(deviceKey instanceof Map)) return "the credential's MSO carries no deviceKey";
+    if (deviceKey.get(1) !== 2) return "the credential's deviceKey is not an EC2 COSE key (label 1 must be 2)";
+    if (deviceKey.get(-1) !== 1) return "the credential's deviceKey is not a P-256 key (label -1 must be 1)";
+    var keyY = deviceKey.get(-3);
+    if (!(deviceKey.get(-2) instanceof Uint8Array) || !(keyY instanceof Uint8Array || typeof keyY === "boolean")) {
+      return "the credential's deviceKey carries no P-256 coordinates (labels -2 and -3)";
+    }
+    var jwk = publicJwk || {};
+    var sameY = keyY instanceof Uint8Array ? base64url(keyY) === jwk.y : ySign(jwk.y) === keyY;
+    if (base64url(deviceKey.get(-2)) !== jwk.x || !sameY) {
+      return "the credential's deviceKey is not this record's key: it was issued to another holder";
+    }
+    return null;
+  }
+
+  /**
+   * The DeviceResponse for one kept credential (ISO/IEC 18013-5 8.3.2.1.2.2, plan 4.7):
+   *
+   *   DeviceResponse = {"version": "1.0", "documents": [Document], "status": 0}
+   *   Document     = {"docType", "issuerSigned": {? "nameSpaces", "issuerAuth"}, "deviceSigned": …}
+   *
+   * Every `nameSpaces` entry is a slice of the kept bytes (`item.raw`), and `issuerAuth` is the kept IssuerAuth's own
+   * slice, so the digests the issuer signed still cover exactly what is presented (9.1.2.5). `chosen` names the
+   * disclosed elements as `[namespace, elementIdentifier]` pairs; the kept order decides the order they are written in
+   * (9.1.3.4 hashes each item, so order only matters for reproducibility). A namespace with no chosen element is
+   * omitted, never written as an empty array (`[+ IssuerSignedItemBytes]` requires at least one).
+   *
+   * `deviceSigned.nameSpaces` is `#6.24(bstr .cbor {})`, `d8 18 41 a0`: the wallet asserts no device-signed element, and
+   * the mDL profile has none (18013-5 9.1.3.4). The device signature is a COSE_Sign1 with a detached payload over
+   * `DeviceAuthenticationBytes = #6.24(bstr .cbor ["DeviceAuthentication", SessionTranscript, docType,
+   * DeviceNameSpacesBytes])` (9.1.3.4, 9.1.3.6), signed by the record's own non-extractable key. The COSE signature of
+   * ES256 is WebCrypto's 64-byte `r ‖ s` (RFC 9053 2.1, W3C WebCrypto 23.7.1), which is what `subtle.sign` returns.
+   *
+   * `options.alg` is the COSE algorithm label in the protected header: -7 (ES256) by default, -9 (ESP256, the same
+   * algorithm fully specified) only when the verifier's `deviceauth_alg_values` lists -9 and not -7 (plan 4.7).
+   *
+   * Returns `{bytes, docType, alg, disclosed}`, where `disclosed` lists what the response carries in kept order. Throws
+   * with the reason instead: a chosen element the credential does not have, a docType other than the kept one, a record
+   * whose public key is not the MSO's `deviceKey` (a key from another credential), a transcript that is not one CBOR
+   * item, or an algorithm the page does not sign with.
+   */
+  async function deviceResponse(record, chosen, sessionTranscript, options) {
+    var opts = options || {};
+    var read = readIssuerSigned(bytesOf(record.issuerSigned));
+    var mso = read.issuerAuth.mso;
+    var docType = field(mso, "docType");
+    if (typeof docType !== "string" || !docType) throw new Error("the credential's MSO names no docType");
+    if (typeof record.docType === "string" && record.docType !== docType) {
+      throw new Error("the record names the docType " + JSON.stringify(record.docType) + ", and its MSO "
+        + JSON.stringify(docType) + "; a DeviceResponse carries the docType the issuer signed");
+    }
+    if (opts.docType !== undefined && opts.docType !== docType) {
+      throw new Error("a DeviceResponse for " + JSON.stringify(opts.docType) + " cannot be built from this "
+        + JSON.stringify(docType) + " credential");
+    }
+    var problem = deviceKeyProblem(mso, record.publicJwk);
+    if (problem !== null) throw new Error(problem);
+    if (!record.privateKey) {
+      throw new Error("the record carries no signing key");
+    }
+    var alg = opts.alg === undefined ? -7 : opts.alg;
+    if (DEVICE_SIGNATURE_ALGORITHMS.indexOf(alg) < 0) {
+      throw new Error("a device signature carries the COSE algorithm -7 (ES256) or -9 (ESP256), not " + String(alg));
+    }
+
+    // the disclosed items, grouped by namespace in the kept order; a namespace with nothing chosen is omitted
+    var wanted = new Set();
+    (chosen || []).forEach(function (pair) {
+      if (!Array.isArray(pair) || typeof pair[0] !== "string" || typeof pair[1] !== "string") {
+        throw new Error("a chosen element is a [namespace, elementIdentifier] pair");
+      }
+      wanted.add(pair[0] + "\u0000" + pair[1]);
+    });
+    var known = new Set();
+    var nameSpaces = new Map();
+    var disclosed = [];
+    Object.keys(read.nameSpaces).forEach(function (namespace) {
+      var items = read.nameSpaces[namespace].filter(function (item) {
+        known.add(namespace + "\u0000" + item.elementIdentifier);
+        return wanted.has(namespace + "\u0000" + item.elementIdentifier);
+      });
+      if (!items.length) return;
+      nameSpaces.set(namespace, items.map(function (item) {
+        disclosed.push([namespace, item.elementIdentifier]);
+        return new Cbor.Raw(item.raw);
+      }));
+    });
+    wanted.forEach(function (key) {
+      if (!known.has(key)) {
+        var pair = key.split("\u0000");
+        throw new Error("the credential carries no " + JSON.stringify(pair[0]) + "/" + JSON.stringify(pair[1])
+          + " element to disclose");
+      }
+    });
+
+    // DeviceNameSpacesBytes = #6.24(bstr .cbor {}); the bytes are d8 18 41 a0
+    var deviceNameSpaces = new Cbor.Tagged(24, Cbor.encode(new Map()));
+    var deviceAuthentication = ["DeviceAuthentication", new Cbor.Raw(sessionTranscript), docType, deviceNameSpaces];
+    // DeviceAuthenticationBytes = #6.24(bstr .cbor DeviceAuthentication): the payload the signature covers
+    var deviceAuthenticationBytes = Cbor.encode(new Cbor.Tagged(24, Cbor.encode(deviceAuthentication)));
+    var protectedHeader = Cbor.encode(new Map([[1, alg]]));
+    // RFC 9052 4.4: Sig_structure = ["Signature1", body_protected, external_aad, payload], payload detached
+    var toBeSigned = Cbor.encode(["Signature1", protectedHeader, new Uint8Array(0), deviceAuthenticationBytes]);
+    var signature = new Uint8Array(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, record.privateKey,
+      toBeSigned));
+    if (signature.length !== 64) {
+      throw new Error("WebCrypto returned a " + signature.length + "-byte signature; a COSE ES256 signature is the 64-byte"
+        + " r || s (RFC 9053 section 2.1)");
+    }
+
+    var issuerSigned = new Map();
+    if (nameSpaces.size) issuerSigned.set("nameSpaces", nameSpaces);
+    issuerSigned.set("issuerAuth", new Cbor.Raw(read.issuerAuth.raw));
+    var document = new Map([
+      ["docType", docType],
+      ["issuerSigned", issuerSigned],
+      ["deviceSigned", new Map([
+        ["nameSpaces", deviceNameSpaces],
+        ["deviceAuth", new Map([["deviceSignature", [protectedHeader, new Map(), null, signature]]])],
+      ])],
+    ]);
+    var response = new Map([["version", "1.0"], ["documents", [document]], ["status", 0]]);
+    return { bytes: Cbor.encode(response), docType: docType, alg: alg, disclosed: disclosed };
+  }
+
   async function digestOf(algorithm, bytes) {
     return new Uint8Array(await crypto.subtle.digest(algorithm, bytes));
   }
@@ -492,6 +664,8 @@ var Mdoc = (function () {
   return {
     readIssuerSigned: readIssuerSigned,
     checkKeepable: checkKeepable,
+    oid4vpSessionTranscript: oid4vpSessionTranscript,
+    deviceResponse: deviceResponse,
     MAX_ISSUER_SIGNED_BYTES: MAX_ISSUER_SIGNED_BYTES,
     MAX_CREDENTIALS: MAX_CREDENTIALS,
   };

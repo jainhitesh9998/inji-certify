@@ -24,6 +24,8 @@ import java.security.KeyPairGenerator;
 import java.security.MessageDigest;
 import java.security.interfaces.ECPrivateKey;
 import java.security.interfaces.ECPublicKey;
+import java.security.cert.CertificateEncodingException;
+import java.security.cert.X509Certificate;
 import java.security.spec.ECGenParameterSpec;
 import java.time.Duration;
 import java.time.Instant;
@@ -43,7 +45,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Records an IssuerSigned exactly as {@link MdocFormatter} signs it, for the demo wallet's browser harness (P5-03a;
  * plan section 4.12): {@code docs/design/tools/fixtures/wallet/mdl-a.issuersigned}, an {@code org.iso.18013.5.1.mDL}
  * carrying the 15 elements the demo issues to {@code mdl-demo-1}, and {@code mdl-a.holder.jwk}, the holder key it was
- * issued to. The wallet harness used to build its own fixtures, and so drifted from what Certify really writes - an
+ * issued to, beside the two things a verifier of the wallet's presentation needs (P5-03b): {@code iaca.pem}, the IACA
+ * the recording's DSC chains to, and {@code clock.txt}, an instant inside the fixture's validity. The wallet harness used to build its own fixtures, and so drifted from what Certify really writes - an
  * IssuerAuth whose payload is a byte string holding {@code #6.24(bstr .cbor MSO)}, and a DSC-only {@code x5chain} as a
  * single bstr (RFC 9360 section 2). This recorder is the answer: the bytes the page is tested on come from the issuer.
  *
@@ -72,13 +75,18 @@ class WalletFixtureRecorderTest {
     private static final Base64.Encoder BASE64URL = Base64.getUrlEncoder().withoutPadding();
     private static final ObjectMapper MAPPER = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
 
-    /** The instant the committed fixture is issued at, so a re-record only changes salts and the holder key. */
-    private static final Instant FIXED_NOW = Instant.parse("2026-11-14T12:00:00Z");
+    /**
+     * The instant the fixtures are issued at: this run's clock, truncated to the seconds {@code tdate} carries. Every
+     * run, recording or not, issues at its own instant on purpose - the dev DSC and IACA are valid from theirs, and the
+     * committed {@code clock.txt} has to sit inside the certificates' validity as well as the MSO's, which a pinned
+     * instant could not do on a later re-record.
+     */
+    private static final Instant NOW = Instant.now().truncatedTo(ChronoUnit.SECONDS);
 
     @Test
     void theFormatterWritesTheLayoutTheWalletReads() throws Exception {
         boolean record = Boolean.getBoolean("wallet.fixture.record");
-        Instant now = record ? FIXED_NOW : Instant.now().truncatedTo(ChronoUnit.SECONDS);
+        Instant now = NOW;
 
         KeyPair holder = holderKeyPair();
         Map<String, Object> publicJwk = jwk((ECPublicKey) holder.getPublic());
@@ -87,12 +95,13 @@ class WalletFixtureRecorderTest {
         privateJwk.put("comment", "TEST KEY - NOT SECRET");
 
         MdocFormatter formatter = new MdocFormatter(new ObjectMapper(), MdlFixtures.properties(Duration.ofDays(90)));
-        CredentialConfiguration configuration = MdlFixtures.configuration(formatter);
+        CredentialConfiguration configuration = MdlFixtures.configuration(formatter,
+                Map.of("docType", MdlFixtures.MDL_DOCTYPE), AnnexBFixtures.dsc());
         IssuanceContext context = MdlFixtures.context(now);
         HolderBinding binding = HolderBinding.did(MAPPER.writeValueAsString(publicJwk), "jwt");
 
         UnsignedCredential unsigned = formatter.build(ClaimSet.of(demoDocument()), configuration, context, binding);
-        IssuedCredential issued = formatter.sign(unsigned, MdlFixtures.signing(MdlFixtures.dsc()), context);
+        IssuedCredential issued = formatter.sign(unsigned, AnnexBFixtures.signing(), context);
         byte[] issuerSignedBytes = Base64.getUrlDecoder().decode((String) issued.credential());
 
         // the layout, read with a CBOR library the page does not share
@@ -142,9 +151,11 @@ class WalletFixtureRecorderTest {
         assertTrue(chain.GetByteString().length > 300, "the DSC is a real certificate");
         assertFalse(issuerAuth.isTagged(), "the formatter writes an untagged COSE_Sign1; the page accepts #6.18 too");
 
-        write(Paths.get("").toAbsolutePath().resolve("target/wallet-fixture"), issuerSignedBytes, privateJwk);
+        // the clock the committed fixture is valid at: inside its MSO validity window (plan 4.12's clock.txt)
+        Instant clock = now.plus(Duration.ofHours(1));
+        write(Paths.get("").toAbsolutePath().resolve("target/wallet-fixture"), issuerSignedBytes, privateJwk, clock);
         if (record) {
-            write(repoRoot().resolve("docs/design/tools/fixtures/wallet"), issuerSignedBytes, privateJwk);
+            write(repoRoot().resolve("docs/design/tools/fixtures/wallet"), issuerSignedBytes, privateJwk, clock);
         }
     }
 
@@ -175,17 +186,35 @@ class WalletFixtureRecorderTest {
         return document;
     }
 
-    private static void write(Path directory, byte[] issuerSigned, Map<String, Object> privateJwk) {
+    private static void write(Path directory, byte[] issuerSigned, Map<String, Object> privateJwk, Instant clock) {
         try {
             Files.createDirectories(directory);
             Path signed = directory.resolve(FIXTURE + ".issuersigned");
             Files.write(signed, issuerSigned);
             Files.writeString(directory.resolve(FIXTURE + ".holder.jwk"), MAPPER.writeValueAsString(privateJwk) + "\n",
                     StandardCharsets.UTF_8);
+            // the trust anchor the wallet's DeviceResponse is verified against, and the instant the fixture is valid at
+            // (P5-03b): the DSC chains to the IACA this run generated, so the two are written together or not at all
+            Files.writeString(directory.resolve("iaca.pem"), pem(iaca()), StandardCharsets.US_ASCII);
+            Files.writeString(directory.resolve("clock.txt"), clock.toString() + "\n", StandardCharsets.UTF_8);
             System.out.println("[wallet-fixture] wrote " + signed + " (" + issuerSigned.length + " bytes)");
-        } catch (IOException e) {
-            throw new UncheckedIOException("the wallet fixture cannot be written", e);
+        } catch (IOException | CertificateEncodingException e) {
+            throw new UncheckedIOException("the wallet fixture cannot be written", new IOException(e));
         }
+    }
+
+    /**
+     * The IACA the recorded DSC chains to: the Annex B IACA of {@link AnnexBFixtures}, built by {@code certify-pki} the
+     * way an operator builds one (plan 4.12), with the subject key identifier a verifier matches trust points against.
+     */
+    private static X509Certificate iaca() {
+        return AnnexBFixtures.IACA;
+    }
+
+    private static String pem(X509Certificate certificate) throws IOException, CertificateEncodingException {
+        return "-----BEGIN CERTIFICATE-----\n"
+                + Base64.getMimeEncoder(64, "\n".getBytes(StandardCharsets.US_ASCII)).encodeToString(certificate.getEncoded())
+                + "\n-----END CERTIFICATE-----\n";
     }
 
     /** The repository root, whether the build runs in the module or at the top. */

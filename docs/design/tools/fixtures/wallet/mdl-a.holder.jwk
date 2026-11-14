@@ -1,8 +1,8 @@
 {
   "kty" : "EC",
   "crv" : "P-256",
-  "x" : "BcHFfqzWXxtXoVDrElBJrK365UIf_AJonptZ7mTlUVI",
-  "y" : "uAyu2IniDodXQQC6W28O_zV6jtHUYq6CDc3k4Aj2THY",
-  "d" : "IW-mAomcm8yPkD060efL1EiYVNPuDtdQe4rLQlTWbYE",
+  "x" : "tqk3X-pDQbvnYZpp153jvR567zenMVuD0MTmDlJng-E",
+  "y" : "hedFh3Ct_IN6he6w-cwxLiEZ25TEs6IWvKpktqaCzRY",
+  "d" : "Zjpm0SxXFCD0ciFbycWsNYCXqBBeIpsy4XZ_VRdlVhk",
   "comment" : "TEST KEY - NOT SECRET"
 }

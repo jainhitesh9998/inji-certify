@@ -136,8 +136,13 @@ final class MdlFixtures {
     }
 
     static CredentialConfiguration configuration(MdocFormatter formatter, Map<String, Object> formatConfig) {
+        return configuration(formatter, formatConfig, dsc());
+    }
+
+    /** The same configuration, signed with {@code key}: a fixture whose DSC comes from another provider says which. */
+    static CredentialConfiguration configuration(MdocFormatter formatter, Map<String, Object> formatConfig, SigningKey key) {
         return new CredentialConfiguration(null, "mdl", "mdl_scope", MdocFormatter.FORMAT, formatter.parseConfig(formatConfig), null,
-                signing(dsc()).config(), null, null, null, null, null);
+                signing(key).config(), null, null, null, null, null);
     }
 
     static HolderBinding holder() {

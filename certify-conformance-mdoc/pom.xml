@@ -41,6 +41,15 @@
             <version>${multipaz.kotlin.version}</version>
             <scope>test</scope>
         </dependency>
+        <!-- The wallet samples' expected.json/transcript.json sidecars (P5-03b), read with the parser Authlete CBOR
+             already brings; declared rather than relied on transitively, and test scope so nothing here can reach the
+             runtime classpath (plan invariant I6). -->
+        <dependency>
+            <groupId>com.google.code.gson</groupId>
+            <artifactId>gson</artifactId>
+            <version>2.10.1</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
