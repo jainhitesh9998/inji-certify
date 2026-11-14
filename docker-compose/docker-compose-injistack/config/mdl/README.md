@@ -9,7 +9,7 @@ case of the same stack (`docs/design/20-mdl-issuer.md`, M-10). Everything here i
 | --- | --- |
 | `../../docker-compose.mdl.yaml` | Overlay on `docker-compose.yaml` + `docker-compose.rebuild.yaml`: profile `mdl` plus `MDL_PKI_PROFILE` (`mdl-dev` or `mdl-operator`, required), the mounts, and the `mdl-seed` service |
 | `../../docker-compose.public.yaml` | Last overlay on a public host or shared machine: certify and certify-nginx on `127.0.0.1`, no PostgreSQL, mimoto or inji-web port, passwords from Compose secret files and never from the shell, actuator limited to `health` (Compose 2.24.4 or later) |
-| `../certify-mdl.properties` | Profile `mdl`: issuer display, offers on `/oid4vci` (D5), anonymous pre-authorized grant advertised (D13), pre-authorized only - one grant in the AS metadata, no own-AS client, no Interactive Authorization Endpoint (G29) - x509-file provider, IACA publication (M-08), MSO validity `P30D`, the file data source `mdldemo`, the offer page's demo subjects (F-15) |
+| `../certify-mdl.properties` | Profile `mdl`: issuer display, offers on `/oid4vci` (D5), anonymous pre-authorized grant advertised (D13), Certify's own authorization code flow advertised next to it with one registered client and subject mode `none` (F-21), x509-file provider, IACA publication (M-08), MSO validity `P30D`, the file data source `mdldemo`, the offer page's demo subjects (F-15) |
 | `../certify-mdl-dev.properties` | Profile `mdl-dev` (local runs and demos): x509-file dev mode generates the IACA and the Document Signer `mdl-dsc` |
 | `../certify-mdl-operator.properties` | Profile `mdl-operator`: the operator's keystore, IACA and CRL, made offline with `certify-cli` (D3) |
 | `mdl-configuration.json` | The v2 configuration body (`/v2/credential-configurations`); `"@@mdl.vm@@"` is replaced by `mdl.vm` |
@@ -20,10 +20,121 @@ case of the same stack (`docs/design/20-mdl-issuer.md`, M-10). Everything here i
 
 The configuration (`org.iso.18013.5.1.mDL`): signed by `x509-file:mdl-dsc` with ES256 and `x5c: without-anchor` (the
 IssuerAuth `x5chain` is the Document Signer alone, HAIP); holder binding `cose_key`; `jwt` proofs with `ES256` (P-256)
-or `EdDSA` (Ed25519, ISO/IEC 18013-5 9.1.5.2), D4; data source `mdldemo`; a Token Status List entry
-(`status.status_list {idx, uri}` in the MSO). The status list is a `statuslist+jwt` signed by keymanager's EC P-256 key,
-since `certify.status.token-status-list.key-ref` is not set. A Document Signer must not sign it (its extended key usage
-is mDL only), so the list's signer does not chain to the IACA (G23); the CWT list under the IACA is M-11. The issuer display is "Lorem Ipsum Demo Credentials".
+or `EdDSA` (Ed25519, ISO/IEC 18013-5 9.1.5.2), D4; data source `mdldemo`; **no status entry** (F-21, decision log
+2026-11-13): an MSO's `status` is optional in ISO/IEC 18013-5, and the only list this stack can write today is a
+`statuslist+jwt` signed by keymanager's EC P-256 key, which does not chain to the IACA, so a wallet that requires the
+list's signer under the mDL's IACA (Paradym) rejects the credential (G23). "Restoring the status list, after M-11" below
+is the one-step change that puts the CWT list back. The issuer display is "Lorem Ipsum Demo Credentials".
+
+## What the authorization server advertises
+
+The mDL demo publishes Certify's own authorization server (`https://<host>`, metadata at
+`/.well-known/oauth-authorization-server`) with **two** grants (F-21, decision log 2026-11-13, superseding an earlier
+pre-authorized-only demo decision):
+
+| Member | Value | Why |
+| --- | --- | --- |
+| `grant_types_supported` | `authorization_code`, `urn:ietf:params:oauth:grant-type:pre-authorized_code` | the offer flow issues on the pre-authorized grant; the code grant is listed because the endpoint that completes it is (RFC 8414 section 2) |
+| `response_types_supported`, `code_challenge_methods_supported` | `code`, `S256` | RFC 7636 PKCE, the only method the flow accepts |
+| `authorization_endpoint`, `pushed_authorization_request_endpoint`, `require_pushed_authorization_requests` | `<host>/v1/certify/oauth/authorize`, `<host>/v1/certify/oauth/par`, `true` | PAR is required (RFC 9126); a wallet that looks for an authorization endpoint even on a pre-authorized offer (Talao) refused the document that had none (G29) |
+| `token_endpoint_auth_methods_supported` | `["none"]` | `demo-wallet` is a public client: it has a redirect URI and no secret, so the RFC 8414 section 2 default (`client_secret_basic`) would name a credential it cannot present (RFC 7591 section 2, RFC 9126 section 2) |
+| `pre-authorized_grant_anonymous_access_supported` | `true` | the offer is redeemed with no client and no user interaction (OID4VCI 1.0 section 12.3) |
+
+One client is registered, `demo-wallet`, whose only redirect URI is the public offer page
+(`${mosip.certify.domain.url}${server.servlet.path}/offer/`). **`certify.as.authorization.subject-mode` is not set and
+stays `none`**: the flow is advertised, and a registered client that pushes a request gets `access_denied` at the
+authorization endpoint instead of a code, because no subject can be established without a user. Never set it to `fixed`
+here - `fixed-subject` would hand that one synthetic holder's mDL to anyone who walks the public flow. The demo issues on
+the pre-authorized grant, which needs no client, no redirect and no user interaction. The interactive authorization
+endpoint of the farmer profiles stays out (`interactive_authorization_endpoint` and its `require_…` member are absent).
+
+nginx passes both endpoints to the public host (`docs/design/tools/check-public-guard.sh`) and rate limits them with the
+offer and token endpoints; a PAR body above 8 KiB is refused there with 413, an offer or token body above 32 KiB too.
+
+## What a public offer may hold
+
+Offer minting (`POST /v1/certify/pre-authorized-data`) is public on this demo (D12), and every offer is cached until it
+is redeemed or lapses, so what one caller can park there is bounded (F-21 review round 2, decision log 2026-11-14):
+
+| Bound | Value here | Where |
+| --- | --- | --- |
+| request body | 32 KiB, then 413 | `certify-nginx.conf` (offer minting, token and authorization endpoints) |
+| `claims` | 1 KiB as UTF-8 JSON and 32 JSON values at any depth (shared default 8 KiB / 256), then `invalid_request` | `certify.protocol.oid4vci-v1.offers.max-claims-bytes` / `max-claims-values` |
+| `subject` | 512 characters, then `invalid_request` | `PreAuthorizedCodeService` |
+| `expires_in` | 60 to 900 s (the page asks for 600) | `mosip.certify.pre-auth.max-expiry-seconds` |
+| live offers | 5000 codes and 5000 offer documents, each kept for 900 s | `mosip.certify.pre-auth.cache-size`, `credential-offer.cache-size` |
+| rate | 30 a minute with a burst of 20 per client, an IPv4 address or an IPv6 /64 | `certify-nginx.conf` |
+
+This stack issues by `subject` (the file data source resolves the token's `sub`), so offer claims are never the mDL's
+data; claims given next to a subject are still validated as claims alone are (no unknown element, every mandatory one present). One client at the
+limit keeps at most 0.5/s x 900 s + 21 = 471 offers live, so more than ten clients flooding at full rate are needed to
+evict a visitor's offer early (the residual risk next to D12 in `docs/design/20-mdl-issuer.md`); an offer costs at most
+~7 KB of heap, ~35 MB for all 5000.
+
+**Which Talao profile the demo is for.** Talao's wallet asks for the AS metadata, then probes
+`<as>/.well-known/openid-configuration` and uses it if it parses as OpenID Connect Discovery; Certify serves no such
+document, so that path stays 404 (the smoke run asserts it: 404/non-JSON, or the same document). The default profile -
+the one the demo works with, no client-attestation headers - reads the RFC 8414 document and completes the
+pre-authorized offer. Talao's **`wia`** and **`clientSecretJwt`** profiles send client-attestation headers
+(`OAuth-Client-Attestation` and `-PoP`); this deployment configures no attester, so `ClientAttestationValidator` answers
+them `401 invalid_client` ("No client attester is configured"). That is pre-existing behaviour of every profile without
+`certify.as.client-attestation.attesters`, not something the demo negotiates.
+
+**The demo is spec-valid OpenID4VCI, not HAIP.** HAIP 1.0 section 4.4.1 requires client authentication at the pushed
+authorization request and the token endpoint, and the offer these wallets follow is redeemed anonymously
+(`pre-authorized_grant_anonymous_access_supported`, OID4VCI 1.0 section 12.3). The document says so, and a HAIP
+conformance run must configure attesters and issue to authenticated clients instead.
+
+## Restoring the status list, after M-11
+
+The demo mDL carries no `status.status_list` entry until the CWT list signed under the IACA lands (M-11, gap G23). To
+restore it, put this member back into `mdl-configuration.json` before `"display"` - byte for byte what F-21 removed,
+where the trailing comma is the separator to the member that follows it:
+
+```json
+  "status": {
+    "mechanism": "TokenStatusList",
+    "purposes": ["revocation"]
+  },
+```
+
+**Restore it only on an image at or after the M-11f merge.** From then on the list is a CWT signed by the same Document
+Signer that signs the mDL, so the entry names a list a wallet that requires the IACA chain accepts. An older image
+answers the same entry with the keymanager-JWT list again, which is exactly what a wallet rejected (G23) - so restart the
+new image first and replace the configuration after it (`docs/design/wp/M-11-status-list-under-iaca.md` section 7.A,
+steps 3 and 4).
+
+Then re-seed, which replaces the stored configuration with a PUT. Local stack (`mdl-dev`):
+
+```bash
+cd "$(git rev-parse --show-toplevel)/docker-compose/docker-compose-injistack"
+export MDL_PKI_PROFILE=mdl-dev
+MDL_SEED_UPDATE=true docker compose -f docker-compose.yaml -f docker-compose.rebuild.yaml -f docker-compose.mdl.yaml \
+    up --no-deps mdl-seed
+```
+
+The public host (`mdl-operator`, the overlay last, the project named, and the secrets in `CERTIFY_SECRETS_DIR`):
+
+```bash
+cd "$(git rev-parse --show-toplevel)/docker-compose/docker-compose-injistack"
+export MDL_PKI_PROFILE=mdl-operator MDL_PKI_DIR=/path/to/deploy
+export CERTIFY_PUBLIC_URL=https://credentials.loremipsum.co.in CERTIFY_SECRETS_DIR="$HOME/certify-mdl-secrets"
+unset CERTIFY_KEYSTORE_PASSWORD                    # the secret file provides it, never the shell
+MDL_SEED_UPDATE=true docker compose -p certify-mdl -f docker-compose.yaml -f docker-compose.rebuild.yaml \
+    -f docker-compose.mdl.yaml -f docker-compose.public.yaml up --no-deps mdl-seed
+```
+
+Check it with the smoke run's expectation, which fails when the entry is missing and when it is malformed (F-21 review
+round 1) - a failed restore no longer passes unnoticed:
+
+```bash
+cd "$(git rev-parse --show-toplevel)"
+.venv/bin/python docs/design/tools/smoke.py --mdl "$CERTIFY_PUBLIC_URL" --expect-status present
+```
+
+`MdlDemoConfigurationTest` (`certify-service`) holds the configuration to the pre-F-21 file minus this exact block,
+byte for byte, and to this block as the one documented here: restoring it means updating that test and its recording
+(`src/test/resources/mdl/mdl-configuration-with-status.json`) in the same change.
 
 ## The offer page's demo subjects
 
@@ -145,14 +256,18 @@ metadata say. It covers:
 - offers by reference and by value (`"issuer": "oid4vci"`), with `credential_issuer` under the base URL given;
 - the issuer metadata at its OpenID4VCI 1.0 section 12.2.2 location, also with `Accept: application/jwt` (200 and
   `application/json`, never a 406 or 500), and the authorization server metadata: `grant_types_supported` present and
-  non-empty, and every `authorization_code` it lists completable through `authorization_endpoint` or
-  `interactive_authorization_endpoint` (RFC 8414 section 2, G29);
+  non-empty, every `authorization_code` it lists completable through `authorization_endpoint` or
+  `interactive_authorization_endpoint` (RFC 8414 section 2, G29), a non-blank `authorization_endpoint` and
+  `token_endpoint` (the "Talao path", F-21), and no OIDC discovery document at `/.well-known/openid-configuration`;
 - a P-256 holder (Bearer) and an Ed25519 holder (DPoP-bound token): each gets a nonce and a credential;
 - every element against `holders.json` in value and CBOR type: `birth_date`, `issue_date`, `expiry_date` and the
   privilege dates as tag 1004 full-dates, `sex` an unsigned integer (never `true`), `age_over_18` a boolean, the
   portrait's bytes, and the whole `driving_privileges`;
-- the Token Status List entry: the list's signature, `sub` equal to the MSO's `uri`, `iat` not in the future, `exp`
-  not passed, the bit clear;
+- the status entry: **none on this demo** - the MSO carries no `status` until M-11 (F-21, gap G23), and the run
+  reports that as a PASS. Only a missing member is absent: a `status` that is present but is not a well-formed
+  `{status_list: {idx, uri}}` (`null`, a string, `{}`, `status_list: null`) fails under either `--expect-status`
+  (F-21 review round 2). A configuration that asks for one again keeps every list check: the list's signature, `sub`
+  equal to the MSO's `uri`, `iat` not in the future, `exp` not passed, the bit clear;
 - `docs/design/tools/verify_mdoc.py` (pymdoccbor) with `--doctype`, `--holder` and `--iaca`: the IACA taken from
   `/v1/certify/mdoc/iaca/<id>.pem`, or with `--iaca <file>` the operator's offline IACA, which the published one must
   equal;
@@ -323,6 +438,12 @@ mdl_public up -d --no-build database certify certify-nginx mdl-seed
 cd "$(git rev-parse --show-toplevel)" && .venv/bin/python docs/design/tools/smoke.py --mdl "$CERTIFY_PUBLIC_URL" --iaca "$MDL_PKI_DIR/iaca.pem"
 ```
 
+**Before announcing a deploy** that changes what the authorization server or the credential advertises: one real
+redemption each with **Paradym** and **Talao** against the public host, scanning an offer from the offer page with
+each wallet and accepting the mDL (F-21 review round 2). `smoke.py --mdl` plays a wallet built from the specifications;
+it is not either wallet, and both have refused documents this smoke accepted (G23, G29). Record the wallet versions and
+the result in `docs/design/wp/PROGRESS.md`.
+
 Name only these four services: `mimoto-service` and `inji-web` are not part of the mDL stack (the public overlay
 removes their ports, but nothing else of theirs is hardened). `CERTIFY_KEYSTORE_PASSWORD` must not be in the shell:
 the public overlay leaves it out of the container's environment (`mdl_public config` shows no such variable, and the
@@ -379,17 +500,20 @@ secret-file passwords and the Document Signer key). Nothing in the stack calls a
 is not a readiness signal here: `certify-default.properties` permits `**/actuator/**`, an Ant pattern that actuator's
 `PathPattern` handler mapping never matches, so health requires authentication, and Certify answers that refusal with
 `200` and an error body.) Public calls to `POST /v1/certify/pre-authorized-data` and `/v1/certify/oauth/token`
-are rate limited per client address (`CF-Connecting-IP`): 30 a minute with a burst of 20, then `429`; local requests
-are never counted. The key is the single address, so an IPv6 client, which usually holds a whole /64, can rotate
-addresses and is limited only by Cloudflare's own rules; add a Cloudflare rate-limiting rule keyed on the client if
-that matters. The guard and the limit both trust `CF-Ray`, which is why 8091 must not be reachable
+(and the pushed authorization and authorization endpoints) are rate limited per client (`CF-Connecting-IP`): 30 a
+minute with a burst of 20, then `429`; local requests are never counted. The key is an IPv4 address, or an IPv6
+address's /64 (F-21 review round 2): an IPv6 subscriber usually holds a whole /64 and could otherwise rotate through
+it. Many distinct clients are still limited only by Cloudflare's own rules; add a Cloudflare rate-limiting rule if that
+matters ("What a public offer may hold" above). The guard and the limit both trust `CF-Ray`, which is why 8091 must not be reachable
 from anywhere but the host and the tunnel. The seed talks to `certify:8090` inside the network, so the guard does not
 apply to it. Access tokens are verified against Certify's own JWKS over loopback (`certify-mdl.properties`), so the
 container never has to reach its public URL.
 
-The Token Status List of the mDL is a `statuslist+jwt` signed by keymanager's EC P-256 key, whose certificate does not
-chain to the IACA: a verifier that requires the status list signer under the mDL's IACA cannot check it yet (G23, open:
-M-11, the CWT list signed under the IACA).
+The public host's mDL carries no status entry (F-21, decision log 2026-11-13): the `statuslist+jwt` this stack signs is
+signed by keymanager's EC P-256 key, whose certificate does not chain to the IACA, and a verifier that requires the
+list's signer under the mDL's IACA refused the credential (Paradym, gap G23, open: M-11, the CWT list signed under the
+IACA). ISO/IEC 18013-5 makes the MSO's `status` optional, so the configuration asks for none; "Restoring the status list,
+after M-11" is the one-step change that puts it back.
 
 ## How Certify reads the holder data
 

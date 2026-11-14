@@ -16,6 +16,11 @@ import cbor2
 
 import verify_mdoc as v
 
+# verify_mdoc.py refuses an interpreter older than 3.11 in main() with a message; these tests exercise its answers and
+# exit codes (including main()'s refusals) on whatever interpreter runs the suite, and its parsing is written to give the
+# same answer on all of them, so the CLI's version check is allowed to pass here.
+os.environ.setdefault("VERIFY_MDOC_ALLOW_OLD_PYTHON", "1")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 NS = "org.iso.18013.5.1"
 
@@ -133,6 +138,19 @@ class Validity(unittest.TestCase):
         self.assertEqual(["notRfc3339"], [c for c, _ in v.tdate_problems(tdate("2026-11-13 10:15:30Z"))])
         self.assertEqual(["notTdate", "notRfc3339"], [c for c, _ in v.tdate_problems(cbor2.CBORTag(1004, "2026-11-13"))])
         self.assertEqual(["notTdate"], [c for c, _ in v.tdate_problems(b"\x01")])
+
+    def test_a_fraction_of_any_length_is_read_the_same_on_every_interpreter(self):
+        # before Python 3.11 `datetime.fromisoformat` accepts only 0, 3 or 6 fraction digits, so `.4Z` was notCalendar
+        for seconds, expected in (("00.4Z", ["fractionalSeconds"]), ("00.12345Z", ["fractionalSeconds"]),
+                                  ("00.123456789Z", ["fractionalSeconds"]), ("00Z", [])):
+            self.assertEqual(expected, [c for c, _ in v.tdate_problems(tdate("2026-11-13T10:15:" + seconds))], seconds)
+        # the order keeps the sub-second part, so two dates in one second still compare
+        self.assertEqual(v.parse_instant("2026-11-13T00:00:00.004Z"),
+                         v.parse_instant("2026-11-13T00:00:00.004000Z"))
+        self.assertGreater(v.parse_instant("2026-11-13T00:00:00.004Z"), v.parse_instant("2026-11-13T00:00:00.002Z"))
+        self.assertEqual(["signedAfterValidFrom"], codes("mso.validityInfo", lambda p: v.check_validity(p, {
+            "signed": tdate("2026-11-13T00:00:00.004Z"), "validFrom": "2026-11-13T00:00:00.002Z",
+            "validUntil": "2028-11-13T00:00:00.002Z"}, self.NOW + timedelta(hours=1))))
 
 
 class Serials(unittest.TestCase):

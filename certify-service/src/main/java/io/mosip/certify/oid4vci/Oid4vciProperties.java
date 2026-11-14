@@ -55,6 +55,29 @@ public record Oid4vciProperties(@DefaultValue CompatCore compatCore, @DefaultVal
      * {@link OfferSurface} enum (bound case-insensitively, like the request field), so a typo fails at startup rather
      * than at the first offer. {@code legacy} is the default, so an unchanged deployment's offers keep the compatibility
      * identifier (the mDL profile sets {@code oid4vci}; docs/design/20-mdl-issuer.md, decision D5).
+     *
+     * <p>{@code max-claims-bytes} and {@code max-claims-values} bound the {@code claims} an offer may carry: the offer is
+     * cached until it is redeemed or lapses, and {@code POST /pre-authorized-data} is public on the mDL demo (D12), so
+     * one caller must not be able to park unbounded data per offer (F-21 review round 2). The bytes are the claims as
+     * JSON (UTF-8); the values are every JSON value inside them at any depth, containers included, because the heap a
+     * parsed value costs is set by how many values it holds, not by its length (8 KiB of {@code [{},{},...]} is
+     * ~180 KB of heap, the same 8 KiB in one string ~8 KB). Raise them for a data provider that takes large claims
+     * ({@code PreAuthDataProviderPlugin} issues them as the credential's data); 0 refuses every non-empty
+     * {@code claims}.
+     *
+     * <p>The built-in defaults (256 KiB, 1024 values) are generous on purpose: {@code POST /pre-authorized-data} shipped
+     * in 0.14.0 with unbounded claims, which {@code PreAuthDataProviderPlugin} issues as the credential's data (a base64
+     * portrait is often 10-50 KB), so an upgraded deployment keeps working with no new setting (non-negotiable 3). The
+     * compose stacks set 8 KiB / 256 and the mDL demo 1 KiB / 32, where the endpoint is public (F-21 review round 3).
      */
-    public record Offers(@DefaultValue("legacy") OfferSurface defaultIssuer) {}
+    public record Offers(@DefaultValue("legacy") OfferSurface defaultIssuer,
+                         @DefaultValue("262144") int maxClaimsBytes,
+                         @DefaultValue("1024") int maxClaimsValues) {
+        public Offers {
+            if (maxClaimsBytes < 0 || maxClaimsValues < 0) {
+                throw new IllegalArgumentException("certify.protocol.oid4vci-v1.offers.max-claims-bytes and max-claims-values "
+                        + "must not be negative");
+            }
+        }
+    }
 }

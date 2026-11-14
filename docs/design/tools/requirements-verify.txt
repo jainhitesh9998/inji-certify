@@ -5,8 +5,10 @@
 # does not move under us. `pip install -r docs/design/tools/requirements-verify.txt` reproduces it; bump a pin only
 # together with a run over the recorded samples.
 #
-# Install (CI and locally):
-#   python3 -m venv .venv-verify
+# Install (CI and locally). Python 3.12, not whatever `python3` is: verify_mdoc.py refuses an interpreter older than
+# 3.11 with a message (before 3.11 `datetime.fromisoformat` reads only 0, 3 or 6 fraction digits, which made a valid
+# tdate with a 1- or 9-digit fraction a bogus notCalendar), and CI pins 3.12 through actions/setup-python.
+#   python3.12 -m venv .venv-verify
 #   .venv-verify/bin/pip install --quiet -r docs/design/tools/requirements-verify.txt
 #
 # Hashes are deliberately not pinned (pip runs without --require-hashes): `cryptography` and `cffi` ship per-platform

@@ -1,0 +1,62 @@
+{
+  "id": "org.iso.18013.5.1.mDL",
+  "scope": "org.iso.18013.5.1.mDL",
+  "format": "mso_mdoc",
+  "formatConfig": {
+    "doctype": "org.iso.18013.5.1.mDL",
+    "mdocClaims": {
+      "org.iso.18013.5.1": {
+        "family_name": {"display": [{"name": "Family name", "locale": "en"}], "mandatory": true},
+        "given_name": {"display": [{"name": "Given name", "locale": "en"}], "mandatory": true},
+        "birth_date": {"display": [{"name": "Date of birth", "locale": "en"}], "mandatory": true},
+        "issue_date": {"display": [{"name": "Date of issue", "locale": "en"}], "mandatory": true},
+        "expiry_date": {"display": [{"name": "Date of expiry", "locale": "en"}], "mandatory": true},
+        "issuing_country": {"display": [{"name": "Issuing country", "locale": "en"}], "mandatory": true},
+        "issuing_authority": {"display": [{"name": "Issuing authority", "locale": "en"}], "mandatory": true},
+        "document_number": {"display": [{"name": "Licence number", "locale": "en"}], "mandatory": true},
+        "portrait": {"display": [{"name": "Portrait", "locale": "en"}], "mandatory": true},
+        "driving_privileges": {"display": [{"name": "Driving privileges", "locale": "en"}], "mandatory": true},
+        "un_distinguishing_sign": {"display": [{"name": "UN distinguishing sign", "locale": "en"}], "mandatory": true},
+        "sex": {"display": [{"name": "Sex", "locale": "en"}]},
+        "age_over_18": {"display": [{"name": "Older than 18", "locale": "en"}]},
+        "nationality": {"display": [{"name": "Nationality", "locale": "en"}]},
+        "resident_city": {"display": [{"name": "City of residence", "locale": "en"}]}
+      }
+    }
+  },
+  "signing": {
+    "provider": "x509-file",
+    "alias": "mdl-dsc",
+    "alg": "ES256",
+    "x5c": "without-anchor"
+  },
+  "template": {
+    "engine": "velocity",
+    "content": "@@mdl.vm@@"
+  },
+  "dataSourceId": "mdldemo",
+  "status": {
+    "mechanism": "TokenStatusList",
+    "purposes": ["revocation"]
+  },
+  "display": {
+    "display": [
+      {
+        "name": "Mobile Driving Licence (Demo)",
+        "locale": "en",
+        "background_color": "#1B3A5C",
+        "text_color": "#FFFFFF"
+      }
+    ],
+    "order": ["portrait", "family_name", "given_name", "birth_date", "document_number", "driving_privileges",
+              "issue_date", "expiry_date", "issuing_authority", "issuing_country", "un_distinguishing_sign",
+              "sex", "age_over_18", "nationality", "resident_city"]
+  },
+  "protocol": {
+    "cryptographicBindingMethodsSupported": ["cose_key"],
+    "credentialSigningAlgValuesSupported": ["ES256"],
+    "proofTypesSupported": {
+      "jwt": {"proof_signing_alg_values_supported": ["ES256", "EdDSA"]}
+    }
+  }
+}

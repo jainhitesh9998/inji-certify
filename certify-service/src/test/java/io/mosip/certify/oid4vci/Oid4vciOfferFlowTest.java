@@ -74,12 +74,13 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
         "mosip.certify.authn.issuer-uri=http://localhost:8090/v1/certify",
         "mosip.certify.oauth.issuer=http://localhost:8090/v1/certify",
         // the in-memory cache the local profile selects; without it the default is Redis (spring.cache.type in
-        // application-local.properties) and there is none in a unit-test JVM
+        // application-local.properties) and there is none in a unit-test JVM. A client is registered below, so the
+        // pushed-request cache must be configured too (AsCacheRequirements refuses to start otherwise)
         "spring.cache.type=simple",
-        "mosip.certify.cache.names=userinfo,vcissuance,templatecache,certificatedatacache,credentialConfig,renderTemplate,jwks,preAuthCodeCache,credentialOfferCache,issuerMetadataCache,nonce,preAuthCacheTxn,dpopJti",
+        "mosip.certify.cache.names=userinfo,vcissuance,templatecache,certificatedatacache,credentialConfig,renderTemplate,jwks,preAuthCodeCache,parRequestCache,credentialOfferCache,issuerMetadataCache,nonce,preAuthCacheTxn,dpopJti",
         "spring.cache.cache-names=${mosip.certify.cache.names}",
-        "mosip.certify.cache.size={'userinfo': 200, 'vcissuance': 2000, 'templatecache': 20, 'jwks': 1, 'preAuthCodeCache': 1000, 'credentialOfferCache': 1000, 'issuerMetadataCache': 10, 'nonce': 1000, 'preAuthCacheTxn': 2000, 'dpopJti': 10000}",
-        "mosip.certify.cache.expire-in-seconds={'userinfo': 3600, 'vcissuance': 3600, 'templatecache': 3600, 'certificatedatacache': 3600, 'credentialConfig': 3600, 'renderTemplate': 3600, 'jwks': 3600, 'preAuthCodeCache': 600, 'credentialOfferCache': 600, 'issuerMetadataCache': 3600, 'nonce': 300, 'preAuthCacheTxn': 3600, 'dpopJti': 120}",
+        "mosip.certify.cache.size={'userinfo': 200, 'vcissuance': 2000, 'templatecache': 20, 'jwks': 1, 'preAuthCodeCache': 1000, 'parRequestCache': 2000, 'credentialOfferCache': 1000, 'issuerMetadataCache': 10, 'nonce': 1000, 'preAuthCacheTxn': 2000, 'dpopJti': 10000}",
+        "mosip.certify.cache.expire-in-seconds={'userinfo': 3600, 'vcissuance': 3600, 'templatecache': 3600, 'certificatedatacache': 3600, 'credentialConfig': 3600, 'renderTemplate': 3600, 'jwks': 3600, 'preAuthCodeCache': 600, 'parRequestCache': 300, 'credentialOfferCache': 600, 'issuerMetadataCache': 3600, 'nonce': 300, 'preAuthCacheTxn': 3600, 'dpopJti': 120}",
         "spring.jpa.database-platform=org.hibernate.dialect.H2Dialect",
         "spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.H2Dialect",
         "mosip.certify.data-provider-plugin.did-url=did:web:localhost:certify",

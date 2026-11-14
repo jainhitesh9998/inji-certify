@@ -689,6 +689,120 @@ public class OAuthAuthorizationServerMetadataServiceTest {
                 new AsProperties.PreAuthorizedGrant(advertiseAnonymousAccess));
     }
 
+    /**
+     * RFC 8414 section 2: an omitted {@code token_endpoint_auth_methods_supported} means {@code client_secret_basic}, and
+     * a client registered under {@code certify.as.clients} is a public client - a redirect URI and no secret (F-21
+     * review round 1). So an own-AS document with clients says {@code ["none"]} (RFC 7591 section 2), the attested method
+     * is published when attesters are configured, and a document with no client says nothing (unchanged).
+     */
+    @Test
+    public void getOAuthAuthorizationServerMetadata_PublicClientsAreAdvertisedAsNone() {
+        ownIdentity("http://localhost:8090");
+        asProperties(as(Map.of("demo-wallet", new AsProperties.Client(List.of("https://wallet.example/cb"))), false, false));
+
+        OAuthAuthorizationServerMetadataDTO result = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+
+        assertEquals(List.of("none"), result.getTokenEndpointAuthMethodsSupported());
+        assertEquals("http://localhost:8090/v1/certify/oauth/authorize", result.getAuthorizationEndpoint());
+    }
+
+    /** Attestation required (HAIP): the attested method alone, as before. */
+    @Test
+    public void getOAuthAuthorizationServerMetadata_RequiredAttestationKeepsTheAttestedMethodAlone() {
+        ownIdentity("http://localhost:8090");
+        asProperties(withAttesters(true));
+
+        OAuthAuthorizationServerMetadataDTO result = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+
+        assertEquals(List.of("attest_jwt_client_auth"), result.getTokenEndpointAuthMethodsSupported());
+    }
+
+    /**
+     * Attesters configured but not required: a registered client that presents no attestation is still accepted
+     * ({@code ClientAttestationValidator} answers it as a public client), so the document lists {@code none} beside the
+     * attested method (F-21 review round 2, Opus nit 8).
+     */
+    @Test
+    public void getOAuthAuthorizationServerMetadata_OptionalAttestationListsNoneBesideTheAttestedMethod() {
+        ownIdentity("http://localhost:8090");
+        asProperties(withAttesters(false));
+
+        OAuthAuthorizationServerMetadataDTO result = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+
+        assertEquals(List.of("attest_jwt_client_auth", "none"), result.getTokenEndpointAuthMethodsSupported());
+    }
+
+    /**
+     * An external authorization server at a {@code .../oauth/token} path - eSignet's, or any other - with clients
+     * registered here: the new {@code none} member is gated on F-17's identity rule (Certify's own token URL exactly),
+     * not on the suffix, so such a document gains nothing (F-21 review round 2). The code-flow endpoints keep their
+     * historical suffix condition (P3-05), which gap G41 records; with attesters configured the attested method is
+     * published exactly as P3-06 did.
+     */
+    @Test
+    public void getOAuthAuthorizationServerMetadata_ExternalTokenEndpointWithClientsGainsNoAuthMethod() {
+        for (String tokenEndpoint : List.of("https://esignet.example/v1/esignet/oauth/token", "https://idp.example/oauth/token")) {
+            ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "tokenEndpoint", tokenEndpoint);
+            ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "interactiveAuthorizationEndpoint", "");
+            identity("https://credentials.example.org", "https://credentials.example.org");
+            dispatcherServletPath("/v1/certify");
+            asProperties(as(Map.of("demo-wallet", new AsProperties.Client(List.of("https://wallet.example/cb"))), false, false));
+
+            OAuthAuthorizationServerMetadataDTO result = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+
+            assertNull(tokenEndpoint + ": another server's client authentication is not this service's to describe",
+                    result.getTokenEndpointAuthMethodsSupported());
+            String base = tokenEndpoint.substring(0, tokenEndpoint.length() - "/oauth/token".length());
+            assertEquals(tokenEndpoint + ": pre-existing (P3-05) suffix behaviour, gap G41", base + "/oauth/authorize",
+                    result.getAuthorizationEndpoint());
+
+            asProperties(withAttesters(false));
+            assertEquals(tokenEndpoint + ": the attested method as before, and no none",
+                    List.of("attest_jwt_client_auth"),
+                    oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata().getTokenEndpointAuthMethodsSupported());
+        }
+    }
+
+    /** demo-wallet registered, an attester configured, attestation required or not. */
+    private static AsProperties withAttesters(boolean required) {
+        return new AsProperties(
+                Map.of("demo-wallet", new AsProperties.Client(List.of("https://wallet.example/cb"))),
+                new AsProperties.Authorization("none", null), new AsProperties.Par(Duration.ofSeconds(90)),
+                new AsProperties.ClientAttestation(required, Map.of("attester", new AsProperties.Attester("{}")),
+                        Duration.ofSeconds(60), Duration.ofMinutes(5)),
+                new AsProperties.PreAuthorizedGrant(false));
+    }
+
+    @Test
+    public void getOAuthAuthorizationServerMetadata_NoClientsAddsNoAuthMethods() {
+        ownIdentity("http://localhost:8090");
+        asProperties(as(Map.of(), false, false));
+
+        OAuthAuthorizationServerMetadataDTO result = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+
+        assertNull("a pre-authorized-only document names no client authentication",
+                result.getTokenEndpointAuthMethodsSupported());
+        assertNull(result.getAuthorizationEndpoint());
+    }
+
+    @Test
+    public void getOAuthAuthorizationServerMetadata_ExternalAuthorizationServerIsServedAsConfigured() {
+        // not Certify's token endpoint and not even at .../oauth/token (an external AS, e.g. an OIDC provider's
+        // /connect/token): nothing is added, and the code flow of this deployment is not advertised for a server it does
+        // not run. The `/oauth/token` suffix gate below this branch is historical and unchanged: an external AS at that
+        // path still gets the members it always got.
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "tokenEndpoint", "https://idp.example/connect/token");
+        ReflectionTestUtils.setField(oAuthAuthorizationServerMetadataService, "interactiveAuthorizationEndpoint", "");
+        identity("https://issuer.example", "https://issuer.example");
+        dispatcherServletPath("/v1/certify");
+        asProperties(as(Map.of("demo-wallet", new AsProperties.Client(List.of("https://wallet.example/cb"))), false, false));
+
+        OAuthAuthorizationServerMetadataDTO result = oAuthAuthorizationServerMetadataService.getOAuthAuthorizationServerMetadata();
+
+        assertNull(result.getTokenEndpointAuthMethodsSupported());
+        assertNull(result.getAuthorizationEndpoint());
+    }
+
     @Test
     public void getOAuthAuthorizationServerMetadata_WithMultipleValues_ShouldParseCorrectly() {
         // Arrange - set multiple values

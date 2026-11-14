@@ -55,6 +55,7 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import re
 import sys
 import warnings
@@ -513,7 +514,7 @@ def instant(p, validity, field, required):
         p.add(f"notDate:{field}", f"validityInfo.{field} is not an RFC 3339 date-time: {value!r}")
         return None
     try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parse_instant(text)
     except ValueError:
         p.add(f"notDate:{field}", f"validityInfo.{field} is not a calendar instant: {text}")
         return None
@@ -547,6 +548,22 @@ def check_validity(p, validity, now):
     return f"signed {signed} within {valid_from}..{valid_until}"
 
 
+def parse_instant(text):
+    """The instant an RFC 3339 date-time names, whatever fraction of a second it carries.
+
+    `datetime.fromisoformat` before Python 3.11 accepts only 0, 3 or 6 fraction digits, so `.4Z`, `.12345Z` or
+    `.123456789Z` raised ValueError: a valid tdate was reported `notCalendar`, and the validity order compared two dates
+    as if one were unreadable. The fraction is normalised to six digits (the precision `datetime` carries; fractions are
+    reported separately as `fractionalSeconds`) instead of dropped, so ordering keeps the sub-second part and the answer
+    is the same on every interpreter. Raises ValueError for a value that is not a calendar instant.
+    """
+    match = RFC3339.fullmatch(text)
+    if match and match.group(1):  # has a fraction: normalise it, keeping the sub-second part
+        fraction = match.group(1)[1:][:6].ljust(6, "0")
+        text = f"{text[:match.start(1)]}.{fraction}{match.group(2)}"
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
 def tdate_problems(value):
     """Every way value misses tdate (#6.0 over RFC 3339 with whole seconds and Z), as (code, message) pairs."""
     problems, text = [], value
@@ -566,7 +583,7 @@ def tdate_problems(value):
     if match.group(2) != "Z":
         problems.append(("notZulu", f"has the offset {match.group(2)}, not Z: {text}"))
     try:
-        datetime.fromisoformat(text.replace("Z", "+00:00"))
+        parse_instant(text)
     except ValueError:
         problems.append(("notCalendar", f"is not a calendar instant: {text}"))
     return problems
@@ -716,7 +733,19 @@ def evaluate(results, gaps, not_run=frozenset()):
 
 # ---- main -----------------------------------------------------------------------------------------------------------
 
+#: The interpreter this tool is pinned to (docs/design/tools/requirements-verify.txt). The parsing here is written to
+#: give the same answer on older interpreters too, so the check runs in main() and not at import (the unit tests import
+#: this module), and VERIFY_MDOC_ALLOW_OLD_PYTHON=1 skips it: test_verify_mdoc.py sets that, because it exercises this
+#: tool's own answers and exit codes on whatever interpreter runs the suite (3.9 in this checkout).
+MINIMUM_PYTHON = (3, 11)
+
+
 def main(argv=None):
+    if sys.version_info < MINIMUM_PYTHON and os.environ.get("VERIFY_MDOC_ALLOW_OLD_PYTHON") != "1":
+        sys.exit(f"verify_mdoc.py: Python {sys.version_info.major}.{sys.version_info.minor} is too old; "
+                 f"use Python {MINIMUM_PYTHON[0]}.{MINIMUM_PYTHON[1]} or later "
+                 f"(python{MINIMUM_PYTHON[0]}.{MINIMUM_PYTHON[1]} -m venv .venv-verify, "
+                 f"see docs/design/tools/requirements-verify.txt)")
     parser = argparse.ArgumentParser(description="Verify an ISO/IEC 18013-5 IssuerSigned with pymdoccbor")
     parser.add_argument("issuer_signed", help="raw CBOR or base64url IssuerSigned or draft-13 Document")
     parser.add_argument("--doctype", help="docType the MSO must declare, e.g. org.iso.18013.5.1.mDL")

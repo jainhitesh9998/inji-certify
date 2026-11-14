@@ -73,7 +73,7 @@ public class PreAuthorizedCodeServiceTest {
                 new io.mosip.certify.oid4vci.Oid4vciProperties.Batch(10),
                 new io.mosip.certify.oid4vci.Oid4vciProperties.KeyAttestation(Map.of(), java.time.Duration.ofSeconds(60)),
                 new io.mosip.certify.oid4vci.Oid4vciProperties.DidWebHolders(false, java.time.Duration.ofSeconds(5)),
-                new io.mosip.certify.oid4vci.Oid4vciProperties.Offers(io.mosip.certify.oid4vci.OfferSurface.LEGACY));
+                new io.mosip.certify.oid4vci.Oid4vciProperties.Offers(io.mosip.certify.oid4vci.OfferSurface.LEGACY, 8192, 256));
         authorizationContext = new io.mosip.certify.core.dto.AuthorizationContext();
         oid4vciIssuers = new io.mosip.certify.oid4vci.Oid4vciIssuerResolver(
                 new io.mosip.certify.oid4vci.Oid4vciIssuer("https://issuer.com/oid4vci"),
@@ -851,6 +851,12 @@ public class PreAuthorizedCodeServiceTest {
     }
 
     private PreAuthorizedCodeService serviceWithDefaultIssuer(String defaultIssuer) {
+        return service(new io.mosip.certify.oid4vci.Oid4vciProperties.Offers(
+                io.mosip.certify.oid4vci.OfferSurface.from(defaultIssuer), 8192, 256));
+    }
+
+    /** The service with these offer settings ({@code certify.protocol.oid4vci-v1.offers.*}). */
+    private PreAuthorizedCodeService service(io.mosip.certify.oid4vci.Oid4vciProperties.Offers offers) {
         return new PreAuthorizedCodeService(vciCacheService, credentialRegistry, accessTokenJwtUtil, objectMapper,
                 credentialConfigurationService, credentialConfigRepository, validator,
                 new io.mosip.certify.oid4vci.Oid4vciProperties(
@@ -860,9 +866,147 @@ public class PreAuthorizedCodeServiceTest {
                         new io.mosip.certify.oid4vci.Oid4vciProperties.Batch(10),
                         new io.mosip.certify.oid4vci.Oid4vciProperties.KeyAttestation(Map.of(), java.time.Duration.ofSeconds(60)),
                         new io.mosip.certify.oid4vci.Oid4vciProperties.DidWebHolders(false, java.time.Duration.ofSeconds(5)),
-                        new io.mosip.certify.oid4vci.Oid4vciProperties.Offers(
-                                io.mosip.certify.oid4vci.OfferSurface.from(defaultIssuer))),
+                        offers),
                 oid4vciIssuers, authorizationContext);
+    }
+
+    // ---- bounded and validated offer input (F-21 review round 2) ------------------------------------------------
+
+    /**
+     * Claims given next to a subject are identity data too: PreAuthDataProviderPlugin issues the cached claims as the
+     * credential's data whatever the token's subject is, so they are held to the configuration's claim names exactly as
+     * claims without a subject are. Before, a subject skipped the check entirely.
+     */
+    @Test
+    public void offer_SubjectWithUnknownClaims_IsRefused() {
+        PreAuthorizedRequest both = subjectRequest("2154189532");
+        both.setClaims(Map.of("name", "John Doe", "notAClaim", "x"));
+
+        InvalidRequestException refused = assertThrows(InvalidRequestException.class,
+                () -> preAuthorizedCodeService.generatePreAuthorizedCode(both));
+
+        Assert.assertEquals(ErrorConstants.UNKNOWN_CLAIMS, refused.getErrorCode());
+        verify(vciCacheService, never()).setPreAuthCodeData(anyString(), any());
+    }
+
+    @Test
+    public void offer_SubjectWithValidClaims_IsAccepted() {
+        PreAuthorizedRequest both = subjectRequest("2154189532");
+        both.setClaims(Map.of("name", "John Doe"));
+
+        preAuthorizedCodeService.generatePreAuthorizedCode(both);
+
+        PreAuthCodeData stored = capturedCodeData();
+        Assert.assertEquals("2154189532", stored.getSubject());
+        Assert.assertEquals(Map.of("name", "John Doe"), stored.getClaims());
+    }
+
+    /** An empty claims object is no claims (bean validation reads it that way too): a subject alone decides. */
+    @Test
+    public void offer_SubjectWithEmptyClaims_IsAccepted() {
+        PreAuthorizedRequest subjectOnly = subjectRequest("2154189532");
+        subjectOnly.setClaims(Map.of());
+
+        preAuthorizedCodeService.generatePreAuthorizedCode(subjectOnly);
+
+        Assert.assertEquals("2154189532", capturedCodeData().getSubject());
+    }
+
+    /** {@code max-claims-bytes}: the claims as JSON, the boundary accepted, one byte more refused. */
+    @Test
+    public void offer_ClaimsAboveTheByteCap_AreRefused() {
+        PreAuthorizedCodeService capped = service(new io.mosip.certify.oid4vci.Oid4vciProperties.Offers(
+                io.mosip.certify.oid4vci.OfferSurface.LEGACY, 64, 256));
+        // {"name":"<n>"} is 11 bytes plus the value
+        PreAuthorizedRequest fits = claimsRequest(Map.of("name", "a".repeat(53)));
+        PreAuthorizedRequest tooLarge = claimsRequest(Map.of("name", "a".repeat(54)));
+
+        Assert.assertTrue(capped.generatePreAuthorizedCode(fits).startsWith("openid-credential-offer://"));
+        CertifyException refused = assertThrows(CertifyException.class, () -> capped.generatePreAuthorizedCode(tooLarge));
+        Assert.assertEquals(ErrorConstants.INVALID_REQUEST, refused.getErrorCode());
+        Assert.assertTrue(refused.getMessage(), refused.getMessage().contains("64 bytes"));
+        // UTF-8 bytes, not characters: 27 two-byte characters are 54 bytes
+        CertifyException utf8 = assertThrows(CertifyException.class,
+                () -> capped.generatePreAuthorizedCode(claimsRequest(Map.of("name", "\u0100".repeat(27)))));
+        Assert.assertEquals(ErrorConstants.INVALID_REQUEST, utf8.getErrorCode());
+        verify(vciCacheService, times(1)).setPreAuthCodeData(anyString(), any());
+    }
+
+    /**
+     * {@code max-claims-values}: every JSON value at any depth counts, containers included, because that is what sets
+     * the heap a parsed offer holds (8 KiB of {@code [{},{},...]} is ~180 KB of heap; the same length in one string
+     * ~8 KB).
+     */
+    @Test
+    public void offer_ClaimsWithMoreValuesThanTheCap_AreRefused() {
+        PreAuthorizedCodeService capped = service(new io.mosip.certify.oid4vci.Oid4vciProperties.Offers(
+                io.mosip.certify.oid4vci.OfferSurface.LEGACY, 8192, 4));
+        Map<String, Object> four = Map.of("name", List.of("a", Map.of("b", "c")));            // list, "a", map, "c"
+        Map<String, Object> five = Map.of("name", List.of("a", Map.of("b", List.of("c"))));   // list, "a", map, list, "c"
+
+        Assert.assertTrue(capped.generatePreAuthorizedCode(claimsRequest(four)).startsWith("openid-credential-offer://"));
+        CertifyException refused = assertThrows(CertifyException.class,
+                () -> capped.generatePreAuthorizedCode(claimsRequest(five)));
+        Assert.assertEquals(ErrorConstants.INVALID_REQUEST, refused.getErrorCode());
+        Assert.assertTrue(refused.getMessage(), refused.getMessage().contains("4 JSON values"));
+    }
+
+    /** The caps hold next to a subject too: the claims are cached with the offer either way. */
+    @Test
+    public void offer_OversizedClaimsNextToASubject_AreRefused() {
+        PreAuthorizedCodeService capped = service(new io.mosip.certify.oid4vci.Oid4vciProperties.Offers(
+                io.mosip.certify.oid4vci.OfferSurface.LEGACY, 64, 256));
+        PreAuthorizedRequest both = subjectRequest("2154189532");
+        both.setClaims(Map.of("name", "a".repeat(1000)));
+
+        CertifyException refused = assertThrows(CertifyException.class, () -> capped.generatePreAuthorizedCode(both));
+
+        Assert.assertEquals(ErrorConstants.INVALID_REQUEST, refused.getErrorCode());
+        verify(vciCacheService, never()).setPreAuthCodeData(anyString(), any());
+    }
+
+    /** A subject is an identifier: 512 characters at most, after trimming. */
+    @Test
+    public void offer_SubjectLongerThanTheCap_IsRefused() {
+        Assert.assertTrue(preAuthorizedCodeService.generatePreAuthorizedCode(subjectRequest(" " + "s".repeat(512) + " "))
+                .startsWith("openid-credential-offer://"));
+        CertifyException refused = assertThrows(CertifyException.class,
+                () -> preAuthorizedCodeService.generatePreAuthorizedCode(subjectRequest("s".repeat(513))));
+        Assert.assertEquals(ErrorConstants.INVALID_REQUEST, refused.getErrorCode());
+        Assert.assertTrue(refused.getMessage(), refused.getMessage().contains("512"));
+    }
+
+    /** A JSON null is a value (and ArrayDeque, which refuses nulls, is not what counts them). */
+    @Test
+    public void countValues_CountsEveryValueAtAnyDepthNullsIncluded() {
+        Map<String, Object> claims = new HashMap<>();
+        claims.put("a", null);
+        claims.put("b", Arrays.asList(null, Map.of("c", "d"), List.of()));
+        Assert.assertEquals(6, PreAuthorizedCodeService.countValues(claims, 100)); // a, b, null, {c}, "d", []
+        Assert.assertEquals("counting stops one past the limit", 3, PreAuthorizedCodeService.countValues(claims, 2));
+        Assert.assertEquals(0, PreAuthorizedCodeService.countValues(Map.of(), 100));
+    }
+
+    @Test
+    public void offers_NegativeCapsAreRefusedAtBindTime() {
+        assertThrows(IllegalArgumentException.class, () -> new io.mosip.certify.oid4vci.Oid4vciProperties.Offers(
+                io.mosip.certify.oid4vci.OfferSurface.LEGACY, -1, 256));
+        assertThrows(IllegalArgumentException.class, () -> new io.mosip.certify.oid4vci.Oid4vciProperties.Offers(
+                io.mosip.certify.oid4vci.OfferSurface.LEGACY, 8192, -1));
+    }
+
+    private PreAuthorizedRequest subjectRequest(String subject) {
+        PreAuthorizedRequest subjectRequest = new PreAuthorizedRequest();
+        subjectRequest.setCredentialConfigurationId(CONFIG_ID);
+        subjectRequest.setSubject(subject);
+        return subjectRequest;
+    }
+
+    private PreAuthorizedRequest claimsRequest(Map<String, Object> claims) {
+        PreAuthorizedRequest claimsRequest = new PreAuthorizedRequest();
+        claimsRequest.setCredentialConfigurationId(CONFIG_ID);
+        claimsRequest.setClaims(claims);
+        return claimsRequest;
     }
 
     private CredentialOfferResponse capturedOffer() {

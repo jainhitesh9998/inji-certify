@@ -11,6 +11,12 @@
 #         `%2e%2e`, `;`, a trailing slash, an extra segment) are refused for a public request;
 #   local the same keymanager and admin paths still reach the upstream without CF-Ray (the operator on the host), which
 #         is why 8091 must only listen on loopback (docker-compose.public.yaml).
+#   limit a public burst on the rate-limited paths (offer minting, token, PAR, authorize) is answered 429, a local one
+#         is not, and a PAR body above the 8 KiB cap is 413 while an offer's claims JSON still reaches the upstream;
+#         an offer or token body above 32 KiB is 413 for every caller (F-21 review round 2);
+#   key   the rate limit's client key: an IPv4 address whole, an IPv6 address by its /64 for every spelling (read from a
+#         test-only server added to the throwaway nginx that answers $certify_client_address), and two addresses in
+#         one /64 share one limit while the neighbouring /64 and the neighbouring IPv4 address do not;
 #   fwd   the OpenID4VCI 1.0 metadata, root-mapped (section 12.2.2) and under the servlet path, reaches the 1.0 handler's
 #         path for GET and HEAD with the request's Accept unchanged (absent, application/jwt, text/html,
 #         application/json, */*): the stub echoes what it received in X-Stub-* headers, which HEAD carries too. The
@@ -49,13 +55,26 @@ server {
 }
 EOF
 
+# test-only, next to the file under test (the same http block, so its maps are in scope): answers the rate limit's key
+cat > "$WORK/keys.conf" <<'EOF'
+server {
+    listen 81;
+    location / {
+        default_type text/plain;
+        return 200 "$certify_client_address";
+    }
+}
+EOF
+
 docker network create "$NAME" >/dev/null
 docker run -d --name "$NAME-certify" --network "$NAME" --network-alias certify \
     -v "$WORK/stub.conf:/etc/nginx/conf.d/default.conf:ro" "$IMAGE" >/dev/null
-docker run -d --name "$NAME-nginx" --network "$NAME" -p 127.0.0.1::80 \
-    -v "$WORK/default.conf:/etc/nginx/conf.d/default.conf:ro" "$IMAGE" >/dev/null
+docker run -d --name "$NAME-nginx" --network "$NAME" -p 127.0.0.1::80 -p 127.0.0.1::81 \
+    -v "$WORK/default.conf:/etc/nginx/conf.d/default.conf:ro" -v "$WORK/keys.conf:/etc/nginx/conf.d/keys.conf:ro" \
+    "$IMAGE" >/dev/null
 
 PORT="$(docker port "$NAME-nginx" 80/tcp | head -n1 | sed 's/.*://')"
+KEYS_PORT="$(docker port "$NAME-nginx" 81/tcp | head -n1 | sed 's/.*://')"
 BASE="http://127.0.0.1:$PORT"
 for _ in $(seq 1 50); do
     if curl -s -o /dev/null "$BASE/50x.html"; then break; fi
@@ -299,6 +318,159 @@ for mapping in "/.well-known/openid-credential-issuer/v1/certify/oid4vci $ONE_ZE
         done
     done
 done
+
+# --- the rate-limited paths (F-21 review round 1) ---
+# certify-nginx rate limits the unauthenticated issuance calls a public client can make in a loop - offer minting, the
+# token endpoint, the pushed authorization endpoint and the authorization endpoint - by client address (CF-Connecting-IP,
+# 30 a minute with a burst of 20, then 429). A pushed authorization request is stored until it is redeemed, so it is
+# rate limited too, and its body is capped at 8 KiB (its form fields are a few dozen bytes; offer minting keeps the
+# server default because its claims JSON is legitimately larger).
+#
+# Every request of a burst carries the SAME client address, which is what the limit keys on; the checks above rotate the
+# address, which is why they never trip it.
+python3 - "$WORK" <<'PY_EOF'
+import sys, pathlib
+pathlib.Path(sys.argv[1], "par-body.txt").write_text("client_id=demo-wallet&state=" + "a" * 9000)
+pathlib.Path(sys.argv[1], "par-small.txt").write_text("client_id=demo-wallet&response_type=code")
+pathlib.Path(sys.argv[1], "offer-body.json").write_text('{"credential_configuration_id":"org.iso.18013.5.1.mDL","claims":{"x":"' + "a" * 9000 + '"}}')
+# 31 KiB fits under the 32 KiB cap of offer minting and the token endpoint, 33 KiB does not (F-21 review round 2)
+for name, size in (("offer-31k.json", 31 * 1024), ("offer-33k.json", 33 * 1024)):
+    head = '{"credential_configuration_id":"org.iso.18013.5.1.mDL","claims":{"x":"'
+    pathlib.Path(sys.argv[1], name).write_text(head + "a" * (size - len(head) - 3) + '"}}')
+pathlib.Path(sys.argv[1], "token-33k.txt").write_text("grant_type=x&pre-authorized_code=" + "a" * (33 * 1024))
+PY_EOF
+
+# burst <who> <method> <path> <count> <client address> -> the number of 429 answers
+burst() {
+    local who="$1" method="$2" path="$3" count="$4" address="$5" n=0 i=0 code body="$WORK/par-small.txt"
+    [ "$method" = GET ] && body=/dev/null
+    while [ "$i" -lt "$count" ]; do
+        local args=(-s -o /dev/null -w '%{http_code}' -X "$method")
+        if [ "$who" = public ]; then
+            args+=(-H 'CF-Ray: 8f00000000000000-BLR' -H "CF-Connecting-IP: $address")
+        fi
+        if [ "$method" = POST ]; then
+            args+=(-H 'Content-Type: application/x-www-form-urlencoded' --data-binary "@$body")
+        fi
+        code="$(curl "${args[@]}" "$BASE$path")" || code="curl-error"
+        [ "$code" = 429 ] && n=$((n + 1))
+        i=$((i + 1))
+    done
+    echo "$n"
+}
+
+# limited <who> <method> <path> <count> <address> <want: some|none>
+limited() {
+    local who="$1" method="$2" path="$3" count="$4" address="$5" want="$6" n
+    n="$(burst "$who" "$method" "$path" "$count" "$address")"
+    total=$((total + 1))
+    local ok=0
+    if [ "$want" = some ] && [ "$n" -gt 0 ]; then ok=1; fi
+    if [ "$want" = none ] && [ "$n" -eq 0 ]; then ok=1; fi
+    if [ "$ok" = 1 ]; then
+        printf 'ok    %-4s %-6s %-4s %-40s %2s requests from %s, 429 x%-2s\n' "$want" "$who" "$method" "$path" "$count" "$address" "$n"
+    else
+        printf 'FAIL  %-4s %-6s %-4s %-40s %2s requests from %s, 429 x%-2s\n' "$want" "$who" "$method" "$path" "$count" "$address" "$n"
+        failures=$((failures + 1))
+    fi
+}
+
+limited public POST /v1/certify/oauth/par 40 203.0.113.11 some
+limited public GET  "/v1/certify/oauth/authorize?client_id=demo-wallet&request_uri=urn:ietf:params:oauth:request_uri:x" 40 203.0.113.12 some
+limited public POST /v1/certify/oauth/token 40 203.0.113.13 some
+limited public POST /v1/certify/pre-authorized-data 40 203.0.113.14 some
+# the operator and the seed talk to certify from the host or inside the network: not counted, never limited
+limited local  POST /v1/certify/oauth/par 40 - none
+limited local  POST /v1/certify/pre-authorized-data 40 - none
+
+# body-limit <who> <path> <file> <want code>
+body-limit() {
+    local who="$1" path="$2" file="$3" want="$4" code
+    local args=(-s -o "$WORK/body" -w '%{http_code}' -X POST -H 'Content-Type: application/json')
+    if [ "$who" = public ]; then
+        args+=(-H 'CF-Ray: 8f00000000000000-BLR' -H "CF-Connecting-IP: 203.0.113.$(( total % 200 + 20 ))")
+    fi
+    code="$(curl "${args[@]}" --data-binary "@$file" "$BASE$path")" || code="curl-error"
+    total=$((total + 1))
+    if [ "$code" = "$want" ]; then
+        printf 'ok    %-5s %-6s POST %-40s (%s bytes) -> %s\n' "$want" "$who" "$path" "$(wc -c < "$file" | tr -d ' ')" "$code"
+    else
+        printf 'FAIL  %-5s %-6s POST %-40s (%s bytes) -> %s\n' "$want" "$who" "$path" "$(wc -c < "$file" | tr -d ' ')" "$code"
+        failures=$((failures + 1))
+    fi
+}
+
+# a pushed authorization request body above 8 KiB is refused before Certify sees it; an offer's claims JSON is not
+body-limit public /v1/certify/oauth/par "$WORK/par-body.txt" 413
+body-limit public /v1/certify/pre-authorized-data "$WORK/offer-body.json" 200
+body-limit local  /v1/certify/oauth/par "$WORK/par-body.txt" 413
+# offer minting and the token endpoint: 32 KiB, for the operator too (an offer is cached until it lapses)
+body-limit public /v1/certify/pre-authorized-data "$WORK/offer-31k.json" 200
+body-limit public /v1/certify/pre-authorized-data "$WORK/offer-33k.json" 413
+body-limit local  /v1/certify/pre-authorized-data "$WORK/offer-33k.json" 413
+body-limit public /v1/certify/oauth/token "$WORK/token-33k.txt" 413
+
+# --- the rate limit's client key (F-21 review round 2) ---
+# key <CF-Connecting-IP> <expected key>: IPv4 whole, IPv6 by its /64 whatever the spelling
+key() {
+    local address="$1" want="$2" got
+    got="$(curl -s -H "CF-Connecting-IP: $address" "http://127.0.0.1:$KEYS_PORT/")" || got="curl-error"
+    total=$((total + 1))
+    if [ "$got" = "$want" ]; then
+        printf 'ok    key   %-40s -> %s\n' "$address" "$got"
+    else
+        printf 'FAIL  key   %-40s -> %s (want %s)\n' "$address" "$got" "$want"
+        failures=$((failures + 1))
+    fi
+}
+while read -r address want; do
+    case "$address" in ''|'#'*) continue ;; esac
+    key "$address" "$want"
+done <<'EOF'
+# IPv4, and IPv6 with an embedded IPv4 address: the whole address
+203.0.113.7                       203.0.113.7
+203.0.113.8                       203.0.113.8
+::ffff:203.0.113.7                ::ffff:203.0.113.7
+64:ff9b::203.0.113.7              64:ff9b::203.0.113.7
+# four groups before any `::`; leading zeros dropped, so every spelling of one /64 is one key
+2001:db8:1:2::a                   2001:db8:1:2::/64
+2001:db8:1:2:ffff::b              2001:db8:1:2::/64
+2001:db8:1:2:3:4:5:6              2001:db8:1:2::/64
+2001:0db8:0001:0002:0:0:0:c       2001:db8:1:2::/64
+2001:db8:1:3::a                   2001:db8:1:3::/64
+0:0:0:0:0:0:0:1                   0:0:0:0::/64
+# `::` after the third group
+2001:db8:1::5                     2001:db8:1:0::/64
+2001:db8:1:0:0:0:0:5              2001:db8:1:0::/64
+# after the second: the groups behind it decide the fourth
+2001:db8::1                       2001:db8:0:0::/64
+2001:db8::1:2:3:4                 2001:db8:0:0::/64
+2001:db8:0:0:1:2:3:4              2001:db8:0:0::/64
+2001:db8::1:2:3:4:5               2001:db8:0:1::/64
+2001:db8:0:1:2:3:4:5              2001:db8:0:1::/64
+# after the first
+2001::5                           2001:0:0:0::/64
+2001::1:2:3:4:5                   2001:0:0:1::/64
+2001:0:0:1:2:3:4:5                2001:0:0:1::/64
+2001::1:2:3:4:5:6                 2001:0:1:2::/64
+2001:0:1:2:3:4:5:6                2001:0:1:2::/64
+# leading
+::1                               0:0:0:0::/64
+::1:2:3:4:5                       0:0:0:1::/64
+0:0:0:1:2:3:4:5                   0:0:0:1::/64
+::1:2:3:4:5:6                     0:0:1:2::/64
+::1:2:3:4:5:6:7                   0:1:2:3::/64
+# case-insensitive match (Cloudflare sends lower case; the key keeps what it was given)
+2001:DB8:1:2::A                   2001:DB8:1:2::/64
+EOF
+
+# and by behaviour: one /64 shares one limit (burst 20 + 1); the neighbouring /64 and IPv4 address keep their own
+limited public POST /v1/certify/pre-authorized-data 15 2001:db8:a:1::1 none
+limited public POST /v1/certify/pre-authorized-data 15 2001:db8:a:1:ffff:ffff:ffff:fffe some
+limited public POST /v1/certify/pre-authorized-data 15 2001:db8:a:2::1 none
+limited public POST /v1/certify/pre-authorized-data 15 203.0.113.40 none
+limited public POST /v1/certify/pre-authorized-data 15 203.0.113.41 none
+
 
 echo
 if [ "$failures" -ne 0 ]; then
