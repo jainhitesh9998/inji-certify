@@ -1254,6 +1254,8 @@ with Multipaz and Paradym after P5-03f, and by camera after P5-03g.
 
 D-P5-03-1 to -3 are the owner decisions of section 0, already recorded.
 
+**Answered 2026-11-14: the owner took every recommendation below** (D-P5-03-4 (a) with (c) as outreach, -5 (a)+(b), -6 (a), -7 (b), -8 (a), -9 (a), -10 (a), -11 (a), -12 (a), -13 (a)); recorded in `docs/design/12-risks-and-decisions.md`. P5-03f and P5-03i are therefore in scope.
+
 | # | Question | Options | Recommendation |
 | --- | --- | --- | --- |
 | D-P5-03-4 | Multipaz (no CORS) and Paradym (Credo has no CORS) cannot be read from a web page on another origin. How does the page get their request objects (and Multipaz's `redirect_uri`)? | (a) a narrow server relay on Certify (4.9, P5-03f): two operations, an explicit https host allow-list (`verifier.multipaz.org`, `paradym.id` in the mDL profile), public addresses only with the address pinned, no redirects, size, time and concurrency limits, nginx rate limit 10/min, off by default; (b) no relay: EUDI works end to end, and for the other two the user fetches the request object with `curl` and pastes it (the paste field accepts a compact JWS). Responses go by form POST, so Multipaz's result page is never reached; (c) ask the Multipaz and Animo maintainers to send CORS headers on their wallet endpoints | **(a), and (c) as outreach.** (a) is the only option that makes two of the three named verifiers work from the page today. The allow-list keeps it from being an open proxy. (b) stays available as the fallback whatever is chosen. |
