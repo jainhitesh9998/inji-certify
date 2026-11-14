@@ -203,22 +203,47 @@ public class DefaultIssuanceService implements IssuanceService {
             }
         }
         UnsignedCredential unsigned = build(formatter, claims, configuration, context, holder);
+        // the key is resolved before the status step, not after it (M-11e): a status list for an mso_mdoc is signed by
+        // the Document Signer of the mDLs indexed in it, so the provider needs that key before it allocates an index, and
+        // an unusable key fails without consuming one. The same context signs the credential below, so one resolution
+        // serves both and nothing about the issued bytes changes.
+        SigningContext signing = keyProviders.signingContext(signingConfig(configuration, context));
         if (configuration.status().isEnabled()) {
             StatusProvider status = statusProviders.stream()
                     .filter(p -> p.mechanism().equals(configuration.status().mechanism()) && p.supports(configuration.format()))
                     .findFirst().orElseThrow(() -> new IssuanceException(IssuanceException.ISSUANCE_FAILED,
                             "No status provider for " + configuration.status().mechanism() + " and format " + configuration.format()));
-            unsigned = status.attach(unsigned, configuration, context);
+            try {
+                unsigned = status.attach(unsigned, configuration, context,
+                        new StatusProvider.StatusBinding(signing, formatter.statusListTokenFormat()));
+            } catch (FormatException e) {
+                // a provider refuses before anything is signed: no usable status list, a refused or retired signer, an
+                // index pool that is gone. The request itself is fine, so the answer stays OpenID4VCI's server_error;
+                // the description names the rule (status_list_unavailable and the reason), which an operator needs
+                throw statusFailure(e);
+            }
         }
         for (IssuanceListener listener : listeners) {
             unsigned = listener.beforeSign(unsigned, configuration, context);
         }
-        SigningContext signing = keyProviders.signingContext(signingConfig(configuration, context));
         try {
             return new Issued(formatter.sign(unsigned, signing, context), claims);
         } catch (FormatException e) {
             throw callerError(e);
         }
+    }
+
+    /**
+     * A {@link StatusProvider} refusing to attach an entry: the credential cannot carry a status a verifier would accept
+     * (no free list, a Document Signer the signer policy refuses, a list whose signer is retired). The credential request
+     * is not at fault, so the code is {@link IssuanceException#ISSUANCE_FAILED} — and the provider's own code is kept in
+     * the description, so a wallet log names the rule ({@code status_list_unavailable}) rather than a bare
+     * "Issuance failed".
+     */
+    private static IssuanceException statusFailure(FormatException e) {
+        String code = e.getErrorCode();
+        return new IssuanceException(IssuanceException.ISSUANCE_FAILED,
+                "Issuance failed: " + (code == null || code.isBlank() ? "" : code + ": ") + e.getMessage(), e);
     }
 
     /** A tenant with its own DID issues under it: the proof's verification method and the issuer must resolve together. */

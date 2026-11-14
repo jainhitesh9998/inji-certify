@@ -234,6 +234,44 @@ class CredentialConfigurationV2Test {
     }
 
     /**
+     * Owner decision D-M11-5 and ISO/IEC 18013-5 second edition 12.3.6.1: an mDoc status list carries only revoked/valid,
+     * so a v2 save (create and update alike) of an {@code mso_mdoc} entry whose {@code status.mechanism} is
+     * {@code TokenStatusList} with any other purpose is a {@code 400 invalid_configuration} naming {@code status.purposes}
+     * and nothing is stored. A row written through the v1 API, which applies no such rule, is refused at issuance
+     * instead (MdocStatusListSampleTest, on PostgreSQL).
+     */
+    @Test
+    void mdocStatusPurposesMustBeRevocationOnly() throws Exception {
+        String id = "V2MdlStatusPurposesCredential";
+        configurations.findByTenantIdAndCredentialConfigKeyId("default", id).ifPresent(configurations::delete);
+        configurations.findByTenantIdAndCredentialFormatAndDocType("default", "mso_mdoc", "org.iso.18013.5.1.mDL")
+                .ifPresent(configurations::delete);
+        Map<String, Object> body = mdocBody(id, mdocTemplate());
+        body.remove("sampleClaims"); // a status-bearing dry run needs PostgreSQL (MdocStatusListSampleTest runs it)
+        body.put("status", Map.of("mechanism", "TokenStatusList", "purposes", List.of("suspension")));
+
+        MvcResult refused = call(post(PATH), body);
+        assertEquals(400, refused.getResponse().getStatus(), refused.getResponse().getContentAsString());
+        assertEquals("invalid_configuration", error(refused));
+        String description = objectMapper.readTree(refused.getResponse().getContentAsString()).get("error_description").asText();
+        assertTrue(description.contains("status.purposes") && description.contains("12.3.6.1"), description);
+        assertTrue(configurations.findByTenantIdAndCredentialConfigKeyId("default", id).isEmpty(), "nothing was saved");
+
+        // revocation itself is of course accepted, and the same rule holds on update
+        body.put("status", Map.of("mechanism", "TokenStatusList", "purposes", List.of("revocation")));
+        MvcResult created = call(post(PATH), body);
+        assertEquals(201, created.getResponse().getStatus(), created.getResponse().getContentAsString());
+        body.put("status", Map.of("mechanism", "TokenStatusList", "purposes", List.of("suspension")));
+        MvcResult update = call(put(PATH + "/" + id), body);
+        assertEquals(400, update.getResponse().getStatus(), update.getResponse().getContentAsString());
+        assertEquals("invalid_configuration", error(update));
+        String stored = String.valueOf(configurations.findByTenantIdAndCredentialConfigKeyId("default", id).orElseThrow()
+                .getCredentialStatusPurposes());
+        assertTrue(stored.contains("revocation") && !stored.contains("suspension"), "the refused update stored nothing: " + stored);
+        configurations.findByTenantIdAndCredentialConfigKeyId("default", id).ifPresent(configurations::delete);
+    }
+
+    /**
      * ISO/IEC 18013-5 9.1.2.4 requires the document signer certificate in the IssuerAuth {@code x5chain}: an mso_mdoc
      * configuration that would leave the chain out ({@code signing.x5c: none}) is refused when it is saved.
      */

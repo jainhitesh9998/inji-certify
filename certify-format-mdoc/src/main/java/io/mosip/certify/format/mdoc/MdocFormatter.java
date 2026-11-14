@@ -41,6 +41,8 @@ import java.util.function.Supplier;
 public class MdocFormatter implements CredentialFormatter {
 
     public static final String FORMAT = "mso_mdoc";
+    /** The token format an mDoc's status list is carried in (ISO/IEC 18013-5 second edition 12.3.6.3). */
+    public static final String STATUS_LIST_TOKEN_FORMAT = "cwt";
     static final String ATTRIBUTE_NAMESPACES = "taggedNamespaces";
     static final String ATTRIBUTE_ELEMENTS = "elementValues";
     static final String RAW_DOCTYPE = "docType";
@@ -70,6 +72,17 @@ public class MdocFormatter implements CredentialFormatter {
     @Override
     public String formatId() {
         return FORMAT;
+    }
+
+    /**
+     * ISO/IEC 18013-5 second edition 12.3.6.3: an mDoc's status list is a CWT Status List Token, because "the IssuerAuth
+     * structure is a CWT", so an {@code mso_mdoc} entry's list is {@code cwt} and never a Token Status List JWT. This is
+     * the one place that says so (CLAUDE.md rule 5): {@code TokenStatusListProvider} only compares it with
+     * {@code certify.status.token-status-list.mdoc.token-format}.
+     */
+    @Override
+    public String statusListTokenFormat() {
+        return STATUS_LIST_TOKEN_FORMAT;
     }
 
     @Override

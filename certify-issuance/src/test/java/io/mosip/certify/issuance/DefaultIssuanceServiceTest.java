@@ -96,9 +96,14 @@ class DefaultIssuanceServiceTest {
 
     /** The same service over a given list of data sources and the default source id a configuration naming none uses. */
     private DefaultIssuanceService service(List<CredentialDataSource> dataSources, String defaultDataSourceId) {
+        return service(dataSources, defaultDataSourceId, List.of(statusProvider));
+    }
+
+    private DefaultIssuanceService service(List<CredentialDataSource> dataSources, String defaultDataSourceId,
+                                           List<StatusProvider> statusProviders) {
         return new DefaultIssuanceService(registry, new FormatterRegistry(List.of(formatter)), new KeyProviderRegistry(List.of(JCA)),
                 dataSources, List.of(new FakeExternalIssuer()), List.of(proofValidator), List.of(templateEngine),
-                List.of(statusProvider), List.of(listener), AuthorizationPolicy.SCOPE, Clock.fixed(NOW, ZoneOffset.UTC), Duration.ofDays(30),
+                statusProviders, List.of(listener), AuthorizationPolicy.SCOPE, Clock.fixed(NOW, ZoneOffset.UTC), Duration.ofDays(30),
                 defaultDataSourceId);
     }
 
@@ -251,6 +256,85 @@ class DefaultIssuanceServiceTest {
         assertEquals(List.of("proof", "fetch", "render", "build", "status", "beforeSign", "sign", "onIssued"), Trace.STEPS);
         assertEquals("farmer-status", statusProvider.configuration.id());
         assertNotNull(formatter.signed.attributes().get("status"));
+    }
+
+    /**
+     * M-11e, additive SPI: a provider written against the three-argument {@code attach} keeps working untouched, because
+     * the four-argument method is a default that delegates to it.
+     */
+    @Test
+    void aProviderWithOnlyTheThreeArgumentAttachStillWorks() {
+        IssuanceResult result = service.issue(command("farmer-status").build());
+
+        assertEquals(1, statusProvider.attached, "the three-argument attach ran through the default method");
+        assertEquals("list#1", formatter.signed.attributes().get("status"));
+        assertInstanceOf(IssuanceResult.Issued.class, result);
+    }
+
+    /** The binding tells a status provider what the credential is signed with and how its format carries a status list. */
+    @Test
+    void theBindingCarriesTheSigningContextAndTheFormatsTokenFormat() {
+        BindingStatusProvider provider = new BindingStatusProvider();
+        service = service(List.of(dataSource), null, List.of(provider));
+
+        service.issue(command("farmer-status").build());
+
+        assertNotNull(provider.binding);
+        assertEquals(KEY, provider.binding.signing().config().keyRef(), "the very key the credential is signed with");
+        assertEquals("jwt", provider.binding.statusListTokenFormat(), "a format that does not say otherwise keeps JWT");
+    }
+
+    /** An {@code mso_mdoc} formatter says its status list is CWT; the core passes that through, switching on nothing. */
+    @Test
+    void aFormatterThatCarriesCwtAsksForItInTheBinding() {
+        formatter.tokenFormat = "cwt";
+        BindingStatusProvider provider = new BindingStatusProvider();
+        service = service(List.of(dataSource), null, List.of(provider));
+
+        service.issue(command("farmer-status").build());
+
+        assertEquals("cwt", provider.binding.statusListTokenFormat());
+    }
+
+    /**
+     * M-11e: the signing key is resolved before the status step, so a key that cannot be resolved fails without the
+     * provider ever being asked — no index is consumed for a credential that cannot be signed — and the error mapping is
+     * the one it always was.
+     */
+    @Test
+    void anUnresolvableKeyFailsBeforeTheStatusProviderIsAsked() {
+        registry.register(config("unresolvable", "farmer_vc", IssuanceStrategy.TEMPLATE,
+                new StatusConfig("token-status-list", List.of("revocation"))));
+        CredentialConfiguration registered = registry.byId("default", "unresolvable").orElseThrow();
+        registry.register(new CredentialConfiguration(null, "unresolvable", "farmer_vc", "vc+jwt", registered.formatConfig(),
+                registered.template(), SigningConfig.of(KeyRef.parse("keymanager:CERTIFY_VC_SIGN_ED25519"), SignatureAlgorithm.EdDSA),
+                IssuanceStrategy.TEMPLATE, null, new StatusConfig("token-status-list", List.of("revocation")), null, null));
+
+        IssuanceException e = assertThrows(IssuanceException.class, () -> service.issue(command("unresolvable").build()));
+
+        assertEquals(IssuanceException.ISSUANCE_FAILED, e.getErrorCode());
+        assertTrue(e.getMessage().contains("keymanager"), e.getMessage());
+        assertEquals(0, statusProvider.attached, "the status provider never ran, so no index was allocated");
+        assertEquals(1, listener.failures.size(), "the failure is still reported to the listeners");
+    }
+
+    /**
+     * A status provider that refuses names its rule in the client's {@code error_description}: the credential request is
+     * not at fault, so the code stays {@code ISSUANCE_FAILED} (OpenID4VCI {@code server_error}), and the message carries
+     * the provider's own code ({@code status_list_unavailable}).
+     */
+    @Test
+    void aRefusedStatusEntryNamesItsRuleAndNothingIsSigned() {
+        statusProvider.refuseWith = new FormatException("status_list_unavailable",
+                "ISO/IEC 18013-5 second edition 12.3.6.1: an mDoc status list carries only revoked/valid");
+
+        IssuanceException e = assertThrows(IssuanceException.class, () -> service.issue(command("farmer-status").build()));
+
+        assertEquals(IssuanceException.ISSUANCE_FAILED, e.getErrorCode());
+        assertTrue(e.getMessage().contains("status_list_unavailable"), e.getMessage());
+        assertTrue(e.getMessage().contains("12.3.6.1"), e.getMessage());
+        assertNull(formatter.signed, "nothing was signed");
+        assertEquals(1, listener.failures.size());
     }
 
     @Test
@@ -518,8 +602,10 @@ class DefaultIssuanceServiceTest {
         }
     }
 
-    static final class FakeStatusProvider implements StatusProvider {
+    static class FakeStatusProvider implements StatusProvider {
         CredentialConfiguration configuration;
+        int attached;
+        FormatException refuseWith;
 
         public String mechanism() { return "token-status-list"; }
 
@@ -528,10 +614,26 @@ class DefaultIssuanceServiceTest {
         public UnsignedCredential attach(UnsignedCredential credential, CredentialConfiguration configuration, IssuanceContext context) {
             Trace.step("status");
             this.configuration = configuration;
+            this.attached++;
+            if (refuseWith != null) {
+                throw refuseWith;
+            }
             return credential.withAttribute("status", "list#1");
         }
 
         public void update(StatusUpdate update) {}
+    }
+
+    /** A provider that takes the binding and then does exactly what the three-argument one does. */
+    static final class BindingStatusProvider extends FakeStatusProvider {
+        StatusBinding binding;
+
+        @Override
+        public UnsignedCredential attach(UnsignedCredential credential, CredentialConfiguration configuration,
+                                        IssuanceContext context, StatusBinding binding) {
+            this.binding = binding;
+            return super.attach(credential, configuration, context);
+        }
     }
 
     static final class RecordingListener implements IssuanceListener {
@@ -558,10 +660,13 @@ class DefaultIssuanceServiceTest {
         boolean explode;
         FormatException buildFailure;
         FormatException signFailure;
+        String tokenFormat = "jwt";
 
         public String formatId() { return "vc+jwt"; }
 
         public Set<String> aliases() { return Set.of("jwt_vc_json"); }
+
+        public String statusListTokenFormat() { return tokenFormat; }
 
         public FormatConfig parseConfig(Map<String, Object> raw) { return new FormatConfig.Generic(raw, null); }
 

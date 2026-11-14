@@ -60,6 +60,8 @@ public class CredentialConfigurationV2Service {
             ("{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\",\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"}")
                     .getBytes(java.nio.charset.StandardCharsets.UTF_8)), "jwt");
     static final String FORMAT_MSO_MDOC = "mso_mdoc";
+    /** The only status purposes an mDoc list may carry (ISO/IEC 18013-5 second edition 12.3.6.1, D-M11-5). */
+    static final List<String> MDOC_STATUS_PURPOSES = List.of("revocation");
 
     private final CredentialConfigRepository configurations;
     private final CredentialTemplateRepository templates;
@@ -308,6 +310,19 @@ public class CredentialConfigurationV2Service {
         if (status != null && status.getPurposes() != null && !status.getPurposes().isEmpty()) {
             if (status.getPurposes().size() > 1) {
                 throw ConfigV2Exception.invalid("Only one status purpose is supported");
+            }
+            // before the deployment's own allow-list: an mDoc list's purpose is fixed by the specification, and the
+            // operator's answer to "why was this refused" must name the field and the clause, not a deployment setting
+            if (FORMAT_MSO_MDOC.equals(format)
+                    && io.mosip.certify.status.TokenStatusListProvider.MECHANISM.equals(status.getMechanism())
+                    && !MDOC_STATUS_PURPOSES.equals(status.getPurposes())) {
+                // ISO/IEC 18013-5 second edition 12.3.6.1 and owner decision D-M11-5: an mDoc status list carries only
+                // revoked/valid, so a purpose no wallet can read is refused when the row is written, not at issuance
+                throw ConfigV2Exception.invalid("status.purposes must be exactly " + MDOC_STATUS_PURPOSES
+                        + " for an mso_mdoc entry whose status.mechanism is "
+                        + io.mosip.certify.status.TokenStatusListProvider.MECHANISM
+                        + ": ISO/IEC 18013-5 second edition 12.3.6.1 makes an mDoc status list carry only"
+                        + " revoked/valid (D-M11-5)");
             }
             List<String> allowed = legacyService.protocolDefaults(format).allowedStatusPurposes();
             if (allowed != null && !allowed.isEmpty() && !allowed.containsAll(status.getPurposes())) {

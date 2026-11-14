@@ -245,6 +245,14 @@ public final class IndependentStatusListVerifier {
         public static StatusListOptions strictMode() {
             return new StatusListOptions(true, 0, true);
         }
+
+        /**
+         * As {@link #strictMode()}, for a sample that declares another expected status: {@code 1} for a revoked mDL
+         * (M-11e's {@code .statuslist.status} sidecar). ISO/IEC 18013-5 second edition 12.3.6.1 admits no other.
+         */
+        public static StatusListOptions strictMode(int expectedStatus) {
+            return new StatusListOptions(true, expectedStatus, true);
+        }
     }
 
     /**
