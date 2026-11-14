@@ -312,7 +312,7 @@ class StatusListBatchJobCwtTest {
 
     static {
         // the fixture certificates sit around the real now; the test instants must be inside them
-        if (!DSC.getNotAfter().toInstant().isAfter(Instant.parse("2026-11-13T12:00:00Z"))) {
+        if (!DSC.getNotAfter().toInstant().isAfter(StatusListTestKeys.NOW.plus(java.time.Duration.ofDays(1)))) {
             throw new IllegalStateException("the fixture Document Signer must outlive the test");
         }
     }

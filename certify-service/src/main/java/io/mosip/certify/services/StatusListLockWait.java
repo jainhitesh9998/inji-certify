@@ -97,6 +97,15 @@ public class StatusListLockWait {
      * @throws StatusListBusyException the lock was not available in time; the transaction must roll back (it is aborted
      *                                 on PostgreSQL), which throwing this out of a {@code @Transactional} method does
      */
+    /** The innermost cause's message: PostgreSQL's own text (a lock timeout, a statement timeout or a cancel). */
+    private static String rootMessage(Throwable failure) {
+        Throwable root = failure;
+        while (root.getCause() != null && root.getCause() != root) {
+            root = root.getCause();
+        }
+        return root.getMessage();
+    }
+
     public <T> T bounded(String listId, Supplier<T> lock) {
         Long statementTimeoutBefore = boundTheWait();
         T locked;
@@ -104,9 +113,11 @@ public class StatusListLockWait {
             locked = lock.get();
         } catch (RuntimeException e) {
             if (lockNotAvailable(e) || (statementTimeoutBefore != null && hasSqlState(e, POSTGRES_QUERY_CANCELED))) {
+                // 57014 is also what an explicit cancel (pg_cancel_backend) raises: the refusal is the same (rolled back,
+                // retryable), and the WARN carries PostgreSQL's own message so a cancel is not read as contention
                 log.warn("Status list {} is locked by another writer (the batch job signing it, or a status change) and"
-                        + " its lock was not available within {} (certify.status.update.lock-wait); refused as retryable",
-                        listId, lockWait);
+                        + " its lock was not available within {} (certify.status.update.lock-wait); refused as retryable"
+                        + " (database: {})", listId, lockWait, rootMessage(e));
                 throw new StatusListBusyException(listId, lockWait, e);
             }
             throw e;

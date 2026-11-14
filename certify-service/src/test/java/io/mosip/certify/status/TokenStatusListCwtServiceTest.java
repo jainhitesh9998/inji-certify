@@ -99,7 +99,7 @@ import static org.mockito.Mockito.when;
  */
 class TokenStatusListCwtServiceTest {
 
-    static final Instant T0 = Instant.parse("2026-11-13T10:00:00Z");
+    static final Instant T0 = StatusListTestKeys.NOW; // the instant the fixture certificates sit around
     static final Duration TTL = Duration.ofHours(1);
     static final Duration RENEW_WAIT = Duration.ofSeconds(5);
     static final Duration BACKOFF = Duration.ofSeconds(30);
@@ -115,7 +115,7 @@ class TokenStatusListCwtServiceTest {
     static X509Certificate signerUntil(java.security.KeyPair keys, Instant notAfter, String commonName) {
         return StatusListTestKeys.signer(keys, commonName, IACA, StatusListTestKeys.IACA_KEYS,
                 List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true,
-                Instant.now().minus(100, java.time.temporal.ChronoUnit.DAYS), notAfter);
+                StatusListTestKeys.NOW.minus(100, java.time.temporal.ChronoUnit.DAYS), notAfter);
     }
 
     @Test
@@ -562,7 +562,7 @@ class TokenStatusListCwtServiceTest {
         X509Certificate leaf = StatusListTestKeys.signer(INTERMEDIATE_DSC_KEYS, "Status List Test Behind A Short Intermediate",
                 StatusListTestKeys.SHORT_INTERMEDIATE, StatusListTestKeys.SHORT_INTERMEDIATE_KEYS,
                 List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true,
-                Instant.now().minus(100, java.time.temporal.ChronoUnit.DAYS), Instant.now().plus(200, java.time.temporal.ChronoUnit.DAYS));
+                StatusListTestKeys.NOW.minus(100, java.time.temporal.ChronoUnit.DAYS), StatusListTestKeys.NOW.plus(200, java.time.temporal.ChronoUnit.DAYS));
         fixture.provider.add("mdl-dsc@2030-03", INTERMEDIATE_DSC_KEYS.getPrivate(),
                 CertificateChain.of(leaf, StatusListTestKeys.SHORT_INTERMEDIATE), SignatureAlgorithm.ES256, "mdoc-dsc");
         TokenStatusListService lists = fixture.lists(clock);

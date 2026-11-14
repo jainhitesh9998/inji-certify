@@ -66,7 +66,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 class TokenStatusListFreshnessTest {
 
     static final Duration TTL = Duration.ofHours(1);
-    static final Instant T0 = Instant.parse("2026-11-13T10:00:00Z");
+    static final Instant T0 = StatusListTestKeys.NOW; // the instant the fixture certificates sit around
     static final String DOMAIN = "https://credentials.example.org";
     static final String SERVLET_PATH = "/v1/certify";
     static final String LIST_ID = "4b4a7c5e-5d9a-4b3a-9b0e-2f0b8f6a1c11";
