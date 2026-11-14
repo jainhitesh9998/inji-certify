@@ -9,6 +9,8 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
@@ -24,13 +26,24 @@ import java.util.function.Supplier;
  * list whose signer hangs could drain the pool and stop issuance as well.
  *
  * <p>Hibernate cannot express a bounded wait on PostgreSQL: its lock-timeout hint renders only {@code NOWAIT} (0) or
- * {@code SKIP LOCKED} (-2), and any other value is ignored. So before the lock is taken, {@code SET LOCAL lock_timeout}
- * bounds every lock wait of the rest of the caller's transaction to {@code certify.status.update.lock-wait}; the setting
- * ends with that transaction and never leaks into the pooled connection. PostgreSQL then fails the lock with SQLState
- * {@value #POSTGRES_LOCK_NOT_AVAILABLE} ({@code lock_not_available}), which is raised here as a
+ * {@code SKIP LOCKED} (-2), and any other value is ignored. So before the lock is taken, in the caller's transaction:
+ * <ul>
+ *   <li>{@code SET LOCAL statement_timeout} bounds the lock statement as a whole to {@code certify.status.update.lock-wait}
+ *   (or to the {@code statement_timeout} already in force when that is shorter), and is put back to that value as soon
+ *   as the lock is held. This is the bound. {@code lock_timeout} alone is not one: PostgreSQL applies it to each
+ *   lock acquisition separately, and a row lock that another session is already waiting for takes two — the tuple lock
+ *   that queues the waiters, then the holder's transaction — so the second waiter of a held list waited for up to twice
+ *   the bound, longer still behind a multixact (M-11d CI fix: {@code 10.003 s} against a {@code 5 s} bound, the third of
+ *   three status changes for one list);</li>
+ *   <li>{@code SET LOCAL lock_timeout} bounds every single lock wait of the rest of the caller's transaction to the same
+ *   value, as before.</li>
+ * </ul>
+ * Both settings end with that transaction and never leak into the pooled connection. PostgreSQL then fails the lock with
+ * SQLState {@value #POSTGRES_QUERY_CANCELED} ({@code query_canceled}: the statement timeout) or
+ * {@value #POSTGRES_LOCK_NOT_AVAILABLE} ({@code lock_not_available}: the lock timeout), which is raised here as a
  * {@link StatusListBusyException}; the caller's transaction rolls back, so nothing is queued or written.
  *
- * <p>Other databases: the statement is PostgreSQL's, so it runs only when the connection's
+ * <p>Other databases: the statements are PostgreSQL's, so they run only when the connection's
  * {@code DatabaseMetaData.getDatabaseProductName()} is {@code PostgreSQL} — read from the connection, not from the
  * Hibernate dialect, because an H2 test context that activates the {@code local} profile keeps that profile's
  * {@code PostgreSQLDialect}. Another database keeps its own lock timeout and its own failure: H2 (a test database, not
@@ -45,6 +58,12 @@ public class StatusListLockWait {
 
     /** PostgreSQL {@code lock_not_available}: {@code lock_timeout} expired, or a {@code NOWAIT} lock was taken. */
     public static final String POSTGRES_LOCK_NOT_AVAILABLE = "55P03";
+
+    /**
+     * PostgreSQL {@code query_canceled}: {@code statement_timeout} expired (or the statement was cancelled). A refusal
+     * only for the lock statement this class bounded; anywhere else it is not a lock that was not available.
+     */
+    public static final String POSTGRES_QUERY_CANCELED = "57014";
 
     /** The transaction's session, or {@code null} for a caller whose repository is not a database (unit tests). */
     private final EntityManager entityManager;
@@ -79,11 +98,12 @@ public class StatusListLockWait {
      *                                 on PostgreSQL), which throwing this out of a {@code @Transactional} method does
      */
     public <T> T bounded(String listId, Supplier<T> lock) {
-        boundTheWait();
+        Long statementTimeoutBefore = boundTheWait();
+        T locked;
         try {
-            return lock.get();
+            locked = lock.get();
         } catch (RuntimeException e) {
-            if (lockNotAvailable(e)) {
+            if (lockNotAvailable(e) || (statementTimeoutBefore != null && hasSqlState(e, POSTGRES_QUERY_CANCELED))) {
                 log.warn("Status list {} is locked by another writer (the batch job signing it, or a status change) and"
                         + " its lock was not available within {} (certify.status.update.lock-wait); refused as retryable",
                         listId, lockWait);
@@ -91,12 +111,24 @@ public class StatusListLockWait {
             }
             throw e;
         }
+        if (statementTimeoutBefore != null) {
+            // the lock is held: the rest of the caller's transaction runs under the statement_timeout it had before.
+            // After a failure there is nothing to put back: the transaction is aborted and its SET LOCALs end with it.
+            setLocal("statement_timeout", statementTimeoutBefore);
+        }
+        return locked;
     }
 
-    /** {@code SET LOCAL lock_timeout} on PostgreSQL, in the caller's transaction; nothing elsewhere. */
-    private void boundTheWait() {
+    /**
+     * On PostgreSQL, in the caller's transaction: {@code SET LOCAL lock_timeout} for the rest of it and
+     * {@code SET LOCAL statement_timeout} for the lock statement; nothing elsewhere.
+     *
+     * @return the {@code statement_timeout} in force before, in milliseconds ({@code 0}: none), to put back once the
+     * lock is held; {@code null} when nothing was set (no database, or not PostgreSQL)
+     */
+    private Long boundTheWait() {
         if (entityManager == null) {
-            return;
+            return null;
         }
         if (!TransactionSynchronizationManager.isActualTransactionActive()) {
             // SET LOCAL outside a transaction block is a no-op on PostgreSQL: the wait would not be bounded at all
@@ -104,22 +136,46 @@ public class StatusListLockWait {
                     + " bounded for that transaction only");
         }
         long millis = Math.max(1L, lockWait.toMillis());
-        entityManager.unwrap(Session.class).doWork(connection -> {
-            Boolean known = postgres;
-            if (known == null) {
-                known = "PostgreSQL".equalsIgnoreCase(connection.getMetaData().getDatabaseProductName());
-                postgres = known;
-                if (!known) {
-                    log.info("Status list lock waits are bounded by the database's own lock timeout on {};"
-                                    + " certify.status.update.lock-wait ({}) applies on PostgreSQL",
-                            connection.getMetaData().getDatabaseProductName(), lockWait);
-                }
+        return entityManager.unwrap(Session.class).doReturningWork(connection -> {
+            if (!postgres(connection)) {
+                return null;
             }
-            if (known) {
-                try (Statement statement = connection.createStatement()) {
-                    // a literal: SET takes no bind parameter, and the value is a number this class formats
-                    statement.execute("SET LOCAL lock_timeout = '" + millis + "ms'");
-                }
+            long before;
+            try (Statement statement = connection.createStatement();
+                 ResultSet setting = statement.executeQuery(
+                         "SELECT setting FROM pg_settings WHERE name = 'statement_timeout'")) { // milliseconds
+                setting.next();
+                before = Long.parseLong(setting.getString(1));
+            }
+            // a shorter statement_timeout the deployment set is kept: the bound only ever tightens it
+            long statement = before > 0 && before < millis ? before : millis;
+            try (Statement set = connection.createStatement()) {
+                // literals: SET takes no bind parameter, and the values are numbers this class formats
+                set.execute("SET LOCAL lock_timeout = '" + millis + "ms'");
+                set.execute("SET LOCAL statement_timeout = '" + statement + "ms'");
+            }
+            return before;
+        });
+    }
+
+    private boolean postgres(Connection connection) throws SQLException {
+        Boolean known = postgres;
+        if (known == null) {
+            String product = connection.getMetaData().getDatabaseProductName();
+            known = "PostgreSQL".equalsIgnoreCase(product);
+            postgres = known;
+            if (!known) {
+                log.info("Status list lock waits are bounded by the database's own lock timeout on {};"
+                        + " certify.status.update.lock-wait ({}) applies on PostgreSQL", product, lockWait);
+            }
+        }
+        return known;
+    }
+
+    private void setLocal(String parameter, long millis) {
+        entityManager.unwrap(Session.class).doWork(connection -> {
+            try (Statement statement = connection.createStatement()) {
+                statement.execute("SET LOCAL " + parameter + " = '" + millis + "ms'");
             }
         });
     }
@@ -127,13 +183,19 @@ public class StatusListLockWait {
     /**
      * Whether {@code failure} is a lock that was not available in time: PostgreSQL {@value #POSTGRES_LOCK_NOT_AVAILABLE},
      * wherever it sits in the cause chain (Spring and Hibernate wrap the driver's exception in their own, whose classes
-     * differ by version and lock mode).
+     * differ by version and lock mode). A statement timeout ({@value #POSTGRES_QUERY_CANCELED}) is not one in general;
+     * {@link #bounded} recognises it for the one statement it bounded.
      */
     public static boolean lockNotAvailable(Throwable failure) {
+        return hasSqlState(failure, POSTGRES_LOCK_NOT_AVAILABLE);
+    }
+
+    /** Whether an {@link SQLException} with {@code sqlState} is anywhere in {@code failure}'s cause or next chain. */
+    private static boolean hasSqlState(Throwable failure, String sqlState) {
         for (Throwable cause = failure; cause != null; cause = cause.getCause() == cause ? null : cause.getCause()) {
             if (cause instanceof SQLException sql) {
                 for (SQLException next = sql; next != null; next = next.getNextException()) {
-                    if (POSTGRES_LOCK_NOT_AVAILABLE.equals(next.getSQLState())) {
+                    if (sqlState.equals(next.getSQLState())) {
                         return true;
                     }
                     if (next.getNextException() == next) {

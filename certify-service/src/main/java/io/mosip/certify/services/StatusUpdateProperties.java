@@ -19,8 +19,10 @@ import java.time.Duration;
  *                 {@code Retry-After}) and queues nothing, the batch job moves on to the next list and tries this one
  *                 again on its next run. At least one millisecond and at most {@link Integer#MAX_VALUE} milliseconds
  *                 (PostgreSQL's {@code lock_timeout} range; zero would mean "wait for ever" there, so it is refused).
- *                 Applied with {@code SET LOCAL lock_timeout} on PostgreSQL; another database keeps its own lock timeout
- *                 and failure ({@link StatusListLockWait}).
+ *                 Applied on PostgreSQL as the lock statement's {@code SET LOCAL statement_timeout} (the whole wait: a
+ *                 second waiter takes a held row lock in two lock acquisitions) and as {@code SET LOCAL lock_timeout} for
+ *                 the rest of the transaction; another database keeps its own lock timeout and failure
+ *                 ({@link StatusListLockWait}).
  */
 @ConfigurationProperties(prefix = "certify.status.update")
 public record StatusUpdateProperties(@DefaultValue("PT5S") Duration lockWait) {
