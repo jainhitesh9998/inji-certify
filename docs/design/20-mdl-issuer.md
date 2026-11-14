@@ -22,6 +22,7 @@ Goal (owner, 2026-11-13): a standards-compliant `mso_mdoc` mDL issuer on the ref
   next to the unchanged anonymous pre-authorized grant, so a wallet that looks for an authorization endpoint even on a
   pre-authorized offer (Talao) proceeds.
 - Live demo: `https://credentials.loremipsum.co.in` (offer page `/v1/certify/offer/`, IACA list `/v1/certify/mdoc/iaca`), the compose `mdl-operator` profile behind the public overlay. Runbook: `docker-compose/docker-compose-injistack/config/mdl/README.md` ("The public host"); smoke check `docs/design/tools/smoke.py --mdl` (VALIDATE.md 6f).
+- Planned (P5-03, 2026-11-14): the offer page keeps issued mDLs and presents them to verifiers (EUDI, Multipaz, Paradym) over OpenID4VP 1.0; plan [wp/P5-03-demo-wallet-presentation.md](./wp/P5-03-demo-wallet-presentation.md).
 
 Standards: ISO/IEC 18013-5:2021 (data model 7.2, MSO 9.1.2, Annex B certificate profiles), OpenID4VCI 1.0 final (Appendix A.2 `mso_mdoc`, 12.2.2 metadata location), HAIP 1.0 (no trust anchor in `x5chain`), draft-ietf-oauth-status-list (`status.status_list` in the MSO), RFC 9360 (`x5chain`, label 33), RFC 5280.
 
@@ -198,6 +199,9 @@ Each under about 800 lines excluding goldens and binaries.
 ### M-12 Public deployment (G25)
 - nginx denies admin APIs from non-local sources (D12); `mosip_certify_domain_url=https://credentials.loremipsum.co.in`; tunnel `certify-rebuild` ingress `credentials.loremipsum.co.in -> http://localhost:8091`; runbook and wallet matrix in this document; PROGRESS entry.
 - Acceptance: `workflows.py https://credentials.loremipsum.co.in` green; a Multipaz/EUDI/Inji wallet obtains the mDL; IssuerAuth verifies against the downloaded IACA.
+
+### P5-03 Demo wallet: keep and present the mDL (planned)
+- Plan: [wp/P5-03-demo-wallet-presentation.md](./wp/P5-03-demo-wallet-presentation.md). The offer page's in-browser wallet keeps issued mDLs (IndexedDB, non-extractable P-256 key) and presents them with selective disclosure over OpenID4VP 1.0 (and, by owner choice, ISO/IEC TS 18013-7 Annex A) to the EUDI, Multipaz and Paradym verifiers (decision log 2026-11-14). Not an issuer gap: issuance bytes, goldens and endpoints outside `/offer/**` do not change. Open owner questions D-P5-03-4..13 (relay, Multipaz trust, test mode, Annex A, CI cadence).
 
 ## Order
 
