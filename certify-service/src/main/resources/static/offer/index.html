@@ -87,7 +87,10 @@
       <li>Sign a <code>jwt</code> proof of possession with a fresh P-256 key in this browser and request the credential.</li>
     </ol>
     <button id="wallet" disabled>Run the pre-authorized code flow here</button>
+    <label id="keepLabel" hidden><input type="checkbox" id="keep" checked style="width:auto"> Keep this credential in this browser</label>
     <div id="walletStatus" class="status"></div>
+    <p id="keepNote" class="hint" hidden></p>
+    <p><a id="walletLink" href="wallet" hidden>Open the demo wallet</a></p>
     <pre id="credential" hidden></pre>
     <div id="mdocView" hidden>
       <h3 style="font-size:0.95rem;margin:16px 0 6px">IssuerSigned (ISO/IEC 18013-5) elements</h3>
@@ -99,6 +102,8 @@
 
 <script src="qrcode.min.js"></script>
 <script src="cbor.js"></script>
+<script src="mdoc.js"></script>
+<script src="wallet-store.js"></script>
 <script>
 (function () {
   // Same origin as the issuer: the servlet path is everything before /offer/
@@ -169,8 +174,15 @@
     // ISO/IEC 18013-5 credentials are only issued on the OpenID4VCI 1.0 surface (D5), so for them that surface is forced;
     // every other format defaults to the compatibility surface the page has always used.
     syncSurface();
+    syncKeep();
     // the operator's demo subjects, when there are any; a fetch that fails is not an error the visitor needs to see
     try { await loadDemoSubjects(); } catch (e) { /* no dropdown: the typed id and the claims field work as before */ }
+    // the wallet page, when this deployment serves it: its config endpoint exists only with
+    // certify.offer-page.wallet.enabled, so a 404 leaves no link
+    try {
+      const walletConfig = await api("GET", WALLET_CONFIG);
+      if (walletConfig.status === 200) el("walletLink").hidden = false;
+    } catch (e) { /* no wallet on this deployment */ }
   }
 
   function formatOf(configurationId) {
@@ -197,10 +209,29 @@
     el("surface").value = mdoc ? "oid4vci" : "legacy";
   }
 
+  /**
+   * P5-03a (plan 4.2, D-P5-03-6): only an mso_mdoc credential can be kept, so the checkbox is shown for an mso_mdoc
+   * configuration only (ticked by default) and hidden for every other format.
+   */
+  function syncKeep() {
+    el("keepLabel").hidden = selectedFormat() !== "mso_mdoc";
+  }
+
+  /** One line under the wallet button, about what was kept (or why nothing was). */
+  function keepNote(message, ok) {
+    const note = el("keepNote");
+    note.textContent = message;
+    note.className = "status " + (ok === undefined ? "" : ok ? "ok" : "bad");
+    note.hidden = false;
+  }
+
   // ---- demo subjects (F-15): the subjects the operator configured (certify.offer-page.demo-subjects), offered in a
   // dropdown instead of a typed record id. A deployment that configures none keeps the free-text field and the claims
   // path exactly as they were: no dropdown, no error.
   const DEMO_SUBJECTS = "/offer/demo-subjects";
+  // P5-03a: the wallet page's own config endpoint. It exists only with certify.offer-page.wallet.enabled, which is
+  // also how this page learns whether to link the wallet at all.
+  const WALLET_CONFIG = "/offer/wallet/config";
   // the shape the endpoint promises (OfferPageProperties): one malformed entry makes the whole list untrustworthy
   const SUBJECT_ID = /^[A-Za-z0-9._:-]{1,128}$/;
   const SUBJECT_LABEL_MAX = 128;
@@ -291,7 +322,7 @@
     refreshSubjectChoice();
   }
 
-  el("configuration").addEventListener("change", () => { syncSurface(); refreshSubjectChoice(); });
+  el("configuration").addEventListener("change", () => { syncSurface(); syncKeep(); refreshSubjectChoice(); });
   el("subjectChoice").addEventListener("change", syncSubjectInput);
 
   /**
@@ -419,7 +450,9 @@
   const b64urlText = (text) => b64url(new TextEncoder().encode(text));
 
   async function proofJwt(audience, nonce) {
-    const key = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign"]);
+    // P5-03a (plan 4.2): the private key is never extractable, because a kept credential's key must stay in this
+    // browser. The proof is unchanged: its jwk header comes from the public key, which WebCrypto always exports.
+    const key = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
     const jwk = await crypto.subtle.exportKey("jwk", key.publicKey);
     const header = { alg: "ES256", typ: "openid4vci-proof+jwt", jwk: { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y } };
     // OpenID4VCI 1.0 Appendix F.1: the anonymous pre-authorized code flow sends no iss, and nonce is present exactly when
@@ -428,7 +461,7 @@
     if (nonce) claims.nonce = nonce;
     const signingInput = b64urlText(JSON.stringify(header)) + "." + b64urlText(JSON.stringify(claims));
     const signature = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key.privateKey, new TextEncoder().encode(signingInput));
-    return signingInput + "." + b64url(signature); // WebCrypto's ECDSA signature is already the JOSE R||S form
+    return { jwt: signingInput + "." + b64url(signature), keyPair: key, publicJwk: jwk }; // WebCrypto's ECDSA signature is already the JOSE R||S form
   }
 
   /**
@@ -595,7 +628,8 @@
       const request = identifiers.length ? { credential_identifier: identifiers[0] }
         : { credential_configuration_id: offer.credentialConfigurationId };
       // Appendix F.1: aud is the credential issuer the offer named, whatever surface that is
-      request.proofs = { jwt: [await proofJwt(credentialIssuer, nonce)] };
+      const proof = await proofJwt(credentialIssuer, nonce);
+      request.proofs = { jwt: [proof.jwt] };
       const credential = await walletApi("POST", credentialEndpoint, request,
         { Authorization: (token.body.token_type || "Bearer") + " " + token.body.access_token });
       el("credential").textContent = JSON.stringify(credential.body, null, 2); el("credential").hidden = false;
@@ -610,6 +644,7 @@
         } catch (e) {
           status("walletStatus", "Credential issued, but the IssuerSigned view could not be rendered: " + e.message, false);
         }
+        await keepCredential(credential.body.credentials, offer, issuerMetadata, proof);
       }
     } catch (e) {
       status("walletStatus", "The flow failed: " + e.message, false);
@@ -693,6 +728,74 @@
       });
     });
     view.hidden = false;
+  }
+
+  // ---- P5-03a: keep the first credential in this browser (plan 4.2)
+  /**
+   * Keeps the first credential of a 200 response when the visitor asked for it, the configuration is an mso_mdoc one and
+   * this browser has IndexedDB. Every check must pass (Mdoc.checkKeepable); a refusal keeps nothing and names the check.
+   * Nothing here leaves the browser, and a failure never changes what the issuance run reported.
+   */
+  async function keepCredential(credentials, offer, issuerMetadata, proof) {
+    if (formatOf(offer.configurationId) !== "mso_mdoc") return;
+    if (!el("keep").checked) return;
+    // the harness's stub page has neither module; nothing is kept without them
+    if (typeof WalletStore === "undefined" || typeof Mdoc === "undefined") return;
+    const kept = credentials[0];
+    const configuration = (issuerMetadata.credential_configurations_supported || {})[offer.configurationId] || {};
+    const display = (configuration.credential_metadata && configuration.credential_metadata.display || [])[0];
+    if (!WalletStore.available()) {
+      keepNote("This browser cannot keep credentials (IndexedDB is unavailable), so this one was not kept; issuance works as before.", false);
+      return;
+    }
+    let db;
+    try {
+      db = await WalletStore.open();
+    } catch (e) {
+      keepNote("This browser could not open its credential store (" + e.message + "); nothing was kept.", false);
+      return;
+    }
+    try {
+      let issuerSigned;
+      try {
+        issuerSigned = base64urlBytes(kept.credential);
+      } catch (e) {
+        keepNote("The credential was not kept: its credential value is not base64url (" + e.message + ").", false);
+        return;
+      }
+      const result = await Mdoc.checkKeepable({
+        issuerSigned: issuerSigned,
+        doctype: configuration.doctype,
+        publicJwk: proof.publicJwk,
+        stored: await WalletStore.count(db),
+      });
+      if (!result.ok) {
+        keepNote("The credential was not kept. " + result.message, false);
+        return;
+      }
+      const record = {
+        id: crypto.randomUUID(),
+        format: "mso_mdoc",
+        docType: result.docType,
+        issuerSigned: issuerSigned,
+        privateKey: proof.keyPair.privateKey,
+        publicJwk: { kty: proof.publicJwk.kty, crv: proof.publicJwk.crv, x: proof.publicJwk.x, y: proof.publicJwk.y },
+        credentialIssuer: offer.issuer,
+        credentialConfigurationId: offer.configurationId,
+        storedAt: Date.now(),
+        validFrom: result.validFrom,
+        validUntil: result.validUntil,
+        label: display && display.name ? display.name : result.docType,
+      };
+      await WalletStore.put(db, record);
+      keepNote("Kept in this browser: " + record.label + "."
+        + (credentials.length > 1 ? " This response carried " + credentials.length
+          + " credentials; only the first was kept, the rest were shown." : ""), true);
+    } catch (e) {
+      keepNote("The credential was not kept: " + e.message, false);
+    } finally {
+      try { db.close(); } catch (e) { /* already closed */ }
+    }
   }
 
   load().catch((e) => status("offerStatus", "Could not load the issuer metadata: " + e.message, false));

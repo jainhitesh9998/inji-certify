@@ -74,7 +74,7 @@
  */
 import { createPublicKey, verify, webcrypto } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
@@ -344,6 +344,24 @@ class Element {
         this.listeners.get(type).push(listener);
     }
 
+    // a canvas, enough for a `src` script to run when the page's own scripts are evaluated (`scripts: "real"`): the
+    // QR library draws into a 2d context and reads the result back as a data URL. Nothing here renders anything.
+    getContext() {
+        return {
+            clearRect: () => {}, fillRect: () => {}, strokeRect: () => {}, drawImage: () => {},
+            beginPath: () => {}, moveTo: () => {}, lineTo: () => {},
+            fillStyle: "", strokeStyle: "", lineWidth: 1,
+        };
+    }
+
+    toDataURL() {
+        return "data:image/png;base64,";
+    }
+
+    setAttribute() {}
+
+    setAttributeNS() {}
+
     // the page only ever clears a container with innerHTML; anything else would be a way for server text to become
     // markup, so every assignment is recorded and the checks below look for a non-empty one
     set innerHTML(value) {
@@ -483,6 +501,222 @@ function parseMarkup(markup) {
 /** The declared ids of a piece of markup (see parseMarkup). */
 const markupElements = (markup) => parseMarkup(markup).ids;
 
+/* ---------------------------------------------------------------- fake IndexedDB (P5-03a) */
+
+/** One request of the fake IndexedDB: asynchronous, like the real one, with its result or error. */
+class FakeRequest {
+    constructor() {
+        this.onsuccess = null;
+        this.onerror = null;
+        this.result = undefined;
+        this.error = null;
+    }
+
+    succeed(result) {
+        this.result = result;
+        queueMicrotask(() => { if (this.onsuccess) this.onsuccess({ target: this }); });
+    }
+
+    fail(error) {
+        this.error = error;
+        queueMicrotask(() => { if (this.onerror) this.onerror({ target: this }); });
+    }
+}
+
+/**
+ * A small IndexedDB, enough for wallet-store.js: `open`/`deleteDatabase`, one transaction at a time, stores with a
+ * keyPath or an auto-increment key, and get/put/getAll/delete/clear/count. Records are cloned with `structuredClone`
+ * on the way in and out, as a browser's structured clone does: a CryptoKey stays a CryptoKey, and a non-extractable
+ * one stays non-extractable.
+ */
+class FakeIndexedDB {
+    constructor() {
+        this.databases = new Map();
+    }
+
+    database(name, version = 1) {
+        let database = this.databases.get(name);
+        if (database === undefined) {
+            database = new FakeDatabase(name, version);
+            this.databases.set(name, database);
+        }
+        return database;
+    }
+
+    /** Fills a store before a page opens the database (the 51st-credential check), creating it as an upgrade would. */
+    seed(storeName, records) {
+        const database = this.database("certify-demo-wallet", 1);
+        database.ensureStores();
+        const store = database.stores.get(storeName);
+        for (const record of records) store.putClone(record);
+        return database;
+    }
+
+    open(name, version) {
+        const request = new FakeRequest();
+        queueMicrotask(() => {
+            const existing = this.databases.get(name);
+            const database = this.database(name, version || 1);
+            // a real open is a new connection to the same database: a handle another page closed is usable again
+            database.closed = false;
+            request.result = database;
+            if (existing === undefined && request.onupgradeneeded) {
+                request.onupgradeneeded({ target: request, oldVersion: 0, newVersion: database.version });
+            }
+            request.succeed(database);
+        });
+        return request;
+    }
+
+    deleteDatabase(name) {
+        const request = new FakeRequest();
+        queueMicrotask(() => {
+            this.databases.delete(name);
+            request.succeed(undefined);
+        });
+        return request;
+    }
+}
+
+class FakeDatabase {
+    constructor(name, version) {
+        this.name = name;
+        this.version = version;
+        this.stores = new Map();
+        this.closed = false;
+        const stores = this.stores;
+        this.objectStoreNames = { contains: (storeName) => stores.has(storeName) };
+    }
+
+    ensureStores() {
+        if (!this.stores.has("credentials")) this.createObjectStore("credentials", { keyPath: "id" });
+        if (!this.stores.has("answered")) this.createObjectStore("answered", { keyPath: "key" });
+        if (!this.stores.has("log")) this.createObjectStore("log", { autoIncrement: true });
+    }
+
+    createObjectStore(name, options = {}) {
+        const store = new FakeObjectStore(name, options);
+        this.stores.set(name, store);
+        return store;
+    }
+
+    transaction(names, mode = "readonly") {
+        if (this.closed) throw new Error("InvalidStateError: the database is closed");
+        const list = Array.isArray(names) ? names : [names];
+        for (const storeName of list) if (!this.stores.has(storeName)) throw new Error("NotFoundError: " + storeName);
+        return new FakeTransaction(this, list, mode);
+    }
+
+    close() {
+        this.closed = true;
+    }
+}
+
+/**
+ * A structured clone of one record, as a browser stores it. Node 24's `structuredClone` turns a WebCrypto `CryptoKey`
+ * into an object with no usable methods (checked on 24.15.0: `clone.sign` is undefined), where a browser's clone stays a
+ * working, still non-extractable key; so a CryptoKey is kept by reference and every other value is cloned. The record
+ * still holds a non-extractable key, which is what the check is about.
+ */
+function cloneRecord(value) {
+    if (value === null || typeof value !== "object") return value;
+    if (typeof CryptoKey !== "undefined" && value instanceof CryptoKey) return value;
+    // realm-independent: a page's Uint8Array is not this module's
+    if (Object.prototype.toString.call(value) === "[object Uint8Array]") return new Uint8Array(value);
+    if (Object.prototype.toString.call(value) === "[object ArrayBuffer]") return value.slice(0);
+    if (value instanceof Map) return new Map([...value].map(([key, member]) => [cloneRecord(key), cloneRecord(member)]));
+    if (Array.isArray(value)) return value.map(cloneRecord);
+    const copy = Object.getPrototypeOf(value) === null ? Object.create(null) : {};
+    for (const key of Object.keys(value)) copy[key] = cloneRecord(value[key]);
+    return copy;
+}
+
+class FakeObjectStore {
+    constructor(name, options) {
+        this.name = name;
+        this.keyPath = options.keyPath === undefined ? null : options.keyPath;
+        this.autoIncrement = !!options.autoIncrement;
+        this.records = new Map();
+        this.nextKey = 1;
+    }
+
+    keyOf(record) {
+        return this.keyPath === null ? record.id : record[this.keyPath];
+    }
+
+    putClone(record) {
+        const clone = cloneRecord(record);
+        let key = this.keyOf(clone);
+        if (key === undefined || key === null) {
+            if (!this.autoIncrement) throw new Error("DataError: the object store has no key");
+            key = this.nextKey++;
+            clone.id = key;
+        }
+        this.records.set(key, clone);
+        return key;
+    }
+
+    getClone(key) {
+        return this.records.has(key) ? cloneRecord(this.records.get(key)) : undefined;
+    }
+}
+
+class FakeTransaction {
+    constructor(database, names, mode) {
+        this.db = database;
+        this.names = names;
+        this.mode = mode;
+        this.oncomplete = null;
+        this.onerror = null;
+        this.onabort = null;
+        this.pending = 0;
+        this.done = false;
+    }
+
+    objectStore(name) {
+        if (!this.names.includes(name)) throw new Error("NotFoundError: " + name);
+        const store = this.db.stores.get(name);
+        const transaction = this;
+        return {
+            get: (key) => transaction.request(() => store.getClone(key)),
+            getAll: () => transaction.request(() => [...store.records.values()].map((record) => cloneRecord(record))),
+            count: () => transaction.request(() => store.records.size),
+            put: (record) => transaction.request(() => store.putClone(record)),
+            delete: (key) => transaction.request(() => { store.records.delete(key); return undefined; }),
+            clear: () => transaction.request(() => { store.records.clear(); return undefined; }),
+        };
+    }
+
+    request(work) {
+        const request = new FakeRequest();
+        this.pending++;
+        queueMicrotask(() => {
+            try {
+                request.result = work();
+                this.pending--;
+                this.maybeComplete();
+                request.succeed(request.result);
+            } catch (error) {
+                request.error = error;
+                this.fail(error);
+            }
+        });
+        return request;
+    }
+
+    maybeComplete() {
+        if (this.pending > 0 || this.done) return;
+        this.done = true;
+        queueMicrotask(() => { if (this.oncomplete) this.oncomplete({ target: this }); });
+    }
+
+    fail(error) {
+        if (this.done) return;
+        this.done = true;
+        queueMicrotask(() => { if (this.onerror) this.onerror({ target: this, error }); });
+    }
+}
+
 /* ---------------------------------------------------------------- fixtures: the documents the live stack serves */
 
 const GRANT = "urn:ietf:params:oauth:grant-type:pre-authorized_code";
@@ -579,6 +813,18 @@ const SUBJECTS = [
 ];
 
 /**
+ * The text of one of the page's own `src` scripts, read from static/offer. A `src` that resolves anywhere else is
+ * refused, so `scripts: "real"` can never load a page script from outside the directory the server serves.
+ */
+function realScript(pageDirectory, staticDirectory, src) {
+    const path = resolve(pageDirectory, String(src));
+    if (path !== staticDirectory && !path.startsWith(staticDirectory + sep)) {
+        throw new Error(`the page's src script ${src} resolves outside static/offer (${path})`);
+    }
+    return readFileSync(path, "utf8");
+}
+
+/**
  * Opens the page: the markup's elements, the inline scripts evaluated against them, and the requests it makes on load
  * (the configuration document and the demo-subject list; the wallet's metadata is read when it redeems an offer).
  * Never throws: a page whose script throws reports it in `scriptError`, as a browser reports it in the console.
@@ -601,8 +847,16 @@ function openPage(demo, options = {}) {
     const created = [];
     const requests = [];
     const missingIds = [];
+    const indexedDBInstance = options.indexedDB === undefined ? new FakeIndexedDB() : options.indexedDB;
 
     const document = {
+        // the markup's root element (the QR library reads its tagName to choose a renderer)
+        documentElement: new Element("html"),
+        createElementNS(namespace, tag) {
+            const element = new Element(String(tag).toLowerCase());
+            created.push(element);
+            return element;
+        },
         // a browser has no element for an id the markup does not declare; returning an invented one let page bugs pass
         getElementById(id) {
             const element = elements.get(String(id));
@@ -682,6 +936,10 @@ function openPage(demo, options = {}) {
         if (method === "POST" && target === "/v1/certify/pre-authorized-data") {
             if (options.offerGate) await options.offerGate;
             return answer(200, nextOffer());
+        }
+        // P5-03a: the wallet page's config endpoint. The offer page links the wallet only when this answers 200.
+        if (method === "GET" && target === "/v1/certify/offer/wallet/config") {
+            return options.walletConfig ? answer(200, { relay: { hosts: [] } }) : answer(404, "not found");
         }
         if (method === "POST" && tokenEndpoints.has(target)) return answer(tokenAnswer.status, tokenAnswer.body);
         if (method === "POST" && nonceEndpoints.has(target)) return answer(nonceAnswer.status, nonceAnswer.body);
@@ -764,19 +1022,30 @@ function openPage(demo, options = {}) {
         URL,
         URLSearchParams,
         Blob,
-        crypto: webcrypto,
+        crypto: options.crypto || webcrypto,
         TextEncoder,
         TextDecoder,
         btoa,
         atob,
+        // P5-03a: the demo wallet's storage. `indexedDB: null` is a browser without it (some private modes).
+        indexedDB: options.indexedDB === null ? undefined : indexedDBInstance,
+        structuredClone,
+        // the QR library renders through a canvas when the interface exists; the fake canvas records nothing
+        CanvasRenderingContext2D: function CanvasRenderingContext2D() {},
     });
-    // a browser runs every inline script (no src) in document order; the `src` scripts are the QRCode and Cbor stubs
-    const inline = scripts.filter((script) => !script.attributes.has("src"));
+    // a browser runs the page's scripts in document order: the inline one always, and (with `scripts: "real"`) the
+    // `src` scripts the page names, read from static/offer; otherwise the `src` scripts stay the QRCode and Cbor stubs
+    const real = options.scripts === "real";
+    const pageDirectory = dirname(resolve(options.pagePath || PAGE));
+    const staticDirectory = resolve(REPO, "certify-service/src/main/resources/static/offer");
+    const runnable = real ? scripts : scripts.filter((script) => !script.attributes.has("src"));
     // a page that looks up an id the markup does not declare throws here, as it does in a browser; the checks report it
-    let scriptError = inline.length ? null : new Error("the page has no inline script");
-    for (const script of inline) {
+    let scriptError = runnable.length ? null : new Error("the page has no script");
+    for (const script of runnable) {
+        const src = script.attributes.get("src");
         try {
-            vm.runInContext(script.textContent, context, { filename: "static/offer/index.html" });
+            const source = src === undefined ? script.textContent : realScript(pageDirectory, staticDirectory, src);
+            vm.runInContext(source, context, { filename: src === undefined ? "static/offer/index.html" : src });
         } catch (error) {
             if (scriptError === null) scriptError = error;
         }
@@ -790,6 +1059,8 @@ function openPage(demo, options = {}) {
         requests,
         missingIds,
         scriptError,
+        // P5-03a: the fake database the page used (a later page can share it, as two pages of one origin do)
+        indexedDB: indexedDBInstance,
         /** Lets every pending promise of the page's load finish. */
         async settle() {
             for (let i = 0; i < 20; i++) await new Promise((done) => setImmediate(done));
@@ -976,6 +1247,11 @@ async function refusedRedemption(label, setup) {
 
 /* ---------------------------------------------------------------- checks */
 
+// this file is also a module: check-offer-wallet.mjs imports openPage, parseMarkup and the check helpers, and only a
+// direct run evaluates the page's own sections
+const isMain = process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isMain) {
 process.on("unhandledRejection", (reason) => {
     check("no promise of the page or the harness rejects unhandled", false, String(reason && reason.stack ? reason.stack : reason));
     process.exitCode = 1;
@@ -2333,3 +2609,28 @@ await section("31. parser newlines", async () => {
     }
     process.exitCode = failures ? 1 : 0;
 }
+}
+
+const counts = () => ({ checks, failures });
+
+export {
+    openPage,
+    parseMarkup,
+    check,
+    equal,
+    equalFields,
+    section,
+    Element,
+    Text,
+    FakeIndexedDB,
+    realScript,
+    counts,
+    REPO,
+    PAGE,
+    DOMAIN,
+    OID4VCI_ISSUER,
+    OID4VCI_DOCUMENT,
+    DEFAULT_AS_METADATA,
+    offerByValue,
+    offerDocument,
+};
