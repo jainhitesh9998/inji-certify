@@ -123,6 +123,10 @@ public class DefaultIssuanceService implements IssuanceService {
             }
             String transactionId = UUID.randomUUID().toString();
             IssuanceListener.IssuanceEvent event = new IssuanceListener.IssuanceEvent(context, configuration, lastClaims, credentials, transactionId);
+            // from here the credentials exist and a listener may have recorded or delivered them, so a later listener's
+            // failure must not hand an index back that one of them already saw: the entries are no longer recordable
+            // as "belonging to no credential" (M-11f, G49 item 1; D-M11e-1 still covers everything before this line)
+            attachments.clear();
             listeners.forEach(l -> l.onIssued(event));
             return new IssuanceResult.Issued(credentials, transactionId);
         } catch (IssuanceException e) {
@@ -143,9 +147,9 @@ public class DefaultIssuanceService implements IssuanceService {
                               CredentialConfiguration configuration, IssuanceContext context) {}
 
     /**
-     * Hands back every index this request took, newest first. A release is best effort and never replaces the failure
-     * that caused it: a provider that cannot give an index back has its exception logged, and the request still answers
-     * with what went wrong.
+     * Hands back every index this request took before {@code onIssued} dispatch began, newest first. A release is best
+     * effort and never replaces the failure that caused it: a provider that cannot give an index back has its exception
+     * logged, and the request still answers with what went wrong.
      */
     private void release(List<Attachment> attachments) {
         for (int i = attachments.size() - 1; i >= 0; i--) {

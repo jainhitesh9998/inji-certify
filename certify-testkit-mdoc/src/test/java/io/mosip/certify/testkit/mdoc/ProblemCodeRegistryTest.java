@@ -28,6 +28,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class ProblemCodeRegistryTest {
 
     static final Path VERIFY_MDOC = Path.of("..", "docs", "design", "tools", "verify_mdoc.py");
+    /** M-11f: the independent verifier of a Status List Token in CWT form carries the same table. */
+    static final Path VERIFY_STATUS_LIST = Path.of("..", "docs", "design", "tools", "verify_status_list.py");
     static final Pattern BLOCK = Pattern.compile("# BEGIN PROBLEM CODES[^\\n]*\\nPROBLEM_CODES = (\\{.*?\\n})\\n# END PROBLEM CODES",
             Pattern.DOTALL);
     static final Pattern KEY = Pattern.compile("^\\s*\"([^\"]+)\":", Pattern.MULTILINE);
@@ -88,5 +90,28 @@ class ProblemCodeRegistryTest {
         assertEquals(IndependentMdocVerifier.PROBLEM_CODES, python, "verify_mdoc.py PROBLEM_CODES");
         assertEquals(List.copyOf(IndependentMdocVerifier.PROBLEM_CODES.keySet()), List.copyOf(python.keySet()),
                 "verify_mdoc.py lists the checks in the Java report order");
+    }
+
+    /**
+     * M-11f: one {@code .gaps} sidecar serves the Java harness and the Python verifier, so
+     * {@code docs/design/tools/verify_status_list.py} carries the same check names and problem codes, in the same order,
+     * in the same {@code BEGIN/END PROBLEM CODES} block. A code added to one without the other fails here.
+     */
+    @Test
+    void thePythonStatusListVerifierCarriesTheSameProblemCodes() throws Exception {
+        String source = Files.readString(VERIFY_STATUS_LIST);
+        Matcher block = BLOCK.matcher(source);
+        assertTrue(block.find(), VERIFY_STATUS_LIST + " has no BEGIN/END PROBLEM CODES block");
+        Map<String, Object> parsed = JSONObjectUtils.parse(block.group(1));
+        Map<String, List<String>> python = new LinkedHashMap<>();
+        Matcher key = KEY.matcher(block.group(1));
+        while (key.find()) {
+            List<String> codes = new ArrayList<>();
+            ((List<?>) parsed.get(key.group(1))).forEach(code -> codes.add((String) code));
+            python.put(key.group(1), codes);
+        }
+        assertEquals(IndependentStatusListVerifier.PROBLEM_CODES, python, "verify_status_list.py PROBLEM_CODES");
+        assertEquals(List.copyOf(IndependentStatusListVerifier.PROBLEM_CODES.keySet()), List.copyOf(python.keySet()),
+                "verify_status_list.py lists the checks in the Java report order");
     }
 }

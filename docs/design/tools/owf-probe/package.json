@@ -1,0 +1,17 @@
+{
+  "name": "certify-owf-probe",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Paradym-equivalent status-list check of the mDoc samples (M-11f, D-M11-8 (b))",
+  "exports": "./probe.mjs",
+  "dependencies": {
+    "@owf/mdoc": "0.9.1",
+    "@owf/token-status-list": "0.6.0"
+  },
+  "overrides": {
+    "@owf/cose": "0.6.2",
+    "@owf/identity-common": "0.6.2",
+    "@owf/x509": "0.6.2"
+  }
+}

@@ -1276,10 +1276,18 @@ Branch `wp/m-11e-status-binding`. Depends on M-11d and M-11b. About 550 lines.
 - [ ] I1-I7 hold; the full suite is green, also in reverse order (as F-10 did).
 - [ ] A failure after the attachment gives its index back — a signing failure, a listener failure, the format's own DSC
   policy and a partly failed batch each leave the free-index count where it was (D-M11e-1;
-  `MdocStatusListSampleTest.aSigningFailureGivesTheIndexBack`, `…aListenerFailureGivesTheIndexBackAndItsMessageIsAsciiSafe`,
-  `…everyEntryOfAFailedBatchIsGivenBack`, `…aRefusalOfTheFormatsOwnKeyPolicyTakesNoIndex`).
+  `MdocStatusListSampleTest.aSigningFailureGivesTheIndexBack`,
+  `…aListenerFailureGivesTheIndexBackAndItsMessageIsAsciiSafe`,
+  `…everyEntryOfAFailedBatchIsGivenBack`, `…aRefusalOfTheFormatsOwnKeyPolicyTakesNoIndex`). M-11f (G49 item 5b,
+  the citations corrected): the proofs are `DefaultIssuanceServiceTest.aSigningFailureGivesTheStatusEntryBack`,
+  `…aListenerFailureGivesTheStatusEntryBack`, `…everyEntryOfAFailedBatchIsGivenBack` and, for "check first",
+  `DefaultIssuanceServiceTest.aRefusedSigningKeyIsCheckedBeforeTheStatusStep` with the escape hatch's
+  `MdocStatusListJwtEscapeHatchTest.aKeymanagerDocumentSignerIsRefusedBeforeAnIndexIsConsumed`; the
+  `MdocStatusListSampleTest` names above are the end-to-end ones, and `…aFailureInTheOnIssuedPhaseKeepsTheStatusEntry`
+  (G49 item 1) is the case where the entry is deliberately **not** given back.
 - [ ] A Token Status List hands out only indices inside itself, whatever `size-bits` says (G48;
-  `StatusListPostgresTest.aSmallTokenStatusListHandsOutOnlyIndicesItCarries`).
+  `StatusListPostgresTest.aSmallTokenStatusListHandsOutOnlyIndicesItCarries`, and for a legacy oversized pool
+  `StatusListPostgresTest.anOversizedLegacyPoolStillHandsOutOnlyIndicesInsideItsList`, M-11f).
 
 **Negative tests.**
 
@@ -1359,6 +1367,22 @@ Branch `wp/m-11f-status-ops`. Depends on M-11e. About 600 lines.
 
 **Negative tests:** the smoke parser refuses a JWT body, tag 61, an unprotected `x5chain`, a missing `exp`, and an
 `x5chain` that differs from the IssuerAuth one (unit tests on recorded bytes).
+
+**As built (M-11f, `wp/m-11f-smoke-docs`), three corrections of this section.** (1) The probe passes
+`trustedCertificates: [{issuance: [<top of x5chain>], status: [<same certificate>]}]`, not `{issuance: [...]}` alone:
+`@owf/mdoc` 0.9.1 reads the status anchors from the trusted entry's `status` list (`index.mjs:2874`), and with none it
+throws `TrustedRevocationCertificatesMustContainAtleastOneCertificateError` before it fetches the list. Supplying the
+presented top certificate for both halves is the faithful "Paradym trusts the mDL's own Document Signer" configuration
+and is what makes Credo's equal-chain rule the effective test: a list signed by any other key fails with "no trusted
+certificate was found in the chain" as well as on the equal-chain check. (2) The probe's lockfile overrides
+`@owf/cose` to 0.6.2 for the whole tree. `npm`'s flat `node_modules` keeps `@owf/token-status-list`'s exact
+`@owf/cose@0.6.0` beside `@owf/mdoc`'s `0.6.2`, and the two copies register their CBOR tag decoders in the one deduped
+`cbor-x`; the copy that loads last then decodes tag 24 for both, and `IssuerSigned.decode` sees a `DataItem` that is not
+its own class, so every sample fails to parse. Paradym's pnpm tree does not share the problem (each package gets its own
+`cbor-x`). (3) The probe skips a sample whose `.gaps` declares `issuerAuth.untagged:tagged` - the draft-13 Document
+wrapper, which `@owf/mdoc` refuses before it reads any status list. That deviation is the sample's own declared one, not
+a status-list finding, and the CWT form itself is verified on the same list by `verify_status_list.py`, which reads the
+wrapper.
 
 ### M-11g (optional) Status-list signer profile and CLI (certify-pki, certify-cli)
 

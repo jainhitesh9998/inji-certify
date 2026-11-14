@@ -45,8 +45,12 @@ public interface StatusProvider {
 
     /**
      * Gives back the status entry {@link #attach} took for a credential that was never issued (M-11e, owner decision
-     * D-M11e-1). The core calls it when anything after the attachment fails — a listener, the format's own signing
-     * policy, the signature — so a failed request does not retire an index no wallet can ever reference.
+     * D-M11e-1). The core calls it when anything after the attachment fails before the {@code onIssued} listeners run —
+     * the format's own signing policy, the signature, a later credential of the batch, a listener that fails while the
+     * credential is still being signed — so a failed request does not retire an index no wallet can ever reference.
+     *
+     * <p>Once {@code onIssued} dispatch begins, no entry is given back: a listener there may already have recorded or
+     * delivered the credential, so the entry does belong to a credential a wallet can hold (M-11f, G49 item 1).
      *
      * <p>{@code credential} is the credential exactly as {@link #attach} returned it, so a provider reads its own entry
      * out of it; a provider whose attachment is not an index (or taken from a pool it must not hand back) leaves this

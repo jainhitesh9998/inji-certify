@@ -526,12 +526,20 @@ class StatusListPostgresTest {
                 lists.add(entry.uri().substring(entry.uri().lastIndexOf('/') + 1));
             }
             assertTrue(lists.size() > 1, "a list of " + sizeBits + " statuses fills up, so more than one was created");
+            int usablePercentage = environment.getProperty("mosip.certify.statuslist.usable-capacity-percentage", Integer.class, 50);
+            long usable = (long) Math.floor(sizeBits * (usablePercentage / 100.0));
             for (String listId : lists) {
                 io.mosip.certify.entity.StatusListCredential row = statusListRepository.findById(listId).orElseThrow();
                 assertEquals(sizeBits, io.mosip.certify.status.TokenStatusListService.capacity(
                                 row.getCredentialType(), row.getVcDocument(), row.getId()).orElseThrow(),
                         "the list itself carries " + sizeBits + " statuses");
                 assertEquals((long) sizeBits, indexRows(listId), "its free-index pool has exactly as many");
+                // the usable-capacity threshold is a share of the list's own size, not of a kilobyte: a closed list stops
+                // at exactly floor(size-bits x percentage), whatever capacity_in_kb says (M-11f, G49 item 3)
+                if (row.getCredentialStatus() == io.mosip.certify.entity.StatusListCredential.CredentialStatus.FULL) {
+                    assertEquals(usable, assignedRows(listId), "a closed list of " + sizeBits + " statuses stops at "
+                            + usablePercentage + "% of its own size");
+                }
             }
             assertTrue(largest >= sizeBits / 2, "the pool really was used: largest index " + largest);
 
@@ -546,11 +554,98 @@ class StatusListPostgresTest {
         }
     }
 
+    /**
+     * M-11f, G49 item 2: a pool an older deployment sized from {@code capacity_in_kb} ({@code 8192} rows for a 256-bit
+     * list) still exists in the table, and every index such a list hands out is inside the list it carries: the
+     * {@code acquireInside} range check releases an out-of-range index and closes the list instead of issuing a credential
+     * whose status entry no verifier and no revocation can reach (G48). Nothing out of range may stay assigned, and the
+     * oversized list must end {@code FULL} so it is never a candidate again.
+     */
+    @Test
+    void anOversizedLegacyPoolStillHandsOutOnlyIndicesInsideItsList() throws Exception {
+        int sizeBits = 256;
+        String purpose = "oversized-legacy-pool";
+        io.mosip.certify.status.TokenStatusListProperties small = new io.mosip.certify.status.TokenStatusListProperties(
+                tokenStatusListProperties.keyRef(), tokenStatusListProperties.alg(), tokenStatusListProperties.x5c(),
+                sizeBits, tokenStatusListProperties.ttl(), tokenStatusListProperties.renewWait(),
+                tokenStatusListProperties.renewBackoff(), tokenStatusListProperties.mdoc(), tokenStatusListProperties.batch());
+        io.mosip.certify.status.TokenStatusListService service = new io.mosip.certify.status.TokenStatusListService(
+                statusListRepository, statusListCredentialService, statusListIndexProvider, keyProviders, small,
+                objectMapper, environment);
+
+        io.mosip.certify.status.TokenStatusListService.Entry first = service.allocateCwt(purpose, dscSigning());
+        String paddedListId = first.uri().substring(first.uri().lastIndexOf('/') + 1);
+        assertEquals(sizeBits, indexRows(paddedListId), "a fresh list's pool is the size of the list itself");
+        // the old code's pool: capacity_in_kb x 1024 x 8 = 8192 rows for a 256-bit list, indices 256.. left outside it
+        try (Connection c = dataSource.getConnection(); PreparedStatement ps = c.prepareStatement(
+                "INSERT INTO " + SCHEMA + ".status_list_available_indices"
+                        + " (status_list_credential_id, list_index, is_assigned, cr_dtimes)"
+                        + " SELECT ?, generate_series(256, 8191), false, NOW()")) {
+            ps.setString(1, paddedListId);
+            assertEquals(8192 - sizeBits, ps.executeUpdate(), "the legacy pool is padded to 8192 rows");
+        }
+        assertEquals(8192, indexRows(paddedListId));
+
+        int usablePercentage = environment.getProperty("mosip.certify.statuslist.usable-capacity-percentage", Integer.class, 50);
+        long usable = (long) Math.floor(sizeBits * (usablePercentage / 100.0));
+        for (int i = 0; i < sizeBits + 50; i++) {
+            io.mosip.certify.status.TokenStatusListService.Entry entry = service.allocateCwt(purpose, dscSigning());
+            assertTrue(entry.idx() < sizeBits,
+                    "index " + entry.idx() + " of the allocation is outside a list of " + sizeBits + " statuses");
+            String listId = entry.uri().substring(entry.uri().lastIndexOf('/') + 1);
+            io.mosip.certify.entity.StatusListCredential row = statusListRepository.findById(listId).orElseThrow();
+            assertEquals(sizeBits, io.mosip.certify.status.TokenStatusListService.capacity(
+                            row.getCredentialType(), row.getVcDocument(), row.getId()).orElseThrow(),
+                    "every list this purpose hands out carries " + sizeBits + " statuses");
+        }
+
+        assertEquals(0, poolRows(paddedListId, "AND is_assigned = true AND list_index >= 256"),
+                "no index outside the padded list stayed assigned: each one the pool offered was given back");
+        assertEquals(io.mosip.certify.entity.StatusListCredential.CredentialStatus.FULL,
+                statusListRepository.findById(paddedListId).orElseThrow().getCredentialStatus(),
+                "the oversized list is closed, so it is never a candidate again");
+        long assignedInside = assignedRows(paddedListId);
+        assertTrue(assignedInside <= usable, "a closed list of " + sizeBits + " stops at " + usable + ": " + assignedInside);
+    }
+
+    /**
+     * M-11f, G49 item 2: {@code release} is part of the CWT binding only. A JWT row keeps exactly its previous behaviour
+     * (M-11e: the legacy JWT and Bitstring paths are unchanged), so releasing an entry on it frees nothing and answers
+     * {@code false}; the same call on the CWT list the mDL is pinned to frees its index.
+     */
+    @Test
+    void releasingAJwtEntryFreesNothing() throws Exception {
+        io.mosip.certify.status.TokenStatusListService.Entry jwt =
+                tokenStatusLists.allocate("jwt-release-guard-" + System.nanoTime());
+        String jwtListId = jwt.uri().substring(jwt.uri().lastIndexOf('/') + 1);
+        assertEquals(io.mosip.certify.status.TokenStatusListService.TYPE,
+                statusListRepository.findById(jwtListId).orElseThrow().getCredentialType(), "a TokenStatusList (JWT) row");
+        assertEquals(1, poolRows(jwtListId, "AND is_assigned = true AND list_index = " + jwt.idx()), "its entry is assigned");
+
+        assertFalse(tokenStatusLists.release(jwt.uri(), jwt.idx()), "a JWT row has no release");
+        assertEquals(1, poolRows(jwtListId, "AND is_assigned = true AND list_index = " + jwt.idx()),
+                "the row stays assigned: a JWT entry is never given back");
+
+        io.mosip.certify.status.TokenStatusListService.Entry cwt = tokenStatusLists.allocateCwt("cwt-release-guard", dscSigning());
+        String cwtListId = cwt.uri().substring(cwt.uri().lastIndexOf('/') + 1);
+        assertTrue(tokenStatusLists.release(cwt.uri(), cwt.idx()), "the CWT list the mDL is pinned to gives its index back");
+        assertEquals(0, poolRows(cwtListId, "AND is_assigned = true AND list_index = " + cwt.idx()));
+    }
+
     /** The rows of a list's free-index pool, assigned or not. */
     private long indexRows(String listId) throws Exception {
+        return poolRows(listId, "");
+    }
+
+    /** The assigned rows of a list's free-index pool. */
+    private long assignedRows(String listId) throws Exception {
+        return poolRows(listId, "AND is_assigned = true");
+    }
+
+    private long poolRows(String listId, String condition) throws Exception {
         try (java.sql.Connection c = dataSource.getConnection();
              java.sql.PreparedStatement ps = c.prepareStatement("SELECT count(*) FROM " + SCHEMA
-                     + ".status_list_available_indices WHERE status_list_credential_id = ?")) {
+                     + ".status_list_available_indices WHERE status_list_credential_id = ? " + condition)) {
             ps.setString(1, listId);
             try (java.sql.ResultSet rows = ps.executeQuery()) {
                 rows.next();

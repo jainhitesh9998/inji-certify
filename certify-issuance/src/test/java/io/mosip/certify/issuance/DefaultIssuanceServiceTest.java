@@ -407,6 +407,34 @@ class DefaultIssuanceServiceTest {
     }
 
     /**
+     * Once {@code onIssued} dispatch begins the entries are no longer given back (M-11f, G49 item 1): the first listener
+     * of the round has already seen the credential, so a later listener's failure must not free an index a wallet can
+     * hold - a second failure of the same request would otherwise hand the same index to another credential. A listener
+     * that fails before signing still gives its entry back, which the tests above hold.
+     */
+    @Test
+    void aFailureInTheOnIssuedPhaseKeepsTheStatusEntry() {
+        ThrowingOnIssuedListener late = new ThrowingOnIssuedListener();
+        service = service(List.of(dataSource), null, List.of(statusProvider), List.of(listener, late));
+
+        IssuanceException e = assertThrows(IssuanceException.class, () -> service.issue(command("farmer-status").build()));
+
+        assertEquals(IssuanceException.ISSUANCE_FAILED, e.getErrorCode());
+        assertNotNull(formatter.signed, "the credential was signed and the first listener saw it");
+        assertEquals(1, listener.issuedCount, "the listener before the failing one ran");
+        assertEquals(1, statusProvider.attached, "its index was taken");
+        assertTrue(statusProvider.released.isEmpty(), "and not given back: a listener already recorded the credential");
+        assertEquals(1, listener.failures.size(), "the failure is reported to the listeners");
+    }
+
+    /** Throws on {@code onIssued}, the phase after every credential of the request is signed. */
+    static final class ThrowingOnIssuedListener implements IssuanceListener {
+        public void onIssued(IssuanceEvent event) {
+            throw new IllegalStateException("the audit sink is down");
+        }
+    }
+
+    /**
      * A batch that fails on its second credential gives back the first one's entry too, signed though it is: nothing of a
      * failed request reaches a wallet, so neither credential may hold an index.
      */
@@ -746,6 +774,7 @@ class DefaultIssuanceServiceTest {
 
     static final class RecordingListener implements IssuanceListener {
         IssuanceEvent issued;
+        int issuedCount;
         final List<IssuanceFailure> failures = new ArrayList<>();
 
         public UnsignedCredential beforeSign(UnsignedCredential credential, CredentialConfiguration configuration, IssuanceContext context) {
@@ -756,6 +785,7 @@ class DefaultIssuanceServiceTest {
         public void onIssued(IssuanceEvent event) {
             Trace.step("onIssued");
             issued = event;
+            issuedCount++;
         }
 
         public void onFailed(IssuanceFailure failure) { failures.add(failure); }

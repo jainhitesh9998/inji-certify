@@ -99,7 +99,7 @@ public class DatabaseStatusListIndexProvider implements StatusListIndexProvider 
 
     /**
      * Gives an index back to its list's free pool (M-11e, D-M11e-1): the row is freed only while it is still assigned,
-     * so two releases of one index, or a release racing the list's own update, free one row and no other.
+     * so one acquisition is given back at most once, however many releases are asked for.
      *
      * <p>credential_status is untouched: a list that was closed as {@code FULL} (no free index at the time) stays closed,
      * because the pool is handed out oldest list first and re-opening a list whose threshold was reached would put it

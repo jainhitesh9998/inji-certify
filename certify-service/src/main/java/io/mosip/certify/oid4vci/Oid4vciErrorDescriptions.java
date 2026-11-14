@@ -18,7 +18,9 @@ package io.mosip.certify.oid4vci;
  * Certify writes itself (CLAUDE.md rule 1).
  *
  * <p>This is the protocol boundary and the only place the rule applies: the compatibility surfaces answer the MOSIP error
- * envelope, whose {@code error_description} is not this grammar's.
+ * envelope, whose {@code error_description} is not this grammar's. It covers every OpenID4VCI surface that answers an
+ * OAuth-style error document — the 1.0 surface under {@code /oid4vci} and the draft-13 compatibility adapter, which
+ * answers this member too — so a description derived from a certificate subject is read the same way on both.
  */
 public final class Oid4vciErrorDescriptions {
 

@@ -283,6 +283,54 @@ jobs:
           done
         shell: bash
 
+      - name: Independent status-list verifier (pycose, cbor2, cryptography)
+        # M-11f: the second, non-Java opinion on every sample whose MSO carries `status.status_list`
+        # (docs/design/wp/M-11-status-list-under-iaca.md section 4.9). The Java harness (certify-testkit-mdoc:
+        # IndependentStatusListVerifier, Multipaz + Authlete) ran in the test step above; this one reads the CWT body the
+        # producer recorded beside the sample and checks the shape (tag 18, a protected typ and x5chain), the signature
+        # with pycose and with the raw Sig_structure, the chain to the sample's IACA, the claims, the bit at idx, and the
+        # token's x5chain against the mDL's IssuerAuth one (Credo's receipt rule). It exits 1 on any problem, so a list a
+        # wallet would refuse cannot merge. The verifier's own mutations (test_verify_status_list.py) ran with the mDoc
+        # verifier's tests in the step above, in the same venv.
+        run: |
+          py="$RUNNER_TEMP/verify-mdoc/bin/python"
+          "$py" --version
+          "$py" -m pip install --quiet -r docs/design/tools/requirements-verify.txt
+          shopt -s nullglob
+          lists=(*/target/mdoc-samples/*.statuslist.cwt)
+          if [ ${#lists[@]} -eq 0 ]; then
+            echo "no status lists under target/mdoc-samples: M-11e's sample producer did not run"
+            exit 1
+          fi
+          for list in "${lists[@]}"; do
+            base="${list%.statuslist.cwt}"
+            args=(--list "$list" --mdoc "${base}.mdoc")
+            if [ -f "${base}.statuslist.ct" ]; then
+              args+=(--content-type "$(cat "${base}.statuslist.ct")")
+            fi
+            if [ -f "${base}.iaca.pem" ]; then
+              args+=(--iaca "${base}.iaca.pem")
+            fi
+            if [ -f "${base}.statuslist.status" ]; then
+              args+=(--expect-status "$(cat "${base}.statuslist.status")")
+            fi
+            "$py" docs/design/tools/verify_status_list.py "${args[@]}"
+          done
+        shell: bash
+
+      - name: Paradym-equivalent status-list probe (@owf/mdoc, @owf/token-status-list)
+        # M-11f, owner decision D-M11-8 (b): the library Paradym Wallet verifies with, at the exact versions Paradym locks
+        # (@owf/mdoc 0.9.1, @owf/token-status-list 0.6.0; package-lock.json, `npm ci` from it only), over the M-11e samples:
+        # it must accept each mDL and the CWT list its MSO points at with Paradym's trust (the top of the presented
+        # issuance chain), and Credo's equal-chain rule must hold certificate for certificate. This is the failure the
+        # demo saw (G23), so a list Paradym would refuse cannot merge. A list signed by another key and a JWT list are
+        # the negative controls (run locally, docs/design/tools/owf-probe/probe.mjs).
+        working-directory: docs/design/tools/owf-probe
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          node probe.mjs ../../../../certify-service/target/mdoc-samples
+        shell: bash
+
       - name: BouncyCastle 1.69 compatibility (published plugin jars)
         # Published plugin jars (mock-certify-plugin, mosip-identity-certify-plugin) bundle unshaded BouncyCastle 1.69
         # and shadow the service's 1.78 on loader.path (decision log 2026-11-13, F-10). The bc169 profile keeps the

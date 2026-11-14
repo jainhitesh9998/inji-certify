@@ -16,14 +16,20 @@ metadata say:
      notification, nonce replay refused;
   4. an Ed25519 holder: a DPoP-bound token, nonce, credential with an EdDSA jwt proof (ISO/IEC 18013-5 9.1.5.2);
   5. every mDL read back: each element equals the holders.json record in value and CBOR type (full-date as tag 1004,
-     bool, uint, bstr, the whole driving_privileges), MSO docType, x5chain without the anchor, and the status entry:
-     the demo issues none until M-11 (F-21: an MSO's status is optional, and the only list the stack can write is signed
-     by a key outside the IACA, G23), which is a PASS under the default `--expect-status absent` and skips the list
-     checks; `--expect-status present` (the M-11 runbook's step) fails when the entry is missing, and a `status`
-     member that is there - whatever it holds - is held to `{status_list: {idx: uint, uri: tstr}}` before anything is
-     fetched or decided, so `status: null` or `{status_list: null}` fails either way. With an entry, every list check runs - the
-     list served, its bit clear, sub equal to the MSO's uri, iat not in the future and exp not passed (exp is
-     RECOMMENDED by draft-ietf-oauth-status-list; requiring it is Certify policy); then
+     bool, uint, bstr, the whole driving_privileges), MSO docType, x5chain without the anchor, and the status entry.
+     `--expect-status absent` (the default: the demo issues none until the M-11 restore lands, F-21 - an MSO's status is
+     optional, ISO/IEC 18013-5 9.1.2.4) passes when the MSO has no `status` member and skips the list checks;
+     `--expect-status present` (the M-11 runbook's step) fails when the entry is missing, and a `status` member that is
+     there - whatever it holds - is held to `{status_list: {idx: uint, uri: tstr}}` before anything is fetched or
+     decided, so `status: null` or `{status_list: null}` fails either way. With an entry, the list is fetched with
+     `Accept: application/statuslist+cwt` and held to ISO/IEC 18013-5 second edition 12.3.6.3 and
+     draft-ietf-oauth-status-list-21 section 5.2: tag 18, the protected `typ` and `x5chain`, the ES256/384/512 signature
+     over `["Signature1", protected, b"", payload]`, `sub` = the MSO's uri, `iat` not ahead, `exp` present and not
+     passed, `bits` 1, `lst` inflating with the bit at `idx` clear, and the token's `x5chain` equal to the IssuerAuth's -
+     the one rule Credo's receipt applies without dedicated status certificates, which `--status-signer dedicated`
+     skips and reports as skipped. The signer leaf is held to `openssl verify -x509_strict -crl_check` against the IACA
+     and the CRL the run downloaded. `--status-format jwt` keeps the JWT check of a deployment running
+     `mdoc.token-format=jwt`; then
      docs/design/tools/verify_mdoc.py (pymdoccbor, a verifier Certify does not maintain) with --doctype, --holder (the
      proof key) and --iaca: the IACA named by the Document Signer's CRL distribution point, downloaded from
      /v1/certify/mdoc/iaca/<id>.pem, or with --iaca <file> the operator's offline IACA, which the published one must
@@ -48,6 +54,7 @@ directory by default) for a second look.
 import argparse
 import base64
 import hashlib
+import io
 import json
 import secrets
 import shutil
@@ -73,6 +80,7 @@ import jwt
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 TOOLS = Path(__file__).resolve().parent
 REPO = TOOLS.parents[2]
@@ -91,6 +99,11 @@ TEXTS = ["family_name", "given_name", "issuing_country", "issuing_authority", "d
          "nationality", "resident_city"]
 PRIVILEGE_DATES = ["issue_date", "expiry_date"]
 CLOCK_SKEW = 60  # seconds a status list's iat may lie ahead of this machine's clock
+# ISO/IEC 18013-5 second edition 12.3.6.3 and draft-ietf-oauth-status-list-21 section 5.2: an mDoc's status list is a
+# Status List Token in CWT form, served as this media type (section 8.1).
+STATUS_LIST_CWT = "application/statuslist+cwt"
+# COSE algorithm identifiers (RFC 9053 section 2/3) the smoke run can verify, and the hash each one signs with.
+CWT_ALGORITHMS = {-7: hashes.SHA256, -35: hashes.SHA384, -36: hashes.SHA512}
 
 results = []
 
@@ -375,6 +388,165 @@ def status_list_problems(payload, uri, index, now):
     return problems
 
 
+def cwt_status_bit(lst, index):
+    raw = zlib.decompress(lst)
+    return (raw[index // 8] >> (index % 8)) & 1  # bits=1, least significant bit first (TSL 4.1)
+
+
+def decode_status_list_cwt(body):
+    """A Status List Token in CWT form, read from the bytes the endpoint served (draft-ietf-oauth-status-list-21
+    section 5.2; ISO/IEC 18013-5 second edition 12.3.6.3): tag 18 around a COSE_Sign1 [protected, unprotected, payload,
+    signature], the protected header carrying `typ` 16 and `x5chain` 33. Raises ValueError with the reason, so a shape
+    the draft does not allow is a reported problem rather than a traceback. Returns the parts as the wire has them:
+    {"protected": bytes, "unprotected": bytes, "payload": bytes, "signature": bytes, "header": dict,
+    "unprotected_header": dict, "claims": dict, "x5chain": [DER, ...]}."""
+    if not isinstance(body, (bytes, bytearray)) or not body:
+        raise ValueError("the body is empty")
+    if body.lstrip()[:3] == b"eyJ" or body.lstrip()[:1] in (b"{", b"["):
+        raise ValueError("the body is a JWT, not a CWT: an mDoc's status list is a CWT (ISO2 12.3.6.3), and @owf/mdoc "
+                         "(Paradym, Credo) refuses a JWT with JwtNotSupportForStatusListError")
+    stream = io.BytesIO(bytes(body))
+    try:
+        token = cbor2.CBORDecoder(stream).decode()
+    except Exception as e:  # noqa: BLE001 - any decode failure is the same finding
+        raise ValueError(f"the body is not CBOR: {e}")
+    if stream.tell() != len(body):
+        raise ValueError(f"{len(body) - stream.tell()} byte(s) follow the token")
+    tag = getattr(token, "tag", None)
+    if tag == 61:
+        raise ValueError("the token is tagged 61 (the CWT tag): a Status List Token MUST NOT carry it, only tag 18")
+    if tag != 18:
+        raise ValueError(f"the token is not a tagged COSE_Sign1_Tagged (18): tag {tag}")
+    value = token.value
+    if not isinstance(value, list) or len(value) != 4:
+        raise ValueError(f"the tagged value is not the four-element COSE_Sign1 array: {type(value).__name__}")
+    protected, unprotected, payload, signature = value
+    if not isinstance(protected, (bytes, bytearray)):
+        raise ValueError("the protected header is not a bstr")
+    if payload is None:
+        raise ValueError("the payload is detached; a Status List Token carries its claims")
+    if not isinstance(payload, (bytes, bytearray)) or not isinstance(signature, (bytes, bytearray)):
+        raise ValueError("the payload or the signature is not a bstr")
+    try:
+        header = cbor2.loads(protected)
+        unprotected_header = cbor2.loads(unprotected) if isinstance(unprotected, (bytes, bytearray)) \
+            else unprotected if unprotected is not None else {}
+        claims = cbor2.loads(payload)
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(f"the protected header, unprotected header or payload is not CBOR: {e}")
+    for name, value in (("protected header", header), ("unprotected header", unprotected_header), ("payload", claims)):
+        if not isinstance(value, dict):
+            raise ValueError(f"the {name} is not a map")
+    if header.get(16) != STATUS_LIST_CWT:
+        raise ValueError(f"the protected typ (16) is {header.get(16)!r}, not {STATUS_LIST_CWT!r}"
+                         + ("; an unprotected typ is not one (TSL 5.2)" if 16 in unprotected_header else ""))
+    if 33 not in header:
+        raise ValueError("the protected header carries no x5chain (33)"
+                         + ("; an unprotected x5chain is not the protected one ISO2 12.3.6.3 requires"
+                            if 33 in unprotected_header else ""))
+    chain = header[33] if isinstance(header[33], list) else [header[33]]
+    if not chain or not all(isinstance(cert, (bytes, bytearray)) and cert for cert in chain):
+        raise ValueError("the protected x5chain (33) is not one or more certificates")
+    return {"protected": bytes(protected), "unprotected": bytes(unprotected or b""), "payload": bytes(payload),
+            "signature": bytes(signature), "header": header, "unprotected_header": unprotected_header,
+            "claims": claims, "x5chain": [bytes(cert) for cert in chain]}
+
+
+def cwt_signature_verifies(token, leaf):
+    """COSE_Sign1 signature verification of RFC 9052 section 4.4 over `["Signature1", protected, b"", payload]`, with
+    the ECDSA signature the wire carries (r || s, RFC 9053 section 2.1) converted to the DER form `cryptography`
+    takes. Returns None when it verifies, else the reason."""
+    alg = token["header"].get(1)
+    hash_algorithm = CWT_ALGORITHMS.get(alg)
+    if hash_algorithm is None:
+        return f"COSE algorithm {alg!r} is not one this run verifies ({sorted(CWT_ALGORITHMS)})"
+    signature = token["signature"]
+    if len(signature) % 2 or not signature:
+        return f"the signature is {len(signature)} bytes, not r || s"
+    half = len(signature) // 2
+    der = encode_dss_signature(int.from_bytes(signature[:half], "big"), int.from_bytes(signature[half:], "big"))
+    try:
+        leaf.public_key().verify(der, cbor2.dumps(["Signature1", token["protected"], b"", token["payload"]]),
+                                 ec.ECDSA(hash_algorithm()))
+    except Exception as e:  # noqa: BLE001 - InvalidSignature and anything else the key refuses
+        return f"the signature does not verify with the leaf of its x5chain: {e}"
+    return None
+
+
+def describe_chain(chain):
+    """A one-line rendering of certificate DERs for a check's detail: the subject of each, leaf first."""
+    described = []
+    for der in chain:
+        try:
+            cert = x509.load_der_x509_certificate(der)
+        except Exception:  # noqa: BLE001
+            described.append(f"<{len(der)} bytes that do not parse>")
+            continue
+        described.append(cert.subject.rfc4514_string())
+    return "[" + ", ".join(described) + "]"
+
+
+def status_list_cwt_problems(body, content_type, uri, index, issuer_auth_chain, now,
+                             require_issuance_chain=True):
+    """A Status List Token in CWT form held to what an mDoc wallet checks (draft-ietf-oauth-status-list-21 section 5.2,
+    ISO/IEC 18013-5 second edition 12.3.6): the media type, tag 18, a protected typ and x5chain, the signature, sub =
+    the MSO's uri, iat not ahead, exp present and not passed, bits 1, the lst inflates and the credential's bit is
+    clear, and - unless the deployment signs with a dedicated signer - the token's x5chain equal to the mDL's IssuerAuth
+    x5chain, which is what Credo's receipt enforces without dedicated status certificates (Credo
+    mdocUtil.ts:76-115). [problem, ...]."""
+    problems = []
+    media_type = (content_type or "").split(";")[0].strip().lower()
+    if media_type != STATUS_LIST_CWT:
+        problems.append(f"Content-Type {content_type!r} is not {STATUS_LIST_CWT} (TSL 8.2)")
+    try:
+        token = decode_status_list_cwt(body)
+    except ValueError as e:
+        return problems + [str(e)]
+    try:
+        leaf = x509.load_der_x509_certificate(token["x5chain"][0])
+    except Exception as e:  # noqa: BLE001
+        return problems + [f"the first certificate of the x5chain does not parse: {e}"]
+    problem = cwt_signature_verifies(token, leaf)
+    if problem:
+        problems.append(problem)
+    claims = token["claims"]
+    if claims.get(2) != uri:
+        problems.append(f"sub (2) {claims.get(2)!r} is not the MSO's uri {uri!r}")
+    iat, exp = claims.get(6), claims.get(4)
+    if not isinstance(iat, int) or isinstance(iat, bool) or iat > now + CLOCK_SKEW:
+        problems.append(f"iat (6) {iat!r} missing or in the future (now {int(now)}) "
+                        f"(@owf/mdoc refuses a future iat)")
+    if not isinstance(exp, int) or isinstance(exp, bool):
+        problems.append(f"exp (4) {exp!r} missing (ISO2 12.3.6.3: an mDoc's list carries exp)")
+    elif exp <= now:
+        problems.append(f"exp (4) {exp} has passed (now {int(now)}) "
+                        f"(RFC 8392 3.1.4: the evaluation time must be before exp)")
+    status_list = claims.get(65533)
+    if not isinstance(status_list, dict):
+        problems.append(f"claim 65533 (status_list) {status_list!r} is not a map")
+    else:
+        if status_list.get("bits") != 1:
+            problems.append(f"bits {status_list.get('bits')!r} is not 1 (ISO2 12.3.6.5)")
+        lst = status_list.get("lst")
+        if not isinstance(lst, (bytes, bytearray)) or not lst:
+            problems.append(f"lst {lst!r} is not a bstr")
+        else:
+            try:
+                bit = cwt_status_bit(bytes(lst), index)
+            except Exception as e:  # noqa: BLE001 - zlib.error, IndexError past the end
+                problems.append(f"lst does not inflate to a list holding index {index}: {e}")
+            else:
+                if bit != 0:
+                    problems.append(f"bit {index} is {bit}, not 0 (valid)")
+    if require_issuance_chain and issuer_auth_chain is not None:
+        expected = [cert.public_bytes(serialization.Encoding.DER) for cert in issuer_auth_chain]
+        if token["x5chain"] != expected:
+            problems.append("the token's x5chain is not the mDL's IssuerAuth x5chain certificate for certificate "
+                            f"(Credo's receipt rule): status list {describe_chain(token['x5chain'])}, "
+                            f"mDL {describe_chain(expected)}")
+    return problems
+
+
 def has_status(mso):
     """Whether the MSO has a `status` member at all, whatever it holds. ISO/IEC 18013-5 9.1.2.4 makes `status` OPTIONAL,
     and the demo issues none until M-11 (F-21): the only list the compose stack can write is a statuslist+jwt signed by
@@ -466,7 +638,8 @@ def run_openssl(*args):
 
 
 class Smoke:
-    def __init__(self, base, configuration, subject, out, pinned_iaca=None, holders=HOLDERS, expect_status="absent"):
+    def __init__(self, base, configuration, subject, out, pinned_iaca=None, holders=HOLDERS, expect_status="absent",
+                 status_format="cwt", status_signer="document-signer"):
         self.base = base.rstrip("/")
         self.certify = self.base + "/v1/certify"
         self.configuration = configuration
@@ -476,6 +649,8 @@ class Smoke:
         self.holders = json.loads(holders.read_text()) if holders.exists() else None
         self.pinned_iaca = pinned_iaca
         self.expect_status = expect_status
+        self.status_format = status_format
+        self.status_signer = status_signer
         self.metadata = self.as_metadata = self.issuer = None
         self.iaca_path = self.dsc = None
 
@@ -679,7 +854,7 @@ class Smoke:
             print("\n".join("    | " + line for line in output.splitlines()))
             check(f"{label}: verify_mdoc.py (pymdoccbor) with --iaca, --doctype, --holder: no problem", p.returncode == 0,
                   "exit 0" if p.returncode == 0 else f"exit {p.returncode}")
-        return mso
+        return mso, chain
 
     def trust(self):
         """The IACA the Document Signer names (its CRL distribution point .../mdoc/iaca/<id>.crl), from the publication."""
@@ -736,13 +911,19 @@ class Smoke:
                                    "-CRLfile", str(crl_pem), str(dsc_path))
         check("Document Signer: openssl verify -x509_strict -crl_check under the IACA and its CRL", code == 0 and output.endswith("OK"), output)
 
-    def status(self, mso):
+    def status(self, mso, issuer_auth_chain=None):
         """The MSO's status entry and its Token Status List, held to `--expect-status` (F-21 review round 1).
 
         The demo issues no status until M-11 (the only list it can write is signed outside the IACA, which Paradym
         rejects, G23; ISO/IEC 18013-5 makes `status` optional), so `--expect-status absent` is the default - and a run
         against a stack that restored the block says `present`, which fails here if the restore did not take. A present
-        entry is shape-checked before anything is fetched, so a malformed one is a failure and not a skip."""
+        entry is shape-checked before anything is fetched, so a malformed one is a failure and not a skip.
+
+        With an entry, the list is held to its own format: `--status-format cwt` (the default from M-11) fetches it with
+        `Accept: application/statuslist+cwt` and checks the tagged COSE_Sign1, its protected `typ` and `x5chain`, its
+        signature, the claims, the bit, and that its `x5chain` is the mDL's IssuerAuth chain (Credo's receipt rule;
+        `--status-signer dedicated` reports that one check as skipped instead). `--status-format jwt` is today's JWT
+        check, for a deployment still running `mdoc.token-format=jwt`."""
         if not isinstance(mso, dict):
             check("MSO status entry: the MSO is a map", False, mso)
             return
@@ -763,6 +944,13 @@ class Smoke:
                      problems or mso["status"]["status_list"]):
             return
         entry = mso["status"]["status_list"]
+        if self.status_format == "jwt":
+            self.jwt_status_list(entry)
+        else:
+            self.cwt_status_list(entry, issuer_auth_chain)
+
+    def jwt_status_list(self, entry):
+        """Today's JWT check (`mdoc.token-format=jwt`, D-M11-3's escape hatch): a `statuslist+jwt` signed by its `x5c`."""
         name = ("status list served as statuslist+jwt, signature verifies with its x5c, sub is the uri, iat, "
                 "exp (Certify policy), bit clear")
         s, h, token = call("GET", entry["uri"])
@@ -779,6 +967,42 @@ class Smoke:
         check(name, s == 200 and header.get("typ") == "statuslist+jwt" and not problems,
               {"content-type": h.get("content-type"), "typ": header.get("typ"), "problems": problems} if problems or s != 200
               else {"typ": header.get("typ"), "sub": payload.get("sub"), "iat": payload.get("iat"), "exp": payload.get("exp")})
+
+    def cwt_status_list(self, entry, issuer_auth_chain):
+        """The mDoc format (ISO/IEC 18013-5 second edition 12.3.6.3): a Status List Token in CWT form, signed by the
+        Document Signer that signed the mDL (D-M11-1), so its `x5chain` is the mDL's IssuerAuth chain."""
+        name = ("status list served as application/statuslist+cwt: tag 18, protected typ and x5chain, signature verifies "
+                "with the leaf, sub is the uri, iat, exp, bits 1, bit clear, x5chain is the mDL's IssuerAuth chain")
+        s, h, body = call("GET", entry["uri"], headers={"Accept": STATUS_LIST_CWT}, binary=True)
+        dedicated = self.status_signer == "dedicated"
+        problems = status_list_cwt_problems(body, h.get("content-type") if s == 200 else None, entry["uri"], entry["idx"],
+                                            issuer_auth_chain, time.time(), require_issuance_chain=not dedicated)
+        if not check(name, s == 200 and not problems,
+                     {"status": s, "content-type": h.get("content-type"), "problems": problems, "bytes": len(body)}
+                     if problems or s != 200 else
+                     {"content-type": h.get("content-type"), "bytes": len(body), "uri": entry["uri"],
+                      "idx": entry["idx"]}):
+            return
+        if dedicated:
+            check("status list x5chain is the mDL's IssuerAuth chain (Credo's receipt rule)", True,
+                  "skipped: --status-signer dedicated (D-M11-1 (b)); Credo needs the IACA configured as a status "
+                  "certificate to accept a dedicated signer")
+        self.verify_status_leaf(x509.load_der_x509_certificate(decode_status_list_cwt(body)["x5chain"][0]))
+
+    def verify_status_leaf(self, leaf):
+        """The list's signer, under the IACA and the CRL this run already downloaded (TSL 11.3, ISO2 12.3.6.2): the
+        same check the mDL's Document Signer gets, and the one isomdl walks to the IACA for a list."""
+        name = "status list leaf: openssl verify -x509_strict -crl_check under the mDL's IACA and its CRL"
+        crl = self.out / "iaca.crl.pem"
+        if self.iaca_path is None or not crl.is_file():
+            check(name, True, "skipped: this run downloaded no IACA and CRL (the mDL's Document Signer carries no CRL "
+                              "distribution point, or --iaca was refused)")
+            return
+        path = self.out / "status-list-leaf.pem"
+        path.write_bytes(leaf.public_bytes(serialization.Encoding.PEM))
+        code, output = run_openssl("verify", "-x509_strict", "-crl_check", "-CAfile", str(self.iaca_path),
+                                   "-CRLfile", str(crl), str(path))
+        check(name, code == 0 and output.endswith("OK"), output)
 
     # ---------------------------------------------------------------------------------------------- the rest
     def notification(self, issued):
@@ -823,8 +1047,8 @@ class Smoke:
         ed = self.holder_run("Ed25519 holder (DPoP)", by_value, ed25519.Ed25519PrivateKey.generate(),
                              dpop_key=ec.generate_private_key(ec.SECP256R1()))
         if p256:
-            mso = self.inspect(p256)
-            self.status(mso)
+            mso, chain = self.inspect(p256)
+            self.status(mso, chain)
             self.notification(p256)
             self.replay(p256)
         if ed:
@@ -855,6 +1079,12 @@ def main(argv=None):
     parser.add_argument("--expect-status", choices=("absent", "present"), default="absent",
                         help="the MSO's status entry the configuration is expected to produce: absent until the M-11 "
                              "restore lands (the demo's default), present on a stack that restored the block")
+    parser.add_argument("--status-format", choices=("cwt", "jwt"), default="cwt",
+                        help="the form the status list is served in: cwt (the default from M-11, ISO/IEC 18013-5 second "
+                             "edition 12.3.6.3) or jwt (a deployment still running mdoc.token-format=jwt)")
+    parser.add_argument("--status-signer", choices=("document-signer", "dedicated"), default="document-signer",
+                        help="who signs the list: document-signer (D-M11-1 (a), the default; the list's x5chain must be "
+                             "the mDL's IssuerAuth chain) or dedicated (D-M11-1 (b), where that one check is skipped)")
     parser.add_argument("--out", help="directory for the credentials, holder keys, IACA and CRL (default: a new temporary one)")
     parser.add_argument("--iaca", type=Path, help="the operator's offline IACA (PEM, mdl-operator): the published IACA must be "
                                                    "this certificate, and the mDLs are verified against it")
@@ -865,7 +1095,8 @@ def main(argv=None):
     out = Path(args.out) if args.out else Path(tempfile.mkdtemp(prefix="mdl-smoke-"))
     out.mkdir(parents=True, exist_ok=True)
     print(f"mDL smoke against {args.base}, configuration {args.configuration}, subject {args.subject}; files in {out}")
-    Smoke(args.base, args.configuration, args.subject, out, args.iaca, args.holders, args.expect_status).run()
+    Smoke(args.base, args.configuration, args.subject, out, args.iaca, args.holders, args.expect_status,
+          args.status_format, args.status_signer).run()
     return 1 if table() or not results else 0
 
 

@@ -7,10 +7,11 @@ smoke run accepts as equal to holders.json and as a valid status list, without a
 import base64
 import json
 import sys
+import time
 import types
 import unittest
 import zlib
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import cbor2
@@ -22,6 +23,7 @@ except ImportError:  # the CI venv is requirements-verify.txt, without PyJWT
 
 import smoke_mdl as s
 
+NOW = 1_800_000_000  # the evaluation time the CWT checks are made against
 HOLDERS = json.loads(s.HOLDERS.read_text())
 RECORD = HOLDERS["mdl-demo-1"]
 PORTRAIT = (s.HOLDERS.parent / RECORD["portrait"]).read_bytes()
@@ -309,6 +311,192 @@ class IssuerHint(unittest.TestCase):
     def test_no_hint_when_the_issuer_is_under_the_base(self):
         self.assertIsNone(s.issuer_hint("http://localhost:8091/", "http://localhost:8091/v1/certify/oid4vci"))
         self.assertIsNotNone(s.issuer_hint("http://localhost:80", "http://localhost:8091/v1/certify/oid4vci"))
+
+
+def _certificate(subject_key, common_name, issuer=None, issuer_key=None, ca=False):
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.x509.oid import NameOID
+    from datetime import datetime, timezone
+    now = datetime.fromtimestamp(NOW, timezone.utc)
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+    builder = (x509.CertificateBuilder().subject_name(subject).issuer_name(issuer or subject)
+               .public_key(subject_key.public_key()).serial_number(x509.random_serial_number())
+               .not_valid_before(now - timedelta(days=1)).not_valid_after(now + timedelta(days=365))
+               .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True))
+    return builder.sign(issuer_key or subject_key, hashes.SHA256())
+
+
+class Cwt:
+    """A Status List Token in CWT form (ISO/IEC 18013-5 second edition 12.3.6.3) built here with cbor2 and
+    cryptography, and the IACA/Document Signer it is signed under: the bytes a smoke run reads from the endpoint."""
+
+    def __init__(self):
+        from cryptography.hazmat.primitives.asymmetric import ec
+        self.iaca_key, self.dsc_key = ec.generate_private_key(ec.SECP256R1()), ec.generate_private_key(ec.SECP256R1())
+        self.iaca = _certificate(self.iaca_key, "Lorem Ipsum Demo IACA")
+        self.dsc = _certificate(self.dsc_key, "Lorem Ipsum Demo Document Signer", issuer=self.iaca.subject,
+                                issuer_key=self.iaca_key)
+
+    @staticmethod
+    def der(certificate):
+        from cryptography.hazmat.primitives import serialization
+        return certificate.public_bytes(serialization.Encoding.DER)
+
+    def claims(self, override=None):
+        values = {2: self.URI, 4: self.NOW + 3600, 6: self.NOW, 65533: {"lst": zlib.compress(bytes(16)), "bits": 1},
+                  65534: 3600}
+        values.update(override or {})
+        return {key: value for key, value in values.items() if value is not None}
+
+    def token(self, claims=None, protected=None, unprotected=None, tags=(18,), key=None):
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+        claims = claims if claims is not None else self.claims()
+        protected = cbor2.dumps(protected if protected is not None
+                                else {1: -7, 16: s.STATUS_LIST_CWT, 33: self.der(self.dsc)}, canonical=True)
+        payload = cbor2.dumps(claims, canonical=True)
+        der = (key or self.dsc_key).sign(cbor2.dumps(["Signature1", protected, b"", payload]),
+                                         ec.ECDSA(hashes.SHA256()))
+        r, v = decode_dss_signature(der)
+        value = [protected, unprotected if unprotected is not None else {}, payload,
+                 r.to_bytes(32, "big") + v.to_bytes(32, "big")]
+        body = cbor2.dumps(value)
+        for tag in reversed(tags):
+            body = cbor2.dumps(cbor2.CBORTag(tag, cbor2.loads(body)))
+        return body
+
+    URI = "https://issuer.example/v1/certify/credentials/token-status-list/1"
+    INDEX = 3
+    NOW = 1_800_000_000
+
+
+class StatusListCwtParser(unittest.TestCase):
+    """`smoke.py --mdl --expect-status present` reads the list an mTouch mSO names: a JWT, tag 61, an unprotected
+    x5chain, a missing exp and an x5chain that differs from the mDL's IssuerAuth one must each be refused on the bytes
+    (M-11f negative tests), so a list Paradym would refuse cannot pass the smoke run."""
+
+    def setUp(self):
+        self.cwt = Cwt()
+        self.chain = [self.cwt.dsc]
+
+    def problems(self, body, **kwargs):
+        return s.status_list_cwt_problems(body, kwargs.pop("content_type", s.STATUS_LIST_CWT), self.cwt.URI,
+                                          self.cwt.INDEX, kwargs.pop("chain", self.chain), self.cwt.NOW, **kwargs)
+
+    def test_the_fixtures_token_has_no_problem(self):
+        self.assertEqual([], self.problems(self.cwt.token()))
+
+    def test_a_jwt_body_is_refused(self):
+        problems = self.problems(b"eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln", content_type="application/statuslist+jwt")
+        self.assertEqual(2, len(problems), problems)
+        self.assertIn("application/statuslist+cwt", problems[0])
+        self.assertIn("JWT", problems[1])
+
+    def test_tag_61_is_refused(self):
+        self.assertTrue(any("61" in problem for problem in self.problems(self.cwt.token(tags=(61, 18)))))
+
+    def test_an_unprotected_x5chain_is_refused(self):
+        body = self.cwt.token(protected={1: -7, 16: s.STATUS_LIST_CWT}, unprotected={33: self.cwt.der(self.cwt.dsc)})
+        self.assertTrue(any("no x5chain" in problem and "unprotected" in problem for problem in self.problems(body)),
+                        self.problems(body))
+
+    def test_a_missing_exp_is_refused(self):
+        self.assertTrue(any(problem.startswith("exp (4)") for problem in self.problems(self.cwt.token(claims=self.cwt.claims({4: None})))))
+
+    def test_an_x5chain_that_differs_from_the_issuerauth_one_is_refused(self):
+        problems = self.problems(self.cwt.token(), chain=[_certificate(self.cwt.dsc_key, "Another Document Signer")])
+        self.assertTrue(any("IssuerAuth" in problem for problem in problems), problems)
+        self.assertEqual([], self.problems(self.cwt.token(), require_issuance_chain=False),
+                         "--status-signer dedicated skips this one check")
+
+    def test_a_signature_by_another_key_is_refused(self):
+        from cryptography.hazmat.primitives.asymmetric import ec
+        body = self.cwt.token(key=ec.generate_private_key(ec.SECP256R1()))
+        self.assertTrue(any(problem.startswith("the signature does not verify") for problem in self.problems(body)))
+
+
+class SmokeStatusExpectation(unittest.TestCase):
+    """`--expect-status present` over HTTP against recorded bytes, served by a local test server (M-11f): a CWT signed by
+    another key, a JWT list and a missing status entry each fail it, and `--expect-status absent` still passes with no
+    status member."""
+
+    @classmethod
+    def setUpClass(cls):
+        import http.server, threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", cls.served["type"])
+                self.end_headers()
+                self.wfile.write(cls.served["body"])
+
+            def log_message(self, *args):
+                pass
+
+        cls.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def setUp(self):
+        Cwt.NOW = int(time.time())  # the smoke run evaluates against this machine's clock
+        self.cwt = Cwt()
+        self.uri = f"{self.base}/v1/certify/credentials/token-status-list/1"
+
+    def body(self, key=None):
+        return self.cwt.token(claims=self.cwt.claims({2: self.uri}), key=key)
+
+    def status(self, body, content_type=s.STATUS_LIST_CWT, entry="default", expect="present", chain=None):
+        self.__class__.served = {"body": body, "type": content_type}
+        s.results.clear()
+        smoke = s.Smoke(self.base, s.MDL_DOCTYPE, "mdl-demo-1", Path("."), expect_status=expect)
+        mso = {"docType": s.MDL_DOCTYPE}
+        if entry == "default":
+            mso["status"] = {"status_list": {"idx": Cwt.INDEX, "uri": self.uri}}
+        elif entry is not None:
+            mso["status"] = entry
+        smoke.status(mso, chain if chain is not None else [self.cwt.dsc])
+        steps = [(step, ok) for step, ok, _ in s.results]
+        s.results.clear()
+        return steps
+
+    def test_a_cwt_signed_by_the_mdls_document_signer_passes(self):
+        steps = self.status(self.body())
+        self.assertTrue(all(ok for _, ok in steps), steps)
+
+    def test_a_cwt_signed_by_another_key_fails(self):
+        from cryptography.hazmat.primitives.asymmetric import ec
+        steps = self.status(self.body(key=ec.generate_private_key(ec.SECP256R1())))
+        self.assertFalse(all(ok for _, ok in steps), steps)
+
+    def test_a_jwt_list_fails(self):
+        steps = self.status(b"eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln", content_type="application/statuslist+jwt")
+        self.assertFalse(all(ok for _, ok in steps), steps)
+
+    def test_a_missing_status_entry_fails_present_and_passes_absent(self):
+        self.assertFalse(all(ok for _, ok in self.status(b"", entry=None, expect="present")))
+        steps = self.status(b"", entry=None, expect="absent")
+        self.assertTrue(all(ok for _, ok in steps), steps)
+
+    def test_the_jwt_format_option_keeps_the_jwt_check(self):
+        # --status-format jwt is a deployment on mdoc.token-format=jwt: a CWT body is not the JWT its run expects
+        self.__class__.served = {"body": b"", "type": "application/statuslist+cwt"}
+        s.results.clear()
+        smoke = s.Smoke(self.base, s.MDL_DOCTYPE, "mdl-demo-1", Path("."), expect_status="present",
+                        status_format="jwt", status_signer="document-signer")
+        smoke.status({"docType": s.MDL_DOCTYPE, "status": {"status_list": {"idx": Cwt.INDEX, "uri": self.uri}}},
+                     [self.cwt.dsc])
+        steps = [(step, ok) for step, ok, _ in s.results]
+        s.results.clear()
+        self.assertFalse(all(ok for _, ok in steps), steps)
 
 
 class Holders(unittest.TestCase):

@@ -117,9 +117,9 @@ public class TokenStatusListProvider implements StatusProvider {
     }
 
     /**
-     * Gives back the index of an mDL that was never issued (M-11e, owner decision D-M11e-1): a failed listener, a
-     * Document Signer the format refuses at signing time or a signature that does not happen must not spend an entry of
-     * a CWT list.
+     * Gives back the index of an mDL that was never issued (M-11e, owner decision D-M11e-1): a listener that fails
+     * before the credential is signed, a Document Signer the format refuses at signing time or a signature that does
+     * not happen must not spend an entry of a CWT list.
      *
      * <p>Only a CWT list is touched ({@link TokenStatusListService#release} refuses a JWT row): the legacy JWT path of an
      * SD-JWT VC, an {@code ldp_vc} or an mDoc with the escape hatch keeps exactly its previous behaviour, and a
@@ -148,9 +148,9 @@ public class TokenStatusListProvider implements StatusProvider {
      * Section 4.3's limitation, said once per alias on the first mDL signed with it: a Document Signer reference that
      * keeps no version of itself cannot be resolved back after it rotates, so a list pinned to it can be re-signed by no
      * {@code KeyRef} and is answered {@code STATUS_SIGNER_GONE} (503). Document-signer mode should be configured with
-     * {@code mdl-dsc@2026-11}, which {@code StatusListSigners.pin} records from the key's own {@code kid}. This is
-     * advisory: an owner question recorded in the plan (section 4.3), not a refusal, and the WARN names the key it
-     * resolved so the operator can see which alias to version (owner decision D-M11e-2).
+     * {@code mdl-dsc@2026-11}, which {@link StatusListSigners#pin} records from the key's own {@code kid}. This is
+     * advisory, not a refusal: D-M11e-2 decided the wording, and the WARN fires here, at attach, on the first mDL signed
+     * with the alias, naming the key it resolved so the operator can see which alias to version.
      */
     private void warnAboutAnUnversionedSigner(SigningContext signing) {
         KeyRef ref = signing.config() == null ? null : signing.config().keyRef();

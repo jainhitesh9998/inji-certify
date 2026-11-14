@@ -20,11 +20,13 @@ case of the same stack (`docs/design/20-mdl-issuer.md`, M-10). Everything here i
 
 The configuration (`org.iso.18013.5.1.mDL`): signed by `x509-file:mdl-dsc` with ES256 and `x5c: without-anchor` (the
 IssuerAuth `x5chain` is the Document Signer alone, HAIP); holder binding `cose_key`; `jwt` proofs with `ES256` (P-256)
-or `EdDSA` (Ed25519, ISO/IEC 18013-5 9.1.5.2), D4; data source `mdldemo`; **no status entry** (F-21, decision log
-2026-11-13): an MSO's `status` is optional in ISO/IEC 18013-5, and the only list this stack can write today is a
+or `EdDSA` (Ed25519, ISO/IEC 18013-5 9.1.5.2), D4; data source `mdldemo`; **no status entry yet** (F-21, decision log
+2026-11-13): an MSO's `status` is optional in ISO/IEC 18013-5, and the only list this stack could write then was a
 `statuslist+jwt` signed by keymanager's EC P-256 key, which does not chain to the IACA, so a wallet that requires the
-list's signer under the mDL's IACA (Paradym) rejects the credential (G23). "Restoring the status list, after M-11" below
-is the one-step change that puts the CWT list back. The issuer display is "Lorem Ipsum Demo Credentials".
+list's signer under the mDL's IACA (Paradym) rejected the credential (G23). Since M-11 the list an mDL points at is a
+Status List Token in CWT form (`application/statuslist+cwt`) signed by the Document Signer that signed the mDL (D-M11-1),
+so the entry can be restored: "Restoring the status list, after M-11" below is the one-step change. The issuer display is
+"Lorem Ipsum Demo Credentials".
 
 ## What the authorization server advertises
 
@@ -124,13 +126,36 @@ MDL_SEED_UPDATE=true docker compose -p certify-mdl -f docker-compose.yaml -f doc
     -f docker-compose.mdl.yaml -f docker-compose.public.yaml up --no-deps mdl-seed
 ```
 
+What the restored entry then points at, and why it is only safe on the new image: the list is a **Status List Token in
+CWT form** served as `application/statuslist+cwt` - a tagged COSE_Sign1 with the protected `typ` and `x5chain` - signed by
+the **same Document Signer that signed the mDL**, so its `x5chain` equals the mDL's IssuerAuth `x5chain` and Paradym
+(Credo with `@owf/mdoc`) accepts it (ISO/IEC 18013-5 second edition 12.3.6.3; D-M11-1 (a)). No offline step and no new
+certificate are involved: the DSC already in the keystore signs the list, and the defaults
+(`certify.status.token-status-list.mdoc.token-format=cwt`, `mdoc.signer=document-signer`) need no property. An image from
+before the M-11f merge answers the same entry with the keymanager-JWT list again - exactly what a wallet refused - so
+**restart the new image first and restore the block after it** (plan `docs/design/wp/M-11-status-list-under-iaca.md`
+section 7.A, steps 3 and 4).
+
 Check it with the smoke run's expectation, which fails when the entry is missing and when it is malformed (F-21 review
-round 1) - a failed restore no longer passes unnoticed:
+round 1) - a failed restore no longer passes unnoticed - and which now holds the list itself to the CWT form: served as
+`application/statuslist+cwt`, tag 18, protected `typ` and `x5chain`, the ES256/384/512 signature over the leaf,
+`sub` = the MSO's `uri`, `iat`, `exp`, `bits` 1, the bit at `idx` clear, the `x5chain` equal to the mDL's IssuerAuth one,
+and the signer under the IACA and its CRL with `openssl verify -x509_strict -crl_check`. Pass `--iaca` with the
+operator's offline IACA so the run also checks the published IACA against it (`mdl-operator`; `mdl-dev` downloads the dev
+IACA itself):
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
-.venv/bin/python docs/design/tools/smoke.py --mdl "$CERTIFY_PUBLIC_URL" --expect-status present
+.venv/bin/python docs/design/tools/smoke.py --mdl "$CERTIFY_PUBLIC_URL" --expect-status present           # mdl-dev
+.venv/bin/python docs/design/tools/smoke.py --mdl "$CERTIFY_PUBLIC_URL" --expect-status present \
+    --iaca "$MDL_PKI_DIR/iaca.pem"                                                                      # mdl-operator
 ```
+
+`--status-format jwt` runs the pre-M-11 JWT check instead, for a deployment that set
+`certify.status.token-status-list.mdoc.token-format=jwt`; `--status-signer dedicated` is for the optional dedicated
+signer of M-11g/h and reports the one check it cannot make (the list's chain equalling the mDL's) as skipped. A second,
+independent opinion on the same list is `docs/design/tools/verify_status_list.py` (pycose, cbor2, cryptography; the
+same problem codes as the Java harness), which also runs in CI over every sample that carries a status list.
 
 `MdlDemoConfigurationTest` (`certify-service`) holds the configuration to the pre-F-21 file minus this exact block,
 byte for byte, and to this block as the one documented here: restoring it means updating that test and its recording
@@ -513,7 +538,8 @@ The public host's mDL carries no status entry (F-21, decision log 2026-11-13): t
 signed by keymanager's EC P-256 key, whose certificate does not chain to the IACA, and a verifier that requires the
 list's signer under the mDL's IACA refused the credential (Paradym, gap G23, open: M-11, the CWT list signed under the
 IACA). ISO/IEC 18013-5 makes the MSO's `status` optional, so the configuration asks for none; "Restoring the status list,
-after M-11" is the one-step change that puts it back.
+after M-11" is the one-step change that puts it back, on an image at or after the M-11f merge and not before (an older
+image would answer the restored entry with the keymanager-JWT list again).
 
 ## How Certify reads the holder data
 

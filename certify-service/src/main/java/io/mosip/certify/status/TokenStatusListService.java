@@ -94,6 +94,12 @@ public class TokenStatusListService {
     /** The {@code signer.mode} of a list signed by a dedicated IACA-issued status signer (D-M11-1 (b); M-11h). */
     public static final String SIGNER_DEDICATED = "dedicated";
 
+    /**
+     * The mapper {@link #envelopeOf} reads a stored envelope with. Static because the callers that need it (the capacity
+     * projections) are static too, and an {@link ObjectMapper} is thread-safe once configured (M-11f, G49 nit).
+     */
+    private static final ObjectMapper ENVELOPE_MAPPER = new ObjectMapper();
+
     public record Entry(String uri, long idx) {}
 
     /** The signer a CWT list is pinned to: which reference re-signs it, and the SHA-256 of its leaf certificate. */
@@ -1224,7 +1230,7 @@ public class TokenStatusListService {
     /** The token a {@link #TYPE_CWT} row's document holds, read without an injected mapper (a static caller asks). */
     private static byte[] envelopeOf(String document) {
         try {
-            return token(new ObjectMapper().readValue(document, StoredEnvelope.class));
+            return token(ENVELOPE_MAPPER.readValue(document, StoredEnvelope.class));
         } catch (Exception e) {
             throw new IllegalStateException("Stored CWT token status list is not the section 4.4 envelope", e);
         }
