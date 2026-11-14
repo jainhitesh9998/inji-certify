@@ -57,7 +57,7 @@ public class OfferPageController {
             + " img-src 'self' blob: data:; connect-src %s; frame-ancestors 'none'; base-uri 'none';"
             + " form-action 'none'; object-src 'none'";
     private static final String CONNECT_SRC = "'self' https:";
-    private static final String CONNECT_SRC_LOCAL = "'self' https: http://localhost:* http://127.0.0.1:*";
+    private static final String CONNECT_SRC_LOCAL = "'self' https: http://localhost:* http://127.0.0.1:* http://[::1]:*";
     private static final String REFERRER_POLICY = "no-referrer";
 
     private final OfferPageProperties properties;
@@ -133,8 +133,12 @@ public class OfferPageController {
 
     /** `'sha256-…'` per inline script, base64 of the SHA-256 of the script's text (CSP 3, section 6.7.3.1). */
     static String inlineScriptHashes(String html) {
+        // The browser hashes the script's text as its parser produced it, and the HTML parser turns CRLF and a lone CR
+        // into LF before the tokenizer sees the newline (HTML standard, 13.2.3.1). A page read from a checkout with
+        // another line ending therefore has to be hashed over LF too, or every script would be blocked.
+        String normalised = html.replace("\r\n", "\n").replace('\r', '\n');
         StringBuilder hashes = new StringBuilder();
-        Matcher matcher = INLINE_SCRIPT.matcher(html);
+        Matcher matcher = INLINE_SCRIPT.matcher(normalised);
         while (matcher.find()) {
             hashes.append(" 'sha256-").append(sha256Base64(matcher.group(1))).append('\'');
         }

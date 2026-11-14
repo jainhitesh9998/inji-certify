@@ -151,7 +151,9 @@
     if (selected === null || db === null) return;
     try {
       await WalletStore.remove(db, selected.id);
-      status("detailsStatus", "Deleted " + labelOf(selected) + ". Its key went with it.", true);
+      // the details section is hidden on success, so the confirmation goes where the visitor can still see it
+      status("storageStatus", "Deleted " + labelOf(selected) + ". Its key went with it.", true);
+      status("detailsStatus", "");
       selected = null;
       el("details").hidden = true;
       await refresh();
@@ -164,14 +166,28 @@
     if (db === null) return;
     try {
       db.close();
+      db = null;
       await WalletStore.deleteEverything();
+    } catch (e) {
+      // another tab still holds the store open (WalletStore reports `blocked` instead of waiting): reopen this page's
+      // own connection so the list keeps working, and say what the visitor can do about it
+      try {
+        db = await WalletStore.open();
+        await refresh();
+      } catch (ignored) {
+        // the status below is what the visitor reads; a store that cannot reopen says so on the next action
+      }
+      status("storageStatus", "The store could not be deleted: " + e.message, false);
+      return;
+    }
+    try {
       db = await WalletStore.open();
       selected = null;
       el("details").hidden = true;
       await refresh();
       status("storageStatus", "Everything kept in this browser was deleted.", true);
     } catch (e) {
-      status("storageStatus", "The store could not be deleted: " + e.message, false);
+      status("storageStatus", "The store was deleted, but could not be reopened: " + e.message, false);
     }
   });
 

@@ -132,6 +132,9 @@ class OfferPageTest {
         assertTrue(hashes > 0, "the offer page has an inline script");
         assertTrue(csp.contains("frame-ancestors 'none'") && csp.contains("base-uri 'none'")
                 && csp.contains("form-action 'none'") && csp.contains("object-src 'none'"), csp);
+        // a page served from a loopback host may reach a local stack over plain HTTP, on every loopback spelling the
+        // page's own host check accepts (localhost, 127.0.0.1 and ::1; MockMvc answers as localhost)
+        assertTrue(csp.contains("connect-src 'self' https: http://localhost:* http://127.0.0.1:* http://[::1]:*"), csp);
         assertEquals("camera=()", page.getResponse().getHeader("Permissions-Policy"));
         assertEquals("no-referrer", page.getResponse().getHeader("Referrer-Policy"));
 
@@ -201,5 +204,21 @@ class OfferPageTest {
         String body = answer.getResponse().getContentAsString();
         assertTrue(body.contains("\"credential_configuration_ids\""), "the keys are snake_case: " + body);
         assertFalse(body.contains("credentialConfigurationIds"), "no camelCase key leaks the record's Java names: " + body);
+    }
+
+    @Test
+    void theInlineScriptHashIsTakenOverLfWhateverTheFileSSLineEndings() {
+        // CSP 3 section 6.7.3.1 hashes the script's text as the parser produced it, and the HTML parser normalises CRLF
+        // and a lone CR to LF before it sees a newline (HTML standard, 13.2.3.1): a checkout or an editor that changed
+        // the line endings must not change the hash the served page carries
+        String lf = "<script>\nvar a = 1;\n</script>";
+        String crlf = "<script>\r\nvar a = 1;\r\n</script>";
+        String cr = "<script>\rvar a = 1;\r</script>";
+        assertEquals(OfferPageController.inlineScriptHashes(lf), OfferPageController.inlineScriptHashes(crlf));
+        assertEquals(OfferPageController.inlineScriptHashes(lf), OfferPageController.inlineScriptHashes(cr));
+        assertTrue(OfferPageController.inlineScriptHashes(crlf).startsWith(" 'sha256-"));
+        // and the two scripts that differ still hash differently: the normalisation is the only thing dropped
+        assertFalse(OfferPageController.inlineScriptHashes(lf)
+                .equals(OfferPageController.inlineScriptHashes("<script>\nvar a = 2;\n</script>")));
     }
 }

@@ -3,11 +3,16 @@
  *
  *   credentials  keyPath `id`     {id, format, docType, issuerSigned, privateKey, publicJwk, credentialIssuer,
  *                                  credentialConfigurationId, storedAt, validFrom, validUntil, label}
- *   answered     keyPath `key`    {key, at}: a verifier request already answered, dropped after 24 hours
- *   log          autoIncrement    {at, ...}: the presentation log, the last 100 kept
+ *   answered     keyPath `key`    {key, at}: a verifier request already answered (P5-03c; created here so the version
+ *                                  stays 1)
+ *   log          autoIncrement    {at, ...}: the presentation log (P5-03b/e; created here for the same reason)
  *
  * Nothing here leaves the browser, and a kept credential's private key is a non-extractable CryptoKey: the record holds
  * the only reference to it, so deleting the record deletes the key.
+ *
+ * The two operations that can race another tab are the ones that have to be careful: keeping a credential counts and
+ * writes in one transaction, and deleting the database says so when another tab still holds it open instead of waiting
+ * for it forever.
  */
 var WalletStore = (function () {
   "use strict";
@@ -17,8 +22,6 @@ var WalletStore = (function () {
   var CREDENTIALS = "credentials";
   var ANSWERED = "answered";
   var LOG = "log";
-  var MAX_LOG = 100;
-  var ANSWERED_TTL = 24 * 60 * 60 * 1000;
 
   function available() {
     return typeof indexedDB !== "undefined" && indexedDB !== null;
@@ -39,7 +42,10 @@ var WalletStore = (function () {
     });
   }
 
-  /** Opens (creating on first use) the database; answered requests older than 24 hours are dropped first. */
+  /**
+   * Opens (creating on first use) the database. The connection gives itself up when another tab asks for a version
+   * change - "Delete everything" in another tab - because a connection that stays open is what blocks that delete.
+   */
   function open() {
     return new Promise(function (resolve, reject) {
       var request;
@@ -64,20 +70,13 @@ var WalletStore = (function () {
       request.onerror = function () { reject(request.error || new Error("IndexedDB could not be opened")); };
       request.onsuccess = function () {
         var database = request.result;
-        pruneAnswered(database).then(function () { resolve(database); }, function () { resolve(database); });
+        // the browser fires this on every other connection when one tab upgrades or deletes the database: closing here
+        // is what lets that request complete rather than stay blocked on this tab
+        database.onversionchange = function () {
+          try { database.close(); } catch (error) { /* already closed */ }
+        };
+        resolve(database);
       };
-    });
-  }
-
-  function pruneAnswered(database) {
-    var now = Date.now();
-    return requestDone(database.transaction(ANSWERED, "readonly").objectStore(ANSWERED).getAll()).then(function (entries) {
-      var stale = (entries || []).filter(function (entry) { return !entry || typeof entry.at !== "number" || now - entry.at > ANSWERED_TTL; });
-      if (!stale.length) return undefined;
-      var transaction = database.transaction(ANSWERED, "readwrite");
-      var store = transaction.objectStore(ANSWERED);
-      stale.forEach(function (entry) { if (entry && entry.key !== undefined) store.delete(entry.key); });
-      return transactionDone(transaction);
     });
   }
 
@@ -95,44 +94,61 @@ var WalletStore = (function () {
     return requestDone(database.transaction(CREDENTIALS, "readonly").objectStore(CREDENTIALS).count());
   }
 
-  function put(database, record) {
-    var transaction = database.transaction(CREDENTIALS, "readwrite");
-    transaction.objectStore(CREDENTIALS).put(record);
-    return transactionDone(transaction).then(function () { return record; });
-  }
-
-  function get(database, id) {
-    return requestDone(database.transaction(CREDENTIALS, "readonly").objectStore(CREDENTIALS).get(id));
-  }
-
   function remove(database, id) {
     var transaction = database.transaction(CREDENTIALS, "readwrite");
     transaction.objectStore(CREDENTIALS).delete(id);
     return transactionDone(transaction);
   }
 
-  /** Deletes the whole database: "Delete everything". */
-  function deleteEverything() {
+  /**
+   * Stores one credential only while fewer than `limit` are kept, counted and written inside the same readwrite
+   * transaction. Two tabs that keep their 50th and 51st credential at the same moment therefore cannot both succeed:
+   * the count and the write are never apart, so no read can go stale between them. Resolves `true` when the record was
+   * written, `false` when the limit refused it (nothing was written in that transaction).
+   */
+  function putWithinLimit(database, record, limit) {
+    var stored = false;
     return new Promise(function (resolve, reject) {
-      var request = indexedDB.deleteDatabase(DB_NAME);
-      request.onsuccess = function () { resolve(); };
-      request.onerror = function () { reject(request.error || new Error("IndexedDB could not be deleted")); };
-      request.onblocked = function () { resolve(); };
+      var transaction;
+      try {
+        transaction = database.transaction(CREDENTIALS, "readwrite");
+      } catch (error) {
+        reject(error);
+        return;
+      }
+      transaction.oncomplete = function () { resolve(stored); };
+      transaction.onerror = function () { reject(transaction.error || new Error("IndexedDB transaction failed")); };
+      transaction.onabort = function () { reject(transaction.error || new Error("IndexedDB transaction aborted")); };
+      var store = transaction.objectStore(CREDENTIALS);
+      var counting = store.count();
+      counting.onsuccess = function () {
+        if (counting.result >= limit) return; // the transaction commits with nothing written
+        stored = true;
+        store.put(record);
+      };
     });
   }
 
-  /** Adds one log entry, keeping the last 100. The log never leaves the browser. */
-  function addLog(database, entry) {
-    var transaction = database.transaction(LOG, "readwrite");
-    transaction.objectStore(LOG).put(entry);
-    return transactionDone(transaction).then(function () {
-      return requestDone(database.transaction(LOG, "readonly").objectStore(LOG).getAll()).then(function (entries) {
-        var excess = (entries || []).length - MAX_LOG;
-        if (excess <= 0) return undefined;
-        var trim = database.transaction(LOG, "readwrite");
-        (entries || []).slice(0, excess).forEach(function (old) { trim.objectStore(LOG).delete(old && old.id); });
-        return transactionDone(trim);
-      });
+  /**
+   * Deletes the whole database: "Delete everything". Resolves only once the browser reports the database gone. Another
+   * tab that still holds a connection is asked to close it (see open); if it does not, the browser reports `blocked`,
+   * which is refused here with what the visitor can do about it rather than left waiting forever.
+   */
+  function deleteEverything() {
+    return new Promise(function (resolve, reject) {
+      var request;
+      try {
+        request = indexedDB.deleteDatabase(DB_NAME);
+      } catch (error) {
+        reject(error);
+        return;
+      }
+      request.onsuccess = function () { resolve(); };
+      request.onerror = function () { reject(request.error || new Error("IndexedDB could not be deleted")); };
+      request.onblocked = function () {
+        reject(new Error("another tab of this wallet still has the credential store open; close every other wallet tab"
+          + " and try again"));
+      };
     });
   }
 
@@ -146,10 +162,8 @@ var WalletStore = (function () {
     open: open,
     list: list,
     count: count,
-    put: put,
-    get: get,
+    putWithinLimit: putWithinLimit,
     remove: remove,
     deleteEverything: deleteEverything,
-    addLog: addLog,
   };
 })();

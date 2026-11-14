@@ -196,7 +196,8 @@ jobs:
       - uses: actions/setup-node@v4
         # F-15: the offer page's behaviour check is plain Node with no npm install, so only the interpreter is set up.
         # P5-03a moves it to Node 24 (D-P5-03-13): Node 20 reached end of life on 2026-04-30, and the wallet harness's
-        # fake IndexedDB relies on Node 24's structuredClone for its records.
+        # fake IndexedDB stores records with the platform's `structuredClone`, which on Node 24 clones a non-extractable
+        # CryptoKey into a clone that still signs and still refuses `exportKey` - the behaviour a browser's clone has.
         with:
           node-version: '24'
 
@@ -210,7 +211,8 @@ jobs:
       - name: Demo wallet behaviour (node)
         # P5-03a: the offer page keeps an issued mDL (non-extractable key, IndexedDB, the five checks of plan 4.2) and
         # the wallet page lists, shows and deletes it. The page's own scripts are evaluated (cbor.js, mdoc.js,
-        # wallet-store.js), and the fixtures are built in the harness, so no issuer and no npm install are needed.
+        # wallet-store.js); the fixtures include one recorded from Certify's own MdocFormatter (certify-format-mdoc, plan
+        # 4.12), so no issuer and no npm install are needed.
         run: node docs/design/tools/check-offer-wallet.mjs
         shell: bash
 

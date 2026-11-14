@@ -116,6 +116,9 @@
   let activeOffer = null;
   // an offer is being created / redeemed: each keeps the other's button disabled while it runs
   let creating = false, redeeming = false;
+  // P5-03a (I4): whether this deployment's wallet answered 200. Until it does, nothing is kept and no Keep box is
+  // shown: with certify.offer-page.wallet.enabled=false the config endpoint answers 404 and this browser stores nothing.
+  let walletEnabled = false;
   // the blob URL of the last portrait this page rendered, released when the next one replaces it
   let portraitObjectUrls = [];
 
@@ -178,11 +181,16 @@
     // the operator's demo subjects, when there are any; a fetch that fails is not an error the visitor needs to see
     try { await loadDemoSubjects(); } catch (e) { /* no dropdown: the typed id and the claims field work as before */ }
     // the wallet page, when this deployment serves it: its config endpoint exists only with
-    // certify.offer-page.wallet.enabled, so a 404 leaves no link
+    // certify.offer-page.wallet.enabled, so a 404 leaves no link - and no Keep box, because the switch that answers here
+    // is the switch that allows storing anything at all (I4)
     try {
       const walletConfig = await api("GET", WALLET_CONFIG);
-      if (walletConfig.status === 200) el("walletLink").hidden = false;
-    } catch (e) { /* no wallet on this deployment */ }
+      walletEnabled = walletConfig.status === 200;
+      if (walletEnabled) el("walletLink").hidden = false;
+    } catch (e) {
+      walletEnabled = false; // no wallet on this deployment: nothing is kept
+    }
+    syncKeep();
   }
 
   function formatOf(configurationId) {
@@ -210,11 +218,12 @@
   }
 
   /**
-   * P5-03a (plan 4.2, D-P5-03-6): only an mso_mdoc credential can be kept, so the checkbox is shown for an mso_mdoc
-   * configuration only (ticked by default) and hidden for every other format.
+   * P5-03a (plan 4.2, D-P5-03-6, I4): only an mso_mdoc credential can be kept, and only where the wallet is switched on.
+   * So the checkbox is shown for an mso_mdoc configuration of a deployment whose wallet answers 200 (ticked by default),
+   * and hidden everywhere else.
    */
   function syncKeep() {
-    el("keepLabel").hidden = selectedFormat() !== "mso_mdoc";
+    el("keepLabel").hidden = !walletEnabled || selectedFormat() !== "mso_mdoc";
   }
 
   /** One line under the wallet button, about what was kept (or why nothing was). */
@@ -737,6 +746,9 @@
    * Nothing here leaves the browser, and a failure never changes what the issuance run reported.
    */
   async function keepCredential(credentials, offer, issuerMetadata, proof) {
+    // I4: the wallet's own switch decides whether anything is stored. Without it the page would not even show the box,
+    // so a store is opened only after /offer/wallet/config answered 200.
+    if (!walletEnabled) return;
     if (formatOf(offer.configurationId) !== "mso_mdoc") return;
     if (!el("keep").checked) return;
     // the harness's stub page has neither module; nothing is kept without them
@@ -787,10 +799,18 @@
         validUntil: result.validUntil,
         label: display && display.name ? display.name : result.docType,
       };
-      await WalletStore.put(db, record);
-      keepNote("Kept in this browser: " + record.label + "."
-        + (credentials.length > 1 ? " This response carried " + credentials.length
-          + " credentials; only the first was kept, the rest were shown." : ""), true);
+      await WalletStore.putWithinLimit(db, record, Mdoc.MAX_CREDENTIALS).then(function (stored) {
+        if (!stored) {
+          // the count and the write share one transaction, so this holds even if another tab kept its own credential a
+          // moment ago (plan 4.2 check 5)
+          keepNote("The credential was not kept. This browser already keeps " + Mdoc.MAX_CREDENTIALS
+            + " credentials; delete one first.", false);
+          return;
+        }
+        keepNote("Kept in this browser: " + record.label + "."
+          + (credentials.length > 1 ? " This response carried " + credentials.length
+            + " credentials; only the first was kept, the rest were shown." : ""), true);
+      });
     } catch (e) {
       keepNote("The credential was not kept: " + e.message, false);
     } finally {

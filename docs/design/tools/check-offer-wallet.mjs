@@ -9,10 +9,16 @@
  * `src` scripts (cbor.js, mdoc.js, wallet-store.js; `scripts: "real"`), so `Cbor.encode`, `Mdoc.readIssuerSigned` and
  * `WalletStore` are the shipped files, not stubs.
  *
- * The mDL fixtures are built here, in memory, with the page's own encoder: an ISO/IEC 18013-5 IssuerSigned with a
- * tag-24 MSO, a P-256 deviceKey and one SHA-256 digest per tag-24 IssuerSignedItemBytes. P5-03b records the committed
- * fixtures through Certify's formatter; this slice needs no issuer and no fixture file, which is why the bytes are made
- * here.
+ * The fixtures are of two kinds, on purpose:
+ *
+ * - one recorded from **Certify's own `MdocFormatter`** (`certify-format-mdoc`'s WalletFixtureRecorder, plan 4.12),
+ *   committed under docs/design/tools/fixtures/wallet/ with the holder key it was issued to. This is the layout the
+ *   issuer really writes - an IssuerAuth whose payload is a bstr holding `#6.24(bstr .cbor MSO)`, and a DSC-only
+ *   x5chain as a single bstr (RFC 9360 section 2) - and it is what a self-built fixture got wrong.
+ * - built here, byte part by byte part, in the same ISO/IEC 18013-5 8.3.2.1.2 shape, plus the encodings a reader must
+ *   also accept: a non-preferred tag head (`d9 00 18`), indefinite lengths, a `#6.18`-tagged COSE_Sign1. Each part's
+ *   expected [start, end) is recorded as it is concatenated, so the slices and digests are computed independently of
+ *   `Cbor.spans`, the reader under test.
  *
  * What it cannot check: a real browser's IndexedDB (the fake below is the storage model), a rendered layout, and the
  * HTTP headers (check-offer-page.mjs is offline; OfferPageTest recomputes the inline script's hash from the bytes the
@@ -27,8 +33,10 @@ import { openPage, parseMarkup, check, equal, section, counts, Element, Text, Fa
     OID4VCI_ISSUER, OID4VCI_DOCUMENT, DEFAULT_AS_METADATA, offerByValue, offerDocument } from "./check-offer-page.mjs";
 
 const STATIC = resolve(REPO, "certify-service/src/main/resources/static/offer");
+const FIXTURES = resolve(REPO, "docs/design/tools/fixtures/wallet");
 const DOC_TYPE = "org.iso.18013.5.1.mDL";
 const PID_DOCTYPE = "eu.europa.ec.eudi.pid.1";
+const MDL_NAMESPACE = "org.iso.18013.5.1";
 const DB_NAME = "certify-demo-wallet";
 
 /** Runs one shipped module with the globals it expects, returning its single global. */
@@ -45,14 +53,58 @@ const hex = (bytes) => Buffer.from(bytes).toString("hex");
 const b64url = (bytes) => Buffer.from(bytes).toString("base64url");
 const hash = (algorithm, bytes) => new Uint8Array(createHash(algorithm.replace("-", "").toLowerCase()).update(bytes).digest());
 const bytesOf = (value) => new Uint8Array(Buffer.from(value));
+const sameBytes = (left, right) => hex(left) === hex(right);
 
 /* ---------------------------------------------------------------- fixtures */
 
+/**
+ * Concatenates byte parts, recording each part's [start, end) as it is written. A fixture's expected slices therefore
+ * come from the concatenation itself - not from `Cbor.spans`, the reader under test.
+ */
+class Bytes {
+    constructor() {
+        this.parts = [];
+        this.length = 0;
+    }
+
+    add(part) {
+        const bytes = Buffer.from(part);
+        const start = this.length;
+        this.parts.push(bytes);
+        this.length += bytes.length;
+        return { start, end: this.length };
+    }
+
+    bytes() {
+        return new Uint8Array(Buffer.concat(this.parts, this.length));
+    }
+}
+
+/** The preferred CBOR head for a major type and argument, written here rather than by `Cbor.encode`. */
+function head(major, argument) {
+    const bits = major << 5;
+    if (argument < 24) return Uint8Array.of(bits | argument);
+    if (argument < 256) return Uint8Array.of(bits | 24, argument);
+    if (argument < 65536) return Uint8Array.of(bits | 25, argument >> 8, argument & 0xff);
+    return Uint8Array.of(bits | 26, (argument >>> 24) & 0xff, (argument >> 16) & 0xff, (argument >> 8) & 0xff, argument & 0xff);
+}
+
+const tstr = (value) => {
+    const bytes = Buffer.from(value, "utf8");
+    return Buffer.concat([Buffer.from(head(3, bytes.length)), bytes]);
+};
+const bstr = (value) => Buffer.concat([Buffer.from(head(2, value.length)), Buffer.from(value)]);
+/** A tag head, in its preferred form or in the (legal, non-preferred) three-byte form RFC 8949 allows. */
+const tagHead = (tag, nonPreferred) => nonPreferred ? Uint8Array.of(0xd9, tag >> 8, tag & 0xff) : head(6, tag);
+
+/** A stand-in for a DER certificate: mdoc.js reads the chain into a list, it does not parse certificates. */
+const DUMMY_DER = new Uint8Array([0x30, 0x03, 0x02, 0x01, 0x01]);
+const SECOND_DER = new Uint8Array([0x30, 0x03, 0x02, 0x01, 0x02]);
+
 const HOLDER_A = await webcrypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
 const HOLDER_B = await webcrypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
-const jwkOf = (pair) => webcrypto.subtle.exportKey("jwk", pair.publicKey);
-const HOLDER_A_JWK = await jwkOf(HOLDER_A);
-const HOLDER_B_JWK = await jwkOf(HOLDER_B);
+const HOLDER_A_JWK = await webcrypto.subtle.exportKey("jwk", HOLDER_A.publicKey);
+const HOLDER_B_JWK = await webcrypto.subtle.exportKey("jwk", HOLDER_B.publicKey);
 const HOLDER_A_PRIVATE = await webcrypto.subtle.exportKey("jwk", HOLDER_A.privateKey);
 
 /** A COSE_Key for a P-256 JWK, or the override a negative case needs. */
@@ -62,39 +114,49 @@ function coseKey(jwk, override) {
 }
 
 /**
- * Builds one IssuerSigned the way ISO/IEC 18013-5 8.3.2.1.2 describes it: nameSpaces of tag-24 IssuerSignedItemBytes and
- * an issuerAuth COSE_Sign1 whose payload is a tag-24 MSO. `tamper` re-encodes one element's value after its digest was
- * computed (check 4); `tag24Payload: false` writes the MSO as a plain byte string (check 1).
+ * Assembles one IssuerSigned the way ISO/IEC 18013-5 8.3.2.1.2 and RFC 9052 4.2 lay it out: `nameSpaces` of tag-24
+ * IssuerSignedItemBytes and an `issuerAuth` COSE_Sign1 whose element 2 is a **byte string** holding
+ * `#6.24(bstr .cbor MSO)` - the layout Certify's MdocFormatter writes. `options.forms` selects the encodings a reader
+ * must also accept (`nonPreferredTagHead`, `indefiniteLengths`, `taggedCose`); `options.tamper` re-encodes one element's
+ * value after its digest was computed (check 4); `options.payloadWithoutTag` writes the bare MSO map as the payload's
+ * content, which is the "not tag 24" refusal (check 1).
  */
 function buildIssuerSigned(options) {
+    const forms = options.forms || {};
     const algorithm = options.digestAlgorithm || "SHA-256";
-    const nameSpaces = new Map();
+    const msoTag = tagHead(24, forms.nonPreferredTagHead);
+    const coseTag = tagHead(18, forms.nonPreferredTagHead);
+
+    const itemParts = new Map();
     const digests = new Map();
     let digestId = 0;
     for (const namespace of Object.keys(options.elements)) {
-        const encoded = [];
         const byDigestId = new Map();
+        const items = [];
         for (const [identifier, value] of Object.entries(options.elements[namespace])) {
-            const itemBytes = Cbor.encode(new Map([
+            const itemMap = (elementValue) => Cbor.encode(new Map([
                 ["digestID", digestId],
                 ["random", new Uint8Array(16).fill(digestId + 1)],
                 ["elementIdentifier", identifier],
-                ["elementValue", value],
+                ["elementValue", elementValue],
             ]));
-            let item = Cbor.encode(new Cbor.Tagged(24, itemBytes));
-            if (options.tamper === identifier) {
-                item = Cbor.encode(new Cbor.Tagged(24, Cbor.encode(new Map([
-                    ["digestID", digestId], ["random", new Uint8Array(16).fill(digestId + 1)],
-                    ["elementIdentifier", identifier], ["elementValue", "changed after signing"],
-                ]))));
-            }
-            byDigestId.set(digestId, hash(algorithm, Cbor.encode(new Cbor.Tagged(24, itemBytes))));
-            encoded.push(item);
+            const signed = Buffer.concat([Buffer.from(msoTag), bstr(itemMap(value))]);
+            const written = options.tamper === identifier
+                ? Buffer.concat([Buffer.from(msoTag), bstr(itemMap("changed after signing"))])
+                : signed;
+            byDigestId.set(digestId, hash(algorithm, signed));
+            items.push({ elementIdentifier: identifier, digestID: digestId, bytes: new Uint8Array(written) });
             digestId++;
         }
-        nameSpaces.set(namespace, encoded);
         digests.set(namespace, byDigestId);
+        itemParts.set(namespace, items);
     }
+
+    const chain = options.x5chain === undefined ? [DUMMY_DER] : (Array.isArray(options.x5chain) ? options.x5chain : [options.x5chain]);
+    const x5chainValue = options.chainForm === "array" || chain.length > 1
+        ? Buffer.concat([Buffer.from(head(4, chain.length)), ...chain.map((der) => bstr(der))])
+        : bstr(chain[0]);
+
     const mso = new Map([
         ["version", "1.0"],
         ["digestAlgorithm", algorithm],
@@ -105,22 +167,52 @@ function buildIssuerSigned(options) {
             ["validUntil", "2026-12-01T00:00:00Z"]])],
     ]);
     const msoBytes = Cbor.encode(mso);
-    const payload = options.tag24Payload === false ? new Cbor.Raw(msoBytes) : new Cbor.Raw(Cbor.encode(new Cbor.Tagged(24, msoBytes)));
-    const issuerAuth = [
-        Cbor.encode(new Map([[1, -7]])),
-        new Map([[33, [new Uint8Array([0x30, 0x03, 0x02, 0x01, 0x01])]]]),
-        payload,
-        new Uint8Array(64),
-    ];
-    const bytes = Cbor.encode(new Map([
-        ["nameSpaces", new Map([...nameSpaces].map(([namespace, items]) => [namespace, items.map((item) => new Cbor.Raw(item))]))],
-        ["issuerAuth", issuerAuth],
-    ]));
-    return { bytes, nameSpaces, digests, mso, docType: options.docType };
+    const trailing = Buffer.from(options.payloadTrailing || []);
+    // ISO/IEC 18013-5 9.1.2.4: the payload's content is #6.24(bstr .cbor MSO), tag head and all - and nothing else
+    const payload = options.payloadWithoutTag
+        ? Buffer.concat([msoBytes, trailing])
+        : Buffer.concat([Buffer.from(msoTag), bstr(msoBytes), trailing]);
+
+    // issuerAuth: [protected, unprotected, payload, signature] (RFC 9052 4.2); element 2 is a bstr either way
+    const issuerAuth = new Bytes();
+    issuerAuth.add(forms.indefiniteLengths ? Uint8Array.of(0x9f) : head(4, 4));
+    issuerAuth.add(bstr(Cbor.encode(new Map([[1, -7]]))));
+    issuerAuth.add(Buffer.concat([Buffer.from(head(5, 1)), head(0, 33),
+        Buffer.from(options.x5chainRaw === undefined ? x5chainValue : options.x5chainRaw)]));
+    issuerAuth.add(bstr(payload));
+    issuerAuth.add(bstr(new Uint8Array(64))); // a placeholder signature: the page checks structure, not this signature
+    if (forms.indefiniteLengths) issuerAuth.add(Uint8Array.of(0xff));
+    let issuerAuthBytes = Buffer.from(issuerAuth.bytes());
+    if (forms.taggedCose) issuerAuthBytes = Buffer.concat([Buffer.from(coseTag), issuerAuthBytes]);
+
+    // the IssuerSigned map, its parts' ranges recorded as they are written
+    const out = new Bytes();
+    out.add(forms.indefiniteLengths ? Uint8Array.of(0xbf) : head(5, 2));
+    out.add(tstr("nameSpaces"));
+    const nameSpacesStart = out.length;
+    out.add(forms.indefiniteLengths ? Uint8Array.of(0xbf) : head(5, itemParts.size));
+    const items = new Map();
+    for (const [namespace, namespaceItems] of itemParts) {
+        out.add(tstr(namespace));
+        out.add(forms.indefiniteLengths ? Uint8Array.of(0x9f) : head(4, namespaceItems.length));
+        const ranges = [];
+        for (const item of namespaceItems) {
+            const range = out.add(item.bytes);
+            ranges.push({ elementIdentifier: item.elementIdentifier, digestID: item.digestID, start: range.start, end: range.end });
+        }
+        if (forms.indefiniteLengths) out.add(Uint8Array.of(0xff));
+        items.set(namespace, ranges);
+    }
+    if (forms.indefiniteLengths) out.add(Uint8Array.of(0xff)); // closes nameSpaces' own map
+    const nameSpacesRange = { start: nameSpacesStart, end: out.length };
+    out.add(tstr("issuerAuth"));
+    const issuerAuthRange = out.add(issuerAuthBytes);
+    if (forms.indefiniteLengths) out.add(Uint8Array.of(0xff)); // closes the IssuerSigned map
+    return { bytes: out.bytes(), items, nameSpacesRange, issuerAuthRange, digests, mso, docType: options.docType };
 }
 
 const MDL_ELEMENTS = {
-    "org.iso.18013.5.1": {
+    [MDL_NAMESPACE]: {
         family_name: "Ipsum",
         given_name: "Lorem",
         birth_date: new Cbor.Tagged(1004, "1985-04-12"),
@@ -139,19 +231,40 @@ const PID_ELEMENTS = {
 const MDL_A = buildIssuerSigned({ docType: DOC_TYPE, holder: HOLDER_A_JWK, elements: MDL_ELEMENTS });
 const MDL_B = buildIssuerSigned({ docType: DOC_TYPE, holder: HOLDER_B_JWK, elements: MDL_ELEMENTS });
 const PID = buildIssuerSigned({ docType: PID_DOCTYPE, holder: HOLDER_A_JWK, elements: PID_ELEMENTS });
+/** The same mDL in the encodings a byte-preserving reader must also accept (RFC 8949 3.1, 3.2.3; RFC 9052 4.2). */
+const MDL_TAGGED_COSE = buildIssuerSigned({ docType: DOC_TYPE, holder: HOLDER_A_JWK, elements: MDL_ELEMENTS,
+    forms: { taggedCose: true } });
+const MDL_NON_PREFERRED = buildIssuerSigned({ docType: DOC_TYPE, holder: HOLDER_A_JWK, elements: MDL_ELEMENTS,
+    forms: { nonPreferredTagHead: true, taggedCose: true } });
+const MDL_INDEFINITE = buildIssuerSigned({ docType: DOC_TYPE, holder: HOLDER_A_JWK, elements: MDL_ELEMENTS,
+    forms: { indefiniteLengths: true } });
+const MDL_TWO_CERTIFICATES = buildIssuerSigned({ docType: DOC_TYPE, holder: HOLDER_A_JWK, elements: MDL_ELEMENTS,
+    x5chain: [DUMMY_DER, SECOND_DER], chainForm: "array" });
 
-/** The page's WebCrypto with `generateKey` handing back the fixture holder's key, imported non-extractable. */
-function cryptoForFixture() {
+/**
+ * The IssuerSigned Certify's own MdocFormatter produced, and the holder key it was issued to (plan 4.12). Recorded with
+ * `mvn -pl certify-format-mdoc test -Dwallet.fixture.record=true`; see docs/design/tools/fixtures/wallet/README.md.
+ */
+const CERTIFY_ISSUER_SIGNED = bytesOf(readFileSync(resolve(FIXTURES, "certify-mdl.issuersigned")));
+const CERTIFY_HOLDER = JSON.parse(readFileSync(resolve(FIXTURES, "certify-mdl.holder.jwk"), "utf8"));
+const CERTIFY_PUBLIC_JWK = { kty: CERTIFY_HOLDER.kty, crv: CERTIFY_HOLDER.crv, x: CERTIFY_HOLDER.x, y: CERTIFY_HOLDER.y };
+
+/** The page's WebCrypto with `generateKey` answering the fixture holder's key, imported non-extractable. */
+function cryptoForFixture(holder = { publicJwk: HOLDER_A_JWK, privateJwk: HOLDER_A_PRIVATE }) {
+    const calls = [];
     return {
         subtle: new Proxy(webcrypto.subtle, {
             get(target, property) {
                 if (property === "generateKey") {
-                    return async () => ({
-                        privateKey: await webcrypto.subtle.importKey("jwk", HOLDER_A_PRIVATE,
-                            { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]),
-                        publicKey: await webcrypto.subtle.importKey("jwk", HOLDER_A_JWK,
-                            { name: "ECDSA", namedCurve: "P-256" }, true, ["verify"]),
-                    });
+                    return async (...args) => {
+                        calls.push(args);
+                        return {
+                            privateKey: await webcrypto.subtle.importKey("jwk", holder.privateJwk,
+                                { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]),
+                            publicKey: await webcrypto.subtle.importKey("jwk", holder.publicJwk,
+                                { name: "ECDSA", namedCurve: "P-256" }, true, ["verify"]),
+                        };
+                    };
                 }
                 const value = Reflect.get(target, property);
                 return typeof value === "function" ? value.bind(target) : value;
@@ -159,7 +272,49 @@ function cryptoForFixture() {
         }),
         randomUUID: () => webcrypto.randomUUID(),
         getRandomValues: (array) => webcrypto.getRandomValues(array),
+        // every call the page made, in order: (algorithm, extractable, usages)
+        generateKeyCalls: calls,
     };
+}
+
+/** The page's WebCrypto with the **real** `generateKey`: it records what the page asked for and the pair it produced. */
+function cryptoRecordingRealKeys() {
+    const calls = [];
+    const pairs = [];
+    return {
+        subtle: new Proxy(webcrypto.subtle, {
+            get(target, property) {
+                if (property === "generateKey") {
+                    return async (...args) => {
+                        calls.push(args);
+                        const pair = await webcrypto.subtle.generateKey(...args);
+                        pairs.push(pair);
+                        return pair;
+                    };
+                }
+                const value = Reflect.get(target, property);
+                return typeof value === "function" ? value.bind(target) : value;
+            },
+        }),
+        randomUUID: () => webcrypto.randomUUID(),
+        getRandomValues: (array) => webcrypto.getRandomValues(array),
+        generateKeyCalls: calls,
+        generatedPairs: pairs,
+    };
+}
+
+/**
+ * Asserts the one call the page must make (plan 4.2): a P-256 ECDSA key, generated non-extractable, usable only for
+ * signing. Asserting what the page asked for is the point: a stub that ignored its arguments let a page asking for an
+ * extractable key pass every other check.
+ */
+function assertGenerateKeyCall(label, calls) {
+    equal(`${label}: the page generated exactly one key`, calls.length, 1);
+    if (!calls.length) return;
+    const [algorithm, extractable, usages] = calls[0];
+    equal(`${label}: the key is ECDSA P-256`, [algorithm && algorithm.name, algorithm && algorithm.namedCurve], ["ECDSA", "P-256"]);
+    equal(`${label}: the private key was generated non-extractable`, extractable, false);
+    equal(`${label}: its only usage is sign`, [...usages], ["sign"]);
 }
 
 const CONFIGURATIONS = { mdoc: { format: "mso_mdoc", doctype: DOC_TYPE } };
@@ -178,7 +333,8 @@ function openOffer(options = {}) {
         credential: options.credential || CREDENTIAL_ANSWER([MDL_A]),
         indexedDB: options.indexedDB,
         crypto: options.crypto || cryptoForFixture(),
-        walletConfig: true,
+        // P5-03a: /offer/wallet/config. 404 means certify.offer-page.wallet.enabled=false: no Keep box, no storage.
+        walletConfig: options.walletConfig === undefined ? true : options.walletConfig,
     });
     return page;
 }
@@ -230,12 +386,12 @@ function openWallet(indexedDB) {
 }
 
 async function settle() {
-    for (let i = 0; i < 30; i++) await new Promise((done) => setImmediate(done));
+    for (let i = 0; i < 60; i++) await new Promise((done) => setImmediate(done));
 }
 
 /** The extractable flag and an export attempt on a kept key, and its signature over a challenge. */
-async function checkKeptKey(record, publicJwk) {
-    check("P5-03a: the kept private key is non-extractable", record.privateKey.extractable === false);
+async function checkKeptKey(record, publicJwk, label = "") {
+    check(`P5-03a: the kept private key is non-extractable${label}`, record.privateKey.extractable === false);
     let exported = false;
     try {
         await webcrypto.subtle.exportKey("jwk", record.privateKey);
@@ -243,11 +399,11 @@ async function checkKeptKey(record, publicJwk) {
     } catch (error) {
         exported = false;
     }
-    check("P5-03a: the kept private key cannot be exported", exported === false);
+    check(`P5-03a: the kept private key cannot be exported${label}`, exported === false);
     const challenge = Buffer.from("P5-03a challenge");
     const signature = await webcrypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, record.privateKey, challenge);
     const key = createPublicKey({ key: { kty: publicJwk.kty, crv: publicJwk.crv, x: publicJwk.x, y: publicJwk.y }, format: "jwk" });
-    check("P5-03a: the kept key signs a challenge that verifies with the fixture's public key",
+    check(`P5-03a: the kept key signs a challenge that verifies with the fixture's public key${label}`,
         verify("sha256", challenge, { key, dsaEncoding: "ieee-p1363" }, Buffer.from(signature)) === true);
 }
 
@@ -263,8 +419,10 @@ await section("1. Cbor.encode", async () => {
         [-1, "20"], [-25, "3818"], [-18446744073709551616n, "3bffffffffffffffff"],
         [new Uint8Array(0), "40"], [new Uint8Array([1, 2, 3, 4]), "4401020304"],
         ["", "60"], ["IETF", "6449455446"], ["ü", "62c3bc"],
-        [[], "80"], [[1, [2, 3]], "8201820203"], [{}, "a0"], [new Map([[1, 2], [3, 4]]), "a201020304"],
+        [[], "80"], [[1, [2, 3]], "8201820203"], [new Map(), "a0"], [new Map([[1, 2], [3, 4]]), "a201020304"],
         [new Cbor.Tagged(24, new Uint8Array([0xa0])), "d81841a0"],
+        // plan 4.3: the two constructors work without `new`, as the plan writes them
+        [Cbor.Tagged(24, new Uint8Array([0xa0])), "d81841a0"],
     ];
     for (const [value, expected] of vectors) {
         const label = typeof value === "bigint" ? String(value) : value instanceof Uint8Array ? "h'" + hex(value) + "'"
@@ -274,7 +432,9 @@ await section("1. Cbor.encode", async () => {
     // 2^64 is the first value a head cannot hold: tag 2 bignum (RFC 8949 3.4.3)
     equal("RFC 8949 Appendix A: 2^64 is a tag-2 bignum", hex(Cbor.encode(18446744073709551616n)), "c249010000000000000000");
     equal("RFC 8949 Appendix A: -1-2^64 is a tag-3 bignum", hex(Cbor.encode(-18446744073709551617n)), "c349010000000000000000");
-    for (const [label, value] of [["a float", 1.5], ["undefined", undefined], ["a Date", new Date(0)], ["NaN", NaN]]) {
+    equal("Cbor.Raw works without new", hex(Cbor.encode(Cbor.Raw(new Uint8Array([0x82, 0x01, 0x02])))), "820102");
+    for (const [label, value] of [["a float", 1.5], ["undefined", undefined], ["a Date", new Date(0)], ["NaN", NaN],
+        ["a plain object (only Map is a map, plan 4.3)", { 1: 2 }]]) {
         let refused = false;
         try { Cbor.encode(value); } catch (error) { refused = true; }
         check(`Cbor.encode refuses ${label}`, refused);
@@ -288,11 +448,174 @@ await section("1. Cbor.encode", async () => {
     equal("Cbor.Raw emits exactly the item it was given", hex(Cbor.encode(new Cbor.Raw(new Uint8Array([0x82, 0x01, 0x02])))), "820102");
 });
 
-// 2. the non-extractable holder key, and the proof the page still sends
-await section("2. holder key and proof", async () => {
-    const page = openOffer();
+// 2. Mdoc.readIssuerSigned: the raw slices are the issued items, exactly as the bytes carry them
+await section("2. readIssuerSigned", async () => {
+    const read = Mdoc.readIssuerSigned(MDL_A.bytes);
+    equal("the docType and algorithm are read from the MSO", [read.issuerAuth.mso.docType, read.issuerAuth.mso.digestAlgorithm],
+        [DOC_TYPE, "SHA-256"]);
+    equal("the IssuerAuth keeps its ES256 algorithm", read.issuerAuth.alg, -7);
+    equal("every element is read", read.nameSpaces[MDL_NAMESPACE].map((item) => item.elementIdentifier),
+        Object.keys(MDL_ELEMENTS[MDL_NAMESPACE]));
+    for (const item of read.nameSpaces[MDL_NAMESPACE]) {
+        const expected = MDL_A.items.get(MDL_NAMESPACE).find((entry) => entry.elementIdentifier === item.elementIdentifier);
+        check(`the slice of ${item.elementIdentifier} is the IssuerSignedItemBytes the fixture wrote`,
+            sameBytes(item.raw, MDL_A.bytes.subarray(expected.start, expected.end)),
+            hex(item.raw));
+        equal(`the slice of ${item.elementIdentifier} hashes to the MSO's valueDigest`,
+            hex(hash("sha256", item.raw)), hex(MDL_A.digests.get(MDL_NAMESPACE).get(item.digestID)));
+        equal(`its digest is the one computed over the same expected bytes`,
+            hex(hash("sha256", MDL_A.bytes.subarray(expected.start, expected.end))),
+            hex(MDL_A.digests.get(MDL_NAMESPACE).get(item.digestID)));
+    }
+    // 10: the rebuild comes from the reader's own slices and is compared with the fixture's own bytes, not with the
+    // builder's data: the array header is the only thing added
+    const rebuilt = Cbor.encode(new Map([...Object.keys(read.nameSpaces).map((namespace) =>
+        [namespace, read.nameSpaces[namespace].map((item) => new Cbor.Raw(item.raw))])]));
+    equal("the slices with their array headers reassemble the fixture's nameSpaces byte for byte", hex(rebuilt),
+        hex(MDL_A.bytes.subarray(MDL_A.nameSpacesRange.start, MDL_A.nameSpacesRange.end)));
+    equal("the IssuerAuth's raw slice is the whole COSE_Sign1", hex(read.issuerAuth.raw),
+        hex(MDL_A.bytes.subarray(MDL_A.issuerAuthRange.start, MDL_A.issuerAuthRange.end)));
+
+    // 2: RFC 9360 section 2 - COSE_X509 = bstr / [2*certs: bstr]. Certify emits the bstr form for a DSC-only chain.
+    equal("a single-certificate x5chain, as a single bstr, is normalised to one certificate", read.issuerAuth.x5chain.length, 1);
+    equal("and it is the certificate the fixture carries", hex(read.issuerAuth.x5chain[0]), hex(DUMMY_DER));
+    const two = Mdoc.readIssuerSigned(MDL_TWO_CERTIFICATES.bytes);
+    equal("the array form keeps both certificates, in order", two.issuerAuth.x5chain.map(hex), [hex(DUMMY_DER), hex(SECOND_DER)]);
+    const oneInArray = Mdoc.readIssuerSigned(buildIssuerSigned({ docType: DOC_TYPE, holder: HOLDER_A_JWK,
+        elements: MDL_ELEMENTS, x5chain: [DUMMY_DER], chainForm: "array" }).bytes);
+    equal("a one-entry array is read as one certificate too", oneInArray.issuerAuth.x5chain.map(hex), [hex(DUMMY_DER)]);
+    let refusedChain = null;
+    try {
+        Mdoc.readIssuerSigned(buildIssuerSigned({ docType: DOC_TYPE, holder: HOLDER_A_JWK, elements: MDL_ELEMENTS,
+            x5chainRaw: tstr("not a certificate") }).bytes);
+    } catch (error) {
+        refusedChain = error;
+    }
+    check("an x5chain that is not a byte string or an array of them is refused",
+        refusedChain !== null && /x5chain/.test(refusedChain.message), refusedChain && refusedChain.message);
+
+    // 9: a tag is recognised by its numeric value, whatever head carries it, and the bytes are kept
+    const nonPreferred = Mdoc.readIssuerSigned(MDL_NON_PREFERRED.bytes);
+    equal("a non-preferred tag head (d9 00 18) is the same tag 24", hex(nonPreferred.nameSpaces[MDL_NAMESPACE][0].raw.subarray(0, 3)),
+        "d90018");
+    for (const item of nonPreferred.nameSpaces[MDL_NAMESPACE]) {
+        const expected = MDL_NON_PREFERRED.items.get(MDL_NAMESPACE).find((entry) => entry.elementIdentifier === item.elementIdentifier);
+        check(`the non-preferred head slice of ${item.elementIdentifier} is byte for byte the fixture's`,
+            sameBytes(item.raw, MDL_NON_PREFERRED.bytes.subarray(expected.start, expected.end)));
+        equal(`the non-preferred head slice of ${item.elementIdentifier} hashes to the MSO's valueDigest`,
+            hex(hash("sha256", item.raw)), hex(MDL_NON_PREFERRED.digests.get(MDL_NAMESPACE).get(item.digestID)));
+    }
+
+    // indefinite lengths: the ranges come from the input, so they are still exact
+    const indefinite = Mdoc.readIssuerSigned(MDL_INDEFINITE.bytes);
+    for (const item of indefinite.nameSpaces[MDL_NAMESPACE]) {
+        const expected = MDL_INDEFINITE.items.get(MDL_NAMESPACE).find((entry) => entry.elementIdentifier === item.elementIdentifier);
+        check(`an indefinite-length IssuerSigned: the slice of ${item.elementIdentifier} is exact`,
+            sameBytes(item.raw, MDL_INDEFINITE.bytes.subarray(expected.start, expected.end)));
+        equal(`an indefinite-length IssuerSigned: ${item.elementIdentifier} hashes to its valueDigest`,
+            hex(hash("sha256", item.raw)), hex(MDL_INDEFINITE.digests.get(MDL_NAMESPACE).get(item.digestID)));
+    }
+    equal("the indefinite-length IssuerAuth slice is exact too", hex(indefinite.issuerAuth.raw),
+        hex(MDL_INDEFINITE.bytes.subarray(MDL_INDEFINITE.issuerAuthRange.start, MDL_INDEFINITE.issuerAuthRange.end)));
+
+    // 1: a #6.18-tagged COSE_Sign1 reads the same, and `raw` keeps the tag head
+    const tagged = Mdoc.readIssuerSigned(MDL_TAGGED_COSE.bytes);
+    equal("a #6.18-tagged COSE_Sign1 is read, tag and all", hex(tagged.issuerAuth.raw.subarray(0, 1)), "d2");
+    equal("and its MSO comes out of the bstr payload", tagged.issuerAuth.mso.docType, DOC_TYPE);
+    equal("the tagged COSE_Sign1's raw slice is the fixture's", hex(tagged.issuerAuth.raw),
+        hex(MDL_TAGGED_COSE.bytes.subarray(MDL_TAGGED_COSE.issuerAuthRange.start, MDL_TAGGED_COSE.issuerAuthRange.end)));
+    equal("its elements are read as well", tagged.nameSpaces[MDL_NAMESPACE].length, Object.keys(MDL_ELEMENTS[MDL_NAMESPACE]).length);
+
+    // the one shape that must be refused: a bstr holding a bare MSO map, with no tag 24
+    let refused = null;
+    try {
+        Mdoc.readIssuerSigned(buildIssuerSigned({ docType: DOC_TYPE, holder: HOLDER_A_JWK, elements: MDL_ELEMENTS,
+            payloadWithoutTag: true }).bytes);
+    } catch (error) {
+        refused = error;
+    }
+    check("a payload that is a bare MSO map, with no tag 24, is refused", refused !== null && /tag-24/.test(refused.message),
+        refused && refused.message);
+    let refusedHead = null;
+    try {
+        // a tag 24 whose content is not a bstr (the tag wraps the map directly) is refused as well
+        const bad = new Bytes();
+        bad.add(head(5, 2));
+        bad.add(tstr("nameSpaces"));
+        bad.add(head(5, 0));
+        bad.add(tstr("issuerAuth"));
+        const cose = new Bytes();
+        cose.add(head(4, 4));
+        cose.add(bstr(Cbor.encode(new Map([[1, -7]]))));
+        cose.add(head(5, 0));
+        cose.add(Buffer.concat([Buffer.from(head(6, 24)), Buffer.from(Cbor.encode(new Map([["docType", DOC_TYPE]])))]));
+        cose.add(bstr(new Uint8Array(64)));
+        bad.add(cose.bytes());
+        Mdoc.readIssuerSigned(bad.bytes());
+    } catch (error) {
+        refusedHead = error;
+    }
+    check("a tag 24 whose content is not a byte string is refused", refusedHead !== null && /byte string/.test(refusedHead.message),
+        refusedHead && refusedHead.message);
+    let refusedTrailing = null;
+    try {
+        Mdoc.readIssuerSigned(buildIssuerSigned({ docType: DOC_TYPE, holder: HOLDER_A_JWK, elements: MDL_ELEMENTS,
+            payloadTrailing: new Uint8Array([0x00]) }).bytes);
+    } catch (error) {
+        refusedTrailing = error;
+    }
+    check("a payload with bytes after the tag-24 item is refused", refusedTrailing !== null && /exactly one/.test(refusedTrailing.message),
+        refusedTrailing && refusedTrailing.message);
+});
+
+// 3. the IssuerSigned Certify's own MdocFormatter produced (plan 4.12): the layout real mDLs arrive in
+await section("3. Certify's own IssuerSigned", async () => {
+    const read = Mdoc.readIssuerSigned(CERTIFY_ISSUER_SIGNED);
+    equal("the fixture is the mDL the formatter issued", read.issuerAuth.mso.docType, DOC_TYPE);
+    equal("its MSO version is the formatter's", read.issuerAuth.mso.version, "1.0");
+    equal("the IssuerAuth payload is a bstr holding the tag-24 MSO", read.issuerAuth.mso.digestAlgorithm, "SHA-256");
+    check("the validity window is the formatter's tdate text",
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(read.issuerAuth.mso.validityInfo.validFrom)
+        && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(read.issuerAuth.mso.validityInfo.validUntil),
+        JSON.stringify(read.issuerAuth.mso.validityInfo));
+    // Certify signs without the IACA, so the chain is the DSC alone: RFC 9360 section 2's single bstr, which this
+    // reader used to refuse outright
+    equal("the DSC-only x5chain arrives as a single bstr and is read as one certificate", read.issuerAuth.x5chain.length, 1);
+    check("and it is a real DER certificate, not a placeholder", read.issuerAuth.x5chain[0].length > 300,
+        String(read.issuerAuth.x5chain[0].length));
+    const items = read.nameSpaces[MDL_NAMESPACE];
+    check("every element the formatter salted is read", items.length >= 12, String(items.length));
+    for (const item of items) {
+        const expected = read.issuerAuth.mso.valueDigests[MDL_NAMESPACE][String(item.digestID)];
+        equal(`Certify fixture: ${item.elementIdentifier} hashes to its valueDigest`, hex(hash("sha256", item.raw)), hex(expected));
+    }
+    const verdict = await Mdoc.checkKeepable({ issuerSigned: CERTIFY_ISSUER_SIGNED, doctype: DOC_TYPE,
+        publicJwk: CERTIFY_PUBLIC_JWK });
+    check("Certify's own credential passes every keep check", verdict.ok === true, JSON.stringify(verdict));
+    equal("and it reports the formatter's docType", verdict.docType, DOC_TYPE);
+
+    // the same bytes through the page: kept exactly once, byte for byte, with the key the fixture was issued to
+    const crypto = cryptoForFixture({ publicJwk: CERTIFY_PUBLIC_JWK, privateJwk: CERTIFY_HOLDER });
+    const page = openOffer({ crypto, credential: CREDENTIAL_ANSWER([{ bytes: CERTIFY_ISSUER_SIGNED }]) });
+    await issue(page);
+    assertGenerateKeyCall("Certify fixture through the page", crypto.generateKeyCalls);
+    const kept = credentialsIn(page.indexedDB);
+    equal("Certify's own mDL is kept, exactly once", kept.length, 1);
+    equal("and byte for byte", hex(kept[0].issuerSigned), hex(CERTIFY_ISSUER_SIGNED));
+    equal("the record names the docType the MSO carries", kept[0].docType, DOC_TYPE);
+    check("the page says it kept it", page.el("keepNote").hidden === false
+        && page.el("keepNote").textContent.includes("Kept in this browser"), page.el("keepNote").textContent);
+    await checkKeptKey(kept[0], CERTIFY_PUBLIC_JWK, " (Certify fixture)");
+});
+
+// 4. the holder key: what the page asks WebCrypto for, and the proof it still sends
+await section("4. holder key and proof", async () => {
+    const crypto = cryptoForFixture();
+    const page = openOffer({ crypto });
     await issue(page);
     check("the shipped page scripts ran", page.scriptError === null, page.scriptError && String(page.scriptError.stack));
+    // 6: the arguments the page passed, not only what the stub handed back
+    assertGenerateKeyCall("fixture key", crypto.generateKeyCalls);
     const request = page.requests.filter((entry) => entry.method === "POST" && typeof entry.body === "string" && entry.body.includes("\"proofs\"")).pop();
     const proof = request && JSON.parse(request.body).proofs.jwt[0];
     check("the page still sends one compact proof JWT", typeof proof === "string" && proof.split(".").length === 3);
@@ -302,51 +625,30 @@ await section("2. holder key and proof", async () => {
     equal("aud is still the credential issuer", claims.aud, OID4VCI_ISSUER);
     const [record] = credentialsIn(page.indexedDB);
     await checkKeptKey(record, HOLDER_A_JWK);
-});
 
-// 3. issuing keeps exactly one record, byte for byte
-await section("3. keep one credential", async () => {
-    const page = openOffer();
-    await issue(page);
-    equal("one credential is kept", credentialsIn(page.indexedDB).length, 1);
-    const [record] = credentialsIn(page.indexedDB);
-    equal("the record is the shape the plan names", summary(page.indexedDB),
-        [["mso_mdoc", DOC_TYPE, "mdoc", MDL_A.bytes.length, "private", false]]);
-    equal("the kept issuerSigned is the fixture's bytes", hex(record.issuerSigned), hex(MDL_A.bytes));
-    equal("the public key is the holder's, and carries no private member", [record.publicJwk.x, record.publicJwk.y, "d" in record.publicJwk],
-        [HOLDER_A_JWK.x, HOLDER_A_JWK.y, false]);
-    equal("the record names the issuer and the configuration", [record.credentialIssuer, record.credentialConfigurationId],
-        [OID4VCI_ISSUER, "mdoc"]);
-    check("the record carries its validity window", record.validFrom === "2026-11-01T00:00:00Z" && record.validUntil === "2026-12-01T00:00:00Z");
-    check("the page says what it kept", page.el("keepNote").hidden === false && page.el("keepNote").textContent.includes("Kept in this browser"),
-        page.el("keepNote").textContent);
-    // I9: keeping is a local write. Every request the run made is one the issuance flow already made: the page's own
-    // paths on this origin, or the issuer and authorization server documents and endpoints the offer named.
-    equal("keeping sends nothing anywhere else", page.requests.filter((request) =>
-        !request.url.startsWith("/v1/certify/") && !request.url.startsWith("https://credentials.example/")).map((request) => request.url), []);
-});
-
-// 4. Mdoc.readIssuerSigned: the raw slices are the issued items, and they reassemble the nameSpaces byte for byte
-await section("4. readIssuerSigned", async () => {
-    const read = Mdoc.readIssuerSigned(MDL_A.bytes);
-    equal("the docType and algorithm are read from the MSO", [read.issuerAuth.mso.docType, read.issuerAuth.mso.digestAlgorithm],
-        [DOC_TYPE, "SHA-256"]);
-    equal("the IssuerAuth keeps its ES256 algorithm", read.issuerAuth.alg, -7);
-    const namespace = "org.iso.18013.5.1";
-    equal("every element is read", read.nameSpaces[namespace].map((item) => item.elementIdentifier),
-        Object.keys(MDL_ELEMENTS[namespace]));
-    for (const item of read.nameSpaces[namespace]) {
-        equal(`the slice of ${item.elementIdentifier} starts with the tag-24 head`, hex(item.raw.subarray(0, 2)), "d818");
-        equal(`the slice of ${item.elementIdentifier} hashes to the MSO's valueDigest`,
-            hex(hash("sha256", item.raw)), hex(MDL_A.digests.get(namespace).get(item.digestID)));
+    // 6: and one run with the real generateKey, whose key is genuinely the browser's: non-extractable, not exportable
+    const real = cryptoRecordingRealKeys();
+    const realPage = openOffer({ crypto: real });
+    await issue(realPage);
+    assertGenerateKeyCall("real generateKey", real.generateKeyCalls);
+    equal("real generateKey: one pair was produced", real.generatedPairs.length, 1);
+    const [pair] = real.generatedPairs;
+    equal("real generateKey: the private key is non-extractable", pair.privateKey.extractable, false);
+    let exported = false;
+    try {
+        await webcrypto.subtle.exportKey("jwk", pair.privateKey);
+        exported = true;
+    } catch (error) {
+        exported = false;
     }
-    const rebuilt = Cbor.encode(new Map([...MDL_A.nameSpaces].map(([name, items]) => [name, items.map((item) => new Cbor.Raw(item))])));
-    // the fixture's own nameSpaces value, cut out of the bytes as issued
-    const nameSpacesRange = Cbor.spans(MDL_A.bytes, 1).ranges.find((range) => range.path.length === 1 && range.path[0] === "nameSpaces");
-    equal("the slices with their array headers reassemble nameSpaces byte for byte", hex(rebuilt),
-        hex(MDL_A.bytes.subarray(nameSpacesRange.start, nameSpacesRange.end)));
-    equal("the IssuerAuth's raw slice is the whole COSE_Sign1", hex(read.issuerAuth.raw),
-        hex(MDL_A.bytes.subarray(MDL_A.bytes.length - read.issuerAuth.raw.length)));
+    check("real generateKey: exportKey('jwk', privateKey) rejects", exported === false);
+    const signature = await webcrypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, pair.privateKey, Buffer.from("challenge"));
+    const publicJwk = await webcrypto.subtle.exportKey("jwk", pair.publicKey);
+    const key = createPublicKey({ key: { kty: publicJwk.kty, crv: publicJwk.crv, x: publicJwk.x, y: publicJwk.y }, format: "jwk" });
+    check("real generateKey: the key it produced signs and verifies",
+        verify("sha256", Buffer.from("challenge"), { key, dsaEncoding: "ieee-p1363" }, Buffer.from(signature)) === true);
+    check("real generateKey: issuance is as before", realPage.el("walletStatus").textContent.includes("Credential issued"),
+        realPage.el("walletStatus").textContent);
 });
 
 // 5. checks 1-5 of plan 4.2, each with its own refusal
@@ -360,7 +662,7 @@ await section("5. checkKeepable refusals", async () => {
     };
     await refused("undecodable bytes", await keep({ bytes: new Uint8Array([0xff, 0x00]) }), "not an IssuerSigned");
     await refused("an IssuerAuth payload that is not tag 24",
-        await keep(buildIssuerSigned({ docType: DOC_TYPE, holder: HOLDER_A_JWK, elements: MDL_ELEMENTS, tag24Payload: false })),
+        await keep(buildIssuerSigned({ docType: DOC_TYPE, holder: HOLDER_A_JWK, elements: MDL_ELEMENTS, payloadWithoutTag: true })),
         "tag-24 MSO");
     await refused("another doctype than the configuration's", await keep(PID), "docType");
     await refused("another credential's key", await keep(MDL_B), "another holder");
@@ -392,8 +694,30 @@ await section("6. the page refuses to keep a wrong credential", async () => {
     }
 });
 
-// 7. two credentials in one response: the first is kept and the page says so
-await section("7. two credentials", async () => {
+// 7. issuing keeps exactly one record, byte for byte
+await section("7. keep one credential", async () => {
+    const page = openOffer();
+    await issue(page);
+    equal("one credential is kept", credentialsIn(page.indexedDB).length, 1);
+    const [record] = credentialsIn(page.indexedDB);
+    equal("the record is the shape the plan names", summary(page.indexedDB),
+        [["mso_mdoc", DOC_TYPE, "mdoc", MDL_A.bytes.length, "private", false]]);
+    equal("the kept issuerSigned is the fixture's bytes", hex(record.issuerSigned), hex(MDL_A.bytes));
+    equal("the public key is the holder's, and carries no private member", [record.publicJwk.x, record.publicJwk.y, "d" in record.publicJwk],
+        [HOLDER_A_JWK.x, HOLDER_A_JWK.y, false]);
+    equal("the record names the issuer and the configuration", [record.credentialIssuer, record.credentialConfigurationId],
+        [OID4VCI_ISSUER, "mdoc"]);
+    check("the record carries its validity window", record.validFrom === "2026-11-01T00:00:00Z" && record.validUntil === "2026-12-01T00:00:00Z");
+    check("the page says what it kept", page.el("keepNote").hidden === false && page.el("keepNote").textContent.includes("Kept in this browser"),
+        page.el("keepNote").textContent);
+    // I9: keeping is a local write. Every request the run made is one the issuance flow already made: the page's own
+    // paths on this origin, or the issuer and authorization server documents and endpoints the offer named.
+    equal("keeping sends nothing anywhere else", page.requests.filter((request) =>
+        !request.url.startsWith("/v1/certify/") && !request.url.startsWith("https://credentials.example/")).map((request) => request.url), []);
+});
+
+// 8. two credentials in one response: the first is kept and the page says so
+await section("8. two credentials", async () => {
     const page = openOffer({ credential: CREDENTIAL_ANSWER([MDL_A, PID]) });
     await issue(page);
     const kept = credentialsIn(page.indexedDB);
@@ -403,8 +727,8 @@ await section("7. two credentials", async () => {
         page.el("keepNote").textContent);
 });
 
-// 8. when nothing may be kept: the box unticked, another format, or no IndexedDB
-await section("8. nothing kept", async () => {
+// 9. when nothing may be kept: the box unticked, another format, or no IndexedDB
+await section("9. nothing kept", async () => {
     const unticked = openOffer();
     await unticked.settle();
     unticked.el("keep").checked = false;
@@ -429,23 +753,62 @@ await section("8. nothing kept", async () => {
     check("no IndexedDB: issuance is as today", noStore.el("walletStatus").textContent.includes("Credential issued"));
 });
 
-// 9. the 51st credential, through the page
-await section("9. the 51st credential", async () => {
+// 10. I4: with the wallet switched off, /offer/wallet/config answers 404 and nothing is stored - not even a store opened
+await section("10. the wallet switch gates storage", async () => {
+    const fake = new FakeIndexedDB();
+    const page = openOffer({ indexedDB: fake, walletConfig: false });
+    await issue(page);
+    equal("a 404 from /offer/wallet/config: the Keep box is not shown", page.el("keepLabel").hidden, true);
+    equal("the offer page does not even link the wallet", page.el("walletLink").hidden, true);
+    equal("no connection to the wallet's store was opened", fake.opens, 0);
+    equal("and nothing was kept", credentialsIn(fake).length, 0);
+    check("issuance is as before", page.el("walletStatus").textContent.includes("Credential issued"),
+        page.el("walletStatus").textContent);
+    // the endpoint was asked: the page's silence comes from its answer, not from a skipped fetch
+    check("the page asked for the wallet's config", page.requests.some((request) => request.url === "/v1/certify/offer/wallet/config"),
+        JSON.stringify(page.requests.map((request) => request.url)));
+    // and with the wallet on, the same run shows the box and stores the credential: the gate is the answer, not the format
+    const enabled = openOffer();
+    await issue(enabled);
+    equal("with a 200 from /offer/wallet/config the box is shown", enabled.el("keepLabel").hidden, false);
+    equal("and the credential is kept", credentialsIn(enabled.indexedDB).length, 1);
+});
+
+// 11. the 51st credential, and the cap that two tabs cannot walk past
+await section("11. the 50-credential cap", async () => {
     const fake = new FakeIndexedDB();
     fake.seed("credentials", Array.from({ length: 50 }, (item, index) => ({ id: "seed-" + index, storedAt: index })));
     const page = openOffer({ indexedDB: fake });
     await issue(page);
     equal("the 51st is refused", credentialsIn(fake).length, 50);
     check("with 'delete one first'", page.el("keepNote").textContent.includes("delete one first"), page.el("keepNote").textContent);
+
+    // 5: two tabs keeping their 50th and 51st at the same moment. The count and the put share one readwrite
+    // transaction, so only one of the two can succeed; with them apart, both would read 49 and 51 would be kept.
+    const WalletStore = shipped("wallet-store.js", { indexedDB: fake }, "WalletStore");
+    const first = await WalletStore.open();
+    const second = await WalletStore.open();
+    fake.databases.get(DB_NAME).stores.get("credentials").records.clear();
+    for (let index = 0; index < 49; index++) {
+        fake.databases.get(DB_NAME).stores.get("credentials").putClone({ id: "concurrent-" + index, storedAt: index });
+    }
+    const [keptFirst, keptSecond] = await Promise.all([
+        WalletStore.putWithinLimit(first, { id: "tab-1", storedAt: 100 }, Mdoc.MAX_CREDENTIALS),
+        WalletStore.putWithinLimit(second, { id: "tab-2", storedAt: 101 }, Mdoc.MAX_CREDENTIALS),
+    ]);
+    equal("two tabs starting at 49 keep exactly one more between them", credentialsIn(fake).length, 50);
+    equal("one tab was told its credential was stored", [keptFirst, keptSecond].filter(Boolean).length, 1);
+    first.close();
+    second.close();
 });
 
-// 10. the wallet page: list, details, delete one, delete everything
-await section("10. the wallet page", async () => {
+// 12. the wallet page: list, details, delete one, delete everything
+await section("12. the wallet page", async () => {
     const fake = new FakeIndexedDB();
-    const first = openOffer({ indexedDB: fake });
-    await issue(first);
-    const second = openOffer({ indexedDB: fake });
-    await issue(second);
+    const opened = openOffer({ indexedDB: fake });
+    await issue(opened);
+    const again = openOffer({ indexedDB: fake });
+    await issue(again);
     equal("two credentials were kept", credentialsIn(fake).length, 2);
 
     const wallet = openWallet(fake);
@@ -455,8 +818,8 @@ await section("10. the wallet page", async () => {
     equal("the list shows both", list.children.length, 2);
     equal("and is not empty", wallet.el("empty").hidden, true);
     equal("Delete everything is enabled", wallet.el("deleteAll").disabled, false);
-    const opened = list.children[0].children[0];
-    await opened.fire("click");
+    const openedDetails = list.children[0].children[0];
+    await openedDetails.fire("click");
     equal("the details view opens", wallet.el("details").hidden, false);
     check("the details name the docType and show an element", wallet.el("detailsTable").children.length >= 6,
         String(wallet.el("detailsTable").children.length));
@@ -466,31 +829,72 @@ await section("10. the wallet page", async () => {
     await settle();
     equal("Delete removes one record", credentialsIn(fake).length, 1);
     equal("the list follows", list.children.length, 1);
+    // 16: the confirmation is written where the visitor can still see it: the details section is hidden on success
+    equal("the details section is hidden again", wallet.el("details").hidden, true);
+    check("the deletion is confirmed in the section that stays on screen",
+        wallet.el("storageStatus").textContent.includes("Deleted") && wallet.el("storageStatus").textContent.includes("key went with it"),
+        wallet.el("storageStatus").textContent);
 
     await wallet.el("deleteAll").fire("click");
     await settle();
     equal("Delete everything empties the store", credentialsIn(fake).length, 0);
     equal("the empty message is shown", wallet.el("empty").hidden, false);
     equal("the list follows", list.children.length, 0);
+    check("and says so", wallet.el("storageStatus").textContent.includes("was deleted"), wallet.el("storageStatus").textContent);
+    // the page reopens the store afterwards (a version-1 open recreates an empty database, as a browser does), so what
+    // proves the delete is the delete request's own success, not the database's absence
+    equal("the delete request completed", fake.deletions, 1);
 });
 
-// 11. the page's own headers are the controller's job; here: the page the controller serves has one inline script,
-//     and the wallet page none, so the CSP the controller builds covers exactly them
-await section("11. page scripts and the CSP hash", async () => {
-    const html = readFileSync(resolve(STATIC, "index.html"), "utf8");
-    const inline = parseMarkup(html).scripts.filter((script) => !script.attributes.has("src"));
-    equal("the offer page has exactly one inline script", inline.length, 1);
-    const digest = createHash("sha256").update(inline[0].textContent, "utf8").digest("base64");
-    equal("its CSP hash is the SHA-256 of its text, base64", digest.length, 44);
-    equal("the wallet page has no inline script",
-        parseMarkup(readFileSync(resolve(STATIC, "wallet.html"), "utf8")).scripts.filter((script) => !script.attributes.has("src")).length, 0);
-    // OfferPageTest recomputes this hash from the bytes /offer/ serves and finds it in the header; the controller's own
-    // template is the header list of plan 4.13
-    const controller = readFileSync(resolve(REPO, "certify-service/src/main/java/io/mosip/certify/offer/OfferPageController.java"), "utf8");
-    for (const directive of ["default-src 'none'", "style-src 'self' 'unsafe-inline'", "img-src 'self' blob: data:",
-        "frame-ancestors 'none'", "base-uri 'none'", "form-action 'none'", "object-src 'none'", "camera=()", "camera=(self)"]) {
-        check(`OfferPageController carries "${directive}"`, controller.includes(directive));
-    }
+// 13. Delete everything with another wallet tab open: never hangs, and asks for the one thing that unblocks it
+await section("13. Delete everything with another tab open", async () => {
+    const fake = new FakeIndexedDB();
+    const keepOne = openOffer({ indexedDB: fake });
+    await issue(keepOne);
+    equal("a credential is kept", credentialsIn(fake).length, 1);
+
+    // two more connections, as two open wallet tabs would hold: the page's own delete closes its own first
+    const WalletStore = shipped("wallet-store.js", { indexedDB: fake }, "WalletStore");
+    const tabA = await WalletStore.open();
+    const tabB = await WalletStore.open();
+    let versionChangesA = 0;
+    let versionChangesB = 0;
+    const pageHandlerA = tabA.onversionchange;
+    const pageHandlerB = tabB.onversionchange;
+    // the wrapper counts what the browser delivered and then defers to the page's own handler, when it set one
+    tabA.onversionchange = (event) => { versionChangesA++; if (typeof pageHandlerA === "function") pageHandlerA(event); };
+    tabB.onversionchange = (event) => { versionChangesB++; if (typeof pageHandlerB === "function") pageHandlerB(event); };
+    equal("WalletStore's own connection closes itself on versionchange", typeof pageHandlerA, "function");
+
+    // the wallet page opens a third connection; its "Delete everything" closes that one, then deletes
+    const wallet = openWallet(fake);
+    check("the wallet page's scripts ran", wallet.scriptError === null, wallet.scriptError && String(wallet.scriptError.stack));
+    await settle();
+    await wallet.el("deleteAll").fire("click");
+    await settle();
+    equal("both other tabs were asked to close", [versionChangesA, versionChangesB], [1, 1]);
+    equal("the delete request completed", fake.deletions, 1);
+    check("the page says so", wallet.el("storageStatus").textContent.includes("was deleted"), wallet.el("storageStatus").textContent);
+    equal("and the closed tabs did close", [tabA.closed, tabB.closed], [true, true]);
+
+    // a tab that ignores the request blocks the delete; the page must say what to do about it instead of waiting
+    const blocking = new FakeIndexedDB();
+    const keepsOne = openOffer({ indexedDB: blocking });
+    await issue(keepsOne);
+    const stubborn = await (shipped("wallet-store.js", { indexedDB: blocking }, "WalletStore")).open();
+    stubborn.onversionchange = null; // a tab that does not close (an older build, a frozen tab)
+    const blockedWallet = openWallet(blocking);
+    await settle();
+    await blockedWallet.el("deleteAll").fire("click");
+    await settle();
+    check("a blocked delete is reported, not left hanging",
+        blockedWallet.el("storageStatus").textContent.includes("could not be deleted")
+        && blockedWallet.el("storageStatus").textContent.includes("close every other wallet tab"),
+        blockedWallet.el("storageStatus").textContent);
+    equal("and the store is still there", blocking.databases.has(DB_NAME), true);
+    equal("the page's own list still works after the refusal", blockedWallet.el("records").children.length, 1);
+    stubborn.close();
+    await settle();
 });
 
 } finally {

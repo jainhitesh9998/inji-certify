@@ -4,7 +4,8 @@
  * range it arrived in, because the digest the issuer signed is computed over those bytes (ISO/IEC 18013-5 9.1.2.5), and
  * a DeviceResponse later carries the same slice.
  *
- * Depends on cbor.js (the global `Cbor`): `Cbor.spans` supplies the byte ranges, `Cbor.decode` the values.
+ * Depends on cbor.js (the global `Cbor`): `Cbor.spans` supplies the byte ranges, `Cbor.tagged` the tag of a data item,
+ * `Cbor.decode` the values.
  */
 var Mdoc = (function () {
   "use strict";
@@ -30,10 +31,56 @@ var Mdoc = (function () {
     return btoa(text).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   }
 
-  /** The first byte pair of a range: whether those bytes are a tag-24 (encoded CBOR data item) head. */
+  /**
+   * Whether a byte range is a tag-24 data item. The tag is read by its numeric value, so the non-preferred head
+   * (`d9 00 18`) is the same tag 24 as `d8 18` (RFC 8949 3.1); the bytes are not inspected any further than that.
+   */
   function isTag24(bytes, range) {
-    return range !== undefined && range.end - range.start >= 2
-      && bytes[range.start] === 0xd8 && bytes[range.start + 1] === 0x18;
+    if (range === undefined) return false;
+    var tagged = Cbor.tagged(bytes.subarray(range.start, range.end));
+    return tagged !== null && tagged.tag === 24;
+  }
+
+  /**
+   * The Mobile Security Object of an issuerAuth payload. ISO/IEC 18013-5 9.1.2.4 makes the COSE_Sign1 payload a byte
+   * string, and RFC 8949 3.4.5.1 makes its content `#6.24(bstr .cbor MobileSecurityObject)`: the tag is required here,
+   * never inferred from the payload's shape, and the MSO is decoded from the bstr the tag wraps. This is the layout
+   * Certify's own MdocFormatter writes (`CoseEnvelope` signs the tag-24 bytes, and the envelope carries them as a
+   * bstr), so a real Certify mDL reads exactly like a hand-built one.
+   */
+  function msoOf(payload) {
+    if (!(payload instanceof Uint8Array)) {
+      throw new Error("the issuerAuth payload is not a byte string (ISO/IEC 18013-5 9.1.2.4)");
+    }
+    var tagged = Cbor.tagged(payload);
+    if (tagged === null || tagged.tag !== 24) {
+      throw new Error("the issuerAuth payload is not a tag-24 MSO (ISO/IEC 18013-5 9.1.2.4)");
+    }
+    if (tagged.end !== payload.length) {
+      throw new Error("the issuerAuth payload is not exactly one tag-24 MSO item");
+    }
+    var wrapped = Cbor.decode(tagged.content);
+    if (!(wrapped instanceof Uint8Array)) {
+      throw new Error("the tag-24 MSO content is not a byte string (ISO/IEC 18013-5 9.1.2.4)");
+    }
+    var mso = Cbor.decode(wrapped);
+    if (!mso || typeof mso !== "object" || Array.isArray(mso)) throw new Error("the issuerAuth payload is not an MSO map");
+    return mso;
+  }
+
+  /**
+   * The certificates of an {@code x5chain} header (RFC 9360 section 2: `COSE_X509 = bstr / [2*certs: bstr]`), always as
+   * a list of DER byte strings. The bstr form is one certificate, which is what Certify emits for a DSC-only chain;
+   * reading it as a list must not make it unreadable.
+   */
+  function x5chainOf(value) {
+    if (value === undefined) return [];
+    var certificates = value instanceof Uint8Array ? [value] : value;
+    if (!Array.isArray(certificates) || !certificates.length
+        || !certificates.every(function (der) { return der instanceof Uint8Array; })) {
+      throw new Error("the issuerAuth x5chain is not a certificate or a non-empty array of certificates (RFC 9360 section 2)");
+    }
+    return certificates;
   }
 
   /** A COSE header label's value from the protected header, else from the unprotected one. */
@@ -68,24 +115,12 @@ var Mdoc = (function () {
     if (!Array.isArray(issuerAuth) || issuerAuth.length !== 4) {
       throw new Error("issuerAuth is not a COSE_Sign1 array of four elements");
     }
-    // ISO/IEC 18013-5 9.1.2.4: the MSO inside issuerAuth's payload is tag 24, and its bytes say so
-    var payloadRange = ranges.get(pathKey(["issuerAuth", 2]));
-    if (!isTag24(bytes, payloadRange)) {
-      throw new Error("the issuerAuth payload is not a tag-24 MSO (ISO/IEC 18013-5 9.1.2.4)");
-    }
-    var mso = issuerAuth[2];
-    if (!mso || typeof mso !== "object" || Array.isArray(mso)) {
-      throw new Error("the issuerAuth payload is not an MSO map");
-    }
+    // ISO/IEC 18013-5 9.1.2.4 and RFC 9052 4.2: element 2 is the payload, a bstr holding #6.24(bstr .cbor MSO). An
+    // untagged COSE_Sign1 and one tagged #6.18 (the envelope Certify may carry) read the same way, and `raw` keeps
+    // whichever bytes arrived.
+    var mso = msoOf(issuerAuth[2]);
 
-    var x5chain = [];
-    var chain = headerValue(issuerAuth[0], issuerAuth[1], "33");
-    if (chain !== undefined) {
-      if (!Array.isArray(chain) || !chain.every(function (der) { return der instanceof Uint8Array; })) {
-        throw new Error("the issuerAuth x5chain is not an array of certificates");
-      }
-      x5chain = chain;
-    }
+    var x5chain = x5chainOf(headerValue(issuerAuth[0], issuerAuth[1], "33"));
 
     var nameSpaces = {};
     var decoded = value.nameSpaces === undefined ? {} : value.nameSpaces;
@@ -101,7 +136,7 @@ var Mdoc = (function () {
           throw new Error("an IssuerSignedItem in " + namespace + " is not an element map");
         }
         var itemRange = ranges.get(pathKey(["nameSpaces", namespace, index]));
-        if (itemRange === undefined || !isTag24(bytes, itemRange)) {
+        if (!isTag24(bytes, itemRange)) {
           throw new Error("the IssuerSignedItem " + namespace + "/" + item.elementIdentifier
             + " is not a tag-24 IssuerSignedItemBytes");
         }

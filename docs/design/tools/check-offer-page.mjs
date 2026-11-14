@@ -524,14 +524,27 @@ class FakeRequest {
 }
 
 /**
- * A small IndexedDB, enough for wallet-store.js: `open`/`deleteDatabase`, one transaction at a time, stores with a
- * keyPath or an auto-increment key, and get/put/getAll/delete/clear/count. Records are cloned with `structuredClone`
- * on the way in and out, as a browser's structured clone does: a CryptoKey stays a CryptoKey, and a non-extractable
- * one stays non-extractable.
+ * A small IndexedDB, enough for wallet-store.js: `open`/`deleteDatabase`, one connection per open with its own
+ * `onversionchange`, stores with a keyPath or an auto-increment key, and get/put/getAll/getAllKeys/delete/clear/count.
+ *
+ * Three browser behaviours the page depends on are modelled, because a fake that skipped them hid real bugs:
+ *
+ * - Records are cloned with the platform's own `structuredClone`, in and out, exactly as a browser's structured clone
+ *   does. A `CryptoKey` stays a `CryptoKey` (Node 24 clones a non-extractable one into a working key that still signs
+ *   and still refuses `exportKey`), and a `Uint8Array` from the page's realm stays a `Uint8Array`.
+ * - An out-of-line key never edits the record: a store with `autoIncrement` and no `keyPath` keeps its key beside the
+ *   value, as a browser does, so `getAll()` returns the values with no `id` the page did not put there.
+ * - Readwrite transactions on one database run one at a time in the order they were created, as the IndexedDB standard
+ *   requires for transactions whose scopes overlap: a count and a put in two transactions can interleave with another
+ *   tab's, and a count and a put in one cannot. (That is what makes "at most 50 credentials" atomic.)
  */
 class FakeIndexedDB {
     constructor() {
         this.databases = new Map();
+        // every connection handed out, so a check can say that no store was opened at all
+        this.opens = 0;
+        // every delete that completed, so a check can tell "the page reopened what it deleted" from "nothing happened"
+        this.deletions = 0;
     }
 
     database(name, version = 1) {
@@ -557,22 +570,38 @@ class FakeIndexedDB {
         queueMicrotask(() => {
             const existing = this.databases.get(name);
             const database = this.database(name, version || 1);
-            // a real open is a new connection to the same database: a handle another page closed is usable again
-            database.closed = false;
-            request.result = database;
+            const connection = database.connect();
+            this.opens++;
+            request.result = connection;
             if (existing === undefined && request.onupgradeneeded) {
                 request.onupgradeneeded({ target: request, oldVersion: 0, newVersion: database.version });
             }
-            request.succeed(database);
+            request.succeed(connection);
         });
         return request;
     }
 
+    /**
+     * Deletes the database. Every other connection is asked to close (`versionchange`); if one does not, the request
+     * reports `blocked` and finishes only once the last connection closes, as a browser does.
+     */
     deleteDatabase(name) {
         const request = new FakeRequest();
         queueMicrotask(() => {
-            this.databases.delete(name);
-            request.succeed(undefined);
+            const database = this.databases.get(name);
+            if (database === undefined) {
+                request.succeed(undefined);
+                return;
+            }
+            for (const connection of [...database.connections]) connection.versionChange(null);
+            if (database.connections.size === 0) {
+                this.databases.delete(name);
+                this.deletions++;
+                request.succeed(undefined);
+                return;
+            }
+            database.pendingDeletes.push({ indexedDB: this, request });
+            if (request.onblocked) request.onblocked({ target: request });
         });
         return request;
     }
@@ -583,9 +612,16 @@ class FakeDatabase {
         this.name = name;
         this.version = version;
         this.stores = new Map();
-        this.closed = false;
+        this.connections = new Set();
+        this.pendingDeletes = [];
+        this.writeQueue = [];
+        this.activeWrite = null;
         const stores = this.stores;
         this.objectStoreNames = { contains: (storeName) => stores.has(storeName) };
+    }
+
+    connect() {
+        return new FakeConnection(this);
     }
 
     ensureStores() {
@@ -601,34 +637,71 @@ class FakeDatabase {
     }
 
     transaction(names, mode = "readonly") {
-        if (this.closed) throw new Error("InvalidStateError: the database is closed");
         const list = Array.isArray(names) ? names : [names];
         for (const storeName of list) if (!this.stores.has(storeName)) throw new Error("NotFoundError: " + storeName);
         return new FakeTransaction(this, list, mode);
     }
 
-    close() {
-        this.closed = true;
+    /** Queues a readwrite transaction behind the ones already running, and starts it when its turn comes. */
+    runWhenFree(transaction) {
+        this.writeQueue.push(transaction);
+        this.startNextWrite();
+    }
+
+    startNextWrite() {
+        if (this.activeWrite !== null || this.writeQueue.length === 0) return;
+        this.activeWrite = this.writeQueue.shift();
+        this.activeWrite.start();
+    }
+
+    releaseWrite(transaction) {
+        if (this.activeWrite === transaction) this.activeWrite = null;
+        this.startNextWrite();
+    }
+
+    /** The last connection closed: a delete that was blocked on it can finish now. */
+    afterConnectionClosed() {
+        if (this.connections.size) return;
+        for (const pending of this.pendingDeletes.splice(0)) {
+            pending.indexedDB.databases.delete(this.name);
+            pending.indexedDB.deletions++;
+            pending.request.succeed(undefined);
+        }
     }
 }
 
-/**
- * A structured clone of one record, as a browser stores it. Node 24's `structuredClone` turns a WebCrypto `CryptoKey`
- * into an object with no usable methods (checked on 24.15.0: `clone.sign` is undefined), where a browser's clone stays a
- * working, still non-extractable key; so a CryptoKey is kept by reference and every other value is cloned. The record
- * still holds a non-extractable key, which is what the check is about.
- */
-function cloneRecord(value) {
-    if (value === null || typeof value !== "object") return value;
-    if (typeof CryptoKey !== "undefined" && value instanceof CryptoKey) return value;
-    // realm-independent: a page's Uint8Array is not this module's
-    if (Object.prototype.toString.call(value) === "[object Uint8Array]") return new Uint8Array(value);
-    if (Object.prototype.toString.call(value) === "[object ArrayBuffer]") return value.slice(0);
-    if (value instanceof Map) return new Map([...value].map(([key, member]) => [cloneRecord(key), cloneRecord(member)]));
-    if (Array.isArray(value)) return value.map(cloneRecord);
-    const copy = Object.getPrototypeOf(value) === null ? Object.create(null) : {};
-    for (const key of Object.keys(value)) copy[key] = cloneRecord(value[key]);
-    return copy;
+/** One connection to a database: what `open()` hands the page, and what `versionchange` is delivered to. */
+class FakeConnection {
+    constructor(database) {
+        this.db = database;
+        this.closed = false;
+        this.onversionchange = null;
+        this.objectStoreNames = database.objectStoreNames;
+        database.connections.add(this);
+    }
+
+    transaction(names, mode = "readonly") {
+        if (this.closed) throw new Error("InvalidStateError: the database is closed");
+        return this.db.transaction(names, mode);
+    }
+
+    createObjectStore(name, options = {}) {
+        return this.db.createObjectStore(name, options);
+    }
+
+    close() {
+        if (this.closed) return;
+        this.closed = true;
+        this.db.connections.delete(this);
+        this.db.afterConnectionClosed();
+    }
+
+    /** The browser's `versionchange` event: the page's own handler decides whether to close. */
+    versionChange(newVersion) {
+        if (typeof this.onversionchange === "function") {
+            this.onversionchange({ target: this, oldVersion: this.db.version, newVersion });
+        }
+    }
 }
 
 class FakeObjectStore {
@@ -636,28 +709,29 @@ class FakeObjectStore {
         this.name = name;
         this.keyPath = options.keyPath === undefined ? null : options.keyPath;
         this.autoIncrement = !!options.autoIncrement;
+        // key -> value, with out-of-line keys kept beside the value rather than written into it
         this.records = new Map();
         this.nextKey = 1;
     }
 
-    keyOf(record) {
-        return this.keyPath === null ? record.id : record[this.keyPath];
+    /** The key a record is stored under: its keyPath's value, the key it was given, or the next generated number. */
+    keyOf(record, givenKey) {
+        if (givenKey !== undefined && givenKey !== null) return givenKey;
+        if (this.keyPath !== null) return record[this.keyPath];
+        if (!this.autoIncrement) throw new Error("DataError: the object store has no key");
+        return this.nextKey++;
     }
 
-    putClone(record) {
-        const clone = cloneRecord(record);
-        let key = this.keyOf(clone);
-        if (key === undefined || key === null) {
-            if (!this.autoIncrement) throw new Error("DataError: the object store has no key");
-            key = this.nextKey++;
-            clone.id = key;
-        }
+    putClone(record, givenKey) {
+        const clone = structuredClone(record);
+        const key = this.keyOf(clone, givenKey);
+        if (key === undefined || key === null) throw new Error("DataError: the object store has no key");
         this.records.set(key, clone);
         return key;
     }
 
     getClone(key) {
-        return this.records.has(key) ? cloneRecord(this.records.get(key)) : undefined;
+        return this.records.has(key) ? structuredClone(this.records.get(key)) : undefined;
     }
 }
 
@@ -669,8 +743,18 @@ class FakeTransaction {
         this.oncomplete = null;
         this.onerror = null;
         this.onabort = null;
+        this.queue = [];
         this.pending = 0;
+        this.started = mode !== "readwrite";
         this.done = false;
+        if (this.started) this.drain();
+        else database.runWhenFree(this);
+    }
+
+    /** A queued readwrite transaction's turn has come. */
+    start() {
+        this.started = true;
+        this.drain();
     }
 
     objectStore(name) {
@@ -679,9 +763,10 @@ class FakeTransaction {
         const transaction = this;
         return {
             get: (key) => transaction.request(() => store.getClone(key)),
-            getAll: () => transaction.request(() => [...store.records.values()].map((record) => cloneRecord(record))),
+            getAll: () => transaction.request(() => [...store.records.values()].map((record) => structuredClone(record))),
+            getAllKeys: () => transaction.request(() => [...store.records.keys()]),
             count: () => transaction.request(() => store.records.size),
-            put: (record) => transaction.request(() => store.putClone(record)),
+            put: (record, key) => transaction.request(() => store.putClone(record, key)),
             delete: (key) => transaction.request(() => { store.records.delete(key); return undefined; }),
             clear: () => transaction.request(() => { store.records.clear(); return undefined; }),
         };
@@ -690,30 +775,57 @@ class FakeTransaction {
     request(work) {
         const request = new FakeRequest();
         this.pending++;
-        queueMicrotask(() => {
-            try {
-                request.result = work();
-                this.pending--;
-                this.maybeComplete();
-                request.succeed(request.result);
-            } catch (error) {
-                request.error = error;
-                this.fail(error);
-            }
-        });
+        this.queue.push({ work, request });
+        this.drain();
         return request;
     }
 
+    /** Runs the queued requests one at a time, as a browser runs a transaction's requests. */
+    drain() {
+        if (!this.started || this.done) return;
+        queueMicrotask(() => {
+            if (!this.started || this.done) return;
+            const next = this.queue.shift();
+            if (next === undefined) {
+                this.maybeComplete();
+                return;
+            }
+            try {
+                next.request.result = next.work();
+                this.pending--;
+                next.request.succeed(next.request.result);
+                this.maybeComplete();
+            } catch (error) {
+                next.request.error = error;
+                this.fail(error);
+            }
+            if (this.queue.length) this.drain();
+        });
+    }
+
+    /**
+     * Completes once nothing is queued and nothing is pending, checked after the success handlers have run: a request
+     * the page issues from a success handler (the `put` after a `count`, both in one readwrite transaction) extends the
+     * transaction instead of being refused as "too late".
+     */
     maybeComplete() {
-        if (this.pending > 0 || this.done) return;
-        this.done = true;
-        queueMicrotask(() => { if (this.oncomplete) this.oncomplete({ target: this }); });
+        if (this.pending > 0 || this.queue.length || this.done) return;
+        queueMicrotask(() => {
+            if (this.pending > 0 || this.queue.length || this.done) return;
+            this.done = true;
+            this.db.releaseWrite(this);
+            if (this.oncomplete) this.oncomplete({ target: this });
+        });
     }
 
     fail(error) {
         if (this.done) return;
         this.done = true;
-        queueMicrotask(() => { if (this.onerror) this.onerror({ target: this, error }); });
+        queueMicrotask(() => {
+            this.db.releaseWrite(this);
+            if (this.onerror) this.onerror({ target: this, error });
+            if (this.onabort) this.onabort({ target: this, error });
+        });
     }
 }
 

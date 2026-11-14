@@ -5,6 +5,11 @@
  * (epoch-based date/time) resolves to an ISO instant, tags 2 and 3 (positive and negative bignum) resolve to a BigInt,
  * while tag 0 (tdate, an RFC 3339 text string) and tag 1004 (full-date) print as the string they carry.
  *
+ * Byte ranges (`Cbor.spans`) come from the input's own offsets, never from a re-encoding, and a tag is transparent to
+ * them: `#6.24(item)` and `#6.18([...])` are walked like the item they carry, so a tagged COSE_Sign1 keeps the ranges of
+ * its own array elements. `Cbor.tagged` reports a tag by its numeric value, whatever head carries it (`d8 18` and the
+ * non-preferred `d9 00 18` are both tag 24) and returns the tagged item's content bytes unchanged.
+ *
  * Integers are exact. A value that fits a JavaScript number (|n| <= Number.MAX_SAFE_INTEGER) decodes to a number;
  * anything larger, in either direction, decodes to a BigInt so no digit is silently lost, and the page renders it as the
  * decimal string it is (String(bigint) is exact). Map keys are rendered in one stable form that cannot collide: an
@@ -39,6 +44,11 @@ var Cbor = (function () {
   function Reader(bytes) {
     this.bytes = bytes;
     this.offset = 0;
+    // byte ranges (P5-03a): when `found` is set, every array element and map value down to `limit` levels below the
+    // root is recorded as it is decoded, so a range is the input's own offsets and nothing is re-encoded
+    this.found = null;
+    this.limit = 0;
+    this.path = [];
   }
   Reader.prototype.byte = function () {
     if (this.offset >= this.bytes.length) throw new Error("CBOR: unexpected end of input");
@@ -152,7 +162,23 @@ var Cbor = (function () {
     return String(key); // numbers, BigInts, booleans
   }
 
-  function decode(reader) {
+  /**
+   * One data item. With a recording reader ({@code reader.found} set) the item's `[start, end)` is appended under the
+   * path it was reached by, down to {@code reader.limit} levels below the root. `record` is passed false for a map's
+   * key and a tag's content: neither is a value of the container the caller asked about (a tag adds no level, RFC 8949
+   * 3.4), so neither gets an entry of its own.
+   */
+  function decode(reader, record) {
+    var start = reader.offset;
+    var level = reader.path.length;
+    var value = decodeValue(reader);
+    if (record !== false && reader.found !== null && level > 0 && level <= reader.limit) {
+      reader.found.push({ path: reader.path.slice(), start: start, end: reader.offset });
+    }
+    return value;
+  }
+
+  function decodeValue(reader) {
     var initial = reader.byte();
     var major = initial >> 5;
     var additional = initial & 31;
@@ -190,23 +216,30 @@ var Cbor = (function () {
       case 4:
         length = argument(reader, major, additional);
         var items = [];
+        var element = function () { // the path follows the recursion, so a recorded range knows where it is
+          reader.path.push(items.length);
+          items.push(decode(reader));
+          reader.path.pop();
+        };
         if (length < 0) {
-          while (reader.peek() !== 0xff) items.push(decode(reader));
+          while (reader.peek() !== 0xff) element();
           reader.byte();
           return items;
         }
         if (typeof length !== "number") throw new Error("CBOR: array length " + String(length) + " is too large to read");
-        for (var i = 0; i < length; i++) items.push(decode(reader));
+        for (var i = 0; i < length; i++) element();
         return items;
       case 5:
         length = argument(reader, major, additional);
         // no prototype: a decoded "__proto__" key is data, not an assignment to Object.prototype
         var map = Object.create(null);
         var put = function () {
-          var rendered = keyOf(decode(reader));
+          var rendered = keyOf(decode(reader, false)); // a key is not a value: it gets no range entry
           // RFC 8949 5.6: duplicate keys make a map invalid; keys that only render alike (1 and "1") are refused too, never overwritten
           if (Object.prototype.hasOwnProperty.call(map, rendered)) throw new Error("CBOR: duplicate or ambiguous map key " + rendered);
+          reader.path.push(rendered);
           map[rendered] = decode(reader);
+          reader.path.pop();
         };
         if (length < 0) {
           while (reader.peek() !== 0xff) put();
@@ -218,7 +251,7 @@ var Cbor = (function () {
         return map;
       case 6:
         var tag = argument(reader, major, additional);
-        var tagged = decode(reader);
+        var tagged = decode(reader, false); // the tagged value is the item at this path, not a child of it
         if (tag === 24) { // embedded CBOR: exactly one data item, no padding around it
           if (!(tagged instanceof Uint8Array)) throw new Error("CBOR: tag 24 content is not a byte string");
           return decodeItem(tagged);
@@ -254,156 +287,52 @@ var Cbor = (function () {
   /* ---------------------------------------------------------------- byte ranges (P5-03a) */
 
   /**
-   * One item's header, without decoding its value: where the argument ends (`at`) and whether the item is indefinite.
-   * Structural walking is how a range is found without re-encoding anything: the offsets are the input's own.
+   * The decoded item and the `[start, end)` range of every array element and map value down to {@code depth} levels
+   * below the root (the root's own children are depth 1). The ranges are recorded by `decode` as it reads, so they are
+   * the input's own offsets: nothing is re-encoded, and a definite- or an indefinite-length item is read the same way.
+   * Each entry is `{path, start, end}`, the path being the rendered map keys and array indexes from the root.
    */
-  function header(bytes, offset) {
-    if (offset >= bytes.length) throw new Error("CBOR: unexpected end of input");
-    var initial = bytes[offset];
-    var major = initial >> 5;
-    var additional = initial & 31;
-    var at = offset + 1;
-    if (additional < 24) return { major: major, additional: additional, argument: additional, at: at, indefinite: false };
-    if (additional === 31) {
-      if (major !== 2 && major !== 3 && major !== 4 && major !== 5) {
-        throw new Error("CBOR: indefinite length is not allowed for major type " + major);
-      }
-      return { major: major, additional: additional, argument: -1, at: at, indefinite: true };
+  function ranges(bytes, depth) {
+    var reader = new Reader(bytes);
+    reader.found = [];
+    reader.limit = typeof depth === "number" ? depth : 0;
+    var value = decode(reader);
+    if (!reader.done()) {
+      throw new Error("CBOR: " + (bytes.length - reader.offset) + " trailing byte(s) after the data item");
     }
-    var width = additional === 24 ? 1 : additional === 25 ? 2 : additional === 26 ? 4 : additional === 27 ? 8 : 0;
-    if (!width) throw new Error("CBOR: reserved additional information " + additional);
-    if (offset + 1 + width > bytes.length) throw new Error("CBOR: unexpected end of input");
-    var argument = 0n;
-    for (var i = 0; i < width; i++) argument = argument * 256n + BigInt(bytes[at + i]);
-    var exact = argument <= 9007199254740991n ? Number(argument) : argument;
-    return { major: major, additional: additional, argument: exact, at: at + width, indefinite: false };
-  }
-
-  /** The offset just past the one data item that starts at {@code offset}. */
-  function itemEnd(bytes, offset) {
-    var h = header(bytes, offset);
-    var at = h.at;
-    var count;
-    switch (h.major) {
-      case 0:
-      case 1:
-        return at;
-      case 2:
-      case 3:
-        if (!h.indefinite) {
-          if (typeof h.argument !== "number") throw new Error("CBOR: length " + String(h.argument) + " is too large to read");
-          return endWithin(bytes, at + h.argument);
-        }
-        while (true) {
-          if (at >= bytes.length) throw new Error("CBOR: unexpected end of input");
-          if (bytes[at] === 0xff) return at + 1;
-          at = itemEnd(bytes, at);
-        }
-      case 4:
-        if (!h.indefinite) {
-          for (var i = 0; i < h.argument; i++) at = itemEnd(bytes, at);
-          return at;
-        }
-        while (true) {
-          if (at >= bytes.length) throw new Error("CBOR: unexpected end of input");
-          if (bytes[at] === 0xff) return at + 1;
-          at = itemEnd(bytes, at);
-        }
-      case 5:
-        if (!h.indefinite) {
-          for (var k = 0; k < h.argument; k++) {
-            at = itemEnd(bytes, at); // key
-            at = itemEnd(bytes, at); // value
-          }
-          return at;
-        }
-        while (true) {
-          if (at >= bytes.length) throw new Error("CBOR: unexpected end of input");
-          if (bytes[at] === 0xff) return at + 1;
-          at = itemEnd(bytes, at); // key
-          at = itemEnd(bytes, at); // value
-        }
-      case 6:
-        return itemEnd(bytes, at);
-      case 7:
-        if (h.additional === 31) throw new Error("CBOR: unexpected break outside an indefinite-length item");
-        if (h.additional < 24 || h.additional === 24) return at;
-        count = h.additional === 25 ? 2 : h.additional === 26 ? 4 : 8;
-        return endWithin(bytes, offset + 1 + count);
-      default:
-        throw new Error("CBOR: unsupported major type " + h.major);
-    }
-  }
-
-  function endWithin(bytes, end) {
-    if (end > bytes.length) throw new Error("CBOR: unexpected end of input");
-    return end;
+    return { value: value, ranges: reader.found };
   }
 
   /**
-   * Records the [start, end) range of every array element and map value in {@code bytes}, down to {@code depth} levels
-   * below the root (the root's own children are depth 1), and returns the decoded item with them. Each entry is
-   * `{path, start, end}`: a path is the array of rendered map keys and array indexes that leads to the value from the
-   * root, so a reader can ask for the exact bytes of an IssuerSignedItemBytes or of the IssuerAuth as they arrived.
+   * The tag of the data item at {@code offset}: `{tag, content, end}` - the tag by its numeric value however the head
+   * encodes it (RFC 8949 3.1: `d8 18` and the non-preferred `d9 00 18` are both tag 24), the exact bytes of the tagged
+   * item's content, and the offset just past the whole item. `null` when the item is not tagged. The bytes are never
+   * changed, so a reader can require the tag and still carry the item exactly as it arrived.
    */
-  function ranges(bytes, depth) {
-    var value = decodeItem(bytes);
-    var found = [];
-    walk(bytes, 0, depth, [], found);
-    return { value: value, ranges: found };
-  }
-
-  function walk(bytes, offset, depth, path, found) {
-    if (depth <= 0) return;
-    var h = header(bytes, offset);
-    var at = h.at;
-    if (h.major === 4) {
-      var index = 0;
-      while (true) {
-        if (!h.indefinite && index >= h.argument) return;
-        if (h.indefinite) {
-          if (at >= bytes.length) throw new Error("CBOR: unexpected end of input");
-          if (bytes[at] === 0xff) return;
-        }
-        var elementEnd = itemEnd(bytes, at);
-        var elementPath = path.concat([index]);
-        found.push({ path: elementPath, start: at, end: elementEnd });
-        walk(bytes, at, depth - 1, elementPath, found);
-        at = elementEnd;
-        index++;
-      }
-    }
-    if (h.major !== 5) return; // a tag's content is not a value of the map/array the caller asked about
-    var pairs = 0;
-    while (true) {
-      if (!h.indefinite && pairs >= h.argument) return;
-      if (h.indefinite) {
-        if (at >= bytes.length) throw new Error("CBOR: unexpected end of input");
-        if (bytes[at] === 0xff) return;
-      }
-      var keyEnd = itemEnd(bytes, at);
-      var key = keyOf(decodeItem(bytes.subarray(at, keyEnd)));
-      at = keyEnd;
-      var valueEnd = itemEnd(bytes, at);
-      var childPath = path.concat([key]);
-      found.push({ path: childPath, start: at, end: valueEnd });
-      walk(bytes, at, depth - 1, childPath, found);
-      at = valueEnd;
-      pairs++;
-    }
+  function tagOf(bytes, offset) {
+    var at = offset === undefined ? 0 : offset;
+    var reader = new Reader(bytes.subarray(at));
+    var initial = reader.byte();
+    if (initial >> 5 !== 6) return null;
+    var tag = argument(reader, 6, initial & 31);
+    var contentStart = reader.offset;
+    decode(reader, false); // exactly the tagged item's content, with the decoder's own rules
+    return { tag: tag, content: reader.bytes.subarray(contentStart, reader.offset), end: at + reader.offset };
   }
 
   /* ---------------------------------------------------------------- encoding (RFC 8949 4.1, preferred) */
 
-  /** A tagged value: `Cbor.Tagged(24, itemBytes)` is `#6.24(bstr .cbor item)`. */
+  /** A tagged value: `Cbor.Tagged(24, itemBytes)` is `#6.24(bstr .cbor item)` (callable with or without `new`). */
   function Tagged(tag, value) {
+    if (!(this instanceof Tagged)) return new Tagged(tag, value);
     if (typeof tag !== "number" || !Number.isSafeInteger(tag) || tag < 0) throw new Error("CBOR: a tag is a non-negative integer");
     this.tag = tag;
     this.value = value;
   }
 
-  /** Bytes emitted verbatim; refused unless they are exactly one well-formed data item. */
+  /** Bytes emitted verbatim; refused unless they are exactly one well-formed data item (with or without `new`). */
   function Raw(input) {
+    if (!(this instanceof Raw)) return new Raw(input);
     var bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
     decodeItem(bytes);
     this.bytes = bytes;
@@ -503,17 +432,9 @@ var Cbor = (function () {
       return;
     }
     if (typeof value === "object") {
-      var prototype = Object.getPrototypeOf(value);
-      if (prototype !== Object.prototype && prototype !== null) {
-        throw new Error("CBOR: cannot encode " + Object.prototype.toString.call(value));
-      }
-      var names = Object.keys(value);
-      parts.push(head(5, names.length));
-      for (var n = 0; n < names.length; n++) {
-        encodeInto(names[n], parts);
-        encodeInto(value[names[n]], parts);
-      }
-      return;
+      // plan 4.3: a map is a `Map` and nothing else. A plain object would encode under key names the caller did not
+      // choose and an order ISO/IEC 18013-5's CDDL does not give it, so it is refused rather than guessed at.
+      throw new Error("CBOR: only Map encodes as a map, not " + Object.prototype.toString.call(value));
     }
     throw new Error("CBOR: cannot encode a " + typeof value);
   }
@@ -532,6 +453,15 @@ var Cbor = (function () {
     spans: function (input, depth) {
       var bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
       return ranges(bytes, depth);
+    },
+
+    /**
+     * The tag of the data item at {@code offset} of {@code input}, by numeric value, with the exact bytes of its content
+     * and the offset just past the whole tagged item: `{tag, content, end}`. `null` when the item is not tagged.
+     */
+    tagged: function (input, offset) {
+      var bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+      return tagOf(bytes, offset);
     },
 
     /** Encodes one value in the preferred serialization (RFC 8949 4.1). */
