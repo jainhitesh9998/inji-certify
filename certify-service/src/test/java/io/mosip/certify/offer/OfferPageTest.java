@@ -143,6 +143,15 @@ class OfferPageTest {
         assertEquals("camera=()", page.getResponse().getHeader("Permissions-Policy"));
         assertEquals("no-referrer", page.getResponse().getHeader("Referrer-Policy"));
 
+        // review round 3: the page's file name is the same page with the same headers, never a static answer without
+        // them (the static resource handler served /offer/index.html with no Content-Security-Policy at all)
+        MvcResult file = mockMvc.perform(get("/offer/index.html")).andReturn();
+        assertEquals(200, file.getResponse().getStatus());
+        assertEquals(html, new String(file.getResponse().getContentAsByteArray(), StandardCharsets.UTF_8));
+        assertEquals(csp, file.getResponse().getHeader("Content-Security-Policy"), "/offer/index.html carries the page's CSP");
+        assertEquals("camera=()", file.getResponse().getHeader("Permissions-Policy"));
+        assertEquals("no-referrer", file.getResponse().getHeader("Referrer-Policy"));
+
         MvcResult wallet = mockMvc.perform(get("/offer/wallet")).andReturn();
         String walletCsp = wallet.getResponse().getHeader("Content-Security-Policy");
         assertTrue(walletCsp.contains("script-src 'self';") && !walletCsp.contains("sha256-"), walletCsp);

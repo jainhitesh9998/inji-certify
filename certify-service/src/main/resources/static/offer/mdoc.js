@@ -5,7 +5,9 @@
  * a DeviceResponse later carries the same slice.
  *
  * Depends on cbor.js (the global `Cbor`): `Cbor.spans` supplies the byte ranges, `Cbor.tagged` the tag of a data item,
- * `Cbor.decode` the values.
+ * `Cbor.decodeTyped` the values. Every map is read typed (a `Map` whose integer keys are numbers and whose text keys are
+ * strings), so a lookup names the key's type: `deviceKey.get(1)` is the COSE label 1, never a text label "1" (RFC 9052
+ * 1.5), and `valueDigests.get(ns).get(digestID)` is the uint DigestID, never a text key that prints alike.
  */
 var Mdoc = (function () {
   "use strict";
@@ -16,9 +18,14 @@ var Mdoc = (function () {
   /** The digest algorithms an MSO may name (ISO/IEC 18013-5 9.1.2.4). */
   var DIGEST_ALGORITHMS = ["SHA-256", "SHA-384", "SHA-512"];
 
-  /** The key of a spans entry: its path, in one string. */
+  /** The key of a spans entry: its path, in one string. Typed segments print apart: `[33]` and `["33"]` differ. */
   function pathKey(path) {
     return JSON.stringify(path);
+  }
+
+  /** The value at a text or integer key of a typed map; `undefined` when the value is not a map or has no such key. */
+  function field(map, key) {
+    return map instanceof Map ? map.get(key) : undefined;
   }
 
   function bytesOf(input) {
@@ -59,12 +66,12 @@ var Mdoc = (function () {
     if (tagged.end !== payload.length) {
       throw new Error("the issuerAuth payload is not exactly one tag-24 MSO item");
     }
-    var wrapped = Cbor.decode(tagged.content);
+    var wrapped = Cbor.decodeTyped(tagged.content);
     if (!(wrapped instanceof Uint8Array)) {
       throw new Error("the tag-24 MSO content is not a byte string (ISO/IEC 18013-5 9.1.2.4)");
     }
-    var mso = Cbor.decode(wrapped);
-    if (!mso || typeof mso !== "object" || Array.isArray(mso)) throw new Error("the issuerAuth payload is not an MSO map");
+    var mso = Cbor.decodeTyped(wrapped);
+    if (!(mso instanceof Map)) throw new Error("the issuerAuth payload is not an MSO map");
     return mso;
   }
 
@@ -108,25 +115,49 @@ var Mdoc = (function () {
   }
 
   /**
-   * One COSE header map, walked so its labels keep their types (RFC 9052 section 3: `label = int / tstr`; the decoder
-   * renders the integer 33 and the text "33" alike, and only the key's major type tells them apart).
+   * One COSE header map, walked so its labels keep their types. RFC 9052 1.5 and 3: `label = int / tstr`, and the
+   * integer 33 and the text "33" are two labels; the typed walk keeps them apart (`[33]` and `["33"]` are two paths), so
+   * a header carrying both is read, not refused. A label of any other type - a byte string, a float, a tag around an
+   * integer, a map - is not a COSE label and is refused (`labels` lists the header's labels as path segments).
    */
   function headerOf(bytes, what) {
+    if (!bytes.length || bytes[0] >> 5 !== 5) throw new Error("the issuerAuth " + what + " is not a map (RFC 9052 section 3)");
     var walked = Cbor.spans(bytes, 2);
-    if (bytes[0] >> 5 !== 5) throw new Error("the issuerAuth " + what + " is not a map (RFC 9052 section 3)");
-    return { bytes: bytes, walked: walked, ranges: rangesByPath(walked) };
+    var labels = keysAt(walked, []).map(function (key) {
+      if (key.major !== 0 && key.major !== 1 && key.major !== 3) {
+        throw new Error("the issuerAuth " + what + " has a label that is " + MAJOR_NAMES[key.major]
+          + "; a COSE label is an int or a tstr (RFC 9052 sections 1.5 and 3)");
+      }
+      return key.key;
+    });
+    return { bytes: bytes, walked: walked, ranges: rangesByPath(walked), labels: labels, what: what };
+  }
+
+  /**
+   * RFC 9052 section 3: "the same label MUST NOT occur in both the protected and unprotected headers". Labels compare by
+   * type and value, so the integer 1 in one bucket and the text "1" in the other are two labels and both are kept.
+   * Without this, a reader that looks in one bucket first would read whichever copy that bucket holds (a stand-in
+   * x5chain in the protected bucket next to the real one in the unprotected bucket, ISO/IEC 18013-5 9.1.2.4).
+   */
+  function requireDisjointBuckets(protectedHeader, unprotectedHeader) {
+    if (protectedHeader === null) return;
+    var unprotectedLabels = new Set(unprotectedHeader.labels.map(function (label) { return pathKey([label]); }));
+    protectedHeader.labels.forEach(function (label) {
+      if (unprotectedLabels.has(pathKey([label]))) {
+        throw new Error("the issuerAuth header label " + JSON.stringify(label) + " is in both the protected and the"
+          + " unprotected header (RFC 9052 section 3: a label MUST NOT occur in both)");
+      }
+    });
   }
 
   /** The value of an integer label in one header, with its range there; `undefined` when the label is absent. */
   function intLabel(header, label) {
-    if (header === null) return undefined;
-    var entry = keysAt(header.walked, []).filter(function (key) { return key.key === String(label); })[0];
-    // a text label that happens to read "33" is another label (RFC 9052 section 3), not x5chain
-    if (entry === undefined || entry.major !== (label < 0 ? 1 : 0)) return undefined;
-    return { header: header, value: header.walked.value[String(label)], range: header.ranges.get(pathKey([String(label)])) };
+    // a typed lookup: the text label "33" is another label (RFC 9052 1.5), not x5chain
+    if (header === null || !header.walked.value.has(label)) return undefined;
+    return { header: header, value: header.walked.value.get(label), range: header.ranges.get(pathKey([label])) };
   }
 
-  /** A header label from the protected header, else from the unprotected one (RFC 9052 section 3). */
+  /** A header label from whichever bucket holds it; `requireDisjointBuckets` has made sure only one does. */
   function headerValue(protectedHeader, unprotectedHeader, label) {
     var found = intLabel(protectedHeader, label);
     return found !== undefined ? found : intLabel(unprotectedHeader, label);
@@ -145,7 +176,7 @@ var Mdoc = (function () {
     if (major === 2) return [found.value];
     if (major === 4 && Array.isArray(found.value) && found.value.length >= 2) {
       found.value.forEach(function (der, index) {
-        requireMajor(bytes, found.header.ranges.get(pathKey(["33", index])), 2,
+        requireMajor(bytes, found.header.ranges.get(pathKey([33, index])), 2,
           "x5chain certificate " + index + " (RFC 9360 section 2)");
       });
       return found.value;
@@ -168,13 +199,20 @@ var Mdoc = (function () {
    * - no path carries two data items;
    * - `issuerAuth` is a COSE_Sign1 array, untagged or tag 18 (RFC 9052 section 4.2), whose four elements are a bstr, a
    *   map, a bstr and a bstr, each untagged; the protected header's content is empty or a map (RFC 9052 section 3);
+   * - every header label is an int or a tstr, compared by type (RFC 9052 sections 1.5 and 3), and no label is in both
+   *   the protected and the unprotected header (RFC 9052 section 3);
    * - each IssuerSignedItemBytes is tag 24 (ISO/IEC 18013-5 8.3.2.1.2).
+   * Plan 4.2 (check 1) and the decision log's P5-03a review round 3 row record these refusals and the clauses behind
+   * them: each is a shape the CDDL or RFC 9052 / RFC 9360 does not allow, read from the bytes the page would carry.
+   *
+   * Maps are read typed (`Map`), so `mso` and each `elementValue` that is a map are `Map`s; `nameSpaces` is an object
+   * with no prototype, so a namespace named "__proto__" is a namespace like any other.
    */
   function readIssuerSigned(input) {
     var bytes = bytesOf(input);
     var walked = Cbor.spans(bytes, 3);
     var value = walked.value;
-    if (!bytes.length || majorAt(bytes, { start: 0 }) !== 5 || !value || typeof value !== "object" || Array.isArray(value)) {
+    if (!bytes.length || majorAt(bytes, { start: 0 }) !== 5 || !(value instanceof Map)) {
       throw new Error("the credential is not an IssuerSigned map");
     }
     keysAt(walked, []).forEach(function (key) {
@@ -204,7 +242,7 @@ var Mdoc = (function () {
         + " (RFC 9052 section 4.2)");
     }
     var arrayMajor = outer === null ? majorAt(bytes, issuerAuthRange) : outer.content[0] >> 5;
-    var issuerAuth = value.issuerAuth;
+    var issuerAuth = value.get("issuerAuth");
     if (arrayMajor !== 4 || !Array.isArray(issuerAuth) || issuerAuth.length !== 4) {
       throw new Error("issuerAuth is not a COSE_Sign1 array of four elements");
     }
@@ -219,33 +257,34 @@ var Mdoc = (function () {
     var protectedHeader = issuerAuth[0].length ? headerOf(issuerAuth[0], "protected header") : null;
     var unprotectedRange = ranges.get(pathKey(["issuerAuth", 1]));
     var unprotectedHeader = headerOf(bytes.subarray(unprotectedRange.start, unprotectedRange.end), "unprotected header");
+    requireDisjointBuckets(protectedHeader, unprotectedHeader);
     var x5chain = x5chainOf(headerValue(protectedHeader, unprotectedHeader, 33));
     var alg = headerValue(protectedHeader, unprotectedHeader, 1);
 
-    var nameSpaces = {};
-    var decoded = value.nameSpaces === undefined ? {} : value.nameSpaces;
-    if (value.nameSpaces !== undefined) requireMajor(bytes, ranges.get(pathKey(["nameSpaces"])), 5, "IssuerSigned nameSpaces");
-    if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
-      throw new Error("IssuerSigned nameSpaces is not a map");
-    }
-    Object.keys(decoded).forEach(function (namespace) {
-      var items = decoded[namespace];
+    // no prototype: a namespace named "__proto__" is stored as one, not as this object's prototype (which would hide its
+    // items from every check that lists the namespaces)
+    var nameSpaces = Object.create(null);
+    var decoded = value.has("nameSpaces") ? value.get("nameSpaces") : new Map();
+    if (value.has("nameSpaces")) requireMajor(bytes, ranges.get(pathKey(["nameSpaces"])), 5, "IssuerSigned nameSpaces");
+    if (!(decoded instanceof Map)) throw new Error("IssuerSigned nameSpaces is not a map");
+    decoded.forEach(function (items, namespace) {
       if (!Array.isArray(items)) throw new Error("the namespace " + namespace + " is not an array of IssuerSignedItems");
       requireMajor(bytes, ranges.get(pathKey(["nameSpaces", namespace])), 4, "the namespace " + namespace);
       nameSpaces[namespace] = items.map(function (item, index) {
-        if (!item || typeof item !== "object" || Array.isArray(item)
-            || typeof item.elementIdentifier !== "string" || typeof item.digestID !== "number") {
+        var elementIdentifier = field(item, "elementIdentifier");
+        var digestID = field(item, "digestID");
+        if (typeof elementIdentifier !== "string" || typeof digestID !== "number") {
           throw new Error("an IssuerSignedItem in " + namespace + " is not an element map");
         }
         var itemRange = ranges.get(pathKey(["nameSpaces", namespace, index]));
         if (!isTag24(bytes, itemRange)) {
-          throw new Error("the IssuerSignedItem " + namespace + "/" + item.elementIdentifier
+          throw new Error("the IssuerSignedItem " + namespace + "/" + elementIdentifier
             + " is not a tag-24 IssuerSignedItemBytes");
         }
         return {
-          elementIdentifier: item.elementIdentifier,
-          digestID: item.digestID,
-          elementValue: item.elementValue,
+          elementIdentifier: elementIdentifier,
+          digestID: digestID,
+          elementValue: item.get("elementValue"),
           raw: bytes.subarray(itemRange.start, itemRange.end),
         };
       });
@@ -300,7 +339,8 @@ var Mdoc = (function () {
         + error.message);
     }
     var mso = read.issuerAuth.mso;
-    if (typeof mso.docType !== "string" || !mso.docType) {
+    var docType = field(mso, "docType");
+    if (typeof docType !== "string" || !docType) {
       return refuse("issuer-signed", "The credential's MSO names no docType.");
     }
     // check 2: the docType the configuration issues
@@ -308,45 +348,47 @@ var Mdoc = (function () {
       return refuse("doctype", "The issuer metadata names no doctype for this configuration, so the credential"
         + " cannot be checked against it.");
     }
-    if (mso.docType !== options.doctype) {
-      return refuse("doctype", "The credential's docType is " + JSON.stringify(mso.docType)
+    if (docType !== options.doctype) {
+      return refuse("doctype", "The credential's docType is " + JSON.stringify(docType)
         + ", not this configuration's " + JSON.stringify(options.doctype) + ".");
     }
     // check 3: the MSO's deviceKey is this browser's P-256 key (ISO/IEC 18013-5 9.1.2.4)
-    var deviceKey = mso.deviceKeyInfo && mso.deviceKeyInfo.deviceKey;
-    if (!deviceKey || typeof deviceKey !== "object") {
+    // COSE_Key labels are int / tstr (RFC 9052 7): the lookups are by the integer labels, never a text key alike
+    var deviceKey = field(field(mso, "deviceKeyInfo"), "deviceKey");
+    if (!(deviceKey instanceof Map)) {
       return refuse("device-key", "The credential's MSO carries no deviceKey.");
     }
-    if (deviceKey["1"] !== 2) {
+    if (deviceKey.get(1) !== 2) {
       return refuse("device-key", "The credential's deviceKey is not an EC2 COSE key (label 1 must be 2).");
     }
-    if (deviceKey["-1"] !== 1) {
+    if (deviceKey.get(-1) !== 1) {
       return refuse("device-key", "The credential's deviceKey is not a P-256 key (label -1 must be 1); this page holds"
         + " P-256 keys only.");
     }
-    if (!(deviceKey["-2"] instanceof Uint8Array) || !(deviceKey["-3"] instanceof Uint8Array)) {
+    if (!(deviceKey.get(-2) instanceof Uint8Array) || !(deviceKey.get(-3) instanceof Uint8Array)) {
       return refuse("device-key", "The credential's deviceKey carries no P-256 coordinates (labels -2 and -3).");
     }
     var publicJwk = options.publicJwk || {};
-    if (base64url(deviceKey["-2"]) !== publicJwk.x || base64url(deviceKey["-3"]) !== publicJwk.y) {
+    if (base64url(deviceKey.get(-2)) !== publicJwk.x || base64url(deviceKey.get(-3)) !== publicJwk.y) {
       return refuse("device-key", "The credential's deviceKey is not this browser's key: it was issued to another"
         + " holder.");
     }
     // check 4: every IssuerSignedItemBytes hashes to its valueDigests entry, over the bytes as received
-    var algorithm = mso.digestAlgorithm;
+    var algorithm = field(mso, "digestAlgorithm");
     if (DIGEST_ALGORITHMS.indexOf(algorithm) < 0) {
       return refuse("digest", "The credential's MSO names the digest algorithm " + JSON.stringify(algorithm)
         + "; SHA-256, SHA-384 and SHA-512 are supported.");
     }
-    var valueDigests = mso.valueDigests;
+    var valueDigests = field(mso, "valueDigests");
     for (var namespace of Object.keys(read.nameSpaces)) {
-      var byDigestId = valueDigests && valueDigests[namespace];
-      if (!byDigestId || typeof byDigestId !== "object") {
+      var byDigestId = field(valueDigests, namespace);
+      if (!(byDigestId instanceof Map)) {
         return refuse("digest", "The credential's MSO has no valueDigests for the namespace " + namespace + ".");
       }
       var items = read.nameSpaces[namespace];
       for (var item of items) {
-        var expected = byDigestId[String(item.digestID)];
+        // DigestID = uint (ISO/IEC 18013-5 9.1.2.4): the integer key, never a text key that prints alike
+        var expected = byDigestId.get(item.digestID);
         var actual = await digestOf(algorithm, item.raw);
         if (!(expected instanceof Uint8Array) || base64url(expected) !== base64url(actual)) {
           return refuse("digest", "The IssuerSignedItem " + namespace + "/" + item.elementIdentifier
@@ -354,12 +396,14 @@ var Mdoc = (function () {
         }
       }
     }
-    var validity = mso.validityInfo || {};
+    var validity = field(mso, "validityInfo");
+    var validFrom = field(validity, "validFrom");
+    var validUntil = field(validity, "validUntil");
     return {
       ok: true,
-      docType: mso.docType,
-      validFrom: typeof validity.validFrom === "string" ? validity.validFrom : null,
-      validUntil: typeof validity.validUntil === "string" ? validity.validUntil : null,
+      docType: docType,
+      validFrom: typeof validFrom === "string" ? validFrom : null,
+      validUntil: typeof validUntil === "string" ? validUntil : null,
     };
   }
 

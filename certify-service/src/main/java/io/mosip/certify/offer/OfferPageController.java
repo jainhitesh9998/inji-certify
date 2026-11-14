@@ -77,7 +77,13 @@ public class OfferPageController {
         this.pageScriptSources = "'self'" + inlineScriptHashes(new String(page, StandardCharsets.UTF_8));
     }
 
-    @GetMapping(value = {"/offer", "/offer/"}, produces = MediaType.TEXT_HTML_VALUE)
+    /**
+     * The offer page. Its file name, {@code /offer/index.html}, is mapped here too (P5-03a review round 3): as an
+     * ordinary classpath resource it was served by the static resource handler without the headers of plan 4.13, so the
+     * same bytes reached a browser with no Content-Security-Policy. Every spelling now answers the same page with the
+     * same headers.
+     */
+    @GetMapping(value = {"/offer", "/offer/", "/offer/index.html"}, produces = MediaType.TEXT_HTML_VALUE)
     public ResponseEntity<byte[]> page(HttpServletRequest request) {
         // the issuance page never needs the camera, and it is served with the same origin-wide rules as the wallet
         return ResponseEntity.ok()
@@ -107,7 +113,8 @@ public class OfferPageController {
      * The wallet page's file name. {@code static/offer/wallet.html} is an ordinary classpath resource, so without this
      * mapping the static resource handler would serve it here - with the wallet switched off and without the headers
      * above. The page has one address, {@code /offer/wallet}; this spelling answers 404 whatever the switch says. (The
-     * offer page's {@code /offer/index.html} keeps today's static answer, which existing tests and links rely on.)
+     * offer page's {@code /offer/index.html} answers the page with its headers, see {@link #page}: links to it predate
+     * the wallet.)
      */
     @GetMapping("/offer/wallet.html")
     public ResponseEntity<Void> walletPageFile() {

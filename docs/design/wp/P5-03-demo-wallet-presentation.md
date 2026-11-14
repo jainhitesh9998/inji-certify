@@ -324,7 +324,7 @@ untouched. The offer page only gains the "Keep" checkbox and a link to the walle
 | --- | --- | --- |
 | `index.html` (existing) | issuance; non-extractable key; "Keep this credential in this browser"; link to the wallet | a |
 | `wallet.html` (new; no inline script) | kept credentials; scan or paste a request; verifier card and request checks; consent; result; log | a, c-e, g |
-| `cbor.js` (existing) | + `Cbor.encode`, `Cbor.Raw`, `Cbor.Tagged`, `Cbor.spans`; `Cbor.decode` unchanged | a |
+| `cbor.js` (existing) | + `Cbor.encode`, `Cbor.Raw`, `Cbor.Tagged`, `Cbor.spans`, `Cbor.decodeTyped` (typed map keys, 4.3); `Cbor.decode` unchanged | a |
 | `mdoc.js` | IssuerSigned reader, storage checks, DeviceResponse, SessionTranscripts | a, b, i |
 | `wallet-store.js` | IndexedDB | a |
 | `x509.js` | DER reader: names, SAN, AKI/SKI, validity, SPKI import, certificate signature check | c |
@@ -361,6 +361,21 @@ harness calls them directly and also drives them through the page.
   4. Every IssuerSignedItemBytes hashes, under the MSO `digestAlgorithm` (SHA-256/384/512), to
      `valueDigests[ns][digestID]` (ISO5 9.1.2.5). The page never later presents an item the issuer did not sign.
   5. At most 256 KiB per IssuerSigned and at most 50 credentials; the 51st is refused with "delete one first".
+
+  Check 1 reads the structure from the bytes the page will carry, not only from decoded values (a decoder resolves
+  tags and, in a display form, renders keys of different types alike), so it also refuses what the CDDL and COSE do
+  not allow (P5-03a review rounds 1-3; decision log, P5-03a review round 3 row):
+  - an IssuerSigned key other than the text keys `nameSpaces` and `issuerAuth`: `IssuerSigned = {? "nameSpaces":
+    IssuerNameSpaces, "issuerAuth": IssuerAuth}` is a closed map (ISO5 8.3.2.1.2), and `NameSpace = tstr`;
+  - a tag (55799 self-described CBOR, 1 epoch date, 24 embedded CBOR, or any other) around a field the CDDL leaves
+    untagged: the IssuerSigned map, `nameSpaces`, a namespace's array, the COSE_Sign1 elements and the x5chain
+    certificates; the COSE_Sign1 itself is untagged or tag 18 only (RFC 9052 §4.2), and each IssuerSignedItemBytes is
+    tag 24 (ISO5 8.3.2.1.2);
+  - an `x5chain` array with one element: `COSE_X509 = bstr / [2*certs: bstr]` (RFC 9360 §2), so one certificate is a
+    bare bstr;
+  - a header label that is not an `int` or a `tstr` (RFC 9052 §1.5 and §3: `label = int / tstr`; labels compare by
+    type, so `1` and `"1"` are two labels and both are kept);
+  - a label in both the protected and the unprotected header (RFC 9052 §3: a label MUST NOT occur in both).
 - **Deleting.** "Delete" removes a record and with it the only reference to its key. "Delete everything" calls
   `indexedDB.deleteDatabase("certify-demo-wallet")`. Nothing is stored server-side, ever.
 - **No storage.** If `indexedDB` is missing or `open` fails (some private modes), the page says so once and issuance
@@ -370,6 +385,11 @@ harness calls them directly and also drives them through the page.
 
 - `Cbor.spans(bytes, depth)` walks one data item and returns its decoded value plus the `[start, end)` byte range of
   every array element and map value down to `depth`.
+- Map keys keep their types wherever a decision rests on them (P5-03a review round 3): `Cbor.spans` and
+  `Cbor.decodeTyped` give each map as a `Map` keyed by a number for an integer key and a string for a text key, and a
+  path segment keeps that type (`[33]` and `["33"]` are two paths). A key that is the same data item twice (RFC 8949
+  §5.6: the same integer or text under a longer head or in chunks) is refused. `Cbor.decode` keeps its plain objects
+  for the offer page's display, and refuses a map whose keys render alike (`1` and `"1"`) rather than overwrite one.
 - `Mdoc.readIssuerSigned(bytes)` builds on it and returns `{nameSpaces: {ns: [{elementIdentifier, digestID,
   elementValue, raw}]}, issuerAuth: {raw, alg, x5chain: [der…], mso}}`. Each `raw` is the **exact** byte range of an
   IssuerSignedItemBytes (tag-24 header, bstr header and content) or of the IssuerAuth COSE_Sign1 in the kept bytes.

@@ -521,7 +521,9 @@ const markupElements = (markup) => parseMarkup(markup).ids;
  * - Transaction lifetime (2.7, 2.7.1): a transaction is active in the task that created it and while a request's
  *   success or error event is dispatched, together with the promise reactions that dispatch triggers; it turns inactive
  *   when the next task starts, and commits once it is inactive with no request outstanding. A request on a transaction
- *   that is not active - finished included - throws `TransactionInactiveError` (4.5, 4.6).
+ *   that is not active - finished included - throws `TransactionInactiveError` (4.5, 4.6). The next task is this fake's
+ *   own next event or a page timer (`taskTimers`, which the page contexts get as `setTimeout`): a timer callback is a
+ *   task of its own, so it never sees a transaction of an earlier task as active.
  * - Scheduling (2.7.2): a readonly transaction waits for earlier overlapping readwrite ones, a readwrite one for every
  *   earlier overlapping one. That is what makes "at most 50 credentials" atomic: a count and a put in one transaction
  *   cannot interleave with another tab's.
@@ -559,6 +561,19 @@ function activeForThisTask(transaction) {
     idbTask(() => {}); // the next task, should nothing else be queued
 }
 
+/**
+ * The page's timers (review round 3, nit): a `setTimeout` callback starts a task, so the transactions active in the task
+ * that is ending turn inactive first, as they would in a browser. Node runs timers before `setImmediate` callbacks, so
+ * with the bare `setTimeout` a timer's callback could still use a transaction of an earlier task.
+ */
+const taskTimers = {
+    setTimeout: (callback, delay, ...args) => setTimeout(() => {
+        endActiveTask();
+        callback(...args);
+    }, delay),
+    clearTimeout: (handle) => clearTimeout(handle),
+};
+
 /** One request of the fake IndexedDB: its result or error arrive with its event, in a task of their own. */
 class FakeRequest {
     constructor(transaction = null) {
@@ -589,12 +604,51 @@ class FakeIndexedDB {
         this.openRequests = 0;
         // every delete that completed, so a check can tell "the page reopened what it deleted" from "nothing happened"
         this.deletions = 0;
+        // requests a check holds back (see hold)
+        this.holds = [];
+    }
+
+    /**
+     * An ordering knob for a check (review round 3): the next `operation` request (`"getAll"`, `"count"`, ...) made on
+     * `storeName` is accepted and queued as usual, but is not processed until `release()`. Its transaction stays alive
+     * meanwhile, as one does while a browser is still reading, so a connection closing behind it stays close-pending.
+     * `reached` resolves once such a request was made. One hold catches one request.
+     */
+    hold(operation, storeName) {
+        let arrived;
+        const hold = {
+            operation,
+            storeName,
+            request: null,
+            released: false,
+            resumes: [],
+            reached: new Promise((resolve) => { arrived = resolve; }),
+        };
+        hold.arrive = (request) => {
+            hold.request = request;
+            arrived(request);
+        };
+        hold.release = () => {
+            hold.released = true;
+            for (const resume of hold.resumes.splice(0)) idbTask(resume);
+        };
+        this.holds.push(hold);
+        return hold;
+    }
+
+    /** The hold, if any, that catches this request (it then catches no other). */
+    catchRequest(operation, storeName, request) {
+        const hold = this.holds.find((entry) => entry.request === null && entry.operation === operation
+            && entry.storeName === storeName);
+        if (hold === undefined) return null;
+        hold.arrive(request);
+        return hold;
     }
 
     database(name, version = 1) {
         let database = this.databases.get(name);
         if (database === undefined) {
-            database = new FakeDatabase(name, version);
+            database = new FakeDatabase(name, version, this);
             this.databases.set(name, database);
         }
         return database;
@@ -668,7 +722,7 @@ class FakeIndexedDB {
             return;
         }
         if (database === undefined) {
-            database = new FakeDatabase(name, 0);
+            database = new FakeDatabase(name, 0, this);
             this.databases.set(name, database);
         }
         this.closeOthers(database, wanted, request, () => {
@@ -728,9 +782,10 @@ class FakeIndexedDB {
 }
 
 class FakeDatabase {
-    constructor(name, version) {
+    constructor(name, version, factory) {
         this.name = name;
         this.version = version;
+        this.factory = factory;
         this.stores = new Map();
         this.connections = new Set();
         this.closeWaiters = [];
@@ -898,6 +953,7 @@ class FakeTransaction {
         this.processing = false;
         this.started = false;
         this.snapshot = null;
+        this.resume = () => this.processNext();
         connection.transactions.add(this);
         this.db.live.push(this);
         // 2.7.1: active in the task that created it
@@ -923,26 +979,28 @@ class FakeTransaction {
         if (!this.names.includes(name)) throw idbError("NotFoundError", "the object store is not in this transaction's scope");
         const store = this.db.stores.get(name);
         const transaction = this;
+        const op = (operation, work, writes = false) => transaction.request(work, writes, operation, name);
         return {
-            get: (key) => transaction.request(() => store.getClone(key)),
-            getAll: () => transaction.request(() => [...store.records.values()].map((record) => structuredClone(record))),
-            getAllKeys: () => transaction.request(() => [...store.records.keys()]),
-            count: () => transaction.request(() => store.records.size),
-            put: (record, key) => transaction.request(() => store.putClone(record, key), true),
-            delete: (key) => transaction.request(() => { store.records.delete(key); return undefined; }, true),
-            clear: () => transaction.request(() => { store.records.clear(); return undefined; }, true),
+            get: (key) => op("get", () => store.getClone(key)),
+            getAll: () => op("getAll", () => [...store.records.values()].map((record) => structuredClone(record))),
+            getAllKeys: () => op("getAllKeys", () => [...store.records.keys()]),
+            count: () => op("count", () => store.records.size),
+            put: (record, key) => op("put", () => store.putClone(record, key), true),
+            delete: (key) => op("delete", () => { store.records.delete(key); return undefined; }, true),
+            clear: () => op("clear", () => { store.records.clear(); return undefined; }, true),
         };
     }
 
     /** 4.5/4.6: a request is accepted only while the transaction is active; readonly ones cannot write. */
-    request(work, writes = false) {
+    request(work, writes = false, operation = "request", storeName = "") {
         if (this.state !== "active") {
             throw idbError("TransactionInactiveError", this.state === "finished"
                 ? "the transaction has finished" : "the transaction is not active");
         }
         if (writes && this.mode !== "readwrite") throw idbError("ReadOnlyError", "the transaction is read-only");
         const request = new FakeRequest(this);
-        this.queue.push({ work, request });
+        const hold = this.db.factory ? this.db.factory.catchRequest(operation, storeName, request) : null;
+        this.queue.push({ work, request, hold });
         this.processNext();
         return request;
     }
@@ -950,6 +1008,11 @@ class FakeTransaction {
     /** Processes the next request in a task of its own, then fires its event with the transaction active. */
     processNext() {
         if (!this.started || this.processing || this.state === "finished" || !this.queue.length) return;
+        const head = this.queue[0];
+        if (head.hold && !head.hold.released) { // held by a check: processed once released, the transaction alive till then
+            if (!head.hold.resumes.includes(this.resume)) head.hold.resumes.push(this.resume);
+            return;
+        }
         this.processing = true;
         idbTask(() => {
             this.processing = false;
@@ -1316,8 +1379,9 @@ function openPage(demo, options = {}) {
         Cbor: { decode: () => ({}) },
         navigator: { clipboard: { writeText: async () => {} } },
         console: { log: () => {}, warn: () => {}, error: () => {} },
-        setTimeout,
-        clearTimeout,
+        // a timer callback is a task of its own: the fake IndexedDB's transactions of the task before are inactive in it
+        setTimeout: taskTimers.setTimeout,
+        clearTimeout: taskTimers.clearTimeout,
         // the page's wallet: URL/URLSearchParams for the documents and links, WebCrypto for the proof, and the base64
         // helpers it encodes with
         URL,
@@ -2924,6 +2988,7 @@ export {
     Element,
     Text,
     FakeIndexedDB,
+    taskTimers,
     realScript,
     counts,
     REPO,

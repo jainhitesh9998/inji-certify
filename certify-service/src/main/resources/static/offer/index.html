@@ -553,6 +553,9 @@
     // P5-03a: what the last run kept (or why it kept nothing) is not news about this one
     el("keepNote").hidden = true;
     el("keepNote").textContent = "";
+    // the keep this run starts once its own controls are back (review round 3): a store that is waiting behind another
+    // tab's "Delete everything" must not hold Redeem and Create disabled after the credential was issued
+    let keep = null;
     try {
       // OpenID4VCI 1.0 sections 4.1.1, 7, 8.2 and 12.2.2/12.2.4: the offer names its credential issuer, and everything
       // else comes from that issuer's metadata and its authorization server's metadata, each at its well-known
@@ -656,7 +659,7 @@
         } catch (e) {
           status("walletStatus", "Credential issued, but the IssuerSigned view could not be rendered: " + e.message, false);
         }
-        await keepCredential(credential.body.credentials, offer, issuerMetadata, proof);
+        keep = () => keepCredential(credential.body.credentials, offer, issuerMetadata, proof);
       }
     } catch (e) {
       status("walletStatus", "The flow failed: " + e.message, false);
@@ -664,6 +667,14 @@
       redeeming = false;
       el("wallet").disabled = !activeOffer;
       el("create").disabled = creating;
+    }
+    // after the run: keeping is local, and its outcome is reported in its own note whenever the store answers
+    if (keep !== null) {
+      try {
+        await keep();
+      } catch (e) {
+        keepNote("The credential was not kept: " + e.message, false);
+      }
     }
   });
 
@@ -743,6 +754,9 @@
   }
 
   // ---- P5-03a: keep the first credential in this browser (plan 4.2)
+  /** How long the store may take to answer before the page says it is waiting for another tab's delete. */
+  const STORE_WAIT_NOTE_MS = 500;
+
   /**
    * Keeps the first credential of a 200 response when the visitor asked for it, the configuration is an mso_mdoc one and
    * this browser has IndexedDB. Every check must pass (Mdoc.checkKeepable); a refusal keeps nothing and names the check.
@@ -764,11 +778,18 @@
       return;
     }
     let db;
+    // the store answers at once unless another tab's "Delete everything" is pending: an open queues behind a delete
+    // until every other tab has closed the store (IndexedDB 3.0, 5.1 and 5.3), and nothing tells the open it waits.
+    // Say so, then report the outcome when the store answers.
+    const waiting = setTimeout(() => keepNote("Waiting for the credential store (another tab is deleting it). This"
+      + " credential is checked and kept once that delete is done.", undefined), STORE_WAIT_NOTE_MS);
     try {
       db = await WalletStore.open();
     } catch (e) {
       keepNote("This browser could not open its credential store (" + e.message + "); nothing was kept.", false);
       return;
+    } finally {
+      clearTimeout(waiting);
     }
     try {
       let issuerSigned;

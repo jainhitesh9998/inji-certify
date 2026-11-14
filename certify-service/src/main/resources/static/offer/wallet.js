@@ -4,8 +4,10 @@
  * the whole database. No protocol logic lives here; the naming and the modules are the plan's (section 4.1).
  *
  * The page holds one connection (`db`) and gives it up when another tab deletes or upgrades the store, or when the
- * browser closes it; the list then follows. While a delete or a reconnect is under way (`busy`) every control is
- * disabled, so nothing is attempted on a connection that is closing or a store that is being deleted.
+ * browser closes it; the list then follows. While a start, a delete or a reconnect is under way (`busy`, a count of
+ * them, so one finishing never re-enables the controls while another still waits) every control is disabled, so nothing
+ * is attempted on a connection that is closing or a store that is being deleted. A list read on a connection the page
+ * has since given up is dropped, never shown.
  */
 (function () {
   "use strict";
@@ -14,7 +16,8 @@
   var db = null;
   var records = [];
   var selected = null;
-  var busy = false;
+  // how many operations (start, delete, delete everything, reconnect) are under way; the controls wait for all of them
+  var busy = 0;
   // the blob URL of the portrait the details view last rendered, released when another one replaces it
   var portraitObjectUrls = [];
 
@@ -42,22 +45,27 @@
     return record.label || record.docType || record.id;
   }
 
+  /** The controls: off while anything is under way or no store is open; Delete also needs a credential selected. */
+  function syncControls() {
+    el("deleteAll").disabled = busy > 0 || db === null || records.length === 0;
+    el("delete").disabled = busy > 0 || db === null || selected === null;
+  }
+
   function renderList() {
     var list = el("records");
     list.textContent = ""; // clearing the page's own list only; every value below is set as text
     el("empty").hidden = records.length > 0;
-    el("deleteAll").disabled = busy || db === null || records.length === 0;
-    el("delete").disabled = busy || db === null;
     if (selected !== null && !records.some(function (record) { return record.id === selected.id; })) {
       selected = null;
       el("details").hidden = true;
     }
+    syncControls();
     records.forEach(function (record) {
       var item = document.createElement("li");
       var open = document.createElement("button");
       open.className = "secondary";
       open.textContent = labelOf(record);
-      open.disabled = busy;
+      open.disabled = busy > 0;
       open.addEventListener("click", function () { show(record); });
       var meta = document.createElement("span");
       meta.className = "hint";
@@ -81,6 +89,29 @@
     return tr;
   }
 
+  /**
+   * A decoded value as text. Maps arrive typed (`Map`, Mdoc.readIssuerSigned), so a text key prints quoted and an integer
+   * key bare: `{"a":1}` reads as it did when maps were objects, and `{1:"x","1":"y"}` keeps its two keys apart. Bytes
+   * print as their count, a BigInt as its exact digits.
+   */
+  function describe(value) {
+    if (value instanceof Map) {
+      var entries = [];
+      value.forEach(function (member, key) {
+        var name = typeof key === "string" ? JSON.stringify(key)
+          : typeof key === "number" || typeof key === "bigint" ? String(key)
+          : key instanceof Cbor.OtherKey ? describe(key.value) : String(key);
+        entries.push(name + ":" + describe(member));
+      });
+      return "{" + entries.join(",") + "}";
+    }
+    if (Array.isArray(value)) return "[" + value.map(describe).join(",") + "]";
+    if (value instanceof Uint8Array) return JSON.stringify("<" + value.length + " bytes>");
+    if (typeof value === "bigint") return JSON.stringify(value.toString());
+    if (value === undefined) return "undefined";
+    return JSON.stringify(value);
+  }
+
   /** The element value rendered as the offer page renders an issued mDL: a portrait as an image, bytes as a count. */
   function valueNode(elementIdentifier, value) {
     if (value instanceof Uint8Array) {
@@ -100,11 +131,7 @@
       }
       return value.length + " bytes";
     }
-    if (value !== null && typeof value === "object") {
-      return JSON.stringify(value, function (key, nested) {
-        return typeof nested === "bigint" ? nested.toString() : nested instanceof Uint8Array ? "<" + nested.length + " bytes>" : nested;
-      });
-    }
+    if (value !== null && typeof value === "object") return describe(value);
     return String(value);
   }
 
@@ -147,15 +174,32 @@
     }
     el("details").hidden = false;
     status("detailsStatus", "");
+    syncControls();
   }
 
+  /**
+   * Reads the list on the page's connection. The read can outlive the connection - another tab deletes everything
+   * while it runs, and the connection is given up (versionchange) but still answers the read it had started - so the
+   * answer is shown only while it is still the page's connection; otherwise it lists records that may be gone. Returns
+   * whether the list was taken.
+   */
   async function refresh() {
-    records = db === null ? [] : await WalletStore.list(db);
+    var connection = db;
+    if (connection === null) {
+      records = [];
+      renderList();
+      return false;
+    }
+    var listed = await WalletStore.list(connection);
+    if (connection !== db) return false; // given up meanwhile: whoever reconnects lists the store as it now is
+    records = listed;
     renderList();
+    return true;
   }
 
+  /** One operation starts (true) or ends (false); the controls come back only when none is left. */
   function setBusy(value) {
-    busy = value;
+    busy = Math.max(0, busy + (value ? 1 : -1));
     renderList();
   }
 
@@ -200,9 +244,10 @@
   async function reconnect(message) {
     setBusy(true);
     try {
-      db = await connect();
-      await refresh();
-      status("storageStatus", message, false);
+      var connection = await connect();
+      db = connection;
+      // a newer change may have taken this connection away already; its own handler then says what happened
+      if (await refresh() && db === connection) status("storageStatus", message, false);
     } catch (e) {
       status("storageStatus", "The credential store could not be reopened: " + e.message + ". Reload this page.", false);
     } finally {
@@ -211,7 +256,7 @@
   }
 
   el("delete").addEventListener("click", async function () {
-    if (busy || selected === null || db === null) return;
+    if (busy > 0 || selected === null || db === null) return;
     var record = selected;
     setBusy(true);
     try {
@@ -230,7 +275,7 @@
   });
 
   el("deleteAll").addEventListener("click", async function () {
-    if (busy || db === null) return;
+    if (busy > 0 || db === null) return;
     setBusy(true);
     status("storageStatus", "Deleting everything kept in this browser…");
     // this page's own connection goes first, or it would block its own delete

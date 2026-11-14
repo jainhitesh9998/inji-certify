@@ -15,8 +15,20 @@
  *
  * Integers are exact. A value that fits a JavaScript number (|n| <= Number.MAX_SAFE_INTEGER) decodes to a number;
  * anything larger, in either direction, decodes to a BigInt so no digit is silently lost, and the page renders it as the
- * decimal string it is (String(bigint) is exact). Map keys are rendered in one stable form that cannot collide: an
- * integer key is its decimal digits, a byte-string key is h'..' hex, an array key is [..] and a map key is {..}.
+ * decimal string it is (String(bigint) is exact).
+ *
+ * Map keys come in two forms (P5-03a review round 3):
+ * - `Cbor.decode` (the offer page's display) gives a map as a plain object whose property names are the keys rendered
+ *   as strings: a text key is itself, an integer key its decimal digits, a byte-string key h'..' hex, an array key [..]
+ *   and a map key {..}. Distinct keys CAN render alike - the integer 1 and the text "1" are both "1" - so a map whose
+ *   keys render alike is refused as ambiguous, never overwritten. That refuses some valid CBOR (RFC 9052 header labels
+ *   are `int / tstr`, and 1 and "1" are two labels), which is why nothing that decides what is kept reads it.
+ * - `Cbor.decodeTyped`, `Cbor.spans` (and `Cbor.tagged`, `Cbor.Raw`) keep each key's type: a map is a `Map` whose keys
+ *   are a number (or BigInt) for an integer key, a string for a text key, and a `Cbor.OtherKey` for any other key, so
+ *   the integer 1 and the text "1" are two entries and a lookup names the type it means (`map.get(1)`, `map.get("1")`).
+ *   A key that is the same data item twice (RFC 8949 5.6: the same integer under a longer head, the same text under a
+ *   longer head or in indefinite-length chunks) is still a duplicate and refused.
+ *
  * A data item with bytes left over after it - at the top level or inside tag-24 content - is malformed and throws.
  *
  * Test vectors (verified with `node` against this file; run `node -e` with a Uint8Array of the bytes):
@@ -26,7 +38,10 @@
  *   bytes [0xa1,0x69,'_','_','p','r','o','t','o','_','_',0x01] -> an own "__proto__" key, Object.prototype untouched
  *   bytes [0x7f,0x01,0xff]          -> throws       (a text-string chunk that is not a text string)
  *   bytes [0x9f]                    -> throws       (unexpected end of input, never a hang)
- *   bytes a2 01 61 61 61 31 61 62   -> throws       (keys 1 and "1" render alike: ambiguous, never overwritten)
+ *   bytes a2 01 61 61 61 31 61 62   -> throws       (Cbor.decode: keys 1 and "1" render alike: ambiguous, never overwritten)
+ *   decodeTyped(a2 01 61 61 61 31 61 62) -> Map {1 => "a", "1" => "b"} (two keys of two types)
+ *   decodeTyped(a2 01 00 18 01 00)       -> throws (the integer 1 twice, under two heads: a duplicate)
+ *   decodeTyped(a2 61 61 00 7f 61 61 ff 00) -> throws (the text "a" twice, once in indefinite-length chunks)
  *   bytes [0xf9]                    -> throws       (truncated half float)
  *   bytes [0x1f] / [0xff] / [0x7c]  -> throws       (indefinite integer, stray break, reserved additional information)
  *   hex 1b0020000000000001          -> 9007199254740993n  (2^53+1: a BigInt, not 9007199254740992)
@@ -63,6 +78,8 @@ var Cbor = (function () {
     this.muted = 0;
     // how many arrays, maps and tags enclose the next item to decode, tag-24 content included (MAX_DEPTH)
     this.depth = 0;
+    // true: maps decode as `Map`s that keep their keys' types (review round 3); false: `Cbor.decode`'s plain objects
+    this.typed = false;
   }
   Reader.prototype.byte = function () {
     if (this.offset >= this.bytes.length) throw new Error("CBOR: unexpected end of input");
@@ -154,8 +171,10 @@ var Cbor = (function () {
   }
 
   /**
-   * One stable string for a map key. Integer keys are their decimal digits, byte strings are h'..', arrays and maps are
-   * bracketed forms of their own keys, so no two distinct keys render alike (the byte string 0x01 is h'01', never 1).
+   * One stable string for a map key in `Cbor.decode`'s plain objects. Integer keys are their decimal digits, byte strings
+   * are h'..', arrays and maps are bracketed forms of their own keys. The byte string 0x01 (h'01') and the integer 1 differ,
+   * but a text key is printed as itself, so the text "1" and the integer 1 render alike: a map holding both is refused by
+   * `Cbor.decode` as ambiguous. The typed forms (`decodeTyped`, `spans`) keep such keys apart instead.
    */
   function keyOf(key) {
     if (typeof key === "string") return key;
@@ -174,6 +193,84 @@ var Cbor = (function () {
       return "{" + entries.join(",") + "}";
     }
     return String(key); // numbers, BigInts, booleans
+  }
+
+  /**
+   * A map key that is neither an integer nor a text string, in a typed map (`decodeTyped`, `spans`): `value` is what the
+   * key decodes to, `identity` the data item it is (see `identityAt`). Wrapping it keeps a float, a tagged value or a
+   * simple value from ever sharing a `Map` key with an integer or a text key (`0.0` and `0` are two keys, RFC 8949 5.6).
+   */
+  function OtherKey(value, identity) {
+    this.value = value;
+    this.identity = identity;
+  }
+
+  /**
+   * The identity of the data item at {@code offset} as RFC 8949 5.6 compares map keys: the same data item, however it
+   * is serialized, has one identity, and items of different types never share one. An integer is "i" and its value
+   * whatever head carries it; a byte or text string is "b" or "t" and the hex of its content however it is chunked; an
+   * array its elements; a map its entries in any order; a tag "#" with its number and content; a float its value
+   * whatever its width; a simple value its number. So the integer 1 ("i1") and the text "1" ("t31") are two keys, and
+   * `61 61`, `78 01 61` and `7f 61 61 ff` are all the text "a" ("t61"). The bytes were already decoded once, so they are
+   * well formed and nest no deeper than the decoder allows.
+   */
+  function identityAt(bytes, offset) {
+    var reader = new Reader(bytes);
+    reader.offset = offset;
+    return identityOf(reader);
+  }
+
+  function identityOf(reader) {
+    var initial = reader.byte();
+    var major = initial >> 5;
+    var additional = initial & 31;
+    if (major === 7) {
+      if (additional < 24) return "s" + additional; // false, true, null, undefined
+      var number = float(reader, additional);
+      return "f" + (Object.is(number, -0) ? "-0" : String(number)); // -0.0 and 0.0 are two floats
+    }
+    var length = argument(reader, major, additional);
+    var parts = [];
+    switch (major) {
+      case 0:
+        return "i" + String(length);
+      case 1:
+        return "i" + String(typeof length === "bigint" ? -1n - length : -1 - length);
+      case 2:
+      case 3:
+        if (length < 0) {
+          while (reader.peek() !== 0xff) parts.push(hex(stringChunk(reader, major, major === 2 ? "byte string" : "text string")));
+          reader.byte();
+          return (major === 2 ? "b" : "t") + parts.join("");
+        }
+        return (major === 2 ? "b" : "t") + hex(reader.take(length));
+      case 4:
+        if (length < 0) {
+          while (reader.peek() !== 0xff) parts.push(identityOf(reader));
+          reader.byte();
+        } else {
+          for (var i = 0; i < length; i++) parts.push(identityOf(reader));
+        }
+        return "[" + parts.join(",") + "]";
+      case 5:
+        var entry = function () { var key = identityOf(reader); parts.push(key + ":" + identityOf(reader)); };
+        if (length < 0) {
+          while (reader.peek() !== 0xff) entry();
+          reader.byte();
+        } else {
+          for (var k = 0; k < length; k++) entry();
+        }
+        return "{" + parts.sort().join(",") + "}";
+      default: // 6
+        return "#" + String(length) + "(" + identityOf(reader) + ")";
+    }
+  }
+
+  /** A typed key as a message prints it: a text key quoted, an integer key bare, any other key by its identity. */
+  function keyText(key) {
+    if (typeof key === "string") return JSON.stringify(key);
+    if (typeof key === "number" || typeof key === "bigint") return String(key);
+    return key instanceof OtherKey ? key.identity : String(key);
   }
 
   /**
@@ -213,11 +310,32 @@ var Cbor = (function () {
     reader.muted++;
     var key = decode(reader, false);
     reader.muted--;
-    var rendered = keyOf(key);
-    if (reader.keys !== null && reader.muted === 0 && level < reader.limit) {
-      reader.keys.push({ path: reader.path.slice(), key: rendered, major: major, start: start, end: reader.offset });
+    var entry;
+    if (reader.typed) {
+      // the key's identity is the data item its bytes are, so the type is never lost (RFC 8949 5.6)
+      var identity = identityAt(reader.bytes, start);
+      var plain = major === 0 || major === 1 || major === 3; // int or tstr: the key is the number or the string itself
+      entry = { key: plain ? key : new OtherKey(key, identity), identity: identity, segment: segmentOf(key, major, identity) };
+    } else {
+      var rendered = keyOf(key);
+      entry = { key: rendered, identity: rendered, segment: rendered };
     }
-    return rendered;
+    if (reader.keys !== null && reader.muted === 0 && level < reader.limit) {
+      reader.keys.push({ path: reader.path.slice(), key: entry.segment, major: major, start: start, end: reader.offset });
+    }
+    return entry;
+  }
+
+  /**
+   * A typed key as one segment of a `spans` path, which `JSON.stringify` can print without merging two keys: a text key
+   * is its string and an integer key its number (array indexes are numbers too, but sit only under arrays), an integer
+   * beyond the safe range `{int: "digits"}`, and any other key `{key: identity}`. So `["issuerAuth"]`, `[33]` and
+   * `["33"]` are three paths.
+   */
+  function segmentOf(key, major, identity) {
+    if (major === 3) return key;
+    if (major === 0 || major === 1) return typeof key === "number" ? key : { int: String(key) };
+    return { key: identity };
   }
 
   function decodeValue(reader) {
@@ -273,11 +391,36 @@ var Cbor = (function () {
         return items;
       case 5:
         length = argument(reader, major, additional);
+        var put;
+        if (reader.typed) {
+          // a Map keeps each key's type: the integer 1 and the text "1" are two entries (RFC 9052 1.5: label = int / tstr)
+          var typedMap = new Map();
+          var seen = new Set();
+          put = function () {
+            var key = decodeKey(reader); // a key is not a value: neither it nor anything inside it gets a range
+            // RFC 8949 5.6: the same data item twice is a duplicate, whatever heads or chunks carry it. A string key that
+            // decodes like another without being the same item (only invalid UTF-8 can) is refused as well.
+            if (seen.has(key.identity) || typedMap.has(key.key)) throw new Error("CBOR: duplicate map key " + keyText(key.key));
+            seen.add(key.identity);
+            reader.path.push(key.segment);
+            typedMap.set(key.key, decode(reader));
+            reader.path.pop();
+          };
+          if (length < 0) {
+            while (reader.peek() !== 0xff) put();
+            reader.byte();
+            return typedMap;
+          }
+          if (typeof length !== "number") throw new Error("CBOR: map length " + String(length) + " is too large to read");
+          for (var t = 0; t < length; t++) put();
+          return typedMap;
+        }
         // no prototype: a decoded "__proto__" key is data, not an assignment to Object.prototype
         var map = Object.create(null);
-        var put = function () {
-          var rendered = decodeKey(reader); // a key is not a value: neither it nor anything inside it gets a range
-          // RFC 8949 5.6: duplicate keys make a map invalid; keys that only render alike (1 and "1") are refused too, never overwritten
+        put = function () {
+          var rendered = decodeKey(reader).key; // a key is not a value: neither it nor anything inside it gets a range
+          // RFC 8949 5.6: duplicate keys make a map invalid; keys that only render alike (1 and "1") are refused too, never
+          // overwritten - in this plain form only; decodeTyped keeps them apart
           if (Object.prototype.hasOwnProperty.call(map, rendered)) throw new Error("CBOR: duplicate or ambiguous map key " + rendered);
           reader.path.push(rendered);
           map[rendered] = decode(reader);
@@ -296,7 +439,7 @@ var Cbor = (function () {
         var tagged = decode(reader, false); // the tagged value is the item at this path, not a child of it
         if (tag === 24) { // embedded CBOR: exactly one data item, no padding around it
           if (!(tagged instanceof Uint8Array)) throw new Error("CBOR: tag 24 content is not a byte string");
-          return decodeItem(tagged, reader.depth); // the embedded item nests inside this one
+          return decodeItem(tagged, reader.depth, reader.typed); // the embedded item nests inside this one
         }
         if (tag === 2 || tag === 3) { // bignum: an unsigned magnitude in big-endian bytes, exact as a BigInt
           if (!(tagged instanceof Uint8Array)) throw new Error("CBOR: tag " + tag + " content is not a byte string");
@@ -318,11 +461,13 @@ var Cbor = (function () {
 
   /**
    * Decodes exactly one data item from {@code bytes}: anything left over means the input is not just that item.
-   * {@code depth} is how deep the bytes already sit (tag-24 content inside another item), so the cap holds across them.
+   * {@code depth} is how deep the bytes already sit (tag-24 content inside another item), so the cap holds across them;
+   * {@code typed} keeps the map keys' types (`Map`s), as the item around them does.
    */
-  function decodeItem(bytes, depth) {
+  function decodeItem(bytes, depth, typed) {
     var reader = new Reader(bytes);
     reader.depth = depth || 0;
+    reader.typed = typed === true;
     var item = decode(reader);
     if (!reader.done()) {
       throw new Error("CBOR: " + (bytes.length - reader.offset) + " trailing byte(s) after the data item");
@@ -336,15 +481,16 @@ var Cbor = (function () {
    * The decoded item and the `[start, end)` range of every array element and map value down to {@code depth} levels
    * below the root (the root's own children are depth 1). The ranges are recorded by `decode` as it reads, so they are
    * the input's own offsets: nothing is re-encoded, and a definite- or an indefinite-length item is read the same way.
-   * Each entry is `{path, start, end}`, the path being the rendered map keys and array indexes from the root. Nothing
-   * inside a map key is ever an entry.
+   * Each entry is `{path, start, end}`, the path being the typed map keys (see `segmentOf`) and array indexes from the
+   * root. Nothing inside a map key is ever an entry. The value is decoded typed (`Map`s), like `decodeTyped`.
    *
    * `keys` lists the keys of every map whose values are recorded (`{path, key, major, start, end}`: the map's own path,
-   * the rendered key, and the major type of the key's first byte), so a reader can refuse a key of the wrong type: the
-   * text key "33" and the integer key 33 render alike, and only `major` tells them apart.
+   * the key as a path segment, and the major type of the key's first byte), so a reader can refuse a key of the wrong
+   * type: a tag around a text key is still major type 6.
    */
   function ranges(bytes, depth) {
     var reader = new Reader(bytes);
+    reader.typed = true;
     reader.found = [];
     reader.keys = [];
     reader.limit = typeof depth === "number" ? depth : 0;
@@ -364,6 +510,7 @@ var Cbor = (function () {
   function tagOf(bytes, offset) {
     var at = offset === undefined ? 0 : offset;
     var reader = new Reader(bytes.subarray(at));
+    reader.typed = true; // the content is read as what it is: two keys of two types are not refused as alike
     var initial = reader.byte();
     if (initial >> 5 !== 6) return null;
     var tag = argument(reader, 6, initial & 31);
@@ -386,7 +533,7 @@ var Cbor = (function () {
   function Raw(input) {
     if (!(this instanceof Raw)) return new Raw(input);
     var bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
-    decodeItem(bytes);
+    decodeItem(bytes, 0, true); // typed: an item whose keys 1 and "1" are two labels is one well-formed item
     this.bytes = bytes;
   }
 
@@ -492,16 +639,30 @@ var Cbor = (function () {
   }
 
   return {
-    /** Decodes one data item from a Uint8Array (or an ArrayBuffer). */
+    /**
+     * Decodes one data item from a Uint8Array (or an ArrayBuffer), maps as plain objects with rendered keys (the offer
+     * page's display). A map whose keys render alike (1 and "1") is refused as ambiguous; `decodeTyped` reads it.
+     */
     decode: function (input) {
       var bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
       return decodeItem(bytes);
     },
 
     /**
-     * The decoded item and the byte range of every array element and map value down to {@code depth} levels below the
-     * root, as `{path, start, end}` entries, and those maps' keys with their major types (`keys`). Nothing is
-     * re-encoded: the ranges are the input's own offsets, and nothing inside a map key is ever a range.
+     * Decodes one data item keeping its map keys' types: every map is a `Map` keyed by a number (or BigInt) for an
+     * integer key, a string for a text key, a `Cbor.OtherKey` otherwise. Only a key that is the same data item twice is
+     * refused (RFC 8949 5.6).
+     */
+    decodeTyped: function (input) {
+      var bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+      return decodeItem(bytes, 0, true);
+    },
+
+    /**
+     * The decoded item (typed, as `decodeTyped`) and the byte range of every array element and map value down to
+     * {@code depth} levels below the root, as `{path, start, end}` entries whose paths keep the keys' types, and those
+     * maps' keys with their major types (`keys`). Nothing is re-encoded: the ranges are the input's own offsets, and
+     * nothing inside a map key is ever a range.
      */
     spans: function (input, depth) {
       var bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
@@ -533,6 +694,9 @@ var Cbor = (function () {
     Tagged: Tagged,
 
     /** Bytes emitted verbatim; the constructor refuses anything that is not exactly one data item. */
-    Raw: Raw
+    Raw: Raw,
+
+    /** A typed map's key that is neither an integer nor a text string: `{value, identity}`. */
+    OtherKey: OtherKey
   };
 })();

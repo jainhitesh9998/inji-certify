@@ -37,7 +37,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
-import { openPage, parseMarkup, check, equal, section, counts, Element, Text, FakeIndexedDB, REPO,
+import { openPage, parseMarkup, check, equal, section, counts, Element, Text, FakeIndexedDB, taskTimers, REPO,
     OID4VCI_ISSUER, OID4VCI_DOCUMENT, DEFAULT_AS_METADATA, offerByValue, offerDocument } from "./check-offer-page.mjs";
 
 const STATIC = resolve(REPO, "certify-service/src/main/resources/static/offer");
@@ -134,6 +134,10 @@ function coseKey(jwk, override) {
  * decodes to the very bstr a payload is); `protectedAsMap` writes element 0 as a map; `itemForms` writes an element as
  * a bare map (`"bare"`) or `#6.55799(map)` (`"tag55799"`), its digest taken over exactly those bytes so that only the
  * tag-24 check can refuse it.
+ *
+ * The COSE headers and the MSO's typed maps (review round 3): `protectedRaw` is the protected header's map content (the
+ * builder wraps it in the bstr), `unprotectedRaw(x5chainValue)` writes the whole unprotected header map, and
+ * `valueDigests(digests)` replaces the MSO's valueDigests (a text DigestID, say).
  */
 function buildIssuerSigned(options) {
     const forms = options.forms || {};
@@ -177,7 +181,7 @@ function buildIssuerSigned(options) {
     const mso = new Map([
         ["version", "1.0"],
         ["digestAlgorithm", algorithm],
-        ["valueDigests", digests],
+        ["valueDigests", options.valueDigests ? options.valueDigests(digests) : digests],
         ["deviceKeyInfo", new Map([["deviceKey", coseKey(options.holder, options.deviceKey)]])],
         ["docType", options.docType],
         ["validityInfo", new Map([["signed", "2026-11-01T00:00:00Z"], ["validFrom", "2026-11-01T00:00:00Z"],
@@ -193,10 +197,11 @@ function buildIssuerSigned(options) {
     // issuerAuth: [protected, unprotected, payload, signature] (RFC 9052 4.2); element 2 is a bstr either way
     const issuerAuth = new Bytes();
     issuerAuth.add(forms.indefiniteLengths ? Uint8Array.of(0x9f) : head(4, 4));
-    const protectedMap = Cbor.encode(new Map([[1, -7]]));
+    const protectedMap = options.protectedRaw === undefined ? Cbor.encode(new Map([[1, -7]])) : Buffer.from(options.protectedRaw);
     issuerAuth.add(options.protectedAsMap ? protectedMap : bstr(protectedMap));
-    issuerAuth.add(Buffer.concat([Buffer.from(head(5, 1)), head(0, 33),
-        Buffer.from(options.x5chainRaw === undefined ? x5chainValue : options.x5chainRaw)]));
+    issuerAuth.add(options.unprotectedRaw !== undefined ? Buffer.from(options.unprotectedRaw(x5chainValue))
+        : Buffer.concat([Buffer.from(head(5, 1)), head(0, 33),
+            Buffer.from(options.x5chainRaw === undefined ? x5chainValue : options.x5chainRaw)]));
     issuerAuth.add(options.payloadWrap === undefined ? bstr(payload)
         : Buffer.concat([Buffer.from(head(6, options.payloadWrap)), options.payloadWrap === 24 ? bstr(bstr(payload)) : bstr(payload)]));
     issuerAuth.add(bstr(new Uint8Array(64))); // a placeholder signature: the page checks structure, not this signature
@@ -414,7 +419,9 @@ function openWallet(indexedDB, options = {}) {
         location: { href: pageUrl.href, origin: pageUrl.origin, pathname: pageUrl.pathname },
         fetch,
         console: { log: () => {}, warn: () => {}, error: () => {} },
-        setTimeout, clearTimeout, URL, URLSearchParams, Blob, crypto: webcrypto,
+        // a timer callback is a task of its own (the harness fake's transactions of the task before are inactive in it)
+        setTimeout: taskTimers.setTimeout, clearTimeout: taskTimers.clearTimeout,
+        URL, URLSearchParams, Blob, crypto: webcrypto,
         TextEncoder, TextDecoder, btoa, atob, structuredClone, indexedDB,
     });
     let scriptError = null;
@@ -432,6 +439,39 @@ function openWallet(indexedDB, options = {}) {
 
 async function settle() {
     for (let i = 0; i < 200; i++) await new Promise((done) => setImmediate(done));
+}
+
+/** Real time, for what a page does on a timer (the offer page's "waiting for the store" note): bounded, never a hang. */
+async function waitForMs(predicate, ms) {
+    const until = Date.now() + ms;
+    while (Date.now() < until) {
+        if (predicate()) return true;
+        await new Promise((done) => setTimeout(done, 5));
+    }
+    return predicate();
+}
+
+/**
+ * The wallet page's storage status and its "Delete everything" control, written in one ordered trace: `status: <text>`
+ * and `deleteAll enabled` / `deleteAll disabled`. A control that came back for a moment and went off again still shows.
+ */
+function traceControls(wallet) {
+    const trace = [];
+    const node = wallet.el("storageStatus");
+    const descriptor = Object.getOwnPropertyDescriptor(Element.prototype, "textContent");
+    Object.defineProperty(node, "textContent", {
+        configurable: true,
+        get() { return descriptor.get.call(node); },
+        set(value) { trace.push("status: " + String(value)); descriptor.set.call(node, value); },
+    });
+    const button = wallet.el("deleteAll");
+    let disabled = button.disabled;
+    Object.defineProperty(button, "disabled", {
+        configurable: true,
+        get() { return disabled; },
+        set(value) { disabled = !!value; trace.push("deleteAll " + (disabled ? "disabled" : "enabled")); },
+    });
+    return trace;
 }
 
 /**
@@ -620,8 +660,9 @@ async function walletDeleteScenarios(makeIndexedDB, label, { closeWaitsForTransa
         check(`${label}: and the page reports the real outcome: deleted`,
             wallet.el("storageStatus").textContent === "Everything kept in this browser was deleted.", wallet.el("storageStatus").textContent);
         equal(`${label}: the list follows`, wallet.el("records").children.length, 0);
-        equal(`${label}: the controls come back (Delete everything stays off for an empty list)`,
-            [wallet.el("deleteAll").disabled, wallet.el("delete").disabled], [true, false]);
+        // review round 3 (nit): Delete stays off too, as nothing is selected - it waits for a credential to be chosen
+        equal(`${label}: the controls come back (Delete everything off for an empty list, Delete off with nothing selected)`,
+            [wallet.el("deleteAll").disabled, wallet.el("delete").disabled], [true, true]);
         equal(`${label}: nothing is kept any more`, await keptCount(indexedDB), 0);
         await pressed;
     });
@@ -745,8 +786,8 @@ await section("1. Cbor.encode", async () => {
 // 2. Mdoc.readIssuerSigned: the raw slices are the issued items, exactly as the bytes carry them
 await section("2. readIssuerSigned", async () => {
     const read = Mdoc.readIssuerSigned(MDL_A.bytes);
-    equal("the docType and algorithm are read from the MSO", [read.issuerAuth.mso.docType, read.issuerAuth.mso.digestAlgorithm],
-        [DOC_TYPE, "SHA-256"]);
+    equal("the docType and algorithm are read from the MSO", [read.issuerAuth.mso.get("docType"),
+        read.issuerAuth.mso.get("digestAlgorithm")], [DOC_TYPE, "SHA-256"]);
     equal("the IssuerAuth keeps its ES256 algorithm", read.issuerAuth.alg, -7);
     equal("every element is read", read.nameSpaces[MDL_NAMESPACE].map((item) => item.elementIdentifier),
         Object.keys(MDL_ELEMENTS[MDL_NAMESPACE]));
@@ -821,7 +862,7 @@ await section("2. readIssuerSigned", async () => {
     // 1: a #6.18-tagged COSE_Sign1 reads the same, and `raw` keeps the tag head
     const tagged = Mdoc.readIssuerSigned(MDL_TAGGED_COSE.bytes);
     equal("a #6.18-tagged COSE_Sign1 is read, tag and all", hex(tagged.issuerAuth.raw.subarray(0, 1)), "d2");
-    equal("and its MSO comes out of the bstr payload", tagged.issuerAuth.mso.docType, DOC_TYPE);
+    equal("and its MSO comes out of the bstr payload", tagged.issuerAuth.mso.get("docType"), DOC_TYPE);
     equal("the tagged COSE_Sign1's raw slice is the fixture's", hex(tagged.issuerAuth.raw),
         hex(MDL_TAGGED_COSE.bytes.subarray(MDL_TAGGED_COSE.issuerAuthRange.start, MDL_TAGGED_COSE.issuerAuthRange.end)));
     equal("its elements are read as well", tagged.nameSpaces[MDL_NAMESPACE].length, Object.keys(MDL_ELEMENTS[MDL_NAMESPACE]).length);
@@ -946,16 +987,171 @@ await section("2. readIssuerSigned", async () => {
     refusedWith("a walk with two items at one path", () => doubled.readIssuerSigned(MDL_A.bytes), /two data items sit at \["issuerAuth"\]/);
 });
 
+// review round 3: helpers of sections 2b and 2c
+const cat = (...parts) => new Uint8Array(Buffer.concat(parts.map((part) => Buffer.from(part))));
+const verdictOf = (built, publicJwk = HOLDER_A_JWK) => Mdoc.checkKeepable({ issuerSigned: built.bytes, doctype: DOC_TYPE,
+    publicJwk });
+const shapedMdl = (extra) => buildIssuerSigned(Object.assign({ docType: DOC_TYPE, holder: HOLDER_A_JWK, elements: MDL_ELEMENTS }, extra));
+// {1: -7, "1": "private extension"}: RFC 9052 1.5, label = int / tstr, so these are two labels
+const TWO_LABELS = cat(head(5, 2), head(0, 1), head(1, 6), tstr("1"), tstr("private extension"));
+
+// 2b. review round 3, major 1: the decoder keeps map keys' types, and still refuses a key that is one data item twice
+await section("2b. typed map keys in the decoder", async () => {
+    const twoLabels = TWO_LABELS;
+    // the decoder: one map, two keys of two types
+    const typed = Cbor.decodeTyped(twoLabels);
+    equal("decodeTyped keeps the integer key 1 and the text key \"1\" apart", [typed.size, typed.get(1), typed.get("1")],
+        [2, -7, "private extension"]);
+    const walked = Cbor.spans(twoLabels, 1);
+    equal("Cbor.spans records both values, each under a path of its own type", walked.ranges.map((range) =>
+        [range.path, range.start, range.end]), [[[1], 2, 3], [["1"], 5, 23]]);
+    equal("and both keys, with their major types", walked.keys.map((key) => [key.key, key.major]), [[1, 0], ["1", 3]]);
+    check("Cbor.Raw takes the map as the one well-formed item it is", hex(Cbor.encode(Cbor.Raw(twoLabels))) === hex(twoLabels));
+    equal("Cbor.tagged reads it inside tag 24", Cbor.tagged(cat(head(6, 24), bstr(twoLabels))).tag, 24);
+    // Cbor.decode is the offer page's display and is unchanged (plan 4.3): its plain objects cannot hold both keys
+    refusedWith("Cbor.decode (the display form) still refuses the keys it would render alike",
+        () => Cbor.decode(twoLabels), /ambiguous map key 1/);
+
+    // the same data item twice is still a duplicate (RFC 8949 5.6), whatever head or chunks carry it
+    for (const [label, first, second] of [
+        ["the integer 1 under 01 and 18 01", head(0, 1), [0x18, 0x01]],
+        ["the integer 1 under 01 and 19 00 01", head(0, 1), [0x19, 0x00, 0x01]],
+        ["the integer 1 under 01 and 1b 00..01", head(0, 1), [0x1b, 0, 0, 0, 0, 0, 0, 0, 0x01]],
+        ["the integer -7 under 26 and 38 06", head(1, 6), [0x38, 0x06]],
+        ["the text \"1\" under 61 and 78 01", tstr("1"), [0x78, 0x01, 0x31]],
+        ["the text \"1\" under 61 and 79 00 01", tstr("1"), [0x79, 0x00, 0x01, 0x31]],
+        ["the text \"1\" and the same text in indefinite-length chunks", tstr("1"), [0x7f, 0x61, 0x31, 0xff]],
+        ["the text \"ab\" and \"a\" \"b\" as two chunks", tstr("ab"), [0x7f, 0x61, 0x61, 0x61, 0x62, 0xff]],
+        ["the byte string h'01' and the same bytes in chunks", bstr([1]), [0x5f, 0x41, 0x01, 0xff]],
+    ]) {
+        const doubled = cat(head(5, 2), first, head(0, 0), second, head(0, 0));
+        refusedWith(`decodeTyped: ${label} is one key twice`, () => Cbor.decodeTyped(doubled), /duplicate map key/);
+        refusedWith(`Cbor.spans: ${label} is one key twice`, () => Cbor.spans(doubled, 1), /duplicate map key/);
+    }
+    // two text keys whose bytes differ but decode alike (invalid UTF-8, each one U+FFFD) are refused, never merged
+    refusedWith("two invalid UTF-8 text keys that decode to the same string", () => Cbor.decodeTyped(cat(head(5, 2),
+        [0x61, 0xff], head(0, 0), [0x61, 0xfe], head(0, 1))), /duplicate map key/);
+    // ... while two distinct items of other types stay two keys (0 and 0.0, RFC 8949 5.6)
+    equal("the integer 0 and the float 0.0 are two keys", Cbor.decodeTyped(cat(head(5, 2), head(0, 0), head(0, 1),
+        [0xf9, 0x00, 0x00], head(0, 2))).size, 2);
+    refusedWith("0.0 as a half and as a double is one float twice", () => Cbor.decodeTyped(cat(head(5, 2),
+        [0xf9, 0x00, 0x00], head(0, 1), [0xfb, 0, 0, 0, 0, 0, 0, 0, 0], head(0, 2))), /duplicate map key/);
+});
+
+// 2c. review round 3, major 1 and minor 4: the reader looks labels up by type, takes only int / tstr labels, and no
+// label in both header buckets (RFC 9052 1.5 and 3). Only Mdoc's own interface is used, so these run on any build
+await section("2c. COSE header labels and typed lookups in readIssuerSigned", async () => {
+    const shaped = shapedMdl;
+    const twoLabels = TWO_LABELS;
+    // what the reader makes of the bytes, or its refusal: a refusal of a conformant credential is a failed check, not a crash
+    const readsAs = (label, bytes, pick, expected) => {
+        let got;
+        try {
+            got = pick(Mdoc.readIssuerSigned(bytes));
+        } catch (error) {
+            got = "refused: " + error.message;
+        }
+        equal(label, got, expected);
+    };
+    // the IssuerAuth: a protected header with both labels is a conformant credential, and alg is the integer label
+    const bothProtected = shaped({ protectedRaw: twoLabels });
+    readsAs("a protected header {1: -7, \"1\": ...} is read, and alg is the integer label's -7", bothProtected.bytes,
+        (read) => read.issuerAuth.alg, -7);
+    const bothVerdict = await verdictOf(bothProtected);
+    check("checkKeepable keeps a credential whose protected header carries 1 and \"1\"", bothVerdict.ok === true,
+        JSON.stringify(bothVerdict));
+    // an unprotected header with x5chain (33) and a text label "33": the chain is the integer label's
+    const textAndInt = shaped({ unprotectedRaw: (chain) => cat(head(5, 2), tstr("33"), tstr("not a chain"), head(0, 33), chain) });
+    readsAs("x5chain is the integer label 33, never the text label \"33\"", textAndInt.bytes,
+        (read) => read.issuerAuth.x5chain.map(hex), [hex(DUMMY_DER)]);
+    check("checkKeepable keeps it", (await verdictOf(textAndInt)).ok === true);
+    const textOnly = shaped({ unprotectedRaw: () => cat(head(5, 1), tstr("33"), bstr(DUMMY_DER)) });
+    readsAs("a text label \"33\" alone is not an x5chain", textOnly.bytes, (read) => read.issuerAuth.x5chain, []);
+    // a COSE_Key with a text label "1" next to kty: still the holder's EC2 P-256 key (RFC 9052 7: label = int / tstr)
+    const deviceKey = coseKey(HOLDER_A_JWK);
+    deviceKey.set("1", "a text label beside kty");
+    const keyed = shaped({ deviceKey });
+    const keyedVerdict = await verdictOf(keyed);
+    check("checkKeepable reads the deviceKey's integer labels beside a text label \"1\"", keyedVerdict.ok === true,
+        JSON.stringify(keyedVerdict));
+    // DigestID = uint: a valueDigests keyed by the text "0", "1", ... is not the MSO's digest for item 0, 1, ...
+    const textDigestIds = shaped({ valueDigests: (digests) => new Map([...digests].map(([namespace, byId]) =>
+        [namespace, new Map([...byId].map(([id, digest]) => [String(id), digest]))])) });
+    const textVerdict = await verdictOf(textDigestIds);
+    check("checkKeepable refuses digests filed under text DigestIDs (the uint key is the one that counts)",
+        textVerdict.ok === false && textVerdict.code === "digest", JSON.stringify(textVerdict));
+
+    // a label of another type is not a COSE label (RFC 9052 1.5, 3)
+    for (const [label, key] of [
+        ["a byte string", bstr([0x21])],
+        ["a float (33.0)", [0xfb, 0x40, 0x40, 0x80, 0, 0, 0, 0, 0]],
+        ["a tag around the integer 33 (#6.1(33))", [0xc1, 0x18, 0x21]],
+        ["an array", cat(head(4, 1), head(0, 33))],
+        ["true", [0xf5]],
+    ]) {
+        const built = shaped({ unprotectedRaw: (chain) => cat(head(5, 2), head(0, 33), chain, key, head(0, 0)) });
+        refusedWith(`an unprotected label that is ${label}`, () => Mdoc.readIssuerSigned(built.bytes),
+            /a COSE label is an int or a tstr/);
+    }
+    const tagged33 = shaped({ protectedRaw: cat(head(5, 2), head(0, 1), head(1, 6), [0xc1, 0x18, 0x21], head(0, 0)) });
+    refusedWith("a protected label that is a tag", () => Mdoc.readIssuerSigned(tagged33.bytes), /protected header has a label that is a tag/);
+    // the round-2 decoy, in a header: a label that is the map {33: decoy}. Nothing inside it is a range, and it is refused
+    const decoyDer = Uint8Array.from([0x30, 0x03, 0x02, 0x01, 0x09]);
+    const decoyKey = cat(head(5, 1), head(0, 33), bstr(decoyDer));
+    const decoyHeader = shaped({ unprotectedRaw: (chain) => cat(head(5, 2), head(0, 33), chain, decoyKey, head(0, 0)) });
+    const decoyBytes = cat(head(5, 2), head(0, 33), bstr(DUMMY_DER), decoyKey, head(0, 0));
+    const decoyKeyStart = 1 + head(0, 33).length + bstr(DUMMY_DER).length;
+    equal("Cbor.spans records nothing inside a header label that is a map", Cbor.spans(decoyBytes, 2).ranges
+        .filter((range) => range.start >= decoyKeyStart && range.end <= decoyKeyStart + decoyKey.length), []);
+    equal("only the real x5chain is recorded at [33]", Cbor.spans(decoyBytes, 2).ranges
+        .filter((range) => JSON.stringify(range.path) === "[33]").map((range) => [range.start, range.end]),
+        [[1 + head(0, 33).length, decoyKeyStart]]);
+    refusedWith("a header label that is a map holding a decoy x5chain", () => Mdoc.readIssuerSigned(decoyHeader.bytes),
+        /has a label that is a map; a COSE label is an int or a tstr/);
+    // true duplicates in a header are refused, under any encoding
+    refusedWith("a protected header with the label 1 twice (01, 18 01)", () => Mdoc.readIssuerSigned(shaped({
+        protectedRaw: cat(head(5, 2), head(0, 1), head(1, 6), [0x18, 0x01], head(1, 6)) }).bytes), /duplicate map key 1/);
+    refusedWith("an unprotected header with the label \"x\" twice (one in chunks)", () => Mdoc.readIssuerSigned(shaped({
+        unprotectedRaw: (chain) => cat(head(5, 3), head(0, 33), chain, tstr("x"), head(0, 0), [0x7f, 0x61, 0x78, 0xff], head(0, 1)) })
+        .bytes), /duplicate map key "x"/);
+
+    // minor 4: a label in both buckets (RFC 9052 3). A stand-in x5chain in the protected bucket next to the real one in
+    // the unprotected bucket, where ISO/IEC 18013-5 9.1.2.4 puts it, must not be what the reader returns
+    const FAKE_DER = Uint8Array.from([0x30, 0x03, 0x02, 0x01, 0x66]);
+    const shadowed = shaped({ protectedRaw: cat(head(5, 2), head(0, 1), head(1, 6), head(0, 33), bstr(FAKE_DER)) });
+    refusedWith("x5chain in the protected and the unprotected header", () => Mdoc.readIssuerSigned(shadowed.bytes),
+        /label 33 is in both the protected and the unprotected header/);
+    const shadowVerdict = await verdictOf(shadowed);
+    check("checkKeepable refuses the shadowed x5chain", shadowVerdict.ok === false && shadowVerdict.code === "issuer-signed",
+        JSON.stringify(shadowVerdict));
+    refusedWith("alg in both headers", () => Mdoc.readIssuerSigned(shaped({
+        unprotectedRaw: (chain) => cat(head(5, 2), head(0, 1), head(1, 6), head(0, 33), chain) }).bytes),
+        /label 1 is in both/);
+    const textBeside = shaped({ unprotectedRaw: (chain) => cat(head(5, 2), tstr("1"), tstr("not alg"), head(0, 33), chain) });
+    readsAs("the integer label 1 in one bucket and the text label \"1\" in the other are two labels: both kept",
+        textBeside.bytes, (read) => read.issuerAuth.alg, -7);
+
+    // a namespace named "__proto__" is a namespace like any other: its items are checked, never hidden
+    const proto = buildIssuerSigned({ docType: DOC_TYPE, holder: HOLDER_A_JWK,
+        elements: { [MDL_NAMESPACE]: { given_name: "Lorem" }, ["__proto__"]: { proto_element: "a value" } }, tamper: "proto_element" });
+    readsAs("readIssuerSigned lists a \"__proto__\" namespace", proto.bytes, (read) => Object.keys(read.nameSpaces).sort(),
+        ["__proto__", MDL_NAMESPACE].sort());
+    const protoVerdict = await verdictOf(proto);
+    check("and checkKeepable checks its items: a changed one is refused", protoVerdict.ok === false && protoVerdict.code === "digest",
+        JSON.stringify(protoVerdict));
+});
+
 // 3. the IssuerSigned Certify's own MdocFormatter produced (plan 4.12): the layout real mDLs arrive in
 await section("3. Certify's own IssuerSigned", async () => {
     const read = Mdoc.readIssuerSigned(CERTIFY_ISSUER_SIGNED);
-    equal("the fixture is the mDL the formatter issued", read.issuerAuth.mso.docType, DOC_TYPE);
-    equal("its MSO version is the formatter's", read.issuerAuth.mso.version, "1.0");
-    equal("the IssuerAuth payload is a bstr holding the tag-24 MSO", read.issuerAuth.mso.digestAlgorithm, "SHA-256");
+    equal("the fixture is the mDL the formatter issued", read.issuerAuth.mso.get("docType"), DOC_TYPE);
+    equal("its MSO version is the formatter's", read.issuerAuth.mso.get("version"), "1.0");
+    equal("the IssuerAuth payload is a bstr holding the tag-24 MSO", read.issuerAuth.mso.get("digestAlgorithm"), "SHA-256");
+    const validityInfo = read.issuerAuth.mso.get("validityInfo");
     check("the validity window is the formatter's tdate text",
-        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(read.issuerAuth.mso.validityInfo.validFrom)
-        && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(read.issuerAuth.mso.validityInfo.validUntil),
-        JSON.stringify(read.issuerAuth.mso.validityInfo));
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(validityInfo.get("validFrom"))
+        && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(validityInfo.get("validUntil")),
+        JSON.stringify([...validityInfo]));
     // Certify signs without the IACA, so the chain is the DSC alone: RFC 9360 section 2's single bstr, which this
     // reader used to refuse outright
     equal("the DSC-only x5chain arrives as a single bstr and is read as one certificate", read.issuerAuth.x5chain.length, 1);
@@ -965,7 +1161,7 @@ await section("3. Certify's own IssuerSigned", async () => {
     equal("mdl-a carries the 15 elements the demo issues to mdl-demo-1 (plan 4.12)",
         items.map((item) => item.elementIdentifier).sort(), MDL_DEMO_1_ELEMENTS.slice().sort());
     for (const item of items) {
-        const expected = read.issuerAuth.mso.valueDigests[MDL_NAMESPACE][String(item.digestID)];
+        const expected = read.issuerAuth.mso.get("valueDigests").get(MDL_NAMESPACE).get(item.digestID);
         equal(`Certify fixture: ${item.elementIdentifier} hashes to its valueDigest`, hex(hash("sha256", item.raw)), hex(expected));
     }
     const verdict = await Mdoc.checkKeepable({ issuerSigned: CERTIFY_ISSUER_SIGNED, doctype: DOC_TYPE,
@@ -1240,9 +1436,12 @@ await section("12. the wallet page", async () => {
     equal("the list shows both", list.children.length, 2);
     equal("and is not empty", wallet.el("empty").hidden, true);
     equal("Delete everything is enabled", wallet.el("deleteAll").disabled, false);
+    // review round 3 (nit): Delete acts on the selected credential, so it is off until one is selected
+    equal("Delete is disabled while nothing is selected", wallet.el("delete").disabled, true);
     const openedDetails = list.children[0].children[0];
     await openedDetails.fire("click");
     equal("the details view opens", wallet.el("details").hidden, false);
+    equal("and Delete is enabled for the selected credential", wallet.el("delete").disabled, false);
     check("the details name the docType and show an element", wallet.el("detailsTable").children.length >= 6,
         String(wallet.el("detailsTable").children.length));
     equal("the details title is the credential's label", wallet.el("detailsTitle").textContent, DOC_TYPE);
@@ -1354,6 +1553,119 @@ await section("15. the wallet page asks the switch before it stores anything", a
     equal("switched on: one connection", on.opens, 1);
     equal("the wallet page's only request is its own config (I9)", onWallet.requests.map((request) => [request.method, request.url]),
         [["GET", "https://credentials.example/v1/certify/offer/wallet/config"]]);
+});
+
+// 16. review round 3, minor 2: a keep that waits behind another tab's "Delete everything" does not hold the run. The
+// store's open queues behind the pending delete (IndexedDB 3.0 5.1); the harness fake models that queue
+await section("16. a keep waiting for the store does not hold the run", async () => {
+    const fake = new FakeIndexedDB();
+    await seedRecords(fake, 1);
+    const stubborn = await storeOn(fake).open();
+    stubborn.onversionchange = null; // another wallet tab that does not close, so the delete stays pending
+    const blocked = [];
+    let deleted = false;
+    storeOn(fake).deleteEverything(() => blocked.push("blocked")).then(() => { deleted = true; });
+    await waitFor(() => blocked.length === 1);
+    equal("probe: another tab's delete is pending, blocked by a tab that stays open", [blocked.length, deleted], [1, false]);
+
+    const page = openOffer({ indexedDB: fake });
+    await page.settle();
+    page.el("subject").value = "mdl-demo-1";
+    await page.createOffer();
+    let handlerDone = false;
+    const run = page.runWallet().then(() => { handlerDone = true; });
+    const back = await waitForMs(() => page.el("walletStatus").textContent.includes("Credential issued")
+        && page.el("wallet").disabled === false && page.el("create").disabled === false, 3000);
+    check("the run ends - Redeem and Create come back - while the store waits behind the delete", back,
+        JSON.stringify([page.el("walletStatus").textContent, page.el("wallet").disabled, page.el("create").disabled]));
+    const told = await waitForMs(() => page.el("keepNote").textContent.includes("Waiting for the credential store"), 3000);
+    check("the page says it is waiting for the store, and why", told && page.el("keepNote").hidden === false
+        && page.el("keepNote").textContent.includes("another tab is deleting it"), page.el("keepNote").textContent);
+    equal("nothing is written while the delete is pending", credentialsIn(fake).map((record) => record.id), ["seed-0"]);
+    equal("and the keep is still waiting", handlerDone, false);
+
+    stubborn.close();
+    const kept = await waitForMs(() => page.el("keepNote").textContent.includes("Kept in this browser"), 3000);
+    check("once the other tab closes, the delete finishes and the keep reports its outcome", kept, page.el("keepNote").textContent);
+    equal("the delete happened first, and the credential went into the new store", [deleted, credentialsIn(fake).length,
+        credentialsIn(fake).length === 1 && hex(credentialsIn(fake)[0].issuerSigned) === hex(MDL_A.bytes)], [true, 1, true]);
+    await run;
+});
+
+// 17. review round 3, minor 3: a wallet tab whose first list read outlives its connection. Another tab deletes
+// everything while the startup getAll is outstanding (the fake's `hold` keeps that read pending)
+await section("17. a list read on a given-up connection is never shown", async () => {
+    const fake = new FakeIndexedDB();
+    await seedRecords(fake, 2);
+    const stubborn = await storeOn(fake).open();
+    stubborn.onversionchange = null; // keeps the delete pending after the wallet tab has let go
+    const startupList = fake.hold("getAll", "credentials");
+    const wallet = openWallet(fake);
+    check("the wallet page's scripts ran", wallet.scriptError === null, wallet.scriptError && String(wallet.scriptError.stack));
+    const trace = traceControls(wallet);
+    await startupList.reached;
+    let deleted = false;
+    storeOn(fake).deleteEverything().then(() => { deleted = true; });
+    const told = await waitFor(() => wallet.el("storageStatus").textContent.includes("Another wallet tab is deleting everything"));
+    check("the tab hears of the delete while its first list read is still outstanding",
+        told && startupList.request.readyState === "pending", wallet.el("storageStatus").textContent);
+    startupList.release();
+    await waitFor(() => startupList.request.readyState === "done");
+    await settle();
+    equal("probe: the read answered on the given-up connection, and the delete still waits for the other tab",
+        [startupList.request.result.length, deleted], [2, false]);
+    equal("the answer is dropped: no deleted record is listed, so none can be clicked", [wallet.el("records").children.length,
+        listButtons(wallet).filter((button) => !button.disabled).length], [0, 0]);
+    equal("Delete everything and Delete stay off while the tab reconnects", [wallet.el("deleteAll").disabled,
+        wallet.el("delete").disabled], [true, true]);
+
+    // the reconnect's own read, held so the controls can be seen while it runs; another tab keeps a credential meanwhile
+    const reconnectList = fake.hold("getAll", "credentials");
+    stubborn.close();
+    await reconnectList.reached;
+    fake.databases.get(DB_NAME).stores.get("credentials").putClone({ id: "kept-after", format: "mso_mdoc", docType: DOC_TYPE,
+        issuerSigned: MDL_A.bytes, storedAt: 99, label: "Kept after the delete" });
+    await settle();
+    equal("while the reconnect lists the store, nothing is listed and every control is off", [wallet.el("records").children.length,
+        wallet.el("deleteAll").disabled, wallet.el("delete").disabled], [0, true, true]);
+    reconnectList.release();
+    await waitFor(() => wallet.el("records").children.length === 1 && wallet.el("deleteAll").disabled === false);
+    check("the tab says another tab deleted everything", wallet.el("storageStatus").textContent.includes("Another wallet tab deleted everything"),
+        wallet.el("storageStatus").textContent);
+    equal("the list is the store as it now is", listButtons(wallet).map((button) => button.textContent), ["Kept after the delete"]);
+    equal("and the controls are back (Delete waits for a selection)", [wallet.el("deleteAll").disabled, listButtons(wallet)[0].disabled,
+        wallet.el("delete").disabled], [false, false, true]);
+    // the startup ending must not clear the reconnect's busy: no control came back before the reconnect had finished
+    const enabledAt = trace.indexOf("deleteAll enabled");
+    const reconnectedAt = trace.findIndex((entry) => entry.startsWith("status: Another wallet tab deleted everything"));
+    check("no control came back before the reconnect said it was done", reconnectedAt >= 0 && enabledAt > reconnectedAt,
+        JSON.stringify(trace));
+});
+
+// 18. review round 3 (nit): a page timer is a task of its own, so the fake's transactions of the task before are
+// inactive in its callback (IndexedDB 3.0 2.7.1), as they are in a browser
+await section("18. a page timer starts a task", async () => {
+    const fake = new FakeIndexedDB();
+    const store = storeOn(fake);
+    const db = await store.open();
+    // two timers due together run back to back in Node's timers phase, before any setImmediate: the second callback is
+    // a task after the first, so the transaction the first one made is inactive in it
+    const seen = await new Promise((done) => {
+        let objectStore = null;
+        taskTimers.setTimeout(() => {
+            objectStore = db.transaction(store.CREDENTIALS, "readonly").objectStore(store.CREDENTIALS);
+        }, 0);
+        taskTimers.setTimeout(() => {
+            try {
+                objectStore.count();
+                done("active");
+            } catch (error) {
+                done(error.name);
+            }
+        }, 0);
+    });
+    equal("a request from the next timer's callback meets an inactive transaction", seen, "TransactionInactiveError");
+    db.close();
 });
 
 } finally {
