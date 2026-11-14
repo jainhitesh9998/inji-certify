@@ -379,6 +379,18 @@ var Mdoc = (function () {
    * the issuer metadata the run fetched, this browser's holder public JWK (`{kty, crv, x, y}` base64url) and how many
    * credentials are already kept.
    */
+  /**
+   * The sign bit of a base64url P-256 y coordinate (its last byte's lowest bit), as a compressed COSE_Key carries it
+   * in label -3 (RFC 9053 section 7.1.1: true for an odd y); null when `y` is not base64url.
+   */
+  function ySign(y) {
+    if (typeof y !== "string" || !/^[A-Za-z0-9_-]+$/.test(y)) {
+      return null;
+    }
+    var binary = atob(y.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((y.length + 3) % 4));
+    return binary.length > 0 ? (binary.charCodeAt(binary.length - 1) & 1) === 1 : null;
+  }
+
   async function checkKeepable(options) {
     var bytes = bytesOf(options.issuerSigned);
     var stored = typeof options.stored === "number" ? options.stored : 0;
@@ -426,11 +438,14 @@ var Mdoc = (function () {
       return refuse("device-key", "The credential's deviceKey is not a P-256 key (label -1 must be 1); this page holds"
         + " P-256 keys only.");
     }
-    if (!(deviceKey.get(-2) instanceof Uint8Array) || !(deviceKey.get(-3) instanceof Uint8Array)) {
+    // -3 (y) is a bstr, or a bool for a compressed point whose y is the root of that sign (RFC 9053 section 7.1.1)
+    var keyY = deviceKey.get(-3);
+    if (!(deviceKey.get(-2) instanceof Uint8Array) || !(keyY instanceof Uint8Array || typeof keyY === "boolean")) {
       return refuse("device-key", "The credential's deviceKey carries no P-256 coordinates (labels -2 and -3).");
     }
     var publicJwk = options.publicJwk || {};
-    if (base64url(deviceKey.get(-2)) !== publicJwk.x || base64url(deviceKey.get(-3)) !== publicJwk.y) {
+    var sameY = keyY instanceof Uint8Array ? base64url(keyY) === publicJwk.y : ySign(publicJwk.y) === keyY;
+    if (base64url(deviceKey.get(-2)) !== publicJwk.x || !sameY) {
       return refuse("device-key", "The credential's deviceKey is not this browser's key: it was issued to another"
         + " holder.");
     }

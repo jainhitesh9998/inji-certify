@@ -1308,8 +1308,13 @@ await section("2e. key equivalence and value types in readIssuerSigned and check
     // the shapes COSE_Key allows still reach check 3, which names what this page holds
     await refuses("a deviceKey whose kty is the text \"EC2\" at check 3, not as a shape", shaped({ deviceKey: keyWith([[1, "EC2"]]) }),
         "device-key", /label 1 must be 2/);
-    await refuses("a deviceKey whose y is the bool true (compressed point) at check 3", shaped({ deviceKey: keyWith([[-3, true]]) }),
-        "device-key", /no P-256 coordinates/);
+    // a compressed point (RFC 9053 7.1.1: y is the bool sign of the y coordinate) is the holder's key when x and the sign match
+    const holderYOdd = (Buffer.from(HOLDER_A_JWK.y, "base64url").at(-1) & 1) === 1;
+    await keeps("a deviceKey compressed to x and the bool sign of the holder's y", shaped({ deviceKey: keyWith([[-3, holderYOdd]]) }));
+    await refuses("a deviceKey compressed to x and the opposite sign", shaped({ deviceKey: keyWith([[-3, !holderYOdd]]) }),
+        "device-key", /not this browser's key/);
+    await refuses("a deviceKey compressed to another x and the holder's sign", shaped({ deviceKey: keyWith([[-2, new Uint8Array(32).fill(7)],
+        [-3, holderYOdd]]) }), "device-key", /not this browser's key/);
     await refuses("a docType that is #6.99(tstr)", shaped({ docType: new Cbor.Tagged(99, DOC_TYPE) }), "issuer-signed", /docType, a tstr, is a tag/);
     await refuses("a Digest that is #6.99(bstr)", shaped({ valueDigests: (digests) => new Map([...digests].map(([namespace, byId]) =>
         [namespace, new Map([...byId].map(([id, digest]) => [id, new Cbor.Tagged(99, digest)]))])) }), "issuer-signed", /Digest 0 of .* is a tag/);
