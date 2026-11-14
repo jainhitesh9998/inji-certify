@@ -238,6 +238,11 @@ class StatusListPostgresTest {
             status.setCredentialStatusPurposes(List.of("revocation"));
             credentialConfigurationService.addCredentialConfiguration(status);
         }
+        // Every test starts with an empty queue. The tests share one database and its lists (an allocation returns the
+        // newest list with a free index), and a run applies a list's oldest pending rows first, up to its selection's
+        // size: a row a failed test left pending on a shared list would be applied in place of the next test's own,
+        // failing that test as well (M-11d CI fix: cwtAllocationMarkingFull... after aStatusChangeOnALockedList...).
+        closeEveryPendingTransaction();
     }
 
     @Test
@@ -751,6 +756,8 @@ class StatusListPostgresTest {
                 .TransactionTemplate(transactionManager).execute(status -> racing.allocate("revocation"));
 
         assertNotEquals(listId, listIdOf(next), "the full list takes no more indices");
+        assertTrue(transactionRepository.findById(revocation.getTransactionLogId()).orElseThrow().getIsProcessed(),
+                "the concurrent run applied this test's revocation, not an older row another test left pending on the list");
         io.mosip.certify.entity.StatusListCredential full = statusListRepository.findById(listId).orElseThrow();
         assertEquals(io.mosip.certify.entity.StatusListCredential.CredentialStatus.FULL, full.getCredentialStatus());
         byte[] bits = io.mosip.certify.status.TokenStatusListService.decode(SignedJWT.parse(full.getVcDocument())
@@ -777,6 +784,8 @@ class StatusListPostgresTest {
                 .TransactionTemplate(transactionManager).execute(status -> racing.allocateCwt("revocation", signing));
 
         assertNotEquals(listId, listIdOf(next));
+        assertTrue(transactionRepository.findById(revocation.getTransactionLogId()).orElseThrow().getIsProcessed(),
+                "the concurrent run applied this test's revocation, not an older row another test left pending on the list");
         io.mosip.certify.entity.StatusListCredential full = statusListRepository.findById(listId).orElseThrow();
         assertEquals(io.mosip.certify.entity.StatusListCredential.CredentialStatus.FULL, full.getCredentialStatus());
         assertTrue(io.mosip.certify.status.TokenStatusListService.get(io.mosip.certify.status.TokenStatusListCwt.decode(
@@ -960,9 +969,12 @@ class StatusListPostgresTest {
 
     /**
      * M-11d merge (Opus review round 5, minor 1): the bounded wait is transaction-local. After a busy refusal and a
-     * successful status change, every pooled connection reports {@code lock_timeout = 0}, so the bound never caps a
-     * later lock wait elsewhere (keymanager, ShedLock, marking a list FULL), and the connection that hit SQLState
-     * 55P03 is still in the pool (not evicted). A session-level {@code SET} instead of {@code SET LOCAL} fails this test.
+     * successful status change, every pooled connection reports {@code lock_timeout = 0} and {@code statement_timeout = 0},
+     * so the bound never caps a later lock wait or statement elsewhere (keymanager, ShedLock, marking a list FULL), and the
+     * connection whose lock statement was cancelled (SQLState 57014 or 55P03) is still in the pool (not evicted). A
+     * session-level {@code SET} instead of {@code SET LOCAL} fails this test. Within the caller's transaction the lock
+     * statement's {@code statement_timeout} (M-11d CI fix) is put back as soon as the lock is held, while
+     * {@code lock_timeout} stays for the rest of the transaction.
      */
     @Test
     void theLockWaitNeverLeaksIntoPooledConnectionsAndABusyConnectionStaysPooled() throws Exception {
@@ -990,7 +1002,17 @@ class StatusListPostgresTest {
                 refused = t;
             }
             assertTrue(refused instanceof io.mosip.certify.core.exception.StatusListBusyException, String.valueOf(refused));
-            queue(free, freeEntry.idx(), true); // a successful change also ran SET LOCAL
+            String[] within = new String[2];
+            tx.executeWithoutResult(s -> {
+                queue(free, freeEntry.idx(), true); // a successful change also ran SET LOCAL
+                applicationContext.getBean(jakarta.persistence.EntityManager.class).unwrap(org.hibernate.Session.class)
+                        .doWork(c -> {
+                            within[0] = show(c, "statement_timeout");
+                            within[1] = show(c, "lock_timeout");
+                        });
+            });
+            assertEquals("0", within[0], "the lock statement's statement_timeout was put back once the lock was held");
+            assertEquals("5s", within[1], "lock_timeout bounds the rest of the caller's transaction");
             holder.rollback();
         }
         java.util.List<Connection> borrowed = new java.util.ArrayList<>();
@@ -1000,16 +1022,21 @@ class StatusListPostgresTest {
                 Connection c = dataSource.getConnection();
                 borrowed.add(c);
                 pids.add(backendPid(c));
-                try (java.sql.Statement st = c.createStatement(); java.sql.ResultSet rs = st.executeQuery("SHOW lock_timeout")) {
-                    rs.next();
-                    assertEquals("0", rs.getString(1), "pooled connection " + i + " kept a lock_timeout");
-                }
+                assertEquals("0", show(c, "lock_timeout"), "pooled connection " + i + " kept a lock_timeout");
+                assertEquals("0", show(c, "statement_timeout"), "pooled connection " + i + " kept a statement_timeout");
             }
         } finally {
             for (Connection c : borrowed) c.close();
         }
-        assertTrue(pids.contains(busyPid.get()), "the connection that hit 55P03 was evicted from the pool");
+        assertTrue(pids.contains(busyPid.get()), "the connection whose lock statement was cancelled was evicted from the pool");
         closeEveryPendingTransaction();
+    }
+
+    private static String show(Connection c, String parameter) throws java.sql.SQLException {
+        try (java.sql.Statement st = c.createStatement(); java.sql.ResultSet rs = st.executeQuery("SHOW " + parameter)) {
+            rs.next();
+            return rs.getString(1);
+        }
     }
 
     private static int backendPid(Connection c) throws java.sql.SQLException {
@@ -1025,7 +1052,8 @@ class StatusListPostgresTest {
      * ({@code FOR NO KEY UPDATE}); a status change for that list through the service, {@code /credentials/status} and
      * the VC-API is refused within the bound as retryable — the MOSIP error wrapper with {@code status_list_busy_retry_later},
      * VC-API {@code 503} with {@code Retry-After} — and queues nothing, while a status change for another list goes
-     * through meanwhile. Without the {@code lock_timeout} the three wait until the holder lets go, and this test fails.
+     * through meanwhile. Without the bound ({@code statement_timeout} on the lock statement, {@code lock_timeout}) the
+     * three wait until the holder lets go, and this test fails.
      */
     @Test
     void aStatusChangeOnALockedListIsRefusedRetryablyWithinTheBoundAndQueuesNothing() throws Exception {
@@ -1101,6 +1129,56 @@ class StatusListPostgresTest {
         queue(locked, lockedEntry.idx(), true); // the lock released: the same change goes through
         assertEquals(1, pendingOn(locked));
         closeEveryPendingTransaction();
+    }
+
+    /**
+     * M-11d CI fix (PostgreSQL): the bound holds for a status change that queues behind another one. PostgreSQL applies
+     * {@code lock_timeout} to each lock acquisition separately, and a second waiter takes a held row lock in two: the tuple
+     * lock, which it waits for behind the first waiter, then the holder's transaction. With {@code lock_timeout} alone the
+     * second change, arriving a second after the first, waited about twice the bound less that second (CI: the third of
+     * three simultaneous changes took {@code 10.003 s} against {@code 5 s}). The lock statement's
+     * {@code statement_timeout} bounds the whole wait, so both changes are refused within the bound.
+     */
+    @Test
+    void aStatusChangeQueuedBehindAnotherWaiterIsStillRefusedWithinTheBound() throws Exception {
+        io.mosip.certify.status.TokenStatusListService.Entry entry = tokenStatusLists.allocate("revocation");
+        String locked = listIdOf(entry);
+        java.time.Duration bound = statusListLockWait.lockWait();
+        java.util.concurrent.Callable<Timed<Throwable>> change = () -> timed(() -> {
+            try {
+                queue(locked, entry.idx(), true);
+                return null;
+            } catch (Throwable refused) {
+                return refused;
+            }
+        });
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(2);
+        try (Connection holder = dataSource.getConnection()) {
+            holder.setAutoCommit(false);
+            try {
+                lockListRow(holder, locked);
+                java.util.concurrent.Future<Timed<Throwable>> first = pool.submit(change);
+                awaitLockWaiters(1, bound);
+                Thread.sleep(1000); // the second change arrives while the first waits, and queues behind it
+                java.util.concurrent.Future<Timed<Throwable>> second = pool.submit(change);
+                awaitLockWaiters(2, bound);
+
+                long limit = bound.multipliedBy(3).toMillis();
+                Timed<Throwable> firstResult = first.get(limit, java.util.concurrent.TimeUnit.MILLISECONDS);
+                Timed<Throwable> secondResult = second.get(limit, java.util.concurrent.TimeUnit.MILLISECONDS);
+                for (Timed<Throwable> call : List.of(firstResult, secondResult)) {
+                    assertTrue(call.value() instanceof io.mosip.certify.core.exception.StatusListBusyException,
+                            String.valueOf(call.value()));
+                    assertTrue(call.took().compareTo(bound.minusMillis(500)) >= 0, "waited for the lock: " + call.took());
+                    assertTrue(call.took().compareTo(bound.plusSeconds(2)) < 0, "and no longer than the bound: " + call.took());
+                }
+                assertEquals(0, pendingOn(locked), "nothing was queued for the locked list");
+            } finally {
+                holder.rollback();
+            }
+        } finally {
+            pool.shutdownNow();
+        }
     }
 
     /**

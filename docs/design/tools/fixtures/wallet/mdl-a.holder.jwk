@@ -1,0 +1,8 @@
+{
+  "kty" : "EC",
+  "crv" : "P-256",
+  "x" : "BcHFfqzWXxtXoVDrElBJrK365UIf_AJonptZ7mTlUVI",
+  "y" : "uAyu2IniDodXQQC6W28O_zV6jtHUYq6CDc3k4Aj2THY",
+  "d" : "IW-mAomcm8yPkD060efL1EiYVNPuDtdQe4rLQlTWbYE",
+  "comment" : "TEST KEY - NOT SECRET"
+}

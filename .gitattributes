@@ -1,0 +1,4 @@
+# The offer pages are hashed byte for byte for their Content-Security-Policy, and every browser hashes the script's text
+# after normalising its line endings to LF (HTML standard, 13.2.3.1; the controller normalises too). Committing the pages
+# with LF keeps a checkout's bytes and the hash in step whatever the platform.
+certify-service/src/main/resources/static/offer/*.html text eol=lf

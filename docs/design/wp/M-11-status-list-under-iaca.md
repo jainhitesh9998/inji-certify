@@ -1171,6 +1171,14 @@ every node runs this build; a missing index is refused as `missing_credential_st
   contexts): the statement is skipped and a change queues; a locked list is bounded by H2's own timeout and queues
   nothing (`VcApiIssuanceTest.statusChangesQueueOnH2AndALockedListIsBoundedByH2sOwnTimeout`; H2's timeout is not mapped
   to the refusal, Hikari evicts the connection on it).
+- [x] M-11d CI fix (run 43575958795): the bound also holds for a change queued behind another waiter. PostgreSQL arms
+  `lock_timeout` per lock acquisition and a second waiter takes a held row lock in two (the tuple lock, then the holder's
+  transaction), so `lock_timeout` alone let it wait up to twice the bound; the lock statement now also runs under
+  `SET LOCAL statement_timeout` (the bound, or a shorter one already in force), put back once the lock is held, and its
+  `57014` is the same refusal (`StatusListPostgresTest.aStatusChangeQueuedBehindAnotherWaiterIsStillRefusedWithinTheBound`:
+  `8.98 s` against `PT5S` before the fix; `theLockWaitNeverLeaksIntoPooledConnectionsAndABusyConnectionStaysPooled` checks
+  both settings; `StatusListLockWaitTest`). The tests start from an empty queue, so one failure no longer cascades into
+  `cwtAllocationMarkingFullKeepsARevocationCommittedAfterItsRead` through a row it left pending on a shared list.
 - [x] IACA A expiring, re-issue B staged: instances that cached A's cap renew a list another instance re-signed under B,
   in its last `ttl`, before and after A ends
   (`TokenStatusListCwtServiceTest.aCachedCapOfAnIacaThatEndedOrWasSupersededDoesNotStopAnEarlyRenewal`; `FRESH` with the

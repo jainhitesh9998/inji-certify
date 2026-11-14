@@ -12,6 +12,9 @@ import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.Base64;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -37,6 +40,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
         "spring.jpa.database-platform=org.hibernate.dialect.H2Dialect",
         "spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.H2Dialect",
         "certify.offer-page.enabled=true",
+        // P5-03a: the demo wallet page is a second switch, off by default
+        "certify.offer-page.wallet.enabled=true",
         // the demo wiring of config/certify-mdl.properties, plus the two shapes the page falls back on: a subject with
         // no label (the id is shown) and one for a single configuration, whose label is display text only
         "certify.offer-page.demo-subjects[0].id=mdl-demo-1",
@@ -80,6 +85,79 @@ class OfferPageTest {
         MvcResult directory = mockMvc.perform(get("/offer/")).andReturn();
         assertEquals(200, directory.getResponse().getStatus());
         assertTrue(directory.getResponse().getContentType().startsWith("text/html") && directory.getResponse().getContentAsString().equals(html), "the directory path answers the same page");
+    }
+
+    @Test
+    void theWalletPageAndItsScriptsAreServed() throws Exception {
+        MvcResult wallet = mockMvc.perform(get("/offer/wallet")).andReturn();
+        assertEquals(200, wallet.getResponse().getStatus());
+        String html = wallet.getResponse().getContentAsString();
+        assertTrue(html.contains("<title>Demo wallet</title>") && html.contains("id=\"records\"") && html.contains("id=\"deleteAll\""),
+                "the wallet lists kept credentials and deletes one or all of them");
+        assertTrue(html.contains("src=\"mdoc.js\"") && html.contains("src=\"wallet-store.js\"") && html.contains("src=\"wallet.js\""),
+                "the wallet page loads its own modules");
+        // P5-03a (plan 4.13): wallet.html has no inline script, so its CSP needs no hash
+        assertFalse(html.contains("<script>"), "the wallet page has no inline script");
+        for (String script : new String[]{"mdoc.js", "wallet-store.js", "wallet.js"}) {
+            MvcResult served = mockMvc.perform(get("/offer/" + script)).andReturn();
+            assertEquals(200, served.getResponse().getStatus(), script);
+            assertTrue(served.getResponse().getContentAsString().length() > 100, script + " is the bundled script");
+        }
+        // review round 2: the page has one address. Its file name would otherwise be served by the static resource
+        // handler, bypassing the switch and the headers of plan 4.13
+        MvcResult file = mockMvc.perform(get("/offer/wallet.html")).andReturn();
+        assertEquals(404, file.getResponse().getStatus(), "the wallet page is not served under its file name");
+        assertEquals(0, file.getResponse().getContentAsByteArray().length);
+    }
+
+    @Test
+    void theWalletConfigAnswersTheRelayListAndIsNotCached() throws Exception {
+        mockMvc.perform(get("/offer/wallet/config"))
+                .andExpect(status().isOk())
+                .andExpect(header().string("Cache-Control", "no-store"))
+                .andExpect(jsonPath("$.relay.hosts", hasSize(0)));
+    }
+
+    @Test
+    void thePageAnswersTheSecurityHeadersAndTheInlineScriptsHash() throws Exception {
+        MvcResult page = mockMvc.perform(get("/offer/")).andReturn();
+        // the page is UTF-8 (a browser's default for text/html); MockMvc's own decoding is ISO-8859-1 without a charset
+        String html = new String(page.getResponse().getContentAsByteArray(), StandardCharsets.UTF_8);
+        String csp = page.getResponse().getHeader("Content-Security-Policy");
+        assertTrue(csp != null && csp.startsWith("default-src 'none'; script-src 'self' '"), csp);
+        // the hash is recomputed here from the script the response carries, the way a browser checks it
+        Matcher inline = Pattern.compile("<script>([\\s\\S]*?)</script>").matcher(html);
+        int hashes = 0;
+        while (inline.find()) {
+            String hash = Base64.getEncoder().encodeToString(
+                    MessageDigest.getInstance("SHA-256").digest(inline.group(1).getBytes(StandardCharsets.UTF_8)));
+            assertTrue(csp.contains("'sha256-" + hash + "'"), "the CSP carries the served inline script's hash");
+            hashes++;
+        }
+        assertTrue(hashes > 0, "the offer page has an inline script");
+        assertTrue(csp.contains("frame-ancestors 'none'") && csp.contains("base-uri 'none'")
+                && csp.contains("form-action 'none'") && csp.contains("object-src 'none'"), csp);
+        // a page served from a loopback host may reach a local stack over plain HTTP, on every loopback spelling the
+        // page's own host check accepts (localhost, 127.0.0.1 and ::1; MockMvc answers as localhost)
+        assertTrue(csp.contains("connect-src 'self' https: http://localhost:* http://127.0.0.1:* http://[::1]:*"), csp);
+        assertEquals("camera=()", page.getResponse().getHeader("Permissions-Policy"));
+        assertEquals("no-referrer", page.getResponse().getHeader("Referrer-Policy"));
+
+        // review round 3: the page's file name is the same page with the same headers, never a static answer without
+        // them (the static resource handler served /offer/index.html with no Content-Security-Policy at all)
+        MvcResult file = mockMvc.perform(get("/offer/index.html")).andReturn();
+        assertEquals(200, file.getResponse().getStatus());
+        assertEquals(html, new String(file.getResponse().getContentAsByteArray(), StandardCharsets.UTF_8));
+        assertEquals(csp, file.getResponse().getHeader("Content-Security-Policy"), "/offer/index.html carries the page's CSP");
+        assertEquals("camera=()", file.getResponse().getHeader("Permissions-Policy"));
+        assertEquals("no-referrer", file.getResponse().getHeader("Referrer-Policy"));
+
+        MvcResult wallet = mockMvc.perform(get("/offer/wallet")).andReturn();
+        String walletCsp = wallet.getResponse().getHeader("Content-Security-Policy");
+        assertTrue(walletCsp.contains("script-src 'self';") && !walletCsp.contains("sha256-"), walletCsp);
+        assertEquals("camera=(self)", wallet.getResponse().getHeader("Permissions-Policy"));
+        assertEquals("no-referrer", wallet.getResponse().getHeader("Referrer-Policy"));
+        assertEquals("no-store", wallet.getResponse().getHeader("Cache-Control"));
     }
 
     @Test
@@ -140,5 +218,21 @@ class OfferPageTest {
         String body = answer.getResponse().getContentAsString();
         assertTrue(body.contains("\"credential_configuration_ids\""), "the keys are snake_case: " + body);
         assertFalse(body.contains("credentialConfigurationIds"), "no camelCase key leaks the record's Java names: " + body);
+    }
+
+    @Test
+    void theInlineScriptHashIsTakenOverLfWhateverTheFileSSLineEndings() {
+        // CSP 3 section 6.7.3.1 hashes the script's text as the parser produced it, and the HTML parser normalises CRLF
+        // and a lone CR to LF before it sees a newline (HTML standard, 13.2.3.1): a checkout or an editor that changed
+        // the line endings must not change the hash the served page carries
+        String lf = "<script>\nvar a = 1;\n</script>";
+        String crlf = "<script>\r\nvar a = 1;\r\n</script>";
+        String cr = "<script>\rvar a = 1;\r</script>";
+        assertEquals(OfferPageController.inlineScriptHashes(lf), OfferPageController.inlineScriptHashes(crlf));
+        assertEquals(OfferPageController.inlineScriptHashes(lf), OfferPageController.inlineScriptHashes(cr));
+        assertTrue(OfferPageController.inlineScriptHashes(crlf).startsWith(" 'sha256-"));
+        // and the two scripts that differ still hash differently: the normalisation is the only thing dropped
+        assertFalse(OfferPageController.inlineScriptHashes(lf)
+                .equals(OfferPageController.inlineScriptHashes("<script>\nvar a = 2;\n</script>")));
     }
 }

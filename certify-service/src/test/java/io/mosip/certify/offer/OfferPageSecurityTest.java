@@ -72,6 +72,8 @@ class OfferPageSecurityTest {
             .withUserConfiguration(UnauthenticatedIsRefused.class, SecurityConfig.class, Neighbours.class)
             .withPropertyValues(
                     "certify.offer-page.enabled=true",
+                    // P5-03a: the wallet's paths are on the same chain, and so need no entry in the security URL lists
+                    "certify.offer-page.wallet.enabled=true",
                     "certify.offer-page.demo-subjects[0].id=mdl-demo-1",
                     "certify.offer-page.demo-subjects[0].label=Asha Demo",
                     "server.servlet.path=/v1/certify",
@@ -99,6 +101,12 @@ class OfferPageSecurityTest {
             assertEquals(200, subjects.getResponse().getStatus(), subjects.getResponse().getContentAsString());
             assertTrue(subjects.getResponse().getContentAsString().contains("\"mdl-demo-1\""), "the configured subject is served");
             assertEquals("no-store", subjects.getResponse().getHeader("Cache-Control"));
+            MvcResult wallet = mockMvc.perform(get("/offer/wallet")).andReturn();
+            assertEquals(200, wallet.getResponse().getStatus(), "the wallet page");
+            assertEquals("camera=(self)", wallet.getResponse().getHeader("Permissions-Policy"));
+            MvcResult config = mockMvc.perform(get("/offer/wallet/config")).andReturn();
+            assertEquals(200, config.getResponse().getStatus(), "the wallet's config endpoint");
+            assertEquals("no-store", config.getResponse().getHeader("Cache-Control"));
         });
     }
 

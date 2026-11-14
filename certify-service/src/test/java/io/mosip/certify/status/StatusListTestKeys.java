@@ -67,7 +67,13 @@ final class StatusListTestKeys {
     static final String CRL_URI = "https://issuer.example.test/v1/certify/mdoc/iaca/test-iaca.crl";
 
     /** The IACA's own validity start: far enough back that a stale CRL can lie before it. */
-    static final Instant LONG_AGO = Instant.now().minus(200, ChronoUnit.DAYS);
+    /**
+     * The one instant every fixture certificate is placed around, read once per JVM. Tests with a fixed clock start it
+     * at {@code NOW} (not at a calendar date): a fixed date drifts away from certificates made around the real now, and
+     * the "expired" signer stops being expired at the test's instant a day later.
+     */
+    static final Instant NOW = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+    static final Instant LONG_AGO = NOW.minus(200, ChronoUnit.DAYS);
 
     static final KeyPair IACA_KEYS = p256();
     static final X509Certificate IACA = IsoMdocProfiles.iaca(IACA_KEYS).country("IN").organization("Lorem Ipsum Demo")
@@ -84,42 +90,42 @@ final class StatusListTestKeys {
     static final KeyPair DSC_KEYS = p256();
     static final X509Certificate DSC = signer(DSC_KEYS, "Status List Test DSC", IACA, IACA_KEYS,
             List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true, LONG_AGO.plus(100, ChronoUnit.DAYS),
-            Instant.now().plus(200, ChronoUnit.DAYS));
+            NOW.plus(200, ChronoUnit.DAYS));
 
     /** A signer the IACA delegated status-list signing to (TSL section 10, IANA value 45). */
     static final KeyPair DEDICATED_KEYS = p256();
     static final X509Certificate DEDICATED = signer(DEDICATED_KEYS, "Status List Test Dedicated Signer", IACA, IACA_KEYS,
             List.of(StatusListSignerPolicy.STATUS_SIGNING_EKU), true, LONG_AGO.plus(100, ChronoUnit.DAYS),
-            Instant.now().plus(200, ChronoUnit.DAYS));
+            NOW.plus(200, ChronoUnit.DAYS));
 
     /** Issued by the IACA, no extended key usage at all. */
     static final KeyPair NO_EKU_KEYS = p256();
     static final X509Certificate NO_EKU = signer(NO_EKU_KEYS, "Status List Test No EKU", IACA, IACA_KEYS, List.of(),
-            true, LONG_AGO.plus(100, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
+            true, LONG_AGO.plus(100, ChronoUnit.DAYS), NOW.plus(200, ChronoUnit.DAYS));
 
     /** Issued by the IACA with the Document Signer EKU but without {@code digitalSignature}. */
     static final KeyPair NO_DIGITAL_SIGNATURE_KEYS = p256();
     static final X509Certificate NO_DIGITAL_SIGNATURE = signer(NO_DIGITAL_SIGNATURE_KEYS,
             "Status List Test Encipherment Only", IACA, IACA_KEYS, List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU),
-            false, LONG_AGO.plus(100, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
+            false, LONG_AGO.plus(100, ChronoUnit.DAYS), NOW.plus(200, ChronoUnit.DAYS));
 
     /** A Document Signer- shaped certificate no configured IACA issued (keymanager's case once IACAs are configured). */
     static final KeyPair UNTRUSTED_KEYS = p256();
     static final X509Certificate UNTRUSTED = signer(UNTRUSTED_KEYS, "Status List Test Untrusted DSC", OTHER_CA,
             OTHER_CA_KEYS, List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true,
-            LONG_AGO.plus(100, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
+            LONG_AGO.plus(100, ChronoUnit.DAYS), NOW.plus(200, ChronoUnit.DAYS));
 
     /** A Document Signer the IACA issued whose validity already ended. */
     static final KeyPair EXPIRED_KEYS = p256();
     static final X509Certificate EXPIRED = signer(EXPIRED_KEYS, "Status List Test Expired DSC", IACA, IACA_KEYS,
             List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true, LONG_AGO.plus(100, ChronoUnit.DAYS),
-            Instant.now().minus(1, ChronoUnit.DAYS));
+            NOW.minus(1, ChronoUnit.DAYS));
 
     /** A Document Signer the IACA issued whose validity has not begun. */
     static final KeyPair NOT_YET_VALID_KEYS = p256();
     static final X509Certificate NOT_YET_VALID = signer(NOT_YET_VALID_KEYS, "Status List Test Future DSC", IACA,
             IACA_KEYS, List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true,
-            Instant.now().plus(1, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
+            NOW.plus(1, ChronoUnit.DAYS), NOW.plus(200, ChronoUnit.DAYS));
 
     /**
      * A self-signed test root with {@code pathLenConstraint} 1, standing in for an anchor that allows one intermediate.
@@ -128,29 +134,29 @@ final class StatusListTestKeys {
      */
     static final KeyPair MULTI_TIER_ROOT_KEYS = p256();
     static final X509Certificate MULTI_TIER_ROOT = root(MULTI_TIER_ROOT_KEYS, "Status List Test Multi-Tier Root", 1,
-            LONG_AGO, Instant.now().plus(300, ChronoUnit.DAYS));
+            LONG_AGO, NOW.plus(300, ChronoUnit.DAYS));
 
     /** A CA intermediate between the multi-tier root and a Document Signer: cA TRUE, keyCertSign, no pathLen limit. */
     static final KeyPair INTERMEDIATE_KEYS = p256();
     static final X509Certificate INTERMEDIATE = ca(INTERMEDIATE_KEYS, "Status List Test Intermediate", MULTI_TIER_ROOT,
-            MULTI_TIER_ROOT_KEYS, null, LONG_AGO.plus(100, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
+            MULTI_TIER_ROOT_KEYS, null, LONG_AGO.plus(100, ChronoUnit.DAYS), NOW.plus(200, ChronoUnit.DAYS));
 
     static final KeyPair BEHIND_INTERMEDIATE_KEYS = p256();
     static final X509Certificate BEHIND_INTERMEDIATE = signer(BEHIND_INTERMEDIATE_KEYS,
             "Status List Test Intermediate DSC", INTERMEDIATE, INTERMEDIATE_KEYS,
             List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true, LONG_AGO.plus(100, ChronoUnit.DAYS),
-            Instant.now().plus(200, ChronoUnit.DAYS));
+            NOW.plus(200, ChronoUnit.DAYS));
 
     /** A second CA below {@link #INTERMEDIATE}: two intermediates, one more than the multi-tier root allows. */
     static final KeyPair DEEP_INTERMEDIATE_KEYS = p256();
     static final X509Certificate DEEP_INTERMEDIATE = ca(DEEP_INTERMEDIATE_KEYS, "Status List Test Deep Intermediate",
             INTERMEDIATE, INTERMEDIATE_KEYS, null, LONG_AGO.plus(100, ChronoUnit.DAYS),
-            Instant.now().plus(200, ChronoUnit.DAYS));
+            NOW.plus(200, ChronoUnit.DAYS));
     static final KeyPair BEHIND_DEEP_INTERMEDIATE_KEYS = p256();
     static final X509Certificate BEHIND_DEEP_INTERMEDIATE = signer(BEHIND_DEEP_INTERMEDIATE_KEYS,
             "Status List Test Deep Intermediate DSC", DEEP_INTERMEDIATE, DEEP_INTERMEDIATE_KEYS,
             List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true, LONG_AGO.plus(100, ChronoUnit.DAYS),
-            Instant.now().plus(200, ChronoUnit.DAYS));
+            NOW.plus(200, ChronoUnit.DAYS));
 
     /**
      * A CA intermediate the Annex B {@link #IACA} ({@code pathLenConstraint} 0) issued, and a Document Signer below it:
@@ -158,23 +164,23 @@ final class StatusListTestKeys {
      */
     static final KeyPair IACA_INTERMEDIATE_KEYS = p256();
     static final X509Certificate IACA_INTERMEDIATE = ca(IACA_INTERMEDIATE_KEYS, "Status List Test IACA Intermediate",
-            IACA, IACA_KEYS, null, LONG_AGO.plus(100, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
+            IACA, IACA_KEYS, null, LONG_AGO.plus(100, ChronoUnit.DAYS), NOW.plus(200, ChronoUnit.DAYS));
     static final KeyPair BEHIND_IACA_INTERMEDIATE_KEYS = p256();
     static final X509Certificate BEHIND_IACA_INTERMEDIATE = signer(BEHIND_IACA_INTERMEDIATE_KEYS,
             "Status List Test Behind An IACA Intermediate", IACA_INTERMEDIATE, IACA_INTERMEDIATE_KEYS,
             List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true, LONG_AGO.plus(100, ChronoUnit.DAYS),
-            Instant.now().plus(200, ChronoUnit.DAYS));
+            NOW.plus(200, ChronoUnit.DAYS));
 
     /** A CA intermediate that expires ten days from now, long before the signer below it. */
     static final KeyPair SHORT_INTERMEDIATE_KEYS = p256();
     static final X509Certificate SHORT_INTERMEDIATE = ca(SHORT_INTERMEDIATE_KEYS, "Status List Test Short Intermediate",
             MULTI_TIER_ROOT, MULTI_TIER_ROOT_KEYS, null, LONG_AGO.plus(100, ChronoUnit.DAYS),
-            Instant.now().plus(10, ChronoUnit.DAYS).truncatedTo(ChronoUnit.SECONDS));
+            NOW.plus(10, ChronoUnit.DAYS).truncatedTo(ChronoUnit.SECONDS));
     static final KeyPair BEHIND_SHORT_INTERMEDIATE_KEYS = p256();
     static final X509Certificate BEHIND_SHORT_INTERMEDIATE = signer(BEHIND_SHORT_INTERMEDIATE_KEYS,
             "Status List Test Behind A Short Intermediate", SHORT_INTERMEDIATE, SHORT_INTERMEDIATE_KEYS,
             List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true, LONG_AGO.plus(100, ChronoUnit.DAYS),
-            Instant.now().plus(200, ChronoUnit.DAYS));
+            NOW.plus(200, ChronoUnit.DAYS));
 
     /** An IACA that expires ten days from now, and a signer it issued that outlives it (the anchor ends first). */
     static final KeyPair SHORT_IACA_KEYS = p256();
@@ -182,12 +188,12 @@ final class StatusListTestKeys {
             .commonName("Status List Test Short IACA").issuerAltUri("https://short.example.test")
             .crlDistributionPoint("https://short.example.test/iaca.crl").notBefore(LONG_AGO)
             .validity(Duration.between(LONG_AGO.truncatedTo(ChronoUnit.SECONDS),
-                    Instant.now().plus(10, ChronoUnit.DAYS).truncatedTo(ChronoUnit.SECONDS)))
+                    NOW.plus(10, ChronoUnit.DAYS).truncatedTo(ChronoUnit.SECONDS)))
             .build();
     static final KeyPair UNDER_SHORT_IACA_KEYS = p256();
     static final X509Certificate UNDER_SHORT_IACA = signer(UNDER_SHORT_IACA_KEYS, "Status List Test Under A Short IACA",
             SHORT_IACA, SHORT_IACA_KEYS, List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true,
-            LONG_AGO.plus(100, ChronoUnit.DAYS), Instant.now().plus(100, ChronoUnit.DAYS));
+            LONG_AGO.plus(100, ChronoUnit.DAYS), NOW.plus(100, ChronoUnit.DAYS));
 
     /**
      * A self-issued key-rollover intermediate (subject and issuer names equal, signed by another key), the shape
@@ -199,7 +205,7 @@ final class StatusListTestKeys {
     static final KeyPair ROLLOVER_DSC_KEYS = p256();
     static final X509Certificate ROLLOVER_DSC = signer(ROLLOVER_DSC_KEYS, "Status List Rollover", ROLLOVER,
             ROLLOVER_KEYS, List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true,
-            LONG_AGO.plus(100, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
+            LONG_AGO.plus(100, ChronoUnit.DAYS), NOW.plus(200, ChronoUnit.DAYS));
 
     /**
      * An end-entity certificate (no basicConstraints, only {@code digitalSignature}) that signs another certificate: the
@@ -208,12 +214,12 @@ final class StatusListTestKeys {
     static final KeyPair END_ENTITY_INTERMEDIATE_KEYS = p256();
     static final X509Certificate END_ENTITY_INTERMEDIATE = signer(END_ENTITY_INTERMEDIATE_KEYS,
             "Status List Test End Entity Intermediate", IACA, IACA_KEYS, List.of(), true,
-            LONG_AGO.plus(100, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
+            LONG_AGO.plus(100, ChronoUnit.DAYS), NOW.plus(200, ChronoUnit.DAYS));
     static final KeyPair BEHIND_END_ENTITY_INTERMEDIATE_KEYS = p256();
     static final X509Certificate BEHIND_END_ENTITY_INTERMEDIATE = signer(BEHIND_END_ENTITY_INTERMEDIATE_KEYS,
             "Status List Test Behind An End Entity", END_ENTITY_INTERMEDIATE, END_ENTITY_INTERMEDIATE_KEYS,
             List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true, LONG_AGO.plus(100, ChronoUnit.DAYS),
-            Instant.now().plus(200, ChronoUnit.DAYS));
+            NOW.plus(200, ChronoUnit.DAYS));
 
     /**
      * An intermediate CA with {@code pathLenConstraint} 0 and a CA intermediate below it: RFC 5280 section 6.1.4 forbids
@@ -221,27 +227,27 @@ final class StatusListTestKeys {
      */
     static final KeyPair PATHLEN_ZERO_KEYS = p256();
     static final X509Certificate PATHLEN_ZERO = ca(PATHLEN_ZERO_KEYS, "Status List Test PathLen Zero CA", MULTI_TIER_ROOT,
-            MULTI_TIER_ROOT_KEYS, 0, LONG_AGO.plus(100, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
+            MULTI_TIER_ROOT_KEYS, 0, LONG_AGO.plus(100, ChronoUnit.DAYS), NOW.plus(200, ChronoUnit.DAYS));
     static final KeyPair SUB_INTERMEDIATE_KEYS = p256();
     static final X509Certificate SUB_INTERMEDIATE = ca(SUB_INTERMEDIATE_KEYS, "Status List Test Sub Intermediate",
-            PATHLEN_ZERO, PATHLEN_ZERO_KEYS, null, LONG_AGO.plus(100, ChronoUnit.DAYS), Instant.now().plus(200, ChronoUnit.DAYS));
+            PATHLEN_ZERO, PATHLEN_ZERO_KEYS, null, LONG_AGO.plus(100, ChronoUnit.DAYS), NOW.plus(200, ChronoUnit.DAYS));
     static final KeyPair SUB_INTERMEDIATE_DSC_KEYS = p256();
     static final X509Certificate SUB_INTERMEDIATE_DSC = signer(SUB_INTERMEDIATE_DSC_KEYS,
             "Status List Test Sub Intermediate DSC", SUB_INTERMEDIATE, SUB_INTERMEDIATE_KEYS,
             List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true, LONG_AGO.plus(100, ChronoUnit.DAYS),
-            Instant.now().plus(200, ChronoUnit.DAYS));
+            NOW.plus(200, ChronoUnit.DAYS));
 
     /** An IACA whose validity ended long ago, and a signer it issued that is valid now (only the anchor's dates are odd). */
     static final KeyPair EXPIRED_IACA_KEYS = p256();
     static final X509Certificate EXPIRED_IACA = IsoMdocProfiles.iaca(EXPIRED_IACA_KEYS).country("IN")
             .commonName("Status List Test Expired IACA").issuerAltUri("https://expired.example.test")
             .crlDistributionPoint("https://expired.example.test/iaca.crl")
-            .notBefore(Instant.now().minus(400, ChronoUnit.DAYS)).validity(Duration.ofDays(100)).build();
+            .notBefore(NOW.minus(400, ChronoUnit.DAYS)).validity(Duration.ofDays(100)).build();
     static final KeyPair UNDER_EXPIRED_IACA_KEYS = p256();
     static final X509Certificate UNDER_EXPIRED_IACA = signer(UNDER_EXPIRED_IACA_KEYS,
             "Status List Test Under An Expired IACA", EXPIRED_IACA, EXPIRED_IACA_KEYS,
-            List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true, Instant.now().minus(50, ChronoUnit.DAYS),
-            Instant.now().plus(100, ChronoUnit.DAYS));
+            List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true, NOW.minus(50, ChronoUnit.DAYS),
+            NOW.plus(100, ChronoUnit.DAYS));
 
     /**
      * {@link #EXPIRED_IACA} re-issued with the same name and key, valid now and ending before the signer it issued
@@ -250,24 +256,24 @@ final class StatusListTestKeys {
     static final X509Certificate REISSUED_IACA = IsoMdocProfiles.iaca(EXPIRED_IACA_KEYS).country("IN")
             .commonName("Status List Test Expired IACA").issuerAltUri("https://expired.example.test")
             .crlDistributionPoint("https://expired.example.test/iaca.crl")
-            .notBefore(Instant.now().minus(60, ChronoUnit.DAYS)).validity(Duration.ofDays(110)).build();
+            .notBefore(NOW.minus(60, ChronoUnit.DAYS)).validity(Duration.ofDays(110)).build();
     /** The same IACA re-issued again ahead of time: not yet valid, and ending after every other one. */
     static final X509Certificate STAGED_IACA = IsoMdocProfiles.iaca(EXPIRED_IACA_KEYS).country("IN")
             .commonName("Status List Test Expired IACA").issuerAltUri("https://expired.example.test")
             .crlDistributionPoint("https://expired.example.test/iaca.crl")
-            .notBefore(Instant.now().plus(30, ChronoUnit.DAYS)).validity(Duration.ofDays(400)).build();
+            .notBefore(NOW.plus(30, ChronoUnit.DAYS)).validity(Duration.ofDays(400)).build();
 
     /** An IACA that is not yet valid, and a signer it issued that is valid now. */
     static final KeyPair FUTURE_IACA_KEYS = p256();
     static final X509Certificate FUTURE_IACA = IsoMdocProfiles.iaca(FUTURE_IACA_KEYS).country("IN")
             .commonName("Status List Test Future IACA").issuerAltUri("https://future.example.test")
             .crlDistributionPoint("https://future.example.test/iaca.crl")
-            .notBefore(Instant.now().plus(10, ChronoUnit.DAYS)).validity(Duration.ofDays(300)).build();
+            .notBefore(NOW.plus(10, ChronoUnit.DAYS)).validity(Duration.ofDays(300)).build();
     static final KeyPair UNDER_FUTURE_IACA_KEYS = p256();
     static final X509Certificate UNDER_FUTURE_IACA = signer(UNDER_FUTURE_IACA_KEYS,
             "Status List Test Under A Future IACA", FUTURE_IACA, FUTURE_IACA_KEYS,
-            List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true, Instant.now().minus(1, ChronoUnit.DAYS),
-            Instant.now().plus(100, ChronoUnit.DAYS));
+            List.of(StatusListSignerPolicy.DOCUMENT_SIGNER_EKU), true, NOW.minus(1, ChronoUnit.DAYS),
+            NOW.plus(100, ChronoUnit.DAYS));
 
     private StatusListTestKeys() {}
 
@@ -318,7 +324,7 @@ final class StatusListTestKeys {
         try {
             JcaX509v3CertificateBuilder builder = new JcaX509v3CertificateBuilder(
                     X500Name.getInstance(IACA.getSubjectX500Principal().getEncoded()), serial(),
-                    Date.from(LONG_AGO.plus(100, ChronoUnit.DAYS)), Date.from(Instant.now().plus(200, ChronoUnit.DAYS)),
+                    Date.from(LONG_AGO.plus(100, ChronoUnit.DAYS)), Date.from(NOW.plus(200, ChronoUnit.DAYS)),
                     X500Name.getInstance(IACA.getSubjectX500Principal().getEncoded()), keys.getPublic());
             builder.addExtension(Extension.basicConstraints, true, new BasicConstraints(true));
             builder.addExtension(Extension.keyUsage, true, new KeyUsage(KeyUsage.keyCertSign));
@@ -401,12 +407,12 @@ final class StatusListTestKeys {
 
     /** A CRL of the test IACA that does not list {@link #DSC} and is fresh at {@code now}. */
     static X509CRL freshCrl() {
-        return crl(Instant.now().minus(1, ChronoUnit.HOURS), Instant.now().plus(20, ChronoUnit.DAYS));
+        return crl(NOW.minus(1, ChronoUnit.HOURS), NOW.plus(20, ChronoUnit.DAYS));
     }
 
     /** A CRL of the test IACA whose {@code nextUpdate} passed a hundred days ago: stale at {@code now}. */
     static X509CRL staleCrl() {
-        return crl(Instant.now().minus(200, ChronoUnit.DAYS), Instant.now().minus(100, ChronoUnit.DAYS));
+        return crl(NOW.minus(200, ChronoUnit.DAYS), NOW.minus(100, ChronoUnit.DAYS));
     }
 
     /** A signing context over a key and chain, without going through a provider (expired DSCs never resolve there). */
