@@ -68,14 +68,18 @@ public interface StatusListCredentialRepository extends JpaRepository<StatusList
     /**
      * The row locked for the rest of the transaction: the single writer of a list's document (a status update now, a
      * re-sign later) reads it through here, so two updates cannot each sign a snapshot and lose one of the bits, and a
-     * re-sign cannot overwrite a status update committed between its read and its compare-and-set.
+     * re-sign cannot overwrite a status update committed between its read and its compare-and-set. A status change takes
+     * the same lock before it queues its transaction ({@code CredentialStatusServiceImpl}), so a list's transactions
+     * draw their {@code transaction_log_id} in commit order and the batch job, which applies a list under this lock,
+     * never sees a lower id commit after it applied a higher one (M-11d review round 4, G42). A status change for a list
+     * therefore waits while the job signs that list; that wait is the ordering.
      *
      * <p>{@code PESSIMISTIC_WRITE} is rendered by the dialect: {@code for no key update} with {@code PostgreSQLDialect}
-     * (Hibernate 6, PostgreSQL 9.3 and later) and {@code for update} with {@code H2Dialect}. The PostgreSQL form is the
-     * one wanted: a deployment upgraded from 0.12 has a foreign key from {@code credential_status_transaction} to this
-     * table, and the {@code key share} lock each new transaction row takes on its list conflicts with
-     * {@code for update} but not with {@code for no key update}, so a plain {@code for update} would hold every
-     * revocation request for the list while the batch job signs. The consequence for tests: an H2 database under
+     * (Hibernate 6, PostgreSQL 9.3 and later) and {@code for update} with {@code H2Dialect}. On PostgreSQL the two
+     * {@code for no key update} locks conflict with each other, which is the serialisation wanted, but not with the
+     * {@code key share} lock that inserting a transaction row takes on its list through the foreign key a deployment
+     * upgraded from 0.12 has, so a writer that does not take this lock first (a row written by hand) is not blocked by
+     * it either. The consequence for tests: an H2 database under
      * {@code PostgreSQLDialect} — the {@code local} profile's {@code application-local.properties} sets it, and an H2
      * {@code @SpringBootTest} that activates {@code local} keeps it unless it overrides
      * {@code spring.jpa.database-platform} with {@code H2Dialect} as {@code OfferPageTest} does — receives

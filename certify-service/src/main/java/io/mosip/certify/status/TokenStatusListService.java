@@ -300,7 +300,8 @@ public class TokenStatusListService {
         byte[] bits = new byte[Math.max(1, properties.sizeBits() / 8)];
         Instant now = clock.instant();
         Duration ttl = properties.ttl();
-        Instant exp = cap(now.plus(ttl).plus(ttl), signerPolicy.validUntil(signing));
+        Instant validUntil = signerPolicy.validUntil(signing, now);
+        Instant exp = cap(now.plus(ttl).plus(ttl), validUntil);
         byte[] token = TokenStatusListCwt.encode(uri(id), now, exp, ttl, bits, signing, signerPolicy, now,
                 StatusListSignerPolicy.Mode.DOCUMENT_SIGNER);
         StatusListCredential list = new StatusListCredential();
@@ -314,7 +315,7 @@ public class TokenStatusListService {
         StatusListCredential saved = repository.saveAndFlush(list);
         bitstringLists.initializeAvailableIndices(saved);
         pinnedSigners.put(id, pinned.x5tS256());
-        validUntils.put(id, new SignerValidity(pinned.x5tS256(), signerPolicy.validUntil(signing)));
+        validUntils.put(id, new SignerValidity(pinned.x5tS256(), validUntil));
         log.info("Created CWT token status list {} for {} with {} bit(s), signed by {} ({}), exp {}", id, purpose,
                 bits.length * 8, pinned.keyRef(), signing.key().chain().leaf().map(X509Certificate::getSubjectX500Principal).orElse(null), exp);
         return saved;
@@ -526,7 +527,7 @@ public class TokenStatusListService {
         if (cached != null && cached.x5tS256().equals(pin)) {
             return cached.validUntil();
         }
-        Instant computed = signerPolicy.validUntil(decoded.x5chain());
+        Instant computed = signerPolicy.validUntil(decoded.x5chain(), clock.instant());
         validUntils.put(listId, new SignerValidity(pin, computed));
         return computed;
     }
@@ -718,7 +719,7 @@ public class TokenStatusListService {
         SigningContext signing = signers.resolve(pinned(stored), decoded.x5chain().get(0));
         Instant now = clock.instant();
         Duration ttl = properties.ttl();
-        Instant validUntil = signerPolicy.validUntil(signing);
+        Instant validUntil = signerPolicy.validUntil(signing, now);
         Instant exp = cap(now.plus(ttl).plus(ttl), validUntil);
         byte[] token = TokenStatusListCwt.encode(uri(listId), now, exp, ttl, bits, signing, signerPolicy, now,
                 modeOf(stored));
@@ -1072,18 +1073,80 @@ public class TokenStatusListService {
         }
     }
 
-    /** Draft section 4.1: index i is bit (i mod 8) of byte i / 8, least significant bit first (bits = 1). */
+    /**
+     * Draft section 4.1: index i is bit (i mod 8) of byte i / 8, least significant bit first (bits = 1).
+     *
+     * <p>The index is checked against the list as a {@code long}, before anything narrows it: {@code (int) (idx / 8)}
+     * wraps 2^35 to byte 0, which set index 0 of another credential (M-11d review round 4, finding 2), and a negative
+     * index is never inside a list.
+     *
+     * @throws IllegalStateException when {@code idx} is not in {@code [0, bits.length × 8)}
+     */
     static void set(byte[] bits, long idx, boolean value) {
+        if (!inside(bits, idx)) {
+            throw new IllegalStateException("Index " + idx + " is outside the list of " + (long) bits.length * 8 + " bits");
+        }
         int b = (int) (idx / 8);
         int shift = (int) (idx % 8);
-        if (b >= bits.length) {
-            throw new IllegalStateException("Index " + idx + " is outside the list of " + bits.length * 8 + " bits");
-        }
         bits[b] = (byte) (value ? bits[b] | (1 << shift) : bits[b] & ~(1 << shift));
     }
 
+    /**
+     * The status of index {@code idx}, with the bounds {@link #set} holds.
+     *
+     * @throws IndexOutOfBoundsException when {@code idx} is not in {@code [0, bits.length × 8)}
+     */
     public static boolean get(byte[] bits, long idx) {
+        if (!inside(bits, idx)) {
+            throw new IndexOutOfBoundsException("Index " + idx + " is outside the list of " + (long) bits.length * 8 + " bits");
+        }
         return ((bits[(int) (idx / 8)] >> (int) (idx % 8)) & 1) == 1;
+    }
+
+    private static boolean inside(byte[] bits, long idx) {
+        return idx >= 0 && idx < (long) bits.length * 8;
+    }
+
+    /**
+     * How many statuses a stored Token Status List holds: its {@code lst} bytes × 8 ÷ {@code bits} per status (TSL
+     * section 4.1), read from the row's own document — the JWT's {@code status_list} claim, or the CWT envelope's token
+     * — so a list created with another {@code size-bits} keeps its own size. The status-update API refuses an index
+     * outside it before a transaction is queued, and the batch job closes a queued one without touching the list
+     * (M-11d review round 4, finding 2).
+     *
+     * @return empty for a row that is not a Token Status List, or whose document cannot be read (its update then fails
+     *         with what is wrong with it)
+     */
+    public java.util.OptionalLong capacity(StatusListCredential list) {
+        if (list == null || list.getVcDocument() == null) {
+            return java.util.OptionalLong.empty();
+        }
+        try {
+            if (TYPE_CWT.equals(list.getCredentialType())) {
+                TokenStatusListCwt.Decoded decoded = TokenStatusListCwt.decode(token(envelope(list.getVcDocument())));
+                return entries(decoded.lst().length, decoded.bits());
+            }
+            if (TYPE.equals(list.getCredentialType())) {
+                Map<String, Object> statusList = SignedJWT.parse(list.getVcDocument()).getJWTClaimsSet()
+                        .getJSONObjectClaim("status_list");
+                if (statusList == null) {
+                    return java.util.OptionalLong.empty();
+                }
+                int bitsPerStatus = statusList.get("bits") instanceof Number n ? n.intValue() : 1;
+                return entries(decode(String.valueOf(statusList.get("lst"))).length, bitsPerStatus);
+            }
+        } catch (Exception e) {
+            log.debug("The size of token status list {} cannot be read: {}", list.getId(), e.getMessage());
+        }
+        return java.util.OptionalLong.empty();
+    }
+
+    /** {@code bytes × 8 ÷ bitsPerStatus} for the sizes TSL section 4.1 allows (1, 2, 4 or 8 bits per status). */
+    private static java.util.OptionalLong entries(int bytes, int bitsPerStatus) {
+        if (bitsPerStatus != 1 && bitsPerStatus != 2 && bitsPerStatus != 4 && bitsPerStatus != 8) {
+            return java.util.OptionalLong.empty();
+        }
+        return java.util.OptionalLong.of((long) bytes * 8 / bitsPerStatus);
     }
 
     /**

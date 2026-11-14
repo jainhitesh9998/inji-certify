@@ -47,8 +47,8 @@ import static org.mockito.Mockito.when;
  * and never parks one silently (M-11d review rounds 1 and 2).
  *
  * <p>The transaction table is an in-memory one that behaves as the queries do: pending rows that name a list, oldest
- * first (creation time, then id), without the lists the job excludes, at most the page size. The token-list service is
- * a mock whose {@code update} is scripted per test.
+ * first by id, without the lists the job excludes, at most the page size. The token-list service is a mock whose
+ * {@code update} is scripted per test; the per-list step is the real {@link StatusListTransactionApplier}.
  */
 class StatusListUpdateBatchJobStuckListsTest {
 
@@ -73,14 +73,14 @@ class StatusListUpdateBatchJobStuckListsTest {
         when(provider.getIfAvailable()).thenReturn(tokenLists);
         when(tokenLists.trustMaterialVersion()).thenAnswer(inv -> trust.get());
         ReflectionTestUtils.setField(job, "transactionRepository", table.repository);
-        ReflectionTestUtils.setField(job, "statusListRepository", lists);
+        ReflectionTestUtils.setField(job, "applier", new StatusListTransactionApplier(table.repository, lists, provider,
+                mock(StatusListCredentialService.class)));
         ReflectionTestUtils.setField(job, "tokenStatusLists", provider);
-        ReflectionTestUtils.setField(job, "statusListCredentialService", mock(StatusListCredentialService.class));
         ReflectionTestUtils.setField(job, "batchJobEnabled", true);
         ReflectionTestUtils.setField(job, "batchSize", 1);
         job.setClock(clock);
         job.bindMetrics(meters);
-        when(lists.findById(anyString())).thenAnswer(inv -> Optional.of(row(inv.getArgument(0))));
+        when(lists.findByIdForUpdate(anyString())).thenAnswer(inv -> Optional.of(row(inv.getArgument(0))));
         Logger logger = (Logger) LoggerFactory.getLogger(StatusListUpdateBatchJob.class);
         logs.start();
         logger.addAppender(logs);
@@ -275,6 +275,34 @@ class StatusListUpdateBatchJobStuckListsTest {
         assertTrue(table.pending().isEmpty());
         assertTrue(logs.list.stream().anyMatch(event -> event.getFormattedMessage().contains("updated again after 3 failed")),
                 messages());
+    }
+
+    /**
+     * M-11d review round 4, nit 5: binding the meters again — the same registry, or one after another and back — registers
+     * nothing more: each registry holds one gauge per name and one counter, all reading this job's state.
+     */
+    @Test
+    void bindingTheMetricsAgainRegistersNothingMore() {
+        SimpleMeterRegistry other = new SimpleMeterRegistry();
+        job.bindMetrics(meters); // bound once in setUp already
+        job.bindMetrics(other);
+        job.bindMetrics(meters);
+        job.bindMetrics(other);
+        for (SimpleMeterRegistry registry : List.of(meters, other)) {
+            for (String name : List.of(StatusListUpdateBatchJob.METRIC_QUARANTINED_LISTS,
+                    StatusListUpdateBatchJob.METRIC_QUARANTINED_TRANSACTIONS, StatusListUpdateBatchJob.METRIC_REJECTED_TRANSACTIONS)) {
+                assertEquals(1, registry.find(name).meters().size(), name);
+            }
+            assertEquals(3, registry.getMeters().size(), "three meters, nothing else: " + registry.getMetersAsString());
+        }
+        table.add("cwt-revoked", 1, true, T0);
+        script((row, statuses) -> {
+            throw TokenStatusListUpdateException.signing(row.getId(), new IllegalStateException(
+                    StatusListSignerPolicy.REVOKED + ": on hold"));
+        });
+        job.updateStatusLists();
+        assertEquals(1.0, meters.get(StatusListUpdateBatchJob.METRIC_QUARANTINED_LISTS).gauge().value());
+        assertEquals(1.0, other.get(StatusListUpdateBatchJob.METRIC_QUARANTINED_LISTS).gauge().value());
     }
 
     // ---------------------------------------------------------------------------------------------------------------

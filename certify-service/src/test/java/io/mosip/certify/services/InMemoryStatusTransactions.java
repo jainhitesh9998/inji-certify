@@ -23,8 +23,9 @@ import static org.mockito.Mockito.when;
 
 /**
  * {@code credential_status_transaction} as the status-list batch job's queries see it, in memory: pending rows that name
- * a list, oldest first (creation time, then id), without the lists the job excludes, at most the page size; a row the
- * job marks processed leaves the selection. Shared by the batch-job tests of this package and of the CWT service.
+ * a list, oldest first by id (the database sequence, never {@code cr_dtimes}: G42), without the lists the job excludes,
+ * at most the page size; a row the job marks processed leaves the selection. A list's pending rows are read the same way
+ * by {@link StatusListTransactionApplier}. Shared by the batch-job tests of this package and of the CWT service.
  */
 public final class InMemoryStatusTransactions {
 
@@ -33,13 +34,25 @@ public final class InMemoryStatusTransactions {
     public final List<Set<String>> excludedSelections = new CopyOnWriteArrayList<>();
     public final CredentialStatusTransactionRepository repository = mock(CredentialStatusTransactionRepository.class);
     private final AtomicLong ids = new AtomicLong();
+    /**
+     * Runs once, after the next selection was read and before it is returned: what another run does while this one is
+     * paused between its selection and its updates (M-11d review round 4, finding 1).
+     */
+    private final java.util.concurrent.atomic.AtomicReference<Runnable> afterNextSelection = new java.util.concurrent.atomic.AtomicReference<>();
 
     public InMemoryStatusTransactions() {
-        when(repository.findPending(any(Pageable.class))).thenAnswer(inv -> select(Set.of(), inv.getArgument(0)));
+        when(repository.findPending(any(Pageable.class))).thenAnswer(inv -> paused(select(Set.of(), inv.getArgument(0))));
         when(repository.findPendingExcluding(anyCollection(), any(Pageable.class))).thenAnswer(inv -> {
             Set<String> excluded = Set.copyOf(inv.<Collection<String>>getArgument(0));
             excludedSelections.add(excluded);
-            return select(excluded, inv.getArgument(1));
+            return paused(select(excluded, inv.getArgument(1)));
+        });
+        when(repository.findPendingForList(org.mockito.ArgumentMatchers.anyString(), any(Pageable.class))).thenAnswer(inv -> {
+            String listId = inv.getArgument(0);
+            Pageable page = inv.getArgument(1);
+            return rows.stream().filter(t -> !t.getIsProcessed() && listId.equals(t.getStatusListCredentialId()))
+                    .sorted(Comparator.comparing(CredentialStatusTransaction::getTransactionLogId))
+                    .limit(page.getPageSize()).toList();
         });
         // the selection before M-11d review round 2 (OFFSET paging over every pending row): kept so a negative control
         // can run these tests against the old job
@@ -93,13 +106,33 @@ public final class InMemoryStatusTransactions {
         return rows.stream().filter(t -> !t.getIsProcessed()).toList();
     }
 
+    /** {@code interleaved} runs once, between the next selection's read and its return to the job. */
+    public void afterNextSelection(Runnable interleaved) {
+        afterNextSelection.set(interleaved);
+    }
+
+    private List<CredentialStatusTransaction> paused(List<CredentialStatusTransaction> selection) {
+        Runnable interleaved = afterNextSelection.getAndSet(null);
+        if (interleaved != null) {
+            interleaved.run();
+        }
+        return selection;
+    }
+
     private List<CredentialStatusTransaction> select(Set<String> excluded, Pageable page) {
+        // copies, as an ORM hands a separate run its own entities: a later run's writes must not reach this selection
         return rows.stream()
                 .filter(t -> !t.getIsProcessed() && t.getStatusListCredentialId() != null)
                 .filter(t -> !excluded.contains(t.getStatusListCredentialId()))
-                .sorted(Comparator.comparing(CredentialStatusTransaction::getCreatedDtimes)
-                        .thenComparing(CredentialStatusTransaction::getTransactionLogId))
+                .sorted(Comparator.comparing(CredentialStatusTransaction::getTransactionLogId))
                 .limit(page.getPageSize())
+                .map(InMemoryStatusTransactions::copy)
                 .toList();
+    }
+
+    private static CredentialStatusTransaction copy(CredentialStatusTransaction row) {
+        return new CredentialStatusTransaction(row.getTransactionLogId(), row.getCredentialId(), row.getStatusPurpose(),
+                row.getStatusValue(), row.getStatusListCredentialId(), row.getStatusListIndex(), row.getCreatedDtimes(),
+                row.getProcessedTime(), row.getIsProcessed());
     }
 }

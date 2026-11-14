@@ -149,7 +149,7 @@ public final class TokenStatusListCwt {
         try {
             // mandatory, before anything is encoded or signed: no public path signs a status-list CWT without it
             policy.check(signing, now, mode);
-            Instant validUntil = policy.validUntil(signing);
+            Instant validUntil = policy.validUntil(signing, now);
             requireValidAfter(leaf(signing), validUntil, iat);
             if (exp.getEpochSecond() <= iat.getEpochSecond()) {
                 throw new IllegalArgumentException("exp " + exp + " must be later than iat " + iat

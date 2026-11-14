@@ -35,6 +35,7 @@ import java.util.Optional;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -56,9 +57,14 @@ public class StatusListUpdateBatchJobTest {
     @InjectMocks
     private StatusListUpdateBatchJob batchJob;
 
+    /** The per-list step, with the same repositories: it re-reads a list's pending rows under the list's lock. */
+    private StatusListTransactionApplier applier;
+
     @Before
     public void setup() {
         LockAssert.TestHelper.makeAllAssertsPass(true);
+        applier = new StatusListTransactionApplier(transactionRepository, statusListRepository, null, statusListCredentialService);
+        ReflectionTestUtils.setField(batchJob, "applier", applier);
         ReflectionTestUtils.setField(batchJob, "batchJobEnabled", true);
         ReflectionTestUtils.setField(batchJob, "batchSize", 1000);
     }
@@ -89,7 +95,7 @@ public class StatusListUpdateBatchJobTest {
         when(transactionRepository.findPending(any(Pageable.class)))
                 .thenReturn(Collections.emptyList());
         batchJob.updateStatusLists();
-        verify(statusListRepository, never()).findById(anyString());
+        verify(statusListRepository, never()).findByIdForUpdate(anyString());
     }
 
     @Test
@@ -98,7 +104,7 @@ public class StatusListUpdateBatchJobTest {
                 txn("list-a", 1L, true), txn("list-a", 2L, true), txn("list-b", 1L, true));
         when(transactionRepository.findPending(any(Pageable.class)))
                 .thenReturn(txns);
-        doNothing().when(batchJob).updateStatusList(anyString(), anyList());
+        doReturn(new StatusListTransactionApplier.Outcome(1, 0)).when(batchJob).updateStatusList(anyString(), anyList());
 
         batchJob.updateStatusLists();
 
@@ -112,7 +118,7 @@ public class StatusListUpdateBatchJobTest {
         when(transactionRepository.findPending(any(Pageable.class)))
                 .thenReturn(txns);
         doThrow(new RuntimeException("fail")).when(batchJob).updateStatusList(eq("list-a"), anyList());
-        doNothing().when(batchJob).updateStatusList(eq("list-b"), anyList());
+        doReturn(new StatusListTransactionApplier.Outcome(1, 0)).when(batchJob).updateStatusList(eq("list-b"), anyList());
 
         batchJob.updateStatusLists();
 
@@ -128,7 +134,7 @@ public class StatusListUpdateBatchJobTest {
 
     @Test
     public void should_throwCertifyException_when_statusListNotFound() {
-        when(statusListRepository.findById("list-a")).thenReturn(Optional.empty());
+        when(statusListRepository.findByIdForUpdate("list-a")).thenReturn(Optional.empty());
         assertThrows(CertifyException.class, () ->
                 batchJob.updateStatusList("list-a", List.of(txn("list-a", 1L, true))));
     }
@@ -145,13 +151,17 @@ public class StatusListUpdateBatchJobTest {
         list.setCapacityInKB(capacityKb);
         list.setVcDocument(vc.toString());
 
-        when(statusListRepository.findById("list-a")).thenReturn(Optional.of(list));
+        when(statusListRepository.findByIdForUpdate("list-a")).thenReturn(Optional.of(list));
+        List<CredentialStatusTransaction> pending = List.of(txn("list-a", 1L, true), txn("list-a", 1L, false));
+        when(transactionRepository.findPendingForList(eq("list-a"), any(Pageable.class))).thenReturn(pending);
         when(statusListCredentialService.resignStatusListCredential(anyString())).thenReturn(vc.toString());
 
-        batchJob.updateStatusList("list-a", List.of(txn("list-a", 1L, true), txn("list-a", 1L, false)));
+        StatusListTransactionApplier.Outcome outcome = batchJob.updateStatusList("list-a", pending);
 
+        assertEquals(2, outcome.applied());
         verify(transactionRepository).saveAll(anyList());
         verify(statusListRepository, atLeastOnce()).save(list);
+        assertTrue(pending.stream().allMatch(CredentialStatusTransaction::getIsProcessed));
     }
 
     @Test
@@ -165,7 +175,7 @@ public class StatusListUpdateBatchJobTest {
 
         when(statusListCredentialService.resignStatusListCredential(anyString())).thenReturn(vc.toString());
 
-        batchJob.updateStatusListCredential(list, "newEncodedList");
+        applier.updateStatusListCredential(list, "newEncodedList");
 
         verify(statusListRepository).save(list);
     }
@@ -176,7 +186,7 @@ public class StatusListUpdateBatchJobTest {
         list.setId("list-a");
         list.setVcDocument("{invalid json");
         assertThrows(CertifyException.class, () ->
-                batchJob.updateStatusListCredential(list, "newEncodedList"));
+                applier.updateStatusListCredential(list, "newEncodedList"));
     }
 
     /**
@@ -195,7 +205,7 @@ public class StatusListUpdateBatchJobTest {
         list.setVcDocument(vc.toString());
         setClock(Instant.parse("2026-11-13T15:00:23Z"));
 
-        batchJob.updateStatusListCredential(list, "newEncodedList");
+        applier.updateStatusListCredential(list, "newEncodedList");
 
         ArgumentCaptor<String> resigned = ArgumentCaptor.forClass(String.class);
         verify(statusListCredentialService).resignStatusListCredential(resigned.capture());
@@ -218,7 +228,7 @@ public class StatusListUpdateBatchJobTest {
         list.setVcDocument(vc.toString());
         setClock(Instant.parse("2026-11-13T15:00:23.123456789Z"));
 
-        batchJob.updateStatusListCredential(list, "newEncodedList");
+        applier.updateStatusListCredential(list, "newEncodedList");
 
         ArgumentCaptor<String> resigned = ArgumentCaptor.forClass(String.class);
         verify(statusListCredentialService).resignStatusListCredential(resigned.capture());

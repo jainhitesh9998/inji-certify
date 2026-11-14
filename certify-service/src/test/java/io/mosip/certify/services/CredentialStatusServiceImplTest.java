@@ -58,7 +58,7 @@ public class CredentialStatusServiceImplTest {
         String statusListCredential = "https://example.com/status-list/xyz#87823";
         UpdateCredentialStatusRequest request = createValidUpdateCredentialRequest(statusListCredential);
 
-        when(statusListCredentialRepository.findById(statusListCredential)).thenReturn(Optional.empty());
+        when(statusListCredentialRepository.findByIdForUpdate(statusListCredential)).thenReturn(Optional.empty());
 
         CertifyException exception = assertThrows(CertifyException.class, () -> {
             credentialStatusService.updateCredentialStatus(request);
@@ -77,7 +77,7 @@ public class CredentialStatusServiceImplTest {
         StatusListCredential mockStatusListCredential = new StatusListCredential();
         mockStatusListCredential.setStatusPurpose("revocation");
 
-        when(statusListCredentialRepository.findById(statusListCredential)).thenReturn(Optional.of(mockStatusListCredential));
+        when(statusListCredentialRepository.findByIdForUpdate(statusListCredential)).thenReturn(Optional.of(mockStatusListCredential));
         when(credentialStatusTransactionRepository.save(any(CredentialStatusTransaction.class)))
                 .thenAnswer(invocation -> invocation.getArgument(0));
 
@@ -95,7 +95,7 @@ public class CredentialStatusServiceImplTest {
         StatusListCredential mockStatusListCredential = new StatusListCredential();
         mockStatusListCredential.setStatusPurpose("revocation");
 
-        when(statusListCredentialRepository.findById(statusListCredential)).thenReturn(Optional.of(mockStatusListCredential));
+        when(statusListCredentialRepository.findByIdForUpdate(statusListCredential)).thenReturn(Optional.of(mockStatusListCredential));
         when(credentialStatusTransactionRepository.save(any(CredentialStatusTransaction.class)))
                 .thenAnswer(invocation -> invocation.getArgument(0));
 
@@ -142,7 +142,7 @@ public class CredentialStatusServiceImplTest {
         StatusListCredential mockStatusListCredential = new StatusListCredential();
         mockStatusListCredential.setStatusPurpose("revocation");
 
-        when(statusListCredentialRepository.findById(statusListCredential)).thenReturn(Optional.of(mockStatusListCredential));
+        when(statusListCredentialRepository.findByIdForUpdate(statusListCredential)).thenReturn(Optional.of(mockStatusListCredential));
         when(credentialStatusTransactionRepository.save(any(CredentialStatusTransaction.class)))
                 .thenAnswer(invocation -> invocation.getArgument(0));
 
@@ -163,6 +163,59 @@ public class CredentialStatusServiceImplTest {
 
         assertEquals("status_list_not_found_for_the_given_id", exception.getErrorCode());
         assertEquals("Status List Credential not found for ID: invalid-format", exception.getMessage());
+    }
+
+    /**
+     * M-11d review round 4, finding 2 (G43): an index that is not on the list is refused before anything is queued — a
+     * negative one, 2^35 (which a narrowing conversion wrapped onto index 0), and the index equal to the list's size —
+     * for a Bitstring list (its {@code capacity_in_kb}) and for a Token Status List (its own {@code lst}).
+     */
+    @Test
+    public void updateCredentialStatus_IndexNotOnTheList_IsRefusedBeforeAnythingIsQueued() {
+        String listId = "bitstring-list";
+        StatusListCredential bitstring = new StatusListCredential();
+        bitstring.setId(listId);
+        bitstring.setCapacityInKB(16L); // 131,072 statuses
+        when(statusListCredentialRepository.findByIdForUpdate(listId)).thenReturn(Optional.of(bitstring));
+        for (long index : new long[]{-1L, 131_072L, 1L << 35, Long.MIN_VALUE}) {
+            UpdateCredentialStatusRequest request = createValidUpdateCredentialRequest(listId);
+            request.getCredentialStatus().setStatusListIndex(index);
+            CertifyException refused = assertThrows(CertifyException.class, () -> credentialStatusService.updateCredentialStatus(request));
+            assertEquals("requested_index_is_out_of_bounds_for_status_list_capacity", refused.getErrorCode());
+        }
+        org.mockito.Mockito.verify(credentialStatusTransactionRepository, org.mockito.Mockito.never()).save(any());
+
+        when(credentialStatusTransactionRepository.save(any(CredentialStatusTransaction.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        UpdateCredentialStatusRequest last = createValidUpdateCredentialRequest(listId);
+        last.getCredentialStatus().setStatusListIndex(131_071L);
+        assertEquals(131_071L, credentialStatusService.updateCredentialStatus(last).getStatusListIndex(), "the last index is on the list");
+    }
+
+    @Test
+    public void updateCredentialStatus_TokenStatusListIndex_IsHeldToTheListsOwnSize() {
+        String listId = "token-list";
+        StatusListCredential token = new StatusListCredential();
+        token.setId(listId);
+        token.setCredentialType(io.mosip.certify.status.TokenStatusListService.TYPE_CWT);
+        token.setCapacityInKB(1L); // what the row says; the token's own lst decides
+        when(statusListCredentialRepository.findByIdForUpdate(listId)).thenReturn(Optional.of(token));
+        io.mosip.certify.status.TokenStatusListService tokenLists = org.mockito.Mockito.mock(io.mosip.certify.status.TokenStatusListService.class);
+        when(tokenLists.capacity(token)).thenReturn(java.util.OptionalLong.of(16));
+        @SuppressWarnings("unchecked")
+        org.springframework.beans.factory.ObjectProvider<io.mosip.certify.status.TokenStatusListService> provider =
+                org.mockito.Mockito.mock(org.springframework.beans.factory.ObjectProvider.class);
+        when(provider.getIfAvailable()).thenReturn(tokenLists);
+        org.springframework.test.util.ReflectionTestUtils.setField(credentialStatusService, "tokenStatusLists", provider);
+
+        UpdateCredentialStatusRequest atSize = createValidUpdateCredentialRequest(listId);
+        atSize.getCredentialStatus().setStatusListIndex(16L);
+        assertEquals("requested_index_is_out_of_bounds_for_status_list_capacity",
+                assertThrows(CertifyException.class, () -> credentialStatusService.updateCredentialStatus(atSize)).getErrorCode());
+
+        when(credentialStatusTransactionRepository.save(any(CredentialStatusTransaction.class))).thenAnswer(invocation -> invocation.getArgument(0));
+        UpdateCredentialStatusRequest inside = createValidUpdateCredentialRequest(listId);
+        inside.getCredentialStatus().setStatusListIndex(15L);
+        assertEquals(15L, credentialStatusService.updateCredentialStatus(inside).getStatusListIndex());
     }
 
     private UpdateCredentialStatusRequest createValidUpdateCredentialRequest(String statusListCredential) {

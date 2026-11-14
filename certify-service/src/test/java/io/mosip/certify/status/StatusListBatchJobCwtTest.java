@@ -7,6 +7,7 @@ import ch.qos.logback.core.read.ListAppender;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.mosip.certify.services.InMemoryStatusTransactions;
 import io.mosip.certify.services.StatusListCredentialService;
+import io.mosip.certify.services.StatusListTransactionApplier;
 import io.mosip.certify.services.StatusListUpdateBatchJob;
 import net.javacrumbs.shedlock.core.LockAssert;
 import org.junit.jupiter.api.AfterEach;
@@ -24,6 +25,7 @@ import static io.mosip.certify.status.StatusListTestKeys.DSC;
 import static io.mosip.certify.status.StatusListTestKeys.freshCrl;
 import static io.mosip.certify.status.StatusListTestKeys.staleCrl;
 import static io.mosip.certify.status.TokenStatusListCwtServiceTest.T0;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -62,23 +64,10 @@ class StatusListBatchJobCwtTest {
         TokenStatusListService.Entry entry = lists.allocateCwt("revocation", fixture.dsc());
         listId = fixture.listId(entry);
         idx = entry.idx();
-        @SuppressWarnings("unchecked")
-        ObjectProvider<TokenStatusListService> service = mock(ObjectProvider.class);
-        when(service.getIfAvailable()).thenReturn(lists);
-        @SuppressWarnings("unchecked")
-        ObjectProvider<TokenStatusListProperties> properties = mock(ObjectProvider.class);
-        when(properties.getIfAvailable()).thenReturn(fixture.properties);
-        ReflectionTestUtils.setField(job, "transactionRepository", table.repository);
-        ReflectionTestUtils.setField(job, "statusListRepository", fixture.repository);
-        ReflectionTestUtils.setField(job, "tokenStatusLists", service);
-        ReflectionTestUtils.setField(job, "tokenStatusListProperties", properties);
-        ReflectionTestUtils.setField(job, "statusListCredentialService", mock(StatusListCredentialService.class));
-        ReflectionTestUtils.setField(job, "batchJobEnabled", true);
-        ReflectionTestUtils.setField(job, "batchSize", 1);
-        job.setClock(clock);
+        wire(job);
         job.bindMetrics(meters);
         logs.start();
-        for (Class<?> source : List.of(StatusListUpdateBatchJob.class, TokenStatusListService.class)) {
+        for (Class<?> source : List.of(StatusListUpdateBatchJob.class, StatusListTransactionApplier.class, TokenStatusListService.class)) {
             ((Logger) LoggerFactory.getLogger(source)).addAppender(logs);
         }
     }
@@ -86,7 +75,7 @@ class StatusListBatchJobCwtTest {
     @AfterEach
     void tearDown() {
         LockAssert.TestHelper.makeAllAssertsPass(false);
-        for (Class<?> source : List.of(StatusListUpdateBatchJob.class, TokenStatusListService.class)) {
+        for (Class<?> source : List.of(StatusListUpdateBatchJob.class, StatusListTransactionApplier.class, TokenStatusListService.class)) {
             ((Logger) LoggerFactory.getLogger(source)).detachAppender(logs);
         }
     }
@@ -190,6 +179,113 @@ class StatusListBatchJobCwtTest {
         assertTrue(logs.list.stream().filter(event -> event.getLevel() == Level.WARN)
                         .filter(event -> event.getFormattedMessage().contains(TokenStatusListUpdateException.UNVERIFIABLE))
                         .count() >= 4, "reported on every run: " + messages());
+    }
+
+    /**
+     * M-11d review round 4, finding 1, the reviewer's interleaving through the real CWT service: run A selects the
+     * pending reinstatement and pauses (an instance stalled past ShedLock's {@code lockAtMostFor}); meanwhile run B
+     * applies it, a revocation is queued and run B applies that too ({@code revoked=true, pending=0}). Run A then resumes
+     * with its stale selection. Before the fix it applied the reinstatement again and published
+     * {@code revoked=false, pending=0}; the applier now reads the list's pending rows again (under the list's lock in the
+     * database) and finds nothing to apply.
+     */
+    @Test
+    void aStaleSelectionResumedAfterANewerRunLeavesTheNewestState() {
+        StatusListUpdateBatchJob other = new StatusListUpdateBatchJob(); // a second instance on the same database
+        wire(other);
+        table.add(listId, idx, false, T0); // the reinstatement run A selects
+        table.afterNextSelection(() -> {
+            other.updateStatusLists();      // run B applies the reinstatement
+            table.add(listId, idx, true, T0.plusSeconds(1));
+            clock.advance(Duration.ofMinutes(1));
+            other.updateStatusLists();      // and then the revocation
+            assertTrue(bit(), "revoked=true");
+            assertTrue(table.pending().isEmpty(), "pending=0");
+        });
+        int signedBefore = fixture.signed.get();
+
+        job.updateStatusLists();           // run A: selects, pauses while B runs, then resumes with the stale rows
+
+        assertTrue(bit(), "the newest state stands: the stale reinstatement is not applied again");
+        assertTrue(table.pending().isEmpty());
+        assertEquals(signedBefore + 2, fixture.signed.get(), "run B signed twice; run A signed nothing");
+        assertTrue(table.rows.stream().allMatch(row -> row.getIsProcessed()), "each transaction was applied once");
+    }
+
+    /**
+     * Finding 2 (G43), through the real CWT service: the list holds {@code size-bits} statuses. A negative index, 2^35
+     * (whose {@code (int) (idx / 8)} wrapped to byte 0 and revoked index 0, then was marked processed) and the index
+     * equal to the size are each closed on their own with an ERROR and the rejected counter, and the valid revocation
+     * queued behind them is applied in the same run; the list is never quarantined and index 0 is untouched.
+     */
+    @Test
+    void outOfRangeIndicesAreClosedOnTheirOwnAndAValidRevocationBehindThemIsApplied() {
+        ReflectionTestUtils.setField(job, "batchSize", 10);
+        long size = fixture.properties.sizeBits();
+        assertEquals(size, lists.capacity(fixture.rows.get(listId)).orElseThrow(), "the list's own size");
+        long valid = size - 1; // the last index on the list, not index 0 (which the overflow used to hit)
+        assertFalse(TokenStatusListService.get(TokenStatusListCwt.decode(token()).lst(), 0));
+        table.add(listId, -1, true, T0);
+        table.add(listId, 1L << 35, true, T0.plusSeconds(1));
+        table.add(listId, size, true, T0.plusSeconds(2));
+        table.add(listId, valid, true, T0.plusSeconds(3));
+
+        job.updateStatusLists();
+
+        byte[] bits = TokenStatusListCwt.decode(token()).lst();
+        assertTrue(TokenStatusListService.get(bits, valid), "the valid revocation is applied in the same run");
+        assertFalse(TokenStatusListService.get(bits, 0), "2^35 does not wrap onto index 0");
+        assertTrue(table.pending().isEmpty(), "the invalid rows are closed, not left to block the list");
+        assertEquals(3.0, meters.get(StatusListUpdateBatchJob.METRIC_REJECTED_TRANSACTIONS).functionCounter().count());
+        assertEquals(0.0, meters.get(StatusListUpdateBatchJob.METRIC_QUARANTINED_LISTS).gauge().value(), "not quarantined");
+        assertEquals(3, logs.list.stream().filter(event -> event.getLevel() == Level.ERROR)
+                .filter(event -> event.getFormattedMessage().contains("closed without being applied")).count(), messages());
+        for (String index : List.of("-1", String.valueOf(1L << 35), String.valueOf(size))) {
+            assertTrue(logs.list.stream().anyMatch(event -> event.getFormattedMessage().contains("its index " + index + " is not in")),
+                    index + ": " + messages());
+        }
+    }
+
+    /**
+     * Batch size 1: the invalid rows ahead of a valid one cost a run each and never hold the list back, and neither
+     * touches a bit — not index 0, where 2^35 wrapped, nor any other.
+     */
+    @Test
+    void outOfRangeIndicesAheadOfAValidOneNeverHoldTheListBack() {
+        long valid = fixture.properties.sizeBits() - 1;
+        byte[] before = TokenStatusListCwt.decode(token()).lst();
+        table.add(listId, 1L << 35, true, T0);
+        table.add(listId, -5, true, T0.plusSeconds(1));
+        table.add(listId, valid, true, T0.plusSeconds(2));
+
+        job.updateStatusLists();
+        job.updateStatusLists(); // no clock change: a held list would not be tried again
+        assertArrayEquals(before, TokenStatusListCwt.decode(token()).lst(), "the two invalid rows changed no bit");
+        job.updateStatusLists();
+
+        byte[] after = TokenStatusListCwt.decode(token()).lst();
+        assertTrue(TokenStatusListService.get(after, valid), "applied on the third run");
+        TokenStatusListService.set(after, valid, false);
+        assertArrayEquals(before, after, "and nothing else changed");
+        assertTrue(table.pending().isEmpty());
+        assertEquals(0.0, meters.get(StatusListUpdateBatchJob.METRIC_QUARANTINED_LISTS).gauge().value());
+    }
+
+    private void wire(StatusListUpdateBatchJob target) {
+        @SuppressWarnings("unchecked")
+        ObjectProvider<TokenStatusListService> service = mock(ObjectProvider.class);
+        when(service.getIfAvailable()).thenReturn(lists);
+        @SuppressWarnings("unchecked")
+        ObjectProvider<TokenStatusListProperties> properties = mock(ObjectProvider.class);
+        when(properties.getIfAvailable()).thenReturn(fixture.properties);
+        ReflectionTestUtils.setField(target, "transactionRepository", table.repository);
+        ReflectionTestUtils.setField(target, "applier", new StatusListTransactionApplier(table.repository,
+                fixture.repository, service, mock(StatusListCredentialService.class)));
+        ReflectionTestUtils.setField(target, "tokenStatusLists", service);
+        ReflectionTestUtils.setField(target, "tokenStatusListProperties", properties);
+        ReflectionTestUtils.setField(target, "batchJobEnabled", true);
+        ReflectionTestUtils.setField(target, "batchSize", 1);
+        target.setClock(clock);
     }
 
     private boolean bit() {

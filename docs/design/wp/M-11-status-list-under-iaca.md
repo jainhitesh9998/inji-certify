@@ -957,8 +957,9 @@ Branch `wp/m-11d-status-cwt-lists`. Depends on M-11c. About 650 lines.
    job routes `TYPE_CWT` rows the same way as `TYPE` rows. A CWT update that cannot be applied is a
    `TokenStatusListUpdateException` saying whether a retry can help (review round 2, major 2); the batch job applies
    each list's transactions strictly oldest first and holds back a list that failed (review round 2):
-   - **Selection.** Each run reads the oldest pending transactions that name a list (`ORDER BY cr_dtimes,
-     transaction_log_id`), at most `batch-size`, **without** the lists it holds back — the exclusion is in the query
+   - **Selection.** Each run reads the oldest pending transactions that name a list (`ORDER BY transaction_log_id`,
+     the database sequence, never a node's clock: review round 4, G42), at most `batch-size`, **without** the lists it
+     holds back — the exclusion is in the query
      (`status_list_credential_id NOT IN (:excluded)`), so stuck rows never fill the window and there is no OFFSET
      paging and no `max-pages`. One id per held list, not per row: the set is bounded by the number of lists, far
      below PostgreSQL's bind-parameter ceiling, so no exclusion table (and no migration, D-M11-4) is needed.
@@ -970,7 +971,7 @@ Branch `wp/m-11d-status-cwt-lists`. Depends on M-11c. About 650 lines.
      failure up to `batch.retry-backoff-max` (`PT15M`).
    - **Permanent** (`STATUS_SIGNER_GONE` without a cause — the reference names another certificate —, `REVOKED`,
      `PURPOSE`, `NO_TRUSTED_IACA`, `SELF_SIGNED`, `CARRIES_ANCHOR`, `ISSUER_NOT_CA`, `PATH_LENGTH`, `NO_CHAIN`,
-     `EXPIRED`, `IACA_EXPIRED`, `CHAIN_LINK_INVALID`; an unreadable or unverifiable row; an index outside the list):
+     `EXPIRED`, `IACA_EXPIRED`, `CHAIN_LINK_INVALID`; an unreadable or unverifiable row):
      quarantined for `batch.quarantine` (`PT1H`) and tried again after it, or at the next run once the IACA trust
      material (an anchor or its CRL) changes, so an operator's fix needs no restart.
    - **Observable.** The first failure of a streak is an ERROR (a stack trace for a transient one, none for a
@@ -1101,6 +1102,47 @@ GET/HEAD × `Accept` × JWT row-kind cases identical to `7de07e8e`.
 - [x] Every `StatusListSignerPolicy` rule is classified on purpose (`TokenStatusListUpdateExceptionTest`); an edited
   signer binding is refused warm and cold (`aWarmInstanceChecksAnEditedSignerBindingAgain`); serving in the last `ttl`
   resolves nothing (`servingAListInItsLastTtlAsksTheKeyProviderForNothing`).
+
+**Review round 3 (2026-11-14: Opus approved; GPT-6.1 Sol 3 majors, a minor and a nit; fix round 4 on `wp/m-11d-final`,
+Opus).** (1) a stale selection could undo a newer revocation: the job applied the rows it had selected without checking
+they were still pending, so an instance paused past ShedLock's `lockAtMostFor` (50 minutes) resumed after another had
+applied them and a newer revocation, and published `revoked=false, pending=0` over `revoked=true, pending=0`. The job now
+only selects which lists to visit; each list is applied by `StatusListTransactionApplier` (a bean of its own, so
+`@Transactional` is not bypassed by self-invocation) in one database transaction: lock the list's row, read its pending
+transactions again, apply them, mark them processed, commit. `lockAtMostFor` defaults to `10m`; correctness no longer
+depends on it. (2) an out-of-range index could modify another credential: `set` narrowed `idx / 8` to `int` before its
+bounds check, so 2^35 wrapped to byte 0 and revoked index 0. `set`/`get` check `0 <= idx < bits.length × 8` as a `long`
+first; the status-change path refuses an index outside the list's own size before anything is queued; the job closes a
+queued row outside its list on its own (ERROR, `certify.status.batch.rejected-transactions`) and applies the list's
+other rows. (3) the node-clock order (G42): selections order by `transaction_log_id`, and the status-change path takes the
+list's row lock before its insert draws the id, so within a list the id order is the commit order. No schema change.
+(4) the first matching IACA controlled renewal (G45): `check` and `validUntil(…, at)` choose an anchor valid at the
+signing instant, the one that ends last. (5) repeated metric binding is idempotent per registry. Decisions in the
+decision log (2026-11-14, M-11d review round 4).
+
+- [x] Two runs interleaved, the stale one resuming after the newer committed, leave the newest state, through the real
+  CWT service (`StatusListBatchJobCwtTest.aStaleSelectionResumedAfterANewerRunLeavesTheNewestState`) and on PostgreSQL
+  (`StatusListPostgresTest.aStaleSelectionResumedAfterAnotherRunDoesNotUndoANewerRevocation`, which fails when the
+  re-read drops its `is_processed` filter).
+- [x] Negative, 2^35 and size-equal indices: never reach the bit array (`TokenStatusListBitsTest`), are refused at the API
+  (`CredentialStatusServiceImplTest.updateCredentialStatus_*`, `StatusListPostgresTest.anIndexNotOnTheListIsRefusedAtTheApi`:
+  legacy wrapper and VC-API `400`), and a queued one is closed while the valid revocation behind it is applied in the
+  same run (`StatusListBatchJobCwtTest.outOfRangeIndicesAreClosedOnTheirOwnAndAValidRevocationBehindThemIsApplied`, JWT
+  on PostgreSQL `queuedIndicesNotOnTheListAreClosedAndTheValidOneBehindThemIsApplied`); with the old `set` and no
+  partition the 2^35 row flips byte 0 (`outOfRangeIndicesAheadOfAValidOneNeverHoldTheListBack` fails).
+- [x] Fast/slow clock on PostgreSQL ends revoked
+  (`StatusListPostgresTest.aReinstatementFromAFastClockNodeDoesNotUndoALaterRevocation`; with the `cr_dtimes` order it
+  ends valid), and a second status change waits for the first's list lock
+  (`aSecondStatusChangeWaitsForTheFirstsListLockSoTheSequenceIsTheCommitOrder`, which also checks the sequence's
+  `CACHE 1`; it fails when the status change reads the list without the lock).
+- [x] Both anchor orders (`StatusListSignerPolicyTest.aReissuedIacaIsChosenOverItsExpiredPredecessorInEitherOrder`,
+  `aStagedReissueIsNotChosenWhileAValidOneExists`; both fail with the first-match choice).
+- [x] Binding the meters again registers nothing more
+  (`StatusListUpdateBatchJobStuckListsTest.bindingTheMetricsAgainRegistersNothingMore`).
+- [x] I1-I7: `IssuanceGoldenTest`, `IssuanceGoldenCoreTest`, `D13GoldenReplayTest` (which carry P0-03's signature
+  vectors; no class named `SignatureVectorTest` exists on this branch), `*ArchitectureTest`, `FlywayMigrationTest`,
+  `UpgradeFrom014Test`, `check-runtime-classpath.sh` and `check-bc169-linkage.sh` green; JWT and Bitstring bytes unchanged
+  for every index on the list.
 
 ### M-11e Issuance binding: the DSC that signs the mDL signs its list (certify-spi, certify-issuance, certify-format-mdoc, certify-service)
 

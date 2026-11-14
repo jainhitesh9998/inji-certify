@@ -1,33 +1,28 @@
 package io.mosip.certify.services;
 
+import io.micrometer.core.instrument.FunctionCounter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.mosip.certify.core.constants.ErrorConstants;
 import io.mosip.certify.core.exception.CertifyException;
 import io.mosip.certify.entity.CredentialStatusTransaction;
-import io.mosip.certify.entity.StatusListCredential;
 import io.mosip.certify.repository.CredentialStatusTransactionRepository;
-import io.mosip.certify.repository.StatusListCredentialRepository;
 import io.mosip.certify.status.StatusListRetiredException;
 import io.mosip.certify.status.TokenStatusListProperties;
 import io.mosip.certify.status.TokenStatusListService;
 import io.mosip.certify.status.TokenStatusListUpdateException;
-import io.mosip.certify.utils.BitStringStatusListUtils;
 import lombok.extern.slf4j.Slf4j;
 import net.javacrumbs.shedlock.core.LockAssert;
 import net.javacrumbs.shedlock.spring.annotation.SchedulerLock;
-import org.json.JSONObject;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Clock;
 import java.time.Instant;
-import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -46,6 +41,14 @@ import java.util.stream.Collectors;
  * {@code certify.status.token-status-list.batch.quarantine} or until the IACA trust material changes; a quarantined
  * list is reported every run (a WARN with its pending transactions, and the gauges {@value #METRIC_QUARANTINED_LISTS}
  * and {@value #METRIC_QUARANTINED_TRANSACTIONS}).
+ *
+ * <p>The job never applies the rows it selected: the selection only says which lists to visit and how many of their
+ * transactions. Each list is applied by {@link StatusListTransactionApplier} in one database transaction that locks the
+ * list's row, reads its pending transactions again, applies them and marks them processed (M-11d review round 4). So a
+ * run that resumes after another run applied its selection — an instance paused past {@code lockAtMostFor} — applies
+ * nothing stale, the order is the database sequence's rather than any node's clock, and a transaction whose index is
+ * not on its list is closed on its own ({@value #METRIC_REJECTED_TRANSACTIONS}) while the list's other transactions are
+ * applied. ShedLock keeps two instances from doing the same work; correctness no longer depends on its lease.
  */
 @Slf4j
 @Service
@@ -55,12 +58,18 @@ public class StatusListUpdateBatchJob {
     public static final String METRIC_QUARANTINED_LISTS = "certify.status.batch.quarantined-lists";
     /** Gauge: the pending transactions on those lists, as counted by the last run. */
     public static final String METRIC_QUARANTINED_TRANSACTIONS = "certify.status.batch.quarantined-transactions";
+    /**
+     * Counter: queued status transactions closed without being applied because their index is not on their list
+     * (negative, or at or past its size). Each is logged at ERROR with its id; the list's other transactions are applied.
+     */
+    public static final String METRIC_REJECTED_TRANSACTIONS = "certify.status.batch.rejected-transactions";
 
     @Autowired
     private CredentialStatusTransactionRepository transactionRepository;
 
+    /** Applies one list's transactions under its row lock, in a transaction of its own (a separate bean: see there). */
     @Autowired
-    private StatusListCredentialRepository statusListRepository;
+    private StatusListTransactionApplier applier;
 
     @Autowired
     private ObjectProvider<TokenStatusListService> tokenStatusLists;
@@ -71,9 +80,6 @@ public class StatusListUpdateBatchJob {
 
     @Autowired
     private ObjectProvider<MeterRegistry> meterRegistry;
-
-    @Autowired
-    private StatusListCredentialService statusListCredentialService;
 
     @Value("${mosip.certify.batch.status-list-update.enabled:true}")
     private boolean batchJobEnabled;
@@ -87,29 +93,37 @@ public class StatusListUpdateBatchJob {
     /** What the gauges read: held strongly here, since Micrometer may hold its state weakly. */
     private final AtomicInteger quarantinedLists = new AtomicInteger();
     private final AtomicLong quarantinedTransactions = new AtomicLong();
+    private final AtomicLong rejectedTransactions = new AtomicLong();
+    /** The registries the meters are registered with, by identity: binding one again registers nothing. */
+    private final Set<MeterRegistry> boundRegistries = Collections.newSetFromMap(new IdentityHashMap<>());
     private volatile MeterRegistry boundMeters;
     /** Whether the first run has looked for the application's registry: once, so a failing lookup cannot fail every run. */
     private volatile boolean meterLookupDone;
 
     /**
-     * The clock {@code validFrom} is written from: {@code Clock.systemUTC()} always in production;
-     * only a test sets another through {@link #setClock(Clock)} (not a Spring injection point, so a {@code Clock} bean a
-     * deployment or plugin defines can neither replace the writer clock nor make startup ambiguous). The back-off and the
-     * quarantine run on it too.
+     * The clock the back-off and the quarantine run on: {@code Clock.systemUTC()} always in production; only a test sets
+     * another through {@link #setClock(Clock)} (not a Spring injection point, so a {@code Clock} bean a deployment or
+     * plugin defines can neither replace the writer clock nor make startup ambiguous). It is also the clock a Bitstring
+     * list's {@code validFrom} is written from, which {@link StatusListTransactionApplier} holds.
      */
     private Clock clock = Clock.systemUTC();
 
-    /** For tests: the writer clock (production keeps {@code Clock.systemUTC()}). */
+    /** For tests: the writer clock (production keeps {@code Clock.systemUTC()}); {@code null} restores it. */
     public void setClock(Clock clock) {
-        this.clock = clock;
+        this.clock = clock == null ? Clock.systemUTC() : clock;
+        if (applier != null) {
+            applier.setClock(clock);
+        }
     }
 
     /**
-     * Registers the gauges {@value #METRIC_QUARANTINED_LISTS} and {@value #METRIC_QUARANTINED_TRANSACTIONS} with
-     * {@code registry}. A run binds the application's registry itself; a test binds its own.
+     * Registers the gauges {@value #METRIC_QUARANTINED_LISTS} and {@value #METRIC_QUARANTINED_TRANSACTIONS} and the
+     * counter {@value #METRIC_REJECTED_TRANSACTIONS} with {@code registry}, once per registry: binding the same registry
+     * again (or after another) registers nothing more (M-11d review round 4, nit 5). A run binds the application's
+     * registry itself; a test binds its own.
      */
     public synchronized void bindMetrics(MeterRegistry registry) {
-        if (registry == null || registry == boundMeters) {
+        if (registry == null || !boundRegistries.add(registry)) {
             return;
         }
         Gauge.builder(METRIC_QUARANTINED_LISTS, quarantinedLists, AtomicInteger::get)
@@ -117,6 +131,9 @@ public class StatusListUpdateBatchJob {
                 .register(registry);
         Gauge.builder(METRIC_QUARANTINED_TRANSACTIONS, quarantinedTransactions, AtomicLong::get)
                 .description("Pending credential status transactions on quarantined CWT status lists")
+                .register(registry);
+        FunctionCounter.builder(METRIC_REJECTED_TRANSACTIONS, rejectedTransactions, AtomicLong::get)
+                .description("Queued credential status transactions closed without being applied: index not on the list")
                 .register(registry);
         boundMeters = registry;
     }
@@ -128,7 +145,7 @@ public class StatusListUpdateBatchJob {
     @Scheduled(cron = "${mosip.certify.batch.status-list-update.cron-expression:0 0/1 * * * *}")
     @SchedulerLock(
             name = "updateStatusLists",
-            lockAtMostFor = "${mosip.certify.batch.status-list-update.lock-at-most-for:50m}",
+            lockAtMostFor = "${mosip.certify.batch.status-list-update.lock-at-most-for:10m}",
             lockAtLeastFor = "${mosip.certify.batch.status-list-update.lock-at-least-for:50s}"
     )
     public void updateStatusLists() {
@@ -183,20 +200,24 @@ public class StatusListUpdateBatchJob {
                         continue; // failed earlier in this run: its transactions stay pending, in order
                     }
                     try {
-                        updateStatusList(statusListId, transactions);
-                        processed += transactions.size();
-                        updatedLists++;
+                        StatusListTransactionApplier.Outcome outcome = updateStatusList(statusListId, transactions);
+                        processed += outcome.closed();
+                        rejectedTransactions.addAndGet(outcome.rejected());
+                        if (outcome.closed() > 0) {
+                            updatedLists++;
+                        }
                         recovered(statusListId);
-                        log.info("Successfully updated status list: {} and marked {} transactions as processed", statusListId, transactions.size());
+                        log.info("Successfully updated status list: {} and marked {} transactions as processed ({} closed"
+                                + " as out of range)", statusListId, outcome.closed(), outcome.rejected());
                     } catch (StatusListRetiredException e) {
                         // D-M11-7: no re-sign is possible and none is wanted — every mDL that indexed the list has
                         // expired — so the transactions are closed rather than blocking the queue
-                        markProcessed(transactions);
-                        processed += transactions.size();
+                        int closed = closeRetired(statusListId, transactions.size(), excluded);
+                        processed += closed;
                         recovered(statusListId);
                         log.warn("Status list {} is retired ({}); its {} transaction(s) are marked processed without a"
                                         + " re-sign: every mDL on the list has expired (D-M11-7)",
-                                statusListId, e.getMessage(), transactions.size());
+                                statusListId, e.getMessage(), closed);
                     } catch (TokenStatusListUpdateException e) {
                         excluded.add(statusListId);
                         hold(statusListId, e, now, trust, settings);
@@ -322,16 +343,17 @@ public class StatusListUpdateBatchJob {
     }
 
     /**
-     * Closes transactions that can never be published (a retired list) in their own transaction: the caller's run is
-     * not transactional, so the write must not wait for (or be lost with) another list.
+     * Closes transactions that can never be published (a retired list) in their own transaction, under the list's lock;
+     * a failure excludes the list for the rest of the run, as any other.
      */
-    private void markProcessed(List<CredentialStatusTransaction> transactions) {
-        LocalDateTime processedTime = LocalDateTime.now();
-        for (CredentialStatusTransaction txn : transactions) {
-            txn.setProcessedTime(processedTime);
-            txn.setIsProcessed(true);
+    private int closeRetired(String listId, int limit, Set<String> excluded) {
+        try {
+            return applier.closeRetired(listId, limit);
+        } catch (RuntimeException e) {
+            excluded.add(listId);
+            log.error("The transactions of the retired status list {} could not be closed", listId, e);
+            return 0;
         }
-        transactionRepository.saveAll(transactions);
     }
 
     /**
@@ -347,130 +369,19 @@ public class StatusListUpdateBatchJob {
     }
 
     /**
-     * Update a specific status list with the given transactions
+     * Applies one list's pending transactions, at most as many as a selection found for it. The rows given are not
+     * trusted: they may be a stale selection that another run (or instance) has applied since, so the list's pending
+     * transactions are read again under its row lock and applied in one database transaction
+     * ({@link StatusListTransactionApplier#apply}). A transaction whose index is not on the list is closed on its own.
+     *
+     * @param statusListId the list
+     * @param selected     what a selection found pending for the list; only its size is used
+     * @throws StatusListRetiredException     a CWT list whose pinned signer has expired (nothing written)
+     * @throws TokenStatusListUpdateException a CWT list that cannot be updated now (nothing written)
+     * @throws CertifyException               any other failure (nothing written)
      */
-    @Transactional
-    public void updateStatusList(String statusListId, List<CredentialStatusTransaction> transactions) {
-        log.info("Updating status list {} with {} transactions", statusListId, transactions.size());
-
-        try {
-            // Fetch the current status list credential
-            Optional<StatusListCredential> optionalStatusList = statusListRepository.findById(statusListId);
-
-            if (optionalStatusList.isEmpty()) {
-                log.error("Status list credential not found: {}", statusListId);
-                throw new CertifyException(ErrorConstants.STATUS_LIST_NOT_FOUND);
-            }
-
-            StatusListCredential statusListCredential = optionalStatusList.get();
-
-            // Apply transaction updates to the status data
-            Map<Long, Boolean> updatedStatuses = getUpdatedStatus(transactions);
-            String credentialType = statusListCredential.getCredentialType();
-            if (TokenStatusListService.TYPE.equals(credentialType) || TokenStatusListService.TYPE_CWT.equals(credentialType)) {
-                // a Token Status List is a signed JWT or a CWT Status List Token, not a VC document; the service routes
-                // by the row's type, and a CWT list is re-signed by its own pinned signer (M-11d)
-                TokenStatusListService tokenLists = tokenStatusLists == null ? null : tokenStatusLists.getIfAvailable();
-                if (tokenLists == null) {
-                    throw new CertifyException(ErrorConstants.STATUS_LIST_UPDATE_FAILED, "Token status lists are not available");
-                }
-                tokenLists.update(statusListCredential, updatedStatuses);
-                LocalDateTime processedTime = LocalDateTime.now();
-                for (CredentialStatusTransaction txn : transactions) {
-                    txn.setProcessedTime(processedTime);
-                    txn.setIsProcessed(true);
-                }
-                transactionRepository.saveAll(transactions);
-                return;
-            }
-
-            JSONObject vcDocument = new JSONObject(statusListCredential.getVcDocument());
-
-            // Generate new encoded list
-            String newEncodedList = BitStringStatusListUtils.updateEncodedList(vcDocument.getJSONObject("credentialSubject").getString("encodedList"),updatedStatuses, statusListCredential.getCapacityInKB());
-
-            // Update the status list credential with new encoded list
-            updateStatusListCredential(statusListCredential, newEncodedList);
-
-            // Mark transactions as processed
-            LocalDateTime processedTime = LocalDateTime.now();
-            for (CredentialStatusTransaction txn : transactions) {
-                txn.setProcessedTime(processedTime);
-                txn.setIsProcessed(true);
-            }
-            transactionRepository.saveAll(transactions);
-
-            log.info("Successfully updated status list credential: {}", statusListId);
-
-        } catch (StatusListRetiredException | TokenStatusListUpdateException e) {
-            // the caller closes a retired list's transactions, and holds back a CWT list by what its failure says
-            throw e;
-        } catch (RuntimeException e) {
-            log.error("Error occurred while updating status list with ID: {}", statusListId, e);
-            throw new CertifyException(ErrorConstants.STATUS_LIST_UPDATE_FAILED, "Error occurred while updating status list with ID: " + statusListId);
-        } catch (Exception e) {
-            log.error("Error occurred while updating status list with ID: {}", statusListId, e);
-            throw new CertifyException(ErrorConstants.STATUS_LIST_UPDATE_FAILED, "Error occurred while updating status list with ID: " + statusListId);
-        }
-    }
-
-    /** Returns a map of status list index to the latest status value, based on transaction creation time.
-     * If multiple transactions exist for the same index, the latest one (by createdDtimes) is used.
-     */
-    private Map<Long, Boolean> getUpdatedStatus(List<CredentialStatusTransaction> transactions) {
-        return transactions.stream()
-                .filter(t -> t.getStatusListIndex() != null)
-                .sorted(Comparator.comparing(CredentialStatusTransaction::getCreatedDtimes))
-                .collect(Collectors.toMap(
-                        CredentialStatusTransaction::getStatusListIndex,
-                        CredentialStatusTransaction::getStatusValue,
-                        (first, second) -> second,
-                        HashMap::new
-                ));
-    }
-
-
-    /**
-     * Update the status list credential with the new encoded list
-     */
-    @Transactional
-    public void updateStatusListCredential(StatusListCredential statusListCredential, String newEncodedList) {
-        try {
-            log.info("Starting update of StatusListCredential with ID: {}", statusListCredential.getId());
-
-            // Parse the current VC document
-            JSONObject vcDocument = new JSONObject(statusListCredential.getVcDocument());
-            log.info("Parsed VC document for StatusListCredential ID: {}", statusListCredential.getId());
-
-            // Update the encodedList in the credential subject
-            JSONObject credentialSubject = vcDocument.getJSONObject("credentialSubject");
-            credentialSubject.put("encodedList", newEncodedList);
-            log.info("Updated encodedList for StatusListCredential ID: {}", statusListCredential.getId());
-
-            // Update timestamps
-            // Was new Date().toInstant().toString(): the millisecond instant, so Instant.toString() writes three
-            // fraction digits, or none at all when they are zero (:23Z as well as :23.123Z). clock.instant() would keep
-            // this JVM's microsecond clock and write six digits, which is a different wire form; clock.millis() keeps
-            // the instant and the form exactly as they were. The reader of this field accepts both forms - see
-            // LegacyW3cDateTimes.
-            String newValidFrom = Instant.ofEpochMilli(clock.millis()).toString();
-            vcDocument.put("validFrom", newValidFrom);
-            log.info("Set new validFrom timestamp: {} for StatusListCredential ID: {}", newValidFrom, statusListCredential.getId());
-
-            // Re-sign the status list credential
-            String updatedVcDocument = statusListCredentialService.resignStatusListCredential(vcDocument.toString());
-            log.info("Re-signed VC document for StatusListCredential ID: {}", statusListCredential.getId());
-
-            // Update the database record
-            statusListCredential.setVcDocument(updatedVcDocument);
-            statusListCredential.setUpdatedDtimes(LocalDateTime.now());
-            statusListRepository.save(statusListCredential);
-
-            log.info("Successfully updated and saved StatusListCredential ID: {}", statusListCredential.getId());
-
-        } catch (Exception e) {
-            log.error("Error occurred while updating StatusListCredential with ID: {}", statusListCredential.getId(), e);
-            throw new CertifyException(ErrorConstants.STATUS_LIST_CREDENTIAL_UPDATE_FAILED, "Error occurred while updating StatusListCredential with ID: " + statusListCredential.getId());
-        }
+    public StatusListTransactionApplier.Outcome updateStatusList(String statusListId, List<CredentialStatusTransaction> selected) {
+        log.info("Updating status list {} with up to {} transactions", statusListId, selected.size());
+        return applier.apply(statusListId, selected.size());
     }
 }
