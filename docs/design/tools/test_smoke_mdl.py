@@ -574,7 +574,7 @@ class StatusLeafVerify(unittest.TestCase):
     def test_without_an_iaca_a_dedicated_signers_leaf_fails(self):
         # nothing else in the run has checked a dedicated signer's leaf, so skipping it would leave it unverified
         _, ok, detail = self.verify(self.dsc, signer="dedicated", iaca=False)
-        self.assertFalse(ok, detail)
+        self.assertIs(ok, False, detail)  # a FAIL, not a SKIP (None)
         self.assertIn("nothing else in this run has verified", detail)
 
 
@@ -667,6 +667,17 @@ class SmokeStatusExpectation(unittest.TestCase):
         self.assertFalse(all(ok for _, ok in self.status(b"", entry=None, expect="present")))
         steps = self.status(b"", entry=None, expect="absent")
         self.assertTrue(all(ok is not False for _, ok in steps), steps)
+
+    def test_a_dedicated_signer_run_skips_credos_equal_chain_rule_and_never_passes_it(self):
+        self.__class__.served = {"body": self.body(), "type": s.STATUS_LIST_CWT}
+        s.results.clear()
+        smoke = s.Smoke(self.base, s.MDL_DOCTYPE, "mdl-demo-1", Path("."), expect_status="present",
+                        status_signer="dedicated")
+        smoke.status({"docType": s.MDL_DOCTYPE, "status": {"status_list": {"idx": Cwt.INDEX, "uri": self.uri}}},
+                     [self.cwt.dsc])
+        credo = [ok for step, ok, _ in s.results if "Credo's receipt rule" in step]
+        s.results.clear()
+        self.assertEqual([None], credo, "the dedicated-signer run cannot check Credo's rule: a SKIP, never a PASS")
 
     def test_the_jwt_format_option_keeps_the_jwt_check(self):
         # --status-format jwt is a deployment on mdoc.token-format=jwt: a CWT body is not the JWT its run expects

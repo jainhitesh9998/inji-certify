@@ -12,8 +12,8 @@
  *   npm ci && node probe.mjs ../../../../certify-service/target/mdoc-samples   # CI: every *.mdoc with a sidecar
  *   node probe.mjs <directory>                                                 # locally, the same
  *
- * The tree is installed with `install-strategy=nested` (.npmrc), so each package keeps its own dependencies exactly as
- * Paradym's pnpm tree does: `@owf/token-status-list` 0.6.0 gets the `@owf/cose` 0.6.0 it pins and its own `cbor-x`,
+ * The tree is installed with `install-strategy=nested` (.npmrc), so each package keeps the dependency versions Paradym's
+ * pnpm lockfile pins (the versions match; pnpm may still load one shared `cbor-x` instance): `@owf/token-status-list` 0.6.0 gets the `@owf/cose` 0.6.0 it pins and its own `cbor-x`,
  * beside `@owf/mdoc` 0.9.1's `@owf/cose` 0.6.2. `npm`'s flat node_modules instead keeps one `@owf/cose` beside the
  * other, both register their CBOR tag-24 decoders in the one deduped `cbor-x`, and the copy that loads last then decodes
  * tag 24 for both, so `IssuerSigned.decode` sees a `DataItem` that is not its own class. `@owf/cose` 0.6.2 is also a
@@ -169,19 +169,13 @@ const statusCheck = (expectedStatus) => `@owf/mdoc 0.9.1 reports the status the 
 async function judge({ issuerSigned, list, contentType, expectedStatus }) {
   const checks = []
   const record = (name, ok, detail = '') => checks.push({ name, ok, detail })
-  if (contentType !== CWT) {
-    // @owf/token-status-list 0.6.0 asks for this media type and refuses anything else
-    record(CONTENT_TYPE_CHECK, false, `Content-Type ${contentType}`)
-    return checks
-  }
-  record(CONTENT_TYPE_CHECK, true, contentType)
+  // recorded, never a reason to stop: Paradym has no media-type pre-check of its own, @owf/token-status-list 0.6.0
+  // does it, so the library is always called and its own refusal is what a control exercises
+  record(CONTENT_TYPE_CHECK, contentType === CWT, `Content-Type ${contentType}`)
   const issuanceChain = issuerSigned.issuerAuth.x5chain ?? []
   const entry = statusEntry(issuerSigned)
   const uri = entry instanceof Map ? entry.get('uri') : undefined
-  let statusListChain = []
   try {
-    // inside the try: a sidecar that is not a COSE_Sign1 is one failure, and the equal-chain check below still runs
-    statusListChain = Sign1.decode(new Uint8Array(list)).certificateChain ?? []
     await Holder.verifyIssuerSigned(
       {
         issuerSigned,
@@ -206,6 +200,13 @@ async function judge({ issuerSigned, list, contentType, expectedStatus }) {
   } catch (e) {
     const revokedAsDeclared = expectedStatus === 1 && /not Valid \(0\)/.test(e.message)
     record(expectedStatus === 0 ? ACCEPT_CHECK : statusCheck(expectedStatus), revokedAsDeclared, `${e.name}: ${e.message}`)
+  }
+  let statusListChain = []
+  try {
+    // after the library: a sidecar that is not a COSE_Sign1 is the library's refusal above, and here an empty chain
+    statusListChain = Sign1.decode(new Uint8Array(list)).certificateChain ?? []
+  } catch (e) {
+    statusListChain = []
   }
   const equal = equalChains(issuanceChain, statusListChain)
   record(EQUAL_CHAIN_CHECK, equal, equal ? '' : `list ${statusListChain.length} certificate(s), mDL ${issuanceChain.length}`)
@@ -356,9 +357,10 @@ async function controls(directory) {
       list: () => reSign(original, other.privateKey, withChain(original, [pemToDer(iacaPem)]))
     },
     {
-      // the media type is checked before the library reads anything
+      // the media type is wrong, and @owf/token-status-list itself refuses the JWT format
       name: `a JWT body served as ${JWT}`,
-      expected: [CONTENT_TYPE_CHECK],
+      expected: [CONTENT_TYPE_CHECK, ACCEPT_CHECK],
+      reason: /served in JWT format/,
       list: () => JWT_BODY,
       contentType: JWT
     },
@@ -366,6 +368,7 @@ async function controls(directory) {
       // ... and a JWT body under the CWT media type is the library's own refusal (JwtNotSupportForStatusListError)
       name: `a JWT body served as ${CWT}`,
       expected: [ACCEPT_CHECK],
+      reason: /Unable to decode status list CWT/,
       list: () => JWT_BODY
     }
   ].filter((mutant) => {

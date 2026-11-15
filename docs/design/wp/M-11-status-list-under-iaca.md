@@ -1379,8 +1379,8 @@ certificate was found in the chain" as well as on the equal-chain check. (2) The
 lands beside the versions the packages pinned, and the two copies register their CBOR tag decoders in the one deduped
 `cbor-x`; the copy that loads last then decodes tag 24 for both, and `IssuerSigned.decode` sees a `DataItem` that is not
 its own class, so every sample fails to parse. Isolated, `@owf/token-status-list` 0.6.0 keeps its exact `@owf/cose`
-0.6.0 and its own `cbor-x`, `@owf/mdoc` 0.9.1 gets `@owf/cose` 0.6.2, and no `overrides` entry is needed - the same
-shape Paradym's pnpm install produces. `@owf/cose` is also a top-level dependency because the probe imports `Sign1`,
+0.6.0 and its own `cbor-x`, `@owf/mdoc` 0.9.1 gets `@owf/cose` 0.6.2, and no `overrides` entry is needed - the
+versions Paradym's pnpm lockfile pins (versions, not module instances: pnpm may load one shared `cbor-x`). `@owf/cose` is also a top-level dependency because the probe imports `Sign1`,
 `CoseKey` and the CBOR codec itself. (3) The probe skips a sample whose `.gaps` declares `issuerAuth.untagged:tagged` - the draft-13 Document
 wrapper, which `@owf/mdoc` refuses before it reads any status list. That deviation is the sample's own declared one, not
 a status-list finding, and the CWT form itself is verified on the same list by `verify_status_list.py`, which reads the
