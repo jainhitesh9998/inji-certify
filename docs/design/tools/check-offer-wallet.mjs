@@ -31,7 +31,7 @@
  * offline; OfferPageTest recomputes the inline script's hash from the bytes the controller serves and finds it in the
  * Content-Security-Policy).
  */
-import { createHash, createPublicKey, verify, webcrypto } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, sign, verify, webcrypto, constants } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -406,6 +406,10 @@ const summary = (fake) => credentialsIn(fake).map((record) => [record.format, re
  * Opens the wallet page against an IndexedDB factory (the harness's fake, or another implementation), with the shipped
  * scripts. `walletConfig: false` makes `wallet/config` answer 404, as it does with the wallet switched off. Every fetch
  * the page makes is recorded in `requests` (I9).
+ *
+ * P5-03c adds: `pageUrl`, so a same-device invocation can arrive in the query or the fragment; `relayHosts`, which is
+ * what `wallet/config` publishes; `respond`, the answers to every other request (`{status, body, contentType}` or
+ * `"throw"`); and `clock`, the instant the page's `new Date()` reads, so the request checks run under a faked clock.
  */
 function openWallet(indexedDB, options = {}) {
     const source = readFileSync(resolve(STATIC, "wallet.html"), "utf8");
@@ -416,25 +420,58 @@ function openWallet(indexedDB, options = {}) {
         createTextNode: (data) => new Text(data),
     };
     const requests = [];
-    const pageUrl = new URL("https://credentials.example/v1/certify/offer/wallet");
+    const replacedUrls = [];
+    const pageUrl = new URL(options.pageUrl || "https://credentials.example/v1/certify/offer/wallet");
+    const relayHosts = options.relayHosts || [];
     const fetch = async (url, init = {}) => {
         const target = new URL(String(url), pageUrl).href;
-        requests.push({ method: (init.method || "GET").toUpperCase(), url: target });
-        const enabled = options.walletConfig === undefined ? true : options.walletConfig;
+        const request = {
+            method: (init.method || "GET").toUpperCase(),
+            url: target,
+            headers: Object.assign({}, init.headers || {}),
+            body: init.body,
+            redirect: init.redirect,
+        };
+        requests.push(request);
         if (target === "https://credentials.example/v1/certify/offer/wallet/config") {
-            return enabled ? { status: 200, text: async () => "{\"relay\":{\"hosts\":[]}}" } : { status: 404, text: async () => "" };
+            const enabled = options.walletConfig === undefined ? true : options.walletConfig;
+            return enabled
+                ? { status: 200, text: async () => JSON.stringify({ relay: { hosts: relayHosts } }) }
+                : { status: 404, text: async () => "" };
+        }
+        if (typeof options.respond === "function") {
+            const answer = options.respond(request);
+            if (answer === "throw") throw new TypeError("fetch failed");
+            if (answer !== undefined) {
+                return {
+                    status: answer.status,
+                    headers: { get: (name) => (String(name).toLowerCase() === "content-type" ? answer.contentType || "" : null) },
+                    text: async () => (typeof answer.body === "string" ? answer.body : JSON.stringify(answer.body === undefined ? "" : answer.body)),
+                };
+            }
         }
         return { status: 404, text: async () => "" };
     };
+    // a faked clock: `new Date()` answers the pinned instant, every other Date call is the real one
+    const PinnedDate = options.clock === undefined ? Date : class extends Date {
+        constructor(...args) { if (args.length === 0) super(options.clock.getTime()); else super(...args); }
+        static now() { return options.clock.getTime(); }
+    };
     const context = vm.createContext({
         document,
-        location: { href: pageUrl.href, origin: pageUrl.origin, pathname: pageUrl.pathname },
+        location: { href: pageUrl.href, origin: pageUrl.origin, pathname: pageUrl.pathname, search: pageUrl.search,
+            hash: pageUrl.hash },
+        // `replaceState` is recorded; a page that left the request parameters in the address bar shows here
+        history: {
+            replaceState(state, title, url) { replacedUrls.push(String(url)); },
+        },
         fetch,
         console: { log: () => {}, warn: () => {}, error: () => {} },
         // a timer callback is a task of its own (the harness fake's transactions of the task before are inactive in it)
         setTimeout: taskTimers.setTimeout, clearTimeout: taskTimers.clearTimeout,
         URL, URLSearchParams, Blob, crypto: webcrypto,
         TextEncoder, TextDecoder, btoa, atob, structuredClone, indexedDB,
+        Date: PinnedDate,
     });
     let scriptError = null;
     for (const script of scripts) {
@@ -446,7 +483,7 @@ function openWallet(indexedDB, options = {}) {
             scriptError = scriptError || error;
         }
     }
-    return { elements, document, scriptError, requests, el: (id) => elements.get(id) ?? null };
+    return { elements, document, scriptError, requests, replacedUrls, el: (id) => elements.get(id) ?? null };
 }
 
 async function settle() {
@@ -743,7 +780,138 @@ async function walletDeleteScenarios(makeIndexedDB, label, { closeWaitsForTransa
     });
 }
 
-/* ---------------------------------------------------------------- checks */
+/* ---------------------------------------------------------------- P5-03c: the verifier's material */
+
+const VERIFIER_DIR = resolve(FIXTURES, "verifier");
+const HOSTED_DIR = resolve(FIXTURES, "hosted");
+/** The harness's pinned instant: inside every fixture certificate's validity, and the hosted objects' lifetime. */
+const NOW = new Date("2026-11-15T09:00:00Z");
+const PUBLIC_PAGE = new URL("https://credentials.example/v1/certify/offer/wallet");
+const LOCAL_PAGE = new URL("http://localhost:8090/v1/certify/offer/wallet");
+
+const pemText = (name) => readFileSync(resolve(VERIFIER_DIR, name + ".pem"), "utf8");
+/** A fixture certificate's DER. */
+const derOf = (name) => new Uint8Array(Buffer.from(pemText(name).replace(/-----[^-]+-----/g, "").replace(/\s+/g, ""), "base64"));
+const signerOf = (name) => createPrivateKey(readFileSync(resolve(VERIFIER_DIR, name + ".key.pem"), "utf8"));
+/** An `x5c` entry: base64 of the DER, not base64url (RFC 7515 section 4.1.6). */
+const x5cOf = (name) => Buffer.from(derOf(name)).toString("base64");
+const leafHashOf = (name) => createHash("sha256").update(derOf(name)).digest("base64url");
+const jsonPart = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
+
+/** The X.509 module exactly as the page loads it. */
+const X509 = shipped("x509.js", { crypto: webcrypto, TextDecoder }, "X509");
+/** The OpenID4VP module exactly as the page loads it. */
+const Oid4vp = shipped("oid4vp.js", { X509, crypto: webcrypto, TextEncoder, TextDecoder, btoa, atob, URL, URLSearchParams },
+    "Oid4vp");
+
+/** A JWS signature over `signingInput` with a fixture key, for one of the algorithms the page verifies. */
+function jwsSignature(alg, keyName, signingInput) {
+    const data = Buffer.from(signingInput, "ascii");
+    const key = signerOf(keyName);
+    switch (alg) {
+        case "ES256": return sign("sha256", data, { key, dsaEncoding: "ieee-p1363" });
+        case "ES384": return sign("sha384", data, { key, dsaEncoding: "ieee-p1363" });
+        case "ES512": return sign("sha512", data, { key, dsaEncoding: "ieee-p1363" });
+        case "RS256": return sign("sha256", data, { key, padding: constants.RSA_PKCS1_PADDING });
+        case "PS256": return sign("sha256", data, { key, padding: constants.RSA_PKCS1_PSS_PADDING, saltLength: 32 });
+        default: throw new Error("the harness does not sign " + alg);
+    }
+}
+
+/**
+ * A request object: a compact JWS over `payload`. `alg` picks the signature, `keyName` the fixture key that signs, and
+ * `x5c` the chain (by default the signing key's own certificate). `options.header` is merged into the protected header,
+ * `options.tamper` flips one bit of the signature, and `options.sign === false` carries no signature at all.
+ */
+function jar(payload, options = {}) {
+    const alg = options.alg === undefined ? "ES256" : options.alg;
+    const keyName = options.keyName === undefined ? "verifier" : options.keyName;
+    const header = Object.assign({ alg, typ: "oauth-authz-req+jwt" }, options.header || {});
+    if (options.x5c !== null) header.x5c = options.x5c === undefined ? [x5cOf(keyName)] : options.x5c;
+    const signingInput = jsonPart(header) + "." + jsonPart(payload);
+    if (options.sign === false) return signingInput + ".";
+    const signature = Buffer.from(jwsSignature(alg, keyName, signingInput));
+    if (options.tamper) signature[signature.length - 1] ^= 0x01;
+    return signingInput + "." + signature.toString("base64url");
+}
+
+/** The members one request object starts from: an `x509_san_dns` request that passes R1-R11 under the pinned clock. */
+const VERIFIER_REQUEST = () => ({
+    client_id: "x509_san_dns:verifier.example",
+    response_type: "vp_token",
+    response_mode: "direct_post.jwt",
+    response_uri: "https://verifier.example/response",
+    nonce: "nonce-p503c",
+    state: "state-p503c",
+    aud: "https://self-issued.me/v2",
+    iat: Math.floor(NOW.getTime() / 1000) - 10,
+    exp: Math.floor(NOW.getTime() / 1000) + 600,
+    dcql_query: {
+        credentials: [{ id: "q1", format: "mso_mdoc", meta: { doctype_value: DOC_TYPE },
+            claims: [{ path: [MDL_NAMESPACE, "family_name"] }] }],
+    },
+});
+
+/** That request object with members replaced, or removed when the override is `undefined`. */
+function withMembers(overrides) {
+    const out = VERIFIER_REQUEST();
+    for (const [key, value] of Object.entries(overrides || {})) {
+        if (value === undefined) delete out[key];
+        else out[key] = value;
+    }
+    return out;
+}
+
+/** The link parameters `checkRequest` takes, as a request_uri link of the given scheme gives them. */
+function linkParams(extra = {}) {
+    return Object.assign({
+        scheme: "openid4vp",
+        kind: "request_uri",
+        clientId: "x509_san_dns:verifier.example",
+        requestUri: "https://verifier.example/request.jwt/1",
+        requestUriMethod: "get",
+        findings: [],
+    }, extra);
+}
+
+/** One `checkRequest` under the pinned clock and the public page's origin. */
+async function checkRequestOf(text, options = {}) {
+    return Oid4vp.checkRequest({
+        text,
+        link: options.link === undefined ? linkParams() : options.link,
+        contentType: options.contentType === undefined ? "application/oauth-authz-req+jwt" : options.contentType,
+        pageUrl: options.pageUrl === undefined ? PUBLIC_PAGE : options.pageUrl,
+        now: options.now === undefined ? NOW : options.now,
+        keptIssuerAuthAlgs: options.keptIssuerAuthAlgs,
+    });
+}
+
+/** Asserts a refusal, naming the rule and what the message says (plan 4.5: "The panel names the rule"). */
+function refusesWith(label, result, rule, fragment) {
+    check(`${label}: refused under ${rule}`, result.ok === false && result.rule === rule,
+        result.ok ? "it was accepted" : `${result.rule}: ${result.message}`);
+    check(`${label}: the refusal names the reason`, result.ok === false && fragment.test(String(result.message)),
+        result.ok ? "it was accepted" : String(result.message));
+}
+
+/** A `fetch` for `Oid4vp.fetchRequest`, answering from a table of URLs and recording every call. */
+function scriptedFetch(answers) {
+    const calls = [];
+    const impl = async (url, init = {}) => {
+        const target = String(url);
+        calls.push({ url: target, method: (init.method || "GET").toUpperCase(), headers: Object.assign({}, init.headers || {}),
+            body: init.body, redirect: init.redirect });
+        const answer = answers[target];
+        if (answer === undefined || answer === "throw") throw new TypeError("Failed to fetch");
+        return {
+            status: answer.status,
+            headers: { get: (name) => (String(name).toLowerCase() === "content-type" ? answer.contentType || "" : null) },
+            text: async () => answer.body,
+        };
+    };
+    return { impl, calls };
+}
+
 
 const isMain = process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
@@ -1986,6 +2154,622 @@ await section("19. a closing message never overwrites another tab's newer one", 
     equal("this tab's \"Deleted …\" is never written after the other tab's message", after(oneHistory, "Deleted "), []);
     check("the status is the other tab's outcome", one.el("storageStatus").textContent.startsWith("Another wallet tab deleted everything"),
         JSON.stringify(oneHistory));
+});
+
+// --------------------------------------------------------------------------------------------- P5-03c sections
+
+await section("20. X.509 certificates, signatures and the verifier's chain (P5-03c)", async () => {
+    const leaf = X509.parse(derOf("verifier"));
+    equal("the leaf's subject is the fixture's", leaf.subject.text, "C=IN, O=Inji Demo Certify, CN=Wallet Fixture Verifier");
+    equal("the leaf's issuer is the test CA", leaf.issuer.text, "C=IN, O=Inji Demo Certify, CN=Wallet Fixture Verifier CA");
+    equal("the leaf's validity is read as the certificate wrote it",
+        [leaf.notBefore.toISOString(), leaf.notAfter.toISOString()],
+        ["2026-01-01T00:00:00.000Z", "2036-01-01T00:00:00.000Z"]);
+    equal("its dNSName and URI subject alternative names are read (RFC 5280 4.2.1.6)",
+        leaf.sans, { dnsNames: ["verifier.example"], uris: ["https://verifier.example/v1/certify/offer/wallet"] });
+    equal("it is a version 3 leaf, not a CA, and can only sign",
+        [leaf.version, leaf.ca, leaf.keyUsageText], [3, false, "digitalSignature"]);
+    equal("its key is the P-256 EC key it carries", leaf.publicKey, { kind: "ec", curve: "P-256" });
+    equal("its AKI is the CA's SKI (RFC 5280 4.2.1.1)", hex(leaf.aki), hex(X509.parse(derOf("ca")).ski));
+    equal("its own SKI is 20 bytes", leaf.ski.length, 20);
+    equal("the CA's basic constraints carry cA and pathLen 2",
+        [X509.parse(derOf("ca")).ca, X509.parse(derOf("ca")).pathLength], [true, 2]);
+    equal("the intermediate's pathLen is 0", X509.parse(derOf("intermediate")).pathLength, 0);
+    equal("the RSA leaf's key is named by its size", X509.parse(derOf("rsa-leaf")).publicKey, { kind: "rsa", bits: 2048 });
+
+    // each certificate's signature with the next one's key (RFC 5280 6.1.3 (a)(1))
+    const issuedBy = async (child, parent) => {
+        try {
+            return await X509.verifyIssuedBy(X509.parse(derOf(child)), X509.parse(derOf(parent)));
+        } catch (error) {
+            return "threw: " + error.message;
+        }
+    };
+    equal("the CA's signature on the leaf verifies", await issuedBy("verifier", "ca"), true);
+    equal("another leaf under the same CA verifies too", await issuedBy("other", "ca"), true);
+    equal("the expired leaf's signature is still the CA's (validity is a separate check)", await issuedBy("expired", "ca"), true);
+    equal("the other.example leaf did not sign the verifier leaf", await issuedBy("verifier", "other"), false);
+    equal("the impostor CA did not sign the leaf", await issuedBy("verifier", "impostor-ca"), false);
+    equal("the intermediate is signed by the CA", await issuedBy("intermediate", "ca"), true);
+    equal("the leaf under the intermediate is signed by it", await issuedBy("leaf-under-intermediate", "intermediate"), true);
+    equal("the CA did not sign that leaf", await issuedBy("leaf-under-intermediate", "ca"), false);
+    equal("the RSA chain verifies", await issuedBy("rsa-leaf", "rsa-ca"), true);
+    equal("the P-384 chain verifies", await issuedBy("p384-leaf", "p384-ca"), true);
+    equal("the P-521 chain verifies", await issuedBy("p521-leaf", "p521-ca"), true);
+    equal("a self-signed certificate verifies with its own key", await issuedBy("self-signed", "self-signed"), true);
+    equal("an ECDSA certificate against an RSA key is refused, not answered false",
+        /ECDSA certificate is signed by a non-EC key/.test(String(await issuedBy("verifier", "rsa-ca"))), true);
+
+    // validity, and the doubling the check allows for (RFC 5280 6.1.3 (a)(2))
+    const stateAt = (name, when, skew) => X509.validityOf(X509.parse(derOf(name)), when, skew);
+    equal("the leaf is valid at the harness's instant", stateAt("verifier", NOW, 5 * 60 * 1000), "valid");
+    equal("the expired leaf is expired", stateAt("expired", NOW, 5 * 60 * 1000), "expired");
+    equal("the future leaf is not valid yet", stateAt("future", NOW, 5 * 60 * 1000), "notYetValid");
+    equal("five minutes of skew still accepts a leaf that ended a minute ago",
+        stateAt("expired", new Date("2020-01-01T00:01:00Z"), 5 * 60 * 1000), "valid");
+    equal("and without the skew it does not", stateAt("expired", new Date("2020-01-01T00:01:00Z"), 0), "expired");
+
+    // the DER reader refuses what is not a certificate, and says why
+    const parseRefuses = (label, bytes, fragment) => {
+        let message = null;
+        try {
+            X509.parse(bytes);
+        } catch (error) {
+            message = error.message;
+        }
+        check(`${label}: refused`, message !== null && fragment.test(message), String(message));
+    };
+    parseRefuses("a DER SEQUENCE that is not a Certificate", DUMMY_DER, /three elements/);
+    parseRefuses("a truncated certificate", derOf("verifier").subarray(0, 60), /DER|runs past the end/);
+    parseRefuses("an indefinite length (BER, not DER)", Uint8Array.of(0x30, 0x80, 0x00, 0x00), /indefinite length is BER/);
+    parseRefuses("a certificate whose outer tag is not a SEQUENCE", Uint8Array.of(0x04, 0x01, 0x00), /Certificate/);
+
+    // an ECDSA signature in DER as the fixed-width r || s WebCrypto verifies (RFC 3279 2.2.3, RFC 7518 3.4)
+    equal("the leaf's DER signature converts to 64 bytes on P-256", X509.derEcdsaToRaw(leaf.signatureValue, 32).length, 64);
+    let wide = null;
+    try {
+        X509.derEcdsaToRaw(cat([0x30, 0x46, 0x02, 0x21], new Uint8Array(33).fill(0x7f), [0x02, 0x21], new Uint8Array(33).fill(0x7f)), 32);
+    } catch (error) {
+        wide = error.message;
+    }
+    check("a signature integer wider than its curve is refused", /wider than its curve/.test(String(wide)), String(wide));
+
+    const fingerprint = await X509.fingerprintSha256(derOf("verifier"));
+    equal("the fingerprint is 32 colon-separated uppercase hex pairs", /^([0-9A-F]{2}:){31}[0-9A-F]{2}$/.test(fingerprint), true);
+    equal("and it is the DER's own SHA-256", fingerprint.replace(/:/g, ""),
+        createHash("sha256").update(derOf("verifier")).digest("hex").toUpperCase());
+});
+
+await section("21. links: the schemes, the forms and the 8 KiB limit (plan 4.4)", async () => {
+    const requestUri = "https://verifier.example/request.jwt/1";
+    const query = "client_id=x509_san_dns:verifier.example&request_uri=" + encodeURIComponent(requestUri);
+    for (const scheme of ["openid4vp", "haip-vp", "eudi-openid4vp", "mdoc-openid4vp"]) {
+        const parsed = Oid4vp.parseLink(`${scheme}://?${query}`);
+        equal(`${scheme}: the link is read as a request_uri request`, [parsed.ok, parsed.kind, parsed.scheme,
+            parsed.params.requestUri, parsed.params.clientId],
+            [true, "request_uri", scheme, requestUri, "x509_san_dns:verifier.example"]);
+    }
+    const invitation = Oid4vp.parseLink("https://paradym.id/invitation?request_uri=" + encodeURIComponent(requestUri));
+    equal("an https invitation link is read, and it names no client_id", [invitation.ok, invitation.kind,
+        invitation.params.clientId, invitation.scheme], [true, "request_uri", undefined, "https"]);
+    const byValue = Oid4vp.parseLink("openid4vp://?client_id=x509_hash:" + leafHashOf("verifier") + "&request="
+        + jar(withMembers({ client_id: "x509_hash:" + leafHashOf("verifier") })));
+    equal("a link carrying the request object itself is read as by_value", [byValue.ok, byValue.kind, byValue.params.request.split(".").length],
+        [true, "by_value", 3]);
+    const pasted = Oid4vp.parseLink(jar(withMembers({})));
+    equal("a request object pasted by itself is read as by_value with no scheme", [pasted.ok, pasted.kind, pasted.scheme],
+        [true, "by_value", null]);
+    equal("request_uri_method=post is accepted and get is the default",
+        [Oid4vp.parseLink(`openid4vp://?${query}&request_uri_method=post`).params.requestUriMethod,
+            Oid4vp.parseLink(`openid4vp://?${query}`).params.requestUriMethod], ["post", "get"]);
+    const redirectClientId = "redirect_uri:https://verifier.example/response";
+    const plainLink = Oid4vp.parseLink("openid4vp://?client_id=" + encodeURIComponent(redirectClientId)
+        + "&response_uri=" + encodeURIComponent("https://verifier.example/response") + "&nonce=n1");
+    equal("a redirect_uri: link's plain parameters are read as a plain request",
+        [plainLink.ok, plainLink.kind, plainLink.params.plain.nonce], [true, "plain", "n1"]);
+    const extra = Oid4vp.parseLink(`openid4vp://?${query}&flow=qr`);
+    check("a link parameter this page does not read is a finding, not a refusal",
+        extra.ok === true && extra.findings.some((finding) => finding.includes("\"flow\"")), JSON.stringify(extra.findings));
+
+    const refusesLink = (label, text, fragment) => {
+        const result = Oid4vp.parseLink(text);
+        check(`${label}: refused`, result.ok === false && fragment.test(String(result.message)),
+            result.ok ? "it was accepted" : result.message);
+    };
+    refusesLink("a link with neither request_uri nor request", "openid4vp://?client_id=x509_san_dns:verifier.example",
+        /neither request_uri nor request/);
+    refusesLink("a link carrying both request and request_uri",
+        "openid4vp://?request=" + jar(withMembers({})) + "&request_uri=" + encodeURIComponent(requestUri),
+        /both request and request_uri/);
+    refusesLink("a link over 8 KiB", "openid4vp://?request_uri=" + encodeURIComponent("https://verifier.example/" + "a".repeat(9000)),
+        /8 KiB limit/);
+    refusesLink("a scheme that is not a wallet invocation scheme", "ftp://verifier.example/request",
+        /not a wallet invocation scheme/);
+    refusesLink("request_uri_method=put", `openid4vp://?${query}&request_uri_method=put`, /accepts get or post/);
+    refusesLink("an empty field", "   ", /the field is empty/);
+    refusesLink("neither a link nor a request object", "please present your licence", /neither a link nor a request object/);
+});
+
+await section("22. fetching the request object, once (plan 4.4)", async () => {
+    const requestUri = "https://verifier.example/request.jwt/1";
+    const relayUrl = "https://credentials.example/v1/certify/offer/wallet/relay";
+    const text = jar(withMembers({}));
+
+    const get = scriptedFetch({ [requestUri]: { status: 200, body: text, contentType: "application/oauth-authz-req+jwt" } });
+    const fetched = new Set();
+    const answer = await Oid4vp.fetchRequest({ requestUri, method: "get", pageUrl: PUBLIC_PAGE, relayHosts: [], relayUrl,
+        fetched, fetchImpl: get.impl });
+    equal("a 200 answer is read", [answer.ok, answer.text, answer.via], [true, text, "direct"]);
+    equal("one GET, with the JWT Accept header and redirect: \"error\"",
+        [get.calls.length, get.calls[0].method, get.calls[0].headers.Accept, get.calls[0].redirect, get.calls[0].body],
+        [1, "GET", "application/oauth-authz-req+jwt", "error", undefined]);
+    const again = await Oid4vp.fetchRequest({ requestUri, method: "get", pageUrl: PUBLIC_PAGE, relayHosts: [], relayUrl,
+        fetched, fetchImpl: get.impl });
+    equal("a second fetch of the same request_uri is refused and makes no request",
+        [again.ok, again.state, get.calls.length], [false, "alreadyFetched", 1]);
+
+    const nonce = "wallet-nonce-".padEnd(43, "x");
+    const post = scriptedFetch({ [requestUri]: { status: 200, body: text, contentType: "application/oauth-authz-req+jwt" } });
+    const posted = await Oid4vp.fetchRequest({ requestUri, method: "post", walletNonce: nonce, pageUrl: PUBLIC_PAGE,
+        relayHosts: [], relayUrl, fetched: new Set(), fetchImpl: post.impl });
+    const form = post.calls[0].body;
+    equal("a posted request carries wallet_nonce and nothing else, form-encoded",
+        [posted.ok, post.calls[0].method, post.calls[0].headers["Content-Type"],
+            form instanceof URLSearchParams ? [...form.keys()] : "not a form", form.get("wallet_nonce")],
+        [true, "POST", "application/x-www-form-urlencoded", ["wallet_nonce"], nonce]);
+    equal("and it still asks for the JWT media type", post.calls[0].headers.Accept, "application/oauth-authz-req+jwt");
+
+    for (const status of [404, 500]) {
+        const failing = scriptedFetch({ [requestUri]: { status, body: "no" } });
+        const refused = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, relayHosts: [], relayUrl,
+            fetched: new Set(), fetchImpl: failing.impl });
+        check(`a ${status} answer stops the process (VP 5.10.2)`,
+            refused.ok === false && new RegExp("answered " + status).test(refused.message), refused.message);
+    }
+    const redirecting = scriptedFetch({ [requestUri]: "throw" });
+    const redirected = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, relayHosts: [], relayUrl,
+        fetched: new Set(), fetchImpl: redirecting.impl });
+    equal("a redirect is an explicit unreachable state, never a fetch of where it points (redirect: \"error\")",
+        [redirected.ok, redirected.state], [false, "unreachable"]);
+    check("and the state says what to do about a verifier without CORS", /CORS/.test(redirected.message), redirected.message);
+
+    const insecure = scriptedFetch({});
+    equal("an http request_uri on an https page is refused before any request",
+        [(await Oid4vp.fetchRequest({ requestUri: "http://verifier.example/r", pageUrl: PUBLIC_PAGE, relayHosts: [],
+            relayUrl, fetched: new Set(), fetchImpl: insecure.impl })).ok, insecure.calls.length], [false, 0]);
+    const local = scriptedFetch({ "http://localhost:8090/request.jwt": { status: 200, body: text, contentType: "application/jwt" } });
+    equal("and it is allowed while the page itself is served from localhost",
+        (await Oid4vp.fetchRequest({ requestUri: "http://localhost:8090/request.jwt", pageUrl: LOCAL_PAGE, relayHosts: [],
+            relayUrl, fetched: new Set(), fetchImpl: local.impl })).ok, true);
+
+    const relayed = scriptedFetch({ [relayUrl]: { status: 200, contentType: "application/json",
+        body: JSON.stringify({ status: 200, content_type: "application/oauth-authz-req+jwt", body: text }) } });
+    const viaRelay = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, relayHosts: ["verifier.example"],
+        relayUrl, fetched: new Set(), fetchImpl: relayed.impl });
+    equal("a listed host is read through the relay only, never directly",
+        [viaRelay.ok, viaRelay.via, relayed.calls.length, relayed.calls[0].url], [true, "relay", 1, relayUrl]);
+    equal("the relay request names the operation, the uri and the method, and carries no verifier header",
+        [JSON.parse(relayed.calls[0].body), relayed.calls[0].headers.Accept],
+        [{ op: "request-object", uri: requestUri, method: "get" }, "application/json"]);
+    const relayedPost = scriptedFetch({ [relayUrl]: { status: 200, body: JSON.stringify({ status: 200, body: text }) } });
+    await Oid4vp.fetchRequest({ requestUri, method: "post", walletNonce: nonce, pageUrl: PUBLIC_PAGE,
+        relayHosts: ["verifier.example"], relayUrl, fetched: new Set(), fetchImpl: relayedPost.impl });
+    equal("a posted request through the relay forwards wallet_nonce and nothing else",
+        JSON.parse(relayedPost.calls[0].body), { op: "request-object", uri: requestUri, method: "post", wallet_nonce: nonce });
+    const relayError = scriptedFetch({ [relayUrl]: { status: 200, body: JSON.stringify({ status: 400, body: "" }) } });
+    const relayedRefusal = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, relayHosts: ["verifier.example"],
+        relayUrl, fetched: new Set(), fetchImpl: relayError.impl });
+    check("a verifier error reported through the relay stops the process",
+        relayedRefusal.ok === false && /answered 400/.test(relayedRefusal.message), relayedRefusal.message);
+    const relayDown = scriptedFetch({ [relayUrl]: { status: 502, body: "no" } });
+    const relayedDown = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, relayHosts: ["verifier.example"],
+        relayUrl, fetched: new Set(), fetchImpl: relayDown.impl });
+    check("a relay that answers an error is refused", relayedDown.ok === false && /relay answered 502/.test(relayedDown.message),
+        relayedDown.message);
+
+    const oversized = scriptedFetch({ [requestUri]: { status: 200, body: "a".repeat(64 * 1024 + 1) } });
+    const tooLarge = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, relayHosts: [], relayUrl,
+        fetched: new Set(), fetchImpl: oversized.impl });
+    check("a request object over 64 KiB is refused after it is read", tooLarge.ok === false && /64 KiB limit/.test(tooLarge.message),
+        tooLarge.message);
+});
+
+await section("23. the request checks R1-R11 and the findings (plan 4.5)", async () => {
+    const good = await checkRequestOf(jar(withMembers({})));
+    equal("the control request passes every check", [good.ok, good.error, good.card.chainLength], [true, null, 1]);
+    equal("its card names the client_id and the leaf's subject and issuer",
+        [good.card.clientId, good.card.subject.map((a) => a.short).join(","), good.card.issuer.map((a) => a.short).join(",")],
+        ["x509_san_dns:verifier.example", "C,O,CN", "C,O,CN"]);
+    check("its card carries the leaf's and the topmost certificate's SHA-256",
+        good.card.fingerprints.leaf === await X509.fingerprintSha256(derOf("verifier"))
+            && good.card.fingerprints.top === good.card.fingerprints.leaf, JSON.stringify(good.card.fingerprints));
+    equal("the card shows the response_uri's host", good.card.responseUriHost, "verifier.example");
+    equal("a request with aud and state raises no finding about them",
+        good.findings.filter((finding) => /no aud|no state/.test(finding)), []);
+
+    // R1 and the limits of plan 4.4
+    refusesWith("a request object of 64 KiB + 1", await checkRequestOf("a".repeat(64 * 1024 + 1)), "R1", /64 KiB limit/);
+    refusesWith("a request object that is not three parts", await checkRequestOf("only.two"), "R1", /not a compact JWS of three parts/);
+    refusesWith("a request object whose payload is not JSON", await checkRequestOf("eyJ0eXAiOiJvYXV0aC1hdXRoei1yZXErand0In0.bm90IGpzb24.sig"),
+        "R1", /not base64url JSON/);
+    refusesWith("a 6-certificate x5c", await checkRequestOf(jar(withMembers({}), { x5c: new Array(6).fill(x5cOf("verifier")) })),
+        "R1", /6 certificates, over the limit of 5/);
+    refusesWith("a DCQL query with 21 credential queries",
+        await checkRequestOf(jar(withMembers({ dcql_query: { credentials: Array.from({ length: 21 }, (_, index) =>
+            ({ id: "q" + index, format: "mso_mdoc", meta: { doctype_value: DOC_TYPE } })) } }))),
+        "R1", /21 credential queries, over the limit of 20/);
+    refusesWith("a credential query with 101 claims",
+        await checkRequestOf(jar(withMembers({ dcql_query: { credentials: [{ id: "q1", format: "mso_mdoc",
+            meta: { doctype_value: DOC_TYPE }, claims: new Array(101).fill({ path: [MDL_NAMESPACE, "family_name"] }) }] } }))),
+        "R1", /101 claims, over the limit of 100/);
+    let deep = {};
+    for (let level = 0, cursor = deep; level < 20; level++) { cursor.next = {}; cursor = cursor.next; }
+    refusesWith("a request object nested more than 16 levels", await checkRequestOf(jar(withMembers({ extension: deep }))),
+        "R1", /over the limit of 16/);
+
+    // R2: the JWS type VP section 5 requires
+    refusesWith("a request object with no typ", await checkRequestOf(jar(withMembers({}), { header: { typ: undefined } })),
+        "R2", /typ is absent/);
+    refusesWith("typ JWT", await checkRequestOf(jar(withMembers({}), { header: { typ: "JWT" } })), "R2", /"JWT"/);
+
+    // R3 and R4: the link's and the object's client_id, and the echoed wallet_nonce (VP 5.10.1)
+    refusesWith("a link whose client_id differs from the request object's",
+        await checkRequestOf(jar(withMembers({})), { link: linkParams({ clientId: "x509_san_dns:other.example" }) }),
+        "R3", /must be identical/);
+    refusesWith("wallet_nonce missing in the request object",
+        await checkRequestOf(jar(withMembers({})), { link: linkParams({ walletNonce: "sent-by-the-wallet" }) }),
+        "R4", /carries none/);
+    refusesWith("wallet_nonce different in the request object",
+        await checkRequestOf(jar(withMembers({ wallet_nonce: "another" })), { link: linkParams({ walletNonce: "sent-by-the-wallet" }) }),
+        "R4", /carries "another"/);
+    equal("the echoed wallet_nonce is accepted",
+        (await checkRequestOf(jar(withMembers({ wallet_nonce: "sent-by-the-wallet" })),
+            { link: linkParams({ walletNonce: "sent-by-the-wallet" }) })).ok, true);
+
+    // R5: the audience and the object's own lifetime (VP 5.8, RFC 9101 10.2)
+    refusesWith("aud https://other.example", await checkRequestOf(jar(withMembers({ aud: "https://other.example" }))),
+        "R5", /static discovery/);
+    refusesWith("exp in the past", await checkRequestOf(jar(withMembers({ exp: Math.floor(NOW.getTime() / 1000) - 1 }))),
+        "R5", /expired at/);
+    refusesWith("iat more than five minutes ahead",
+        await checkRequestOf(jar(withMembers({ iat: Math.floor(NOW.getTime() / 1000) + 301 }))), "R5", /more than 5 minutes ahead/);
+    equal("iat 299 seconds ahead is accepted, inside the five-minute skew",
+        (await checkRequestOf(jar(withMembers({ iat: Math.floor(NOW.getTime() / 1000) + 299 })))).ok, true);
+    const noAud = await checkRequestOf(jar(withMembers({ aud: undefined })));
+    check("no aud is a finding, not a refusal (Multipaz sends none)",
+        noAud.ok === true && noAud.findings.some((finding) => finding.startsWith("no aud")), JSON.stringify(noAud.findings));
+    const noState = await checkRequestOf(jar(withMembers({ state: undefined })));
+    check("no state is a finding", noState.ok === true && noState.findings.some((finding) => finding.startsWith("no state")),
+        JSON.stringify(noState.findings));
+
+    // R6 and R7: the client identifier bound to the certificate, and the JWS signed with its key (VP 5.9.3)
+    refusesWith("x509_san_dns:verifier.example signed by the other.example leaf",
+        await checkRequestOf(jar(withMembers({}), { keyName: "other" })), "R6",
+        /dNSName subject alternative names are \[other.example\]/);
+    refusesWith("a tampered JAR signature under x509_san_dns", await checkRequestOf(jar(withMembers({}), { tamper: true })),
+        "R6", /does not verify with the leaf certificate's public key/);
+    refusesWith("x509_san_dns with no x5c", await checkRequestOf(jar(withMembers({}), { x5c: null })), "R6", /carries no x5c/);
+    refusesWith("an x509_san_dns value that is not a DNS name",
+        await checkRequestOf(jar(withMembers({ client_id: "x509_san_dns:not a name" })),
+            { link: linkParams({ clientId: "x509_san_dns:not a name" }) }), "R6", /is not a DNS name/);
+    const otherHash = "x509_hash:" + leafHashOf("other");
+    refusesWith("x509_hash of another certificate",
+        await checkRequestOf(jar(withMembers({ client_id: otherHash })), { link: linkParams({ clientId: otherHash }) }),
+        "R7", /the SHA-256 of the leaf certificate in x5c is/);
+    const verifierHash = "x509_hash:" + leafHashOf("verifier");
+    refusesWith("a tampered JAR signature under x509_hash",
+        await checkRequestOf(jar(withMembers({ client_id: verifierHash }), { tamper: true }),
+            { link: linkParams({ clientId: verifierHash }) }), "R7", /does not verify/);
+    refusesWith("an x509_hash value that is not 43 characters",
+        await checkRequestOf(jar(withMembers({ client_id: "x509_hash:short" })), { link: linkParams({ clientId: "x509_hash:short" }) }),
+        "R7", /not the 43-character base64url SHA-256/);
+
+    // R9: the prefixes this wallet refuses (VP 5.9.3, D-P5-03-9)
+    for (const [label, clientId, fragment] of [
+        ["the origin: prefix", "origin:https://verifier.example", /MUST NOT accept it/],
+        ["a signed redirect_uri: request", "redirect_uri:https://verifier.example/response", /cannot be used with a signed request/],
+        ["the decentralized_identifier: prefix", "decentralized_identifier:did:web:verifier.example", /not supported by this demo wallet/],
+        ["the verifier_attestation: prefix", "verifier_attestation:abc", /not supported by this demo wallet/],
+        ["the openid_federation: prefix", "openid_federation:https://verifier.example", /not supported by this demo wallet/],
+        ["a pre-registered client_id (no prefix)", "demo-verifier", /pre-registered/],
+    ]) {
+        refusesWith(label, await checkRequestOf(jar(withMembers({ client_id: clientId })), { link: linkParams({ clientId }) }),
+            "R9", fragment);
+    }
+
+    // R10: the algorithm, and the chain
+    refusesWith("alg: none", await checkRequestOf(jar(withMembers({}), { header: { alg: "none" }, sign: false })),
+        "R10", /alg: none is not a signature/);
+    refusesWith("alg: ES256K", await checkRequestOf(jar(withMembers({}), { header: { alg: "ES256K" } })), "R10", /verifies ES256/);
+    refusesWith("an empty third part under a valid alg", await checkRequestOf(jar(withMembers({}), { sign: false })),
+        "R1", /third part is empty/);
+    refusesWith("an expired leaf", await checkRequestOf(jar(withMembers({}),
+        { keyName: "expired", x5c: [x5cOf("expired"), x5cOf("ca")] })), "R10", /is expired/);
+    refusesWith("a leaf that is not valid yet", await checkRequestOf(jar(withMembers({}),
+        { keyName: "future", x5c: [x5cOf("future"), x5cOf("ca")] })), "R10", /not valid yet/);
+    refusesWith("a chain whose second certificate has the issuer's name and not its key",
+        await checkRequestOf(jar(withMembers({}), { x5c: [x5cOf("verifier"), x5cOf("ca-twin")] })), "R10",
+        /is not signed by certificate 1/);
+    refusesWith("a chain whose second certificate is another CA",
+        await checkRequestOf(jar(withMembers({}), { keyName: "leaf-under-intermediate",
+            x5c: [x5cOf("leaf-under-intermediate"), x5cOf("ca")] })), "R10", /does not link/);
+    refusesWith("a certificate that does not parse",
+        await checkRequestOf(jar(withMembers({}), { x5c: [Buffer.from("not a certificate").toString("base64")] })),
+        "R10", /does not parse as an X.509 certificate/);
+    refusesWith("an x5c entry encoded as base64url",
+        await checkRequestOf(jar(withMembers({}), { x5c: ["AAAA-_AA"] })), "R10", /requires base64, not base64url/);
+    const chain3 = await checkRequestOf(jar(withMembers({}),
+        { keyName: "leaf-under-intermediate", x5c: [x5cOf("leaf-under-intermediate"), x5cOf("intermediate"), x5cOf("ca")] }));
+    equal("a three-certificate chain that links is accepted", [chain3.ok, chain3.card.chainLength], [true, 3]);
+    equal("its card shows the topmost certificate's fingerprint, which is the CA's",
+        chain3.card.fingerprints.top, await X509.fingerprintSha256(derOf("ca")));
+    for (const [label, alg, keyName] of [["ES384", "ES384", "p384-leaf"], ["ES512", "ES512", "p521-leaf"],
+        ["RS256", "RS256", "rsa-leaf"], ["PS256", "PS256", "rsa-leaf"]]) {
+        const signed = await checkRequestOf(jar(withMembers({}), { alg, keyName }));
+        equal(`a JAR signed with ${label} verifies with its chain`, signed.ok, true);
+    }
+    const selfSigned = await checkRequestOf(jar(withMembers({}), { keyName: "self-signed" }));
+    check("a self-signed leaf is a finding, not a refusal (HAIP 1.0 section 5)",
+        selfSigned.ok === true && selfSigned.findings.some((finding) => finding.includes("is self-signed")),
+        JSON.stringify(selfSigned.findings));
+    check("and the card labels the chain as one certificate", selfSigned.card.chainLength === 1);
+
+    // R8: the response_uri and the host its prefix permits (VP 5.9.3, 8.2)
+    refusesWith("response_uri on other.example under x509_san_dns:verifier.example",
+        await checkRequestOf(jar(withMembers({ response_uri: "https://other.example/response" }))),
+        "R8", /response_uri is on other.example/);
+    refusesWith("response_uri over http on an https page",
+        await checkRequestOf(jar(withMembers({ response_uri: "http://verifier.example/response" }))),
+        "R8", /http is allowed only while this page is served from localhost/);
+    equal("the same response_uri is accepted while the page is served from localhost",
+        (await checkRequestOf(jar(withMembers({ response_uri: "http://verifier.example/response" })), { pageUrl: LOCAL_PAGE })).ok,
+        true);
+    refusesWith("a request object with no response_uri", await checkRequestOf(jar(withMembers({ response_uri: undefined }))),
+        "R8", /carries no response_uri/);
+
+    // R11: the response type and mode this wallet implements (VP 5.6, 8.2)
+    refusesWith("response_type=id_token", await checkRequestOf(jar(withMembers({ response_type: "id_token" }))),
+        "R11", /section 5.6 has vp_token/);
+    refusesWith("response_mode=query", await checkRequestOf(jar(withMembers({ response_mode: "query" }))),
+        "R11", /implements direct_post and direct_post.jwt/);
+
+    // the findings of plan 4.5: shown, never blocking
+    const haipPlain = await checkRequestOf(jar(withMembers({ response_mode: "direct_post" })), { link: linkParams({ scheme: "haip-vp" }) });
+    check("a haip-vp link whose request is not direct_post.jwt is a finding",
+        haipPlain.ok === true && haipPlain.findings.some((finding) => finding.startsWith("a haip-vp link")),
+        JSON.stringify(haipPlain.findings));
+    const mediaType = await checkRequestOf(jar(withMembers({})), { contentType: "application/json" });
+    check("a request object served as application/json is a finding",
+        mediaType.ok === true && mediaType.findings.some((finding) => finding.includes("media type")),
+        JSON.stringify(mediaType.findings));
+    const algValues = await checkRequestOf(jar(withMembers({ client_metadata: { vp_formats_supported:
+        { mso_mdoc: { issuerauth_alg_values: [-9] } } } })), { keptIssuerAuthAlgs: [-7] });
+    check("issuerauth_alg_values that do not list the held credential's algorithm is a finding",
+        algValues.ok === true && algValues.findings.some((finding) => finding.includes("issuerauth_alg_values")),
+        JSON.stringify(algValues.findings));
+    const requestHost = await checkRequestOf(jar(withMembers({})), { link: linkParams({ requestUri: "https://elsewhere.example/r" }) });
+    check("a request_uri on a host that is not the client's DNS name is a finding (VP 15.8.1)",
+        requestHost.ok === true && requestHost.findings.some((finding) => finding.startsWith("the request_uri is on")),
+        JSON.stringify(requestHost.findings));
+    const unknown = await checkRequestOf(jar(withMembers({ presentation_definition: { id: "x" } })));
+    check("a request parameter this page does not read is a finding",
+        unknown.ok === true && unknown.findings.some((finding) => finding.includes("presentation_definition")),
+        JSON.stringify(unknown.findings));
+    const missingClientId = await checkRequestOf(jar(withMembers({})), { link: linkParams({ clientId: undefined }) });
+    check("a link that named no client_id says so in the findings, and the object's is used",
+        missingClientId.ok === true && missingClientId.request.clientId === "x509_san_dns:verifier.example"
+            && missingClientId.findings.some((finding) => finding.includes("named no client_id")),
+        JSON.stringify(missingClientId.findings));
+
+    // a redirect_uri: request, which cannot be signed, through the plain path
+    const redirectClientId = "redirect_uri:https://verifier.example/response";
+    const plain = await Oid4vp.checkRequest({
+        plain: { client_id: redirectClientId, response_uri: "https://verifier.example/response", nonce: "n1", state: "s1",
+            response_mode: "direct_post", dcql_query: { credentials: [] } },
+        link: linkParams({ clientId: redirectClientId, kind: "plain" }),
+        pageUrl: PUBLIC_PAGE,
+        now: NOW,
+    });
+    equal("a redirect_uri: request's plain parameters are accepted, unsigned", [plain.ok, plain.request.signed], [true, false]);
+    check("and the findings say the request is unsigned", plain.findings.some((finding) => finding.includes("unsigned")),
+        JSON.stringify(plain.findings));
+    const plainElsewhere = await Oid4vp.checkRequest({
+        plain: { client_id: redirectClientId, response_uri: "https://other.example/response", nonce: "n1" },
+        link: linkParams({ clientId: redirectClientId, kind: "plain" }), pageUrl: PUBLIC_PAGE, now: NOW,
+    });
+    refusesWith("a redirect_uri: request whose response_uri is not the client_id", plainElsewhere, "R8", /they must be the same URI/);
+});
+
+await section("24. the four error cases, and the button that sends one (plan 4.5, VP 8.5)", async () => {
+    const cases = [
+        ["no nonce", withMembers({ nonce: undefined }), "invalid_request", /no nonce/],
+        ["redirect_uri with direct_post.jwt", withMembers({ redirect_uri: "https://verifier.example/done" }), "invalid_request",
+            /redirect_uri together with direct_post.jwt/],
+        ["no dcql_query", withMembers({ dcql_query: undefined }), "invalid_request", /carries no dcql_query/],
+        ["only a scope", withMembers({ dcql_query: undefined, scope: "org.iso.18013.5.1.mDL" }), "invalid_scope", /only the scope/],
+        ["transaction_data", withMembers({ transaction_data: ["a"] }), "invalid_transaction_data", /does not process transaction_data/],
+    ];
+    for (const [label, members, error, fragment] of cases) {
+        const checked = await checkRequestOf(jar(members));
+        check(`${label}: the checks pass and the wallet owes an error response`,
+            checked.ok === true && checked.error !== null && checked.error.error === error, JSON.stringify(checked.error));
+        check(`${label}: the error names the reason`,
+            checked.ok === true && fragment.test(checked.error.description), checked.ok ? JSON.stringify(checked.error) : checked.message);
+    }
+
+    // and on the page, once per case: the error block with its button, and the form the press sends
+    for (const [label, members, error] of cases) {
+        const wallet = openWallet(new FakeIndexedDB(), {
+            clock: NOW,
+            respond: (request) => (request.method === "POST" ? { status: 200, body: "{}" } : undefined),
+        });
+        check(`${label}: the wallet page's scripts ran`, wallet.scriptError === null,
+            wallet.scriptError && String(wallet.scriptError.stack));
+        const answered = (request) => request.method === "POST" && request.url === "https://verifier.example/response";
+        await waitFor(() => wallet.el("readRequest").disabled === false);
+        wallet.el("requestText").value = jar(members);
+        await wallet.el("readRequest").fire("click");
+        await waitFor(() => wallet.el("verifierCard").hidden === false);
+        equal(`${label}: the card is shown, with the error beside it`,
+            [wallet.el("verifierCard").hidden, wallet.el("requestError").hidden], [false, false]);
+        equal(`${label}: the error block names the error`,
+            wallet.el("errorSummary").textContent.startsWith(error + ": "), true);
+        equal(`${label}: nothing has been sent to response_uri before the press`, wallet.requests.filter(answered).length, 0);
+        await wallet.el("sendError").fire("click");
+        const sent = wallet.requests.filter(answered);
+        equal(`${label}: the press sends exactly one POST to response_uri`, sent.length, 1);
+        equal(`${label}: it carries error, error_description and state as a form`,
+            [sent[0].headers["Content-Type"], sent[0].body.get("error"),
+                sent[0].body.get("error_description").length > 0, sent[0].body.get("state")],
+            ["application/x-www-form-urlencoded", error, true, "state-p503c"]);
+        check(`${label}: and the page reports the verifier's answer`, /answered 200/.test(wallet.el("errorStatus").textContent),
+            wallet.el("errorStatus").textContent);
+        await wallet.el("sendError").fire("click");
+        equal(`${label}: a second press sends nothing`, wallet.requests.filter(answered).length, 1);
+    }
+});
+
+await section("25. the hosted request objects' shapes (plan 4.12)", async () => {
+    const eudiText = readFileSync(resolve(HOSTED_DIR, "eudi.request.jwt"), "utf8").trim();
+    check("the EUDI-shaped request object is about 23 KB, as EUDI's is", eudiText.length > 20000 && eudiText.length < 30000,
+        String(eudiText.length));
+    const eudiHash = "x509_hash:" + leafHashOf("verifier");
+    const eudi = await checkRequestOf(eudiText, { link: linkParams({ clientId: eudiHash }) });
+    equal("it passes R1-R11 under the pinned clock", [eudi.ok, eudi.error], [true, null]);
+    equal("its card shows the leaf's subject, issuer and fingerprint",
+        [eudi.card.subject.map((a) => a.short + "=" + a.value).join(", "), eudi.card.fingerprints.leaf],
+        ["C=IN, O=Inji Demo Certify, CN=Wallet Fixture Verifier", await X509.fingerprintSha256(derOf("verifier"))]);
+    equal("it raises no finding about aud or state", eudi.findings.filter((finding) => /no aud|no state/.test(finding)), []);
+    equal("its card names the client_name the verifier gives itself", eudi.card.clientName, "EUDI Reference Verifier (fixture)");
+    check("its verifier_info registration certificate is shown, labelled unverified",
+        eudi.card.verifierInfo !== null && eudi.card.verifierInfo[0].type === "registration_cert"
+            && eudi.card.verifierInfo[0].text.length > 100, JSON.stringify(eudi.card.verifierInfo && eudi.card.verifierInfo[0] && eudi.card.verifierInfo[0].text.slice(0, 40)));
+    equal("the request object is 23 KB without the page fetching anything else", eudi.request.responseMode, "direct_post.jwt");
+
+    const multipazText = readFileSync(resolve(HOSTED_DIR, "multipaz.request.jwt"), "utf8").trim();
+    const multipaz = await checkRequestOf(multipazText, { link: linkParams({ clientId: "x509_san_dns:verifier.example" }) });
+    equal("the Multipaz-shaped request object passes R1-R11 under the pinned clock", [multipaz.ok, multipaz.error], [true, null]);
+    check("it raises the findings plan 2.1 records: no aud and no state",
+        multipaz.ok && multipaz.findings.some((finding) => finding.startsWith("no aud"))
+            && multipaz.findings.some((finding) => finding.startsWith("no state")), JSON.stringify(multipaz.findings));
+    equal("its client_id is the x509_san_dns prefix Multipaz sends", multipaz.request.prefix, "x509_san_dns");
+    equal("its response_uri is on the client's DNS name", multipaz.card.responseUriHost, "verifier.example");
+    const stale = await checkRequestOf(multipazText, { link: linkParams({ clientId: "x509_san_dns:verifier.example" }),
+        now: new Date("2027-06-01T00:00:00Z") });
+    refusesWith("the same Multipaz-shaped object a year later", stale, "R5", /expired at/);
+});
+
+await section("26. an x5chain only in the protected header is refused (ISO 18013-5 9.1.2.4)", async () => {
+    // the protected header carries alg and the chain; the unprotected one is empty, so only one bucket has label 33
+    const inProtected = shapedMdl({ protectedRaw: cat(head(5, 2), head(0, 1), head(1, 6), head(0, 33), bstr(DUMMY_DER)),
+        unprotectedRaw: () => head(5, 0) });
+    equal("readIssuerSigned still reads it from either bucket, and records which one it was (P5-03a's deferral)",
+        [Mdoc.readIssuerSigned(inProtected.bytes).issuerAuth.x5chainHeader,
+            Mdoc.readIssuerSigned(inProtected.bytes).issuerAuth.x5chain.length], ["protected", 1]);
+    let refused = null;
+    try {
+        Mdoc.issuerChain(inProtected.bytes);
+    } catch (error) {
+        refused = error.message;
+    }
+    check("issuerChain refuses that placement, naming the clause",
+        refused !== null && /unprotected header/.test(refused) && /9\.1\.2\.4/.test(refused), String(refused));
+    check("the refusal is about the header, before any certificate is read (the bytes are not a certificate at all)",
+        refused !== null && !/DER|runs past|parse/.test(refused), String(refused));
+    const inUnprotected = shapedMdl({});
+    equal("an unprotected x5chain is returned as the DER it carries",
+        Mdoc.issuerChain(inUnprotected.bytes).map(hex), [hex(DUMMY_DER)]);
+    equal("and the recorded bucket is the unprotected one",
+        Mdoc.readIssuerSigned(inUnprotected.bytes).issuerAuth.x5chainHeader, "unprotected");
+    const recorded = readFileSync(resolve(FIXTURES, "mdl-a.issuersigned"));
+    equal("Certify's own IssuerSigned puts its chain in the unprotected header, and issuerChain returns it",
+        [Mdoc.readIssuerSigned(recorded).issuerAuth.x5chainHeader, Mdoc.issuerChain(recorded).length], ["unprotected", 1]);
+});
+
+await section("27. the wallet page takes a request in (plan 4.4, I9)", async () => {
+    const requestUri = "https://verifier.example/request.jwt/1";
+    const text = jar(withMembers({}));
+    const sameDevice = "https://credentials.example/v1/certify/offer/wallet?client_id=x509_san_dns:verifier.example&request_uri="
+        + encodeURIComponent(requestUri);
+    const wallet = openWallet(new FakeIndexedDB(), {
+        clock: NOW,
+        pageUrl: sameDevice,
+        respond: (request) => (request.url === requestUri
+            ? { status: 200, body: text, contentType: "application/oauth-authz-req+jwt" } : undefined),
+    });
+    check("the wallet page's scripts ran", wallet.scriptError === null, wallet.scriptError && String(wallet.scriptError.stack));
+    const read = await waitFor(() => wallet.el("verifierCard").hidden === false);
+    check("a same-device invocation is read on load and its card is shown", read, wallet.el("intakeStatus").textContent);
+    equal("the page fetched the request object exactly once", wallet.requests.filter((request) => request.url === requestUri).length, 1);
+    equal("the address bar was replaced with the bare wallet URL, so a reload cannot fetch again",
+        wallet.replacedUrls, ["/v1/certify/offer/wallet"]);
+    equal("nothing was sent to response_uri", wallet.requests.filter((request) => request.url === "https://verifier.example/response").length, 0);
+    check("the card says there is no trust list (plan section 6, deviation 1)",
+        /No trusted list/.test(wallet.el("noTrustList").textContent), wallet.el("noTrustList").textContent);
+    equal("the card's table carries the client_id and both names",
+        [wallet.el("verifierTable").textContent.includes("x509_san_dns:verifier.example"),
+            wallet.el("verifierTable").textContent.includes("Wallet Fixture Verifier"),
+            wallet.el("verifierTable").textContent.includes("Wallet Fixture Verifier CA")], [true, true, true]);
+
+    const before = wallet.requests.length;
+    wallet.el("requestText").value = "openid4vp://?client_id=x509_san_dns:verifier.example&request_uri="
+        + encodeURIComponent(requestUri);
+    await wallet.el("readRequest").fire("click");
+    check("a second read of the same request_uri says it was already fetched",
+        /already fetched/.test(wallet.el("intakeStatus").textContent), wallet.el("intakeStatus").textContent);
+    equal("and nothing is requested", wallet.requests.length - before, 0);
+
+    const fragmentUri = "https://verifier.example/request.jwt/2";
+    const fromFragment = openWallet(new FakeIndexedDB(), {
+        clock: NOW,
+        pageUrl: "https://credentials.example/v1/certify/offer/wallet#://?client_id=x509_san_dns:verifier.example&request_uri="
+            + encodeURIComponent(fragmentUri),
+        respond: (request) => (request.url === fragmentUri
+            ? { status: 200, body: text, contentType: "application/oauth-authz-req+jwt" } : undefined),
+    });
+    const fragmentRead = await waitFor(() => fromFragment.el("verifierCard").hidden === false);
+    check("the `#://?…` form Multipaz produces is read the same way", fragmentRead, fromFragment.el("intakeStatus").textContent);
+    equal("and its fragment is taken out of the address bar too", fromFragment.replacedUrls, ["/v1/certify/offer/wallet"]);
+
+    const pasted = openWallet(new FakeIndexedDB(), { clock: NOW });
+    await waitFor(() => pasted.el("readRequest").disabled === false);
+    pasted.el("requestText").value = jar(withMembers({ client_id: "x509_hash:" + leafHashOf("verifier") }));
+    await pasted.el("readRequest").fire("click");
+    check("a pasted request object goes through the same checks",
+        pasted.el("verifierCard").hidden === false && /x509_hash/.test(pasted.el("verifierTable").textContent),
+        pasted.el("intakeStatus").textContent);
+    equal("and it makes no request at all", pasted.requests.filter((request) => request.url.startsWith("https://verifier.example")).length, 0);
+    pasted.el("requestText").value = jar(withMembers({}), { tamper: true });
+    await pasted.el("readRequest").fire("click");
+    check("a tampered request object is refused on the page, naming R6", /^R6: /.test(pasted.el("intakeStatus").textContent),
+        pasted.el("intakeStatus").textContent);
+    equal("and the card is hidden again", pasted.el("verifierCard").hidden, true);
+    pasted.el("requestText").value = "present your licence";
+    await pasted.el("readRequest").fire("click");
+    check("a field that is neither a link nor a request object says so", /neither a link nor a request object/.test(pasted.el("intakeStatus").textContent),
+        pasted.el("intakeStatus").textContent);
+
+    const plain = openWallet(new FakeIndexedDB(), { clock: NOW });
+    await waitFor(() => plain.el("readRequest").disabled === false);
+    plain.el("requestText").value = "openid4vp://?client_id=" + encodeURIComponent("redirect_uri:https://verifier.example/response")
+        + "&response_uri=" + encodeURIComponent("https://verifier.example/response") + "&nonce=n1&state=s1&dcql_query="
+        + encodeURIComponent(JSON.stringify({ credentials: [] }));
+    await plain.el("readRequest").fire("click");
+    check("a redirect_uri: link's plain parameters reach a card with no certificate",
+        plain.el("verifierCard").hidden === false
+            && plain.el("verifierTable").textContent.includes("none: this request is not signed"),
+        plain.el("intakeStatus").textContent);
+    equal("and it is not treated as an error case", plain.el("requestError").hidden, true);
+
+    const off = openWallet(new FakeIndexedDB(), {
+        clock: NOW,
+        walletConfig: false,
+        pageUrl: sameDevice,
+    });
+    await waitFor(() => off.el("storageStatus").textContent.includes("switched off"));
+    equal("with the wallet switched off (I4) the page reads no request at all",
+        off.requests.filter((request) => request.url !== "https://credentials.example/v1/certify/offer/wallet/config").length, 0);
+    check("and it says so", off.el("storageStatus").textContent.includes("switched off"), off.el("storageStatus").textContent);
 });
 
 } finally {

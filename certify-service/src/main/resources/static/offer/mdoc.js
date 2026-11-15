@@ -242,7 +242,8 @@ var Mdoc = (function () {
 
   /**
    * Reads one IssuerSigned (ISO/IEC 18013-5 8.3.2.1.2) without changing a byte:
-   * `{nameSpaces: {ns: [{elementIdentifier, digestID, elementValue, raw}]}, issuerAuth: {raw, alg, x5chain, mso}}`.
+   * `{nameSpaces: {ns: [{elementIdentifier, digestID, elementValue, raw}]}, issuerAuth: {raw, alg, x5chain,
+   * x5chainHeader, mso}}`.
    * `raw` is the exact `[start, end)` slice of `input`, so the tag-24 IssuerSignedItemBytes and the IssuerAuth can be
    * carried into a DeviceResponse exactly as issued. Throws a message naming what is wrong.
    *
@@ -317,7 +318,11 @@ var Mdoc = (function () {
     var unprotectedRange = ranges.get(pathKey(["issuerAuth", 1]));
     var unprotectedHeader = headerOf(bytes.subarray(unprotectedRange.start, unprotectedRange.end), "unprotected header");
     requireDisjointBuckets(protectedHeader, unprotectedHeader);
-    var x5chain = x5chainOf(headerValue(protectedHeader, unprotectedHeader, 33));
+    // where the chain was found is kept, because a caller that validates it must refuse the protected placement
+    // (ISO/IEC 18013-5 9.1.2.4; `issuerChain`, P5-03c). `requireDisjointBuckets` has made sure only one bucket has it.
+    var protectedChain = intLabel(protectedHeader, 33);
+    var chainLabel = protectedChain !== undefined ? protectedChain : intLabel(unprotectedHeader, 33);
+    var x5chain = x5chainOf(chainLabel);
     var alg = headerValue(protectedHeader, unprotectedHeader, 1);
 
     // no prototype: a namespace named "__proto__" is stored as one, not as this object's prototype (which would hide its
@@ -357,9 +362,29 @@ var Mdoc = (function () {
         raw: bytes.subarray(issuerAuthRange.start, issuerAuthRange.end),
         alg: alg === undefined ? undefined : alg.value,
         x5chain: x5chain,
+        x5chainHeader: chainLabel === undefined ? null : protectedChain === undefined ? "unprotected" : "protected",
         mso: mso,
       },
     };
+  }
+
+  /**
+   * The certificates of one IssuerSigned's issuerAuth, for a caller that validates them (P5-03c).
+   *
+   * ISO/IEC 18013-5 9.1.2.4 puts the x5chain in the *unprotected* header. P5-03a reads it from either bucket, because it
+   * validates no chain, and refuses a label carried in both (RFC 9052 section 3); refusing the protected-only placement
+   * is left to the package that first reads a chain to validate it, and that is this one (decision log, P5-03a review
+   * round 3). The refusal comes before anything parses a certificate: this function returns the DER a caller would then
+   * read, and it throws instead when the placement is the wrong one. P5-03d's `trusted_authorities` aki filter matches
+   * the chain this check has placed.
+   */
+  function issuerChain(input) {
+    var read = readIssuerSigned(input);
+    if (read.issuerAuth.x5chainHeader === "protected") {
+      throw new Error("the issuerAuth x5chain is only in the protected header; ISO/IEC 18013-5 9.1.2.4 puts it in the "
+        + "unprotected header");
+    }
+    return read.issuerAuth.x5chain;
   }
 
   function refuse(code, message) {
@@ -491,6 +516,7 @@ var Mdoc = (function () {
 
   return {
     readIssuerSigned: readIssuerSigned,
+    issuerChain: issuerChain,
     checkKeepable: checkKeepable,
     MAX_ISSUER_SIGNED_BYTES: MAX_ISSUER_SIGNED_BYTES,
     MAX_CREDENTIALS: MAX_CREDENTIALS,

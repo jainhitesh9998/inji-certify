@@ -25,6 +25,10 @@
   table#detailsTable { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
   .status { margin-top: 10px; font-size: 0.9rem; }
   .status.ok { color: var(--ok); } .status.bad { color: var(--bad); }
+  .notice { margin: 10px 0 0; padding: 10px 12px; border-left: 3px solid var(--accent); background: #f2f6fc; font-size: 0.9rem; }
+  textarea#requestText { width: 100%; margin-top: 8px; padding: 8px; border: 1px solid var(--line); border-radius: 6px; font: 0.85rem/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; resize: vertical; }
+  ul#checkList { margin: 0; padding-left: 18px; font-size: 0.9rem; }
+  ul#checkList li { margin: 4px 0; }
 </style>
 </head>
 <body>
@@ -49,10 +53,40 @@
     <button id="delete" class="secondary">Delete this credential</button>
     <div id="detailsStatus" class="status"></div>
   </section>
+
+  <section>
+    <h2>Present to a verifier</h2>
+    <p class="hint">Paste the verifier's link (the text a QR code carries) or its request object. This page reads the
+      request and checks the verifier's certificate; nothing is shared until you press Share, which comes with the next
+      step of this wallet.</p>
+    <textarea id="requestText" rows="3" spellcheck="false" placeholder="openid4vp://?client_id=…&amp;request_uri=…"></textarea>
+    <div class="row">
+      <button id="readRequest">Read request</button>
+    </div>
+    <div id="intakeStatus" class="status"></div>
+  </section>
+
+  <section id="verifierCard" hidden>
+    <h2>Verifier</h2>
+    <table id="verifierTable"></table>
+    <p id="noTrustList" class="notice"></p>
+    <div id="requestChecks" hidden>
+      <h2>Request checks</h2>
+      <ul id="checkList" class="checks"></ul>
+    </div>
+    <div id="requestError" hidden>
+      <h2>This request has to be answered with an error</h2>
+      <p id="errorSummary"></p>
+      <button id="sendError">Send error response</button>
+      <div id="errorStatus" class="status"></div>
+    </div>
+  </section>
 </main>
 <script src="cbor.js"></script>
 <script src="mdoc.js"></script>
 <script src="wallet-store.js"></script>
+<script src="x509.js"></script>
+<script src="oid4vp.js"></script>
 <script src="wallet.js"></script>
 </body>
 </html>

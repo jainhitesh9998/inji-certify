@@ -1,7 +1,9 @@
 /*
- * The demo wallet page's controller (P5-03a): DOM only. It lists the credentials kept in this browser (WalletStore),
- * shows one credential's IssuerSigned elements the way the offer page renders an issued mDL, and deletes one record or
- * the whole database. No protocol logic lives here; the naming and the modules are the plan's (section 4.1).
+ * The demo wallet page's controller: DOM only. It lists the credentials kept in this browser (WalletStore), shows one
+ * credential's IssuerSigned elements the way the offer page renders an issued mDL, and deletes one record or the whole
+ * database (P5-03a). P5-03c adds the request intake: the same-device invocation a verifier navigates the page to, the
+ * paste field, the verifier card with the request checks, and the "Send error response" button. The request's meaning
+ * is `Oid4vp`'s and the certificate reading is `X509`'s; nothing protocol-shaped is decided here (plan section 4.1).
  *
  * The page holds one connection (`db`) and gives it up when another tab deletes or upgrades the store, or when the
  * browser closes it; the list then follows. While a start, a delete or a reconnect is under way (`busy`, a count of
@@ -10,6 +12,9 @@
  * has since given up is dropped, never shown, and so is the closing message of an operation whose connection was given up
  * meanwhile: the handler that took the connection away has said what happened since, and its message is the newer one
  * (P5-03a review round 4).
+ *
+ * I9: the intake sends nothing. Its one request is the fetch of the request object a verifier's link names, which is
+ * the request the protocol itself makes; an error response leaves only when the visitor presses "Send error response".
  */
 (function () {
   "use strict";
@@ -22,6 +27,13 @@
   var busy = 0;
   // the blob URL of the portrait the details view last rendered, released when another one replaces it
   var portraitObjectUrls = [];
+  // P5-03c: what `GET offer/wallet/config` published (the relay's host allow-list), the request_uris this page has
+  // already fetched (a request object is read once, plan 4.4), and the request the card is showing
+  var relayHosts = [];
+  var fetchedRequestUris = new Set();
+  var pendingRequest = null;
+  var pendingErrorResponse = null;
+  var WALLET_URL = location.origin + location.pathname.replace(/\/+$/, "");
 
   function status(id, message, ok) {
     var node = el(id);
@@ -51,6 +63,7 @@
   function syncControls() {
     el("deleteAll").disabled = busy > 0 || db === null || records.length === 0;
     el("delete").disabled = busy > 0 || db === null || selected === null;
+    el("readRequest").disabled = busy > 0;
   }
 
   function renderList() {
@@ -319,17 +332,257 @@
   /**
    * I4: the wallet's own switch decides whether this browser stores anything. The page is meant to be reached at
    * `offer/wallet`, which answers 404 with the switch off; asking `wallet/config` (the endpoint the offer page asks
-   * too) before opening the store keeps that true whatever path served these bytes.
+   * too) before opening the store keeps that true whatever path served these bytes. The same answer carries the relay's
+   * host allow-list (P5-03f): a verifier on it is read through the relay and never directly (plan 4.4).
    */
-  async function walletEnabled() {
+  async function readWalletConfig() {
+    var answer;
     try {
-      var answer = await fetch("wallet/config", { cache: "no-store", credentials: "same-origin", redirect: "error" });
-      return answer.status === 200;
+      answer = await fetch("wallet/config", { cache: "no-store", credentials: "same-origin", redirect: "error" });
     } catch (e) {
-      return false;
+      return { enabled: false };
+    }
+    if (answer.status !== 200) return { enabled: false };
+    var document = null;
+    try {
+      document = JSON.parse(await answer.text());
+    } catch (e) {
+      document = null;
+    }
+    var hosts = document && document.relay && Array.isArray(document.relay.hosts) ? document.relay.hosts : [];
+    return { enabled: true, relayHosts: hosts.map(function (host) { return String(host); }) };
+  }
+
+  /* ---------------------------------------------------------------- request intake (P5-03c) */
+
+  /** 16 random bytes in base64url: the wallet_nonce a posted request carries (VP section 5.10.1). */
+  function randomNonce() {
+    var bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    var text = "";
+    for (var i = 0; i < bytes.length; i++) text += String.fromCharCode(bytes[i]);
+    return btoa(text).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  /** The COSE algorithm ids of the IssuerAuth of every kept credential, for the issuerauth_alg_values finding. */
+  function keptIssuerAuthAlgs() {
+    var algs = [];
+    records.forEach(function (record) {
+      var bytes = bytesOf(record.issuerSigned);
+      if (bytes === null) return;
+      try {
+        var read = Mdoc.readIssuerSigned(bytes);
+        if (typeof read.issuerAuth.alg === "number" && algs.indexOf(read.issuerAuth.alg) < 0) algs.push(read.issuerAuth.alg);
+      } catch (e) {
+        // a record this page cannot read decides nothing here; the list already says it could not be shown
+      }
+    });
+    return algs;
+  }
+
+  /**
+   * The parameters a verifier navigated the page to, or null. Same-device invocation is a query string (EUDI's
+   * "Authorization Endpoint" field) or the `#://?…` fragment Multipaz's scheme field produces (plan 4.4); the fragment
+   * never reaches this server, which is the point of it.
+   */
+  function invocationQuery() {
+    var search = typeof location.search === "string" ? location.search : "";
+    var hash = typeof location.hash === "string" ? location.hash : "";
+    if (search.length > 1) return search.slice(1);
+    // `location.hash` carries its "#", and Multipaz's scheme field makes the fragment "://?" + the parameters
+    var fragment = hash.charAt(0) === "#" ? hash.slice(1) : hash;
+    if (fragment.indexOf("://?") === 0) return fragment.slice(4);
+    if (fragment.indexOf("?") === 0) return fragment.slice(1);
+    return null;
+  }
+
+  /**
+   * Takes the request parameters out of the address bar before anything else happens, so a reload cannot fetch a
+   * single-use request object a second time (plan 4.4: EUDI's is fetchable once). `history.replaceState` keeps no entry
+   * behind, which `pushState` would.
+   */
+  function forgetInvocation() {
+    try {
+      if (typeof history !== "undefined" && history && typeof history.replaceState === "function") {
+        history.replaceState(null, "", location.pathname);
+      }
+    } catch (e) {
+      // a page in a sandboxed frame may refuse; the query is still read once per load, and nothing is fetched twice
     }
   }
 
+  function clearNode(node) {
+    if (node !== null) node.textContent = "";
+  }
+
+  /** The verifier card and the request checks (plan 4.5): every value is text, and no URL from the request is loaded. */
+  function renderCard(card, findings) {
+    var table = el("verifierTable");
+    clearNode(table);
+    table.appendChild(row("client_id", card.clientId));
+    if (card.prefixExplanation) table.appendChild(row("client identifier prefix", card.prefixExplanation));
+    var subject = card.subject.map(function (a) { return a.short + "=" + a.value; }).join(", ");
+    var issuer = card.issuer.map(function (a) { return a.short + "=" + a.value; }).join(", ");
+    table.appendChild(row("certificate subject", subject || "none: this request is not signed"));
+    table.appendChild(row("certificate issuer", issuer || "none: this request is not signed"));
+    if (card.sans.length) table.appendChild(row("subject alternative names", card.sans.join(", ")));
+    if (card.validity !== null) {
+      table.appendChild(row("valid", card.validity.notBefore + " to " + card.validity.notAfter));
+    }
+    if (card.key !== null) table.appendChild(row("public key", card.key));
+    if (card.chainLength > 1) table.appendChild(row("certificates in x5c", String(card.chainLength)));
+    if (card.fingerprints.leaf) table.appendChild(row("SHA-256 of the leaf", card.fingerprints.leaf));
+    if (card.fingerprints.top && card.fingerprints.top !== card.fingerprints.leaf) {
+      table.appendChild(row("SHA-256 of the topmost certificate", card.fingerprints.top));
+    }
+    table.appendChild(row("response_uri host", card.responseUriHost));
+    if (card.clientName !== null) {
+      table.appendChild(row("client_name (as the verifier names itself)", card.clientName));
+    }
+    if (card.verifierInfo !== null) {
+      card.verifierInfo.forEach(function (entry, index) {
+        table.appendChild(row("verifier_info[" + index + "] " + (entry.type || entry.format) + " (unverified)",
+          entry.text || "(not a JWS this page can read)"));
+      });
+    }
+    el("noTrustList").textContent = "No trusted list: this demo cannot tell you who this verifier is. It checked the "
+      + "signatures and validity of the certificates the request carries, up to the topmost one, and bound the "
+      + "client_id to the leaf certificate, but it reaches no trust anchor. Nothing is sent until you press Share.";
+    var list = el("checkList");
+    clearNode(list);
+    findings.forEach(function (finding) {
+      var item = document.createElement("li");
+      item.textContent = finding;
+      list.appendChild(item);
+    });
+    el("requestChecks").hidden = findings.length === 0;
+    el("verifierCard").hidden = false;
+  }
+
+  /** The error response the wallet owes the verifier (VP section 8.5), shown with the button that sends it. */
+  function showErrorResponse(error) {
+    el("errorSummary").textContent = error.error + ": " + error.description;
+    el("requestError").hidden = false;
+    status("errorStatus", "");
+  }
+
+  /** Reads one request: the link's request object (fetched once), or the object itself, then the checks. */
+  async function readRequest(text) {
+    el("verifierCard").hidden = true;
+    el("requestError").hidden = true;
+    pendingRequest = null;
+    pendingErrorResponse = null;
+    setBusy(true);
+    status("intakeStatus", "Reading the request…");
+    try {
+      var link = Oid4vp.parseLink(text);
+      if (!link.ok) {
+        status("intakeStatus", (link.rule ? link.rule + ": " : "") + link.message, false);
+        return;
+      }
+      var requestText = null;
+      var contentType = "";
+      if (link.kind === "request_uri") {
+        var walletNonce = link.params.requestUriMethod === "post" ? randomNonce() : undefined;
+        var fetched = await Oid4vp.fetchRequest({
+          requestUri: link.params.requestUri,
+          method: link.params.requestUriMethod,
+          walletNonce: walletNonce,
+          pageUrl: new URL(location.href),
+          relayHosts: relayHosts,
+          relayUrl: WALLET_URL + "/relay",
+          fetched: fetchedRequestUris,
+          fetchImpl: fetch,
+        });
+        if (!fetched.ok) {
+          status("intakeStatus", fetched.message, false);
+          return;
+        }
+        requestText = fetched.text;
+        contentType = fetched.contentType;
+        link.params.walletNonce = walletNonce;
+      } else if (link.kind === "by_value") {
+        requestText = link.params.request;
+      }
+      var checked = await Oid4vp.checkRequest({
+        text: requestText,
+        plain: link.kind === "plain" ? link.params.plain : undefined,
+        link: {
+          scheme: link.scheme,
+          kind: link.kind,
+          clientId: link.params.clientId,
+          requestUri: link.params.requestUri,
+          requestUriMethod: link.params.requestUriMethod,
+          walletNonce: link.params.walletNonce,
+          findings: link.findings,
+        },
+        contentType: contentType,
+        pageUrl: new URL(location.href),
+        now: new Date(),
+        keptIssuerAuthAlgs: keptIssuerAuthAlgs(),
+      });
+      if (!checked.ok) {
+        status("intakeStatus", (checked.rule ? checked.rule + ": " : "") + checked.message, false);
+        return;
+      }
+      pendingRequest = checked;
+      renderCard(checked.card, checked.findings);
+      if (checked.error !== null) {
+        pendingErrorResponse = { uri: checked.request.responseUri, state: checked.request.state, error: checked.error };
+        showErrorResponse(checked.error);
+        status("intakeStatus", "Read. This wallet has to answer this request with an error response, which is only sent "
+          + "when you press the button below.", false);
+        return;
+      }
+      status("intakeStatus", "Read. Nothing has been sent anywhere.", true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  el("readRequest").addEventListener("click", async function () {
+    if (busy > 0) return;
+    var field = el("requestText");
+    var text = field === null ? "" : String(field.value || "").trim();
+    if (!text) {
+      status("intakeStatus", "Paste the verifier's link or its request object first.", false);
+      return;
+    }
+    await readRequest(text);
+  });
+
+  el("sendError").addEventListener("click", async function () {
+    if (busy > 0 || pendingErrorResponse === null) return;
+    var target = pendingErrorResponse;
+    var form = new URLSearchParams();
+    form.set("error", target.error.error);
+    form.set("error_description", target.error.description);
+    if (target.state !== undefined && target.state !== null) form.set("state", String(target.state));
+    setBusy(true);
+    status("errorStatus", "Sending the error response…");
+    try {
+      var answer = await fetch(target.uri, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: form,
+        mode: "cors",
+        credentials: "omit",
+        redirect: "error",
+      });
+      pendingErrorResponse = null;
+      status("errorStatus", "Sent; the verifier answered " + answer.status + ".", true);
+    } catch (e) {
+      status("errorStatus", "The error response could not be sent: " + e.message, false);
+    } finally {
+      setBusy(false);
+    }
+  });
+
+  /**
+   * The page's start. The controls are off from the first turn, before the config is asked for: a visitor cannot press
+   * anything while a start is pending, and a press therefore cannot race the start's own busy count (which would leave
+   * one of them holding the controls off for good).
+   */
   (async function start() {
     renderList();
     if (typeof WalletStore === "undefined" || !WalletStore.available()) {
@@ -337,23 +590,27 @@
       el("empty").hidden = false;
       return;
     }
-    if (!(await walletEnabled())) {
-      status("storageStatus", "The demo wallet is switched off on this deployment, so nothing is kept in this browser.", false);
-      el("empty").hidden = false;
-      return;
-    }
     setBusy(true);
+    var query = null;
     try {
-      db = await connect();
-    } catch (e) {
-      status("storageStatus", "This browser could not open its credential store: " + e.message, false);
-      setBusy(false);
-      return;
-    }
-    try {
-      await refresh();
-    } catch (e) {
-      status("storageStatus", "The kept credentials could not be read: " + e.message, false);
+      var config = await readWalletConfig();
+      if (!config.enabled) {
+        status("storageStatus", "The demo wallet is switched off on this deployment, so nothing is kept in this browser.", false);
+        el("empty").hidden = false;
+        return;
+      }
+      relayHosts = config.relayHosts || [];
+      // ahead of the store: a verifier's same-device invocation must be read, and its parameters taken out of the
+      // address bar, whatever the store does next
+      query = invocationQuery();
+      if (query !== null) forgetInvocation();
+      try {
+        db = await connect();
+        await refresh();
+      } catch (e) {
+        status("storageStatus", "This browser could not open its credential store: " + e.message, false);
+      }
+      if (query !== null) await readRequest(location.origin + location.pathname + "?" + query);
     } finally {
       setBusy(false);
     }
