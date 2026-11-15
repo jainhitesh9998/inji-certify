@@ -243,7 +243,7 @@ var Mdoc = (function () {
 
   /**
    * Reads one IssuerSigned (ISO/IEC 18013-5 8.3.2.1.2) without changing a byte:
-   * `{nameSpaces: {ns: [{elementIdentifier, digestID, elementValue, raw}]}, issuerAuth: {raw, alg, x5chain, mso}}`.
+   * `{nameSpaces: Map<ns, [{elementIdentifier, digestID, elementValue, raw}]>, issuerAuth: {raw, alg, x5chain, mso}}`.
    * `raw` is the exact `[start, end)` slice of `input`, so the tag-24 IssuerSignedItemBytes and the IssuerAuth can be
    * carried into a DeviceResponse exactly as issued. Throws a message naming what is wrong.
    *
@@ -265,8 +265,10 @@ var Mdoc = (function () {
    * behind them: each is a shape the CDDL or RFC 9052 / RFC 9053 / RFC 9360 does not allow, read from the bytes the
    * page would carry.
    *
-   * Maps are read typed (`Map`), so `mso` and each `elementValue` that is a map are `Map`s; `nameSpaces` is an object
-   * with no prototype, so a namespace named "__proto__" is a namespace like any other.
+   * Maps are read typed (`Map`), so `mso`, `nameSpaces` and each `elementValue` that is a map are `Map`s. A `Map`
+   * keeps the order the namespaces were written in and holds any text as a key, where an object would reorder the
+   * namespaces whose names look like integers ("2" before "10") and, with a prototype, hide a namespace named
+   * "__proto__": a DeviceResponse has to write them back in the order the issuer used (plan 4.7).
    */
   function readIssuerSigned(input) {
     var bytes = bytesOf(input);
@@ -321,16 +323,16 @@ var Mdoc = (function () {
     var x5chain = x5chainOf(headerValue(protectedHeader, unprotectedHeader, 33));
     var alg = headerValue(protectedHeader, unprotectedHeader, 1);
 
-    // no prototype: a namespace named "__proto__" is stored as one, not as this object's prototype (which would hide its
-    // items from every check that lists the namespaces)
-    var nameSpaces = Object.create(null);
+    // a Map, not an object: the order the namespaces arrived in is the order a DeviceResponse writes them back in, and
+    // a namespace named "2" or "__proto__" is a namespace like any other (plan 4.7)
+    var nameSpaces = new Map();
     var decoded = value.has("nameSpaces") ? value.get("nameSpaces") : new Map();
     if (value.has("nameSpaces")) requireMajor(bytes, ranges.get(pathKey(["nameSpaces"])), 5, "IssuerSigned nameSpaces");
     if (!(decoded instanceof Map)) throw new Error("IssuerSigned nameSpaces is not a map");
     decoded.forEach(function (items, namespace) {
       if (!Array.isArray(items)) throw new Error("the namespace " + namespace + " is not an array of IssuerSignedItems");
       requireMajor(bytes, ranges.get(pathKey(["nameSpaces", namespace])), 4, "the namespace " + namespace);
-      nameSpaces[namespace] = items.map(function (item, index) {
+      nameSpaces.set(namespace, items.map(function (item, index) {
         var elementIdentifier = field(item, "elementIdentifier");
         var digestID = field(item, "digestID");
         if (typeof elementIdentifier !== "string" || typeof digestID !== "number") {
@@ -349,7 +351,7 @@ var Mdoc = (function () {
           elementValue: item.get("elementValue"),
           raw: bytes.subarray(itemRange.start, itemRange.end),
         };
-      });
+      }));
     });
 
     return {
@@ -449,10 +451,15 @@ var Mdoc = (function () {
    * `options.alg` is the COSE algorithm label in the protected header: -7 (ES256) by default, -9 (ESP256, the same
    * algorithm fully specified) only when the verifier's `deviceauth_alg_values` lists -9 and not -7 (plan 4.7).
    *
+   * The signature the page just made is verified against the record's public key before anything is returned: the
+   * record's public key is the MSO's `deviceKey` (checked above), so a signature that does not check under it was made
+   * with another key, which is a record whose private key does not belong to its credential. Such a record refuses to
+   * sign rather than present a response no verifier would accept (plan 4.7).
+   *
    * Returns `{bytes, docType, alg, disclosed}`, where `disclosed` lists what the response carries in kept order. Throws
    * with the reason instead: a chosen element the credential does not have, a docType other than the kept one, a record
-   * whose public key is not the MSO's `deviceKey` (a key from another credential), a transcript that is not one CBOR
-   * item, or an algorithm the page does not sign with.
+   * whose public key is not the MSO's `deviceKey` (a key from another credential) or whose private key does not match
+   * its own public key, a transcript that is not one CBOR item, or an algorithm the page does not sign with.
    */
   async function deviceResponse(record, chosen, sessionTranscript, options) {
     var opts = options || {};
@@ -478,21 +485,26 @@ var Mdoc = (function () {
       throw new Error("a device signature carries the COSE algorithm -7 (ES256) or -9 (ESP256), not " + String(alg));
     }
 
-    // the disclosed items, grouped by namespace in the kept order; a namespace with nothing chosen is omitted
+    // the disclosed items, grouped by namespace in the kept order (`read.nameSpaces` is a Map, so that order is the
+    // issuer's); a namespace with nothing chosen is omitted. A pair's key is its JSON array: a join on any separator
+    // can collide (a namespace that holds the separator), JSON cannot.
+    var keyOf = function (namespace, identifier) {
+      return JSON.stringify([namespace, identifier]);
+    };
     var wanted = new Set();
     (chosen || []).forEach(function (pair) {
       if (!Array.isArray(pair) || typeof pair[0] !== "string" || typeof pair[1] !== "string") {
         throw new Error("a chosen element is a [namespace, elementIdentifier] pair");
       }
-      wanted.add(pair[0] + "\u0000" + pair[1]);
+      wanted.add(keyOf(pair[0], pair[1]));
     });
     var known = new Set();
     var nameSpaces = new Map();
     var disclosed = [];
-    Object.keys(read.nameSpaces).forEach(function (namespace) {
-      var items = read.nameSpaces[namespace].filter(function (item) {
-        known.add(namespace + "\u0000" + item.elementIdentifier);
-        return wanted.has(namespace + "\u0000" + item.elementIdentifier);
+    read.nameSpaces.forEach(function (namespaceItems, namespace) {
+      var items = namespaceItems.filter(function (item) {
+        known.add(keyOf(namespace, item.elementIdentifier));
+        return wanted.has(keyOf(namespace, item.elementIdentifier));
       });
       if (!items.length) return;
       nameSpaces.set(namespace, items.map(function (item) {
@@ -502,7 +514,7 @@ var Mdoc = (function () {
     });
     wanted.forEach(function (key) {
       if (!known.has(key)) {
-        var pair = key.split("\u0000");
+        var pair = JSON.parse(key);
         throw new Error("the credential carries no " + JSON.stringify(pair[0]) + "/" + JSON.stringify(pair[1])
           + " element to disclose");
       }
@@ -521,6 +533,20 @@ var Mdoc = (function () {
     if (signature.length !== 64) {
       throw new Error("WebCrypto returned a " + signature.length + "-byte signature; a COSE ES256 signature is the 64-byte"
         + " r || s (RFC 9053 section 2.1)");
+    }
+    // The record's public key is the MSO's deviceKey (checked before signing), so a signature that does not verify under
+    // it was made with another key: the record's private key is not the one its credential was issued to. Refuse rather
+    // than present a response every verifier will reject (plan 4.7, "a record whose key was swapped refuses to sign").
+    if (record.publicJwk.kty !== "EC" || record.publicJwk.crv !== "P-256") {
+      throw new Error("the record's public key is not an EC P-256 key, so the signature this page made cannot be checked"
+        + " against it");
+    }
+    var ownKey = await crypto.subtle.importKey("jwk",
+      { kty: "EC", crv: "P-256", x: record.publicJwk.x, y: record.publicJwk.y },
+      { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+    if (!(await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, ownKey, signature, toBeSigned))) {
+      throw new Error("the device signature does not verify with the record's own public key: this record's private key"
+        + " is not the key its credential was issued to, so nothing was presented");
     }
 
     var issuerSigned = new Map();
@@ -634,12 +660,12 @@ var Mdoc = (function () {
         + "; SHA-256, SHA-384 and SHA-512 are supported.");
     }
     var valueDigests = field(mso, "valueDigests");
-    for (var namespace of Object.keys(read.nameSpaces)) {
+    for (var namespace of read.nameSpaces.keys()) {
       var byDigestId = field(valueDigests, namespace);
       if (!(byDigestId instanceof Map)) {
         return refuse("digest", "The credential's MSO has no valueDigests for the namespace " + namespace + ".");
       }
-      var items = read.nameSpaces[namespace];
+      var items = read.nameSpaces.get(namespace);
       for (var item of items) {
         // DigestID = uint (ISO/IEC 18013-5 9.1.2.4): the integer key, never a text key that prints alike
         var expected = byDigestId.get(item.digestID);

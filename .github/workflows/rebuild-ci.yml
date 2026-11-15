@@ -220,6 +220,7 @@ jobs:
         # P5-03a review round 2: the storage scenarios of check-offer-wallet.mjs (the connection queue, `blocked`,
         # transaction lifetime, "Delete everything" against other tabs) also run on fake-indexeddb, an IndexedDB 3.0
         # implementation pinned in wallet-probe/package-lock.json. Test-only: nothing here reaches the runtime classpath.
+        # This is the job's only install: the two steps below reuse this node_modules (same job, same directory).
         working-directory: docs/design/tools/wallet-probe
         run: npm ci --ignore-scripts --no-audit --no-fund && node idb-crosscheck.mjs
         shell: bash
@@ -231,14 +232,16 @@ jobs:
         # itself, anchors the document signer to the fixture IACA, and holds every positive sample to the elements it
         # must disclose and every negative one to the check that must reject it.
         working-directory: docs/design/tools/wallet-probe
-        run: npm ci --ignore-scripts --no-audit --no-fund && node probe.mjs
+        run: node probe.mjs
         shell: bash
 
       - name: Demo wallet DeviceResponse, independently verified (Multipaz)
         # The second library, in Java: certify-conformance-mdoc verifies the same samples with Multipaz 0.102.0
         # (issuer signature, chain to the IACA, digests, device signature over the verifier's transcript, disclosed set).
-        # With CI set, no samples is a failure, so the harness above must have written them.
-        run: mvn -B -ntp -Dgpg.skip=true -pl certify-conformance-mdoc -am test -Dtest=WalletPresentationConformanceTest -Dsurefire.failIfNoSpecifiedTests=false
+        # `wallet.samples.required=true` is what makes a missing sample directory a failure, and it belongs here and
+        # nowhere else: "Build and verify" runs `mvn verify` before this job's harness has written anything, so the same
+        # suite must skip there rather than fail on a fresh tree (P5-03b review round 1, finding 1).
+        run: mvn -B -ntp -Dgpg.skip=true -pl certify-conformance-mdoc -am test -Dtest=WalletPresentationConformanceTest -Dsurefire.failIfNoSpecifiedTests=false -Dwallet.samples.required=true
         shell: bash
 
       - uses: actions/setup-python@v5

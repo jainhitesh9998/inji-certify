@@ -64,13 +64,20 @@ import static org.junit.jupiter.api.Assertions.fail;
  *       ({@code deviceSignature} or {@code digest}).</li>
  * </ul>
  *
- * <p>With {@code CI} set, no samples is a failure: the harness must have run first. Locally the suite skips with a
- * message, so a developer who has not run the harness is not left with a red build.</p>
+ * <p>Whether samples must exist is the caller's call, not the environment's: with
+ * {@code -Dwallet.samples.required=true} no samples is a failure, and every other run skips with a message.
+ * {@code mvn verify} in CI runs before the Node harness has written anything, so keying the failure on {@code CI} made
+ * every fresh build red; the dedicated Multipaz step passes the property right after the harness has run instead.</p>
  */
 class WalletPresentationConformanceTest {
 
     static final Path ROOT = Path.of("..");
-    static final boolean CI = System.getenv("CI") != null;
+    /**
+     * Set by the step that runs this suite on purpose, after the harness wrote the samples. Absent, a missing sample
+     * directory is a skip: {@code mvn verify} runs before the harness in CI, and a developer who has not run it should
+     * not see a red build.
+     */
+    static final boolean SAMPLES_REQUIRED = Boolean.getBoolean("wallet.samples.required");
     /** Where the harness wrote its samples; a CI job may point it elsewhere. */
     static final Path SAMPLES = Path.of(System.getProperty("wallet.samples.dir",
             ROOT.resolve("target/wallet-samples").toString()));
@@ -78,19 +85,23 @@ class WalletPresentationConformanceTest {
     private static final String SAMPLE_RESPONSE = "device-response.cbor";
     private static final String SAMPLE_EXPECTED = "expected.json";
     private static final String SAMPLE_IACA = "iaca.pem";
-    private static final Pattern DEVICE_SIGNATURE = Pattern.compile("(?i)signature");
-    private static final Pattern DIGEST = Pattern.compile("(?i)digest");
+    /**
+     * Multipaz's own wording for these two checks, matched exactly: a bare {@code (?i)signature} also matches its
+     * issuer-signature messages ({@code Signature on MSO failed to verify}), so a document signed by another DSC
+     * would satisfy a device-signature negative for the wrong reason (review round 1, finding 3).
+     */
+    private static final Pattern DEVICE_SIGNATURE = Pattern.compile(
+            "Device authentication signature failed to verify");
+    private static final Pattern DIGEST = Pattern.compile("Digest mismatch for data element");
 
     @Test
     void everySampleTheWalletProducedIsVerifiedByMultipaz() throws IOException {
         List<Path> samples = samples();
         if (samples.isEmpty()) {
-            if (CI) {
-                fail("no wallet presentation samples in " + SAMPLES.toAbsolutePath()
-                        + "; check-offer-wallet.mjs writes them (plan 4.14)");
+            if (SAMPLES_REQUIRED) {
+                fail(noSamples());
             }
-            Assumptions.assumeTrue(false, "no wallet presentation samples in " + SAMPLES.toAbsolutePath()
-                    + "; run node docs/design/tools/check-offer-wallet.mjs first");
+            Assumptions.assumeTrue(false, noSamples());
             return;
         }
         IndependentDeviceResponseVerifier verifier = new IndependentDeviceResponseVerifier();
@@ -153,7 +164,10 @@ class WalletPresentationConformanceTest {
     void multipazComputesTheSameSessionTranscript() throws IOException {
         List<Path> samples = samples();
         if (samples.isEmpty()) {
-            Assumptions.assumeTrue(!CI, "no wallet presentation samples in " + SAMPLES.toAbsolutePath());
+            if (SAMPLES_REQUIRED) {
+                fail(noSamples());
+            }
+            Assumptions.assumeTrue(false, noSamples());
             return;
         }
         int checked = 0;
@@ -191,7 +205,16 @@ class WalletPresentationConformanceTest {
                 handover), false));
     }
 
-    /** Multipaz's own builder, so the two can be compared. */
+    /**
+     * Multipaz's own builder, so the two can be compared.
+     *
+     * <p>{@code vpSessionTranscript$multipaz} is Kotlin-{@code internal}, so this is a deliberate reach past the
+     * library's published surface, pinned to 0.102.0: no public API builds an OpenID4VP 1.0 transcript. The public
+     * alternatives take a whole verification ({@code verifyOpenID4VPResponse} builds the transcript it needs inside),
+     * so none can hand the transcript back to be compared with the one written in {@link #transcriptOf}. The method's
+     * signature is fixed by Kotlin's {@code $multipaz} name mangling, and the POM pins the version, so a rename shows
+     * up as a compile error in the upgrade that changes it, not as a silent skip.</p>
+     */
     private static final class MultipazHandover {
 
         static DataItem transcript(Object responseKey, String clientId, String nonce, String responseUri) {
@@ -224,6 +247,12 @@ class WalletPresentationConformanceTest {
 
     static JsonObject json(Path file) throws IOException {
         return JsonParser.parseString(Files.readString(file, StandardCharsets.UTF_8)).getAsJsonObject();
+    }
+
+    /** Why there is nothing to verify, for the skip and for the failure the required run reports. */
+    static String noSamples() {
+        return "no wallet presentation samples in " + SAMPLES.toAbsolutePath()
+                + "; node docs/design/tools/check-offer-wallet.mjs writes them (plan 4.14)";
     }
 
     /** `[[namespace, elementIdentifier], …]` as `namespace/elementIdentifier` strings. */

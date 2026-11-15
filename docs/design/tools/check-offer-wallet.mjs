@@ -40,7 +40,7 @@
  * offline; OfferPageTest recomputes the inline script's hash from the bytes the controller serves and finds it in the
  * Content-Security-Policy).
  */
-import { createHash, createPublicKey, verify, webcrypto } from "node:crypto";
+import { createHash, createPublicKey, createPrivateKey, sign, verify, webcrypto } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -822,9 +822,9 @@ await section("2. readIssuerSigned", async () => {
     equal("the docType and algorithm are read from the MSO", [read.issuerAuth.mso.get("docType"),
         read.issuerAuth.mso.get("digestAlgorithm")], [DOC_TYPE, "SHA-256"]);
     equal("the IssuerAuth keeps its ES256 algorithm", read.issuerAuth.alg, -7);
-    equal("every element is read", read.nameSpaces[MDL_NAMESPACE].map((item) => item.elementIdentifier),
+    equal("every element is read", read.nameSpaces.get(MDL_NAMESPACE).map((item) => item.elementIdentifier),
         Object.keys(MDL_ELEMENTS[MDL_NAMESPACE]));
-    for (const item of read.nameSpaces[MDL_NAMESPACE]) {
+    for (const item of read.nameSpaces.get(MDL_NAMESPACE)) {
         const expected = MDL_A.items.get(MDL_NAMESPACE).find((entry) => entry.elementIdentifier === item.elementIdentifier);
         check(`the slice of ${item.elementIdentifier} is the IssuerSignedItemBytes the fixture wrote`,
             sameBytes(item.raw, MDL_A.bytes.subarray(expected.start, expected.end)),
@@ -837,8 +837,8 @@ await section("2. readIssuerSigned", async () => {
     }
     // 10: the rebuild comes from the reader's own slices and is compared with the fixture's own bytes, not with the
     // builder's data: the array header is the only thing added
-    const rebuilt = Cbor.encode(new Map([...Object.keys(read.nameSpaces).map((namespace) =>
-        [namespace, read.nameSpaces[namespace].map((item) => new Cbor.Raw(item.raw))])]));
+    const rebuilt = Cbor.encode(new Map([...read.nameSpaces.keys()].map((namespace) =>
+        [namespace, read.nameSpaces.get(namespace).map((item) => new Cbor.Raw(item.raw))])));
     equal("the slices with their array headers reassemble the fixture's nameSpaces byte for byte", hex(rebuilt),
         hex(MDL_A.bytes.subarray(MDL_A.nameSpacesRange.start, MDL_A.nameSpacesRange.end)));
     equal("the IssuerAuth's raw slice is the whole COSE_Sign1", hex(read.issuerAuth.raw),
@@ -870,9 +870,9 @@ await section("2. readIssuerSigned", async () => {
 
     // 9: a tag is recognised by its numeric value, whatever head carries it, and the bytes are kept
     const nonPreferred = Mdoc.readIssuerSigned(MDL_NON_PREFERRED.bytes);
-    equal("a non-preferred tag head (d9 00 18) is the same tag 24", hex(nonPreferred.nameSpaces[MDL_NAMESPACE][0].raw.subarray(0, 3)),
+    equal("a non-preferred tag head (d9 00 18) is the same tag 24", hex(nonPreferred.nameSpaces.get(MDL_NAMESPACE)[0].raw.subarray(0, 3)),
         "d90018");
-    for (const item of nonPreferred.nameSpaces[MDL_NAMESPACE]) {
+    for (const item of nonPreferred.nameSpaces.get(MDL_NAMESPACE)) {
         const expected = MDL_NON_PREFERRED.items.get(MDL_NAMESPACE).find((entry) => entry.elementIdentifier === item.elementIdentifier);
         check(`the non-preferred head slice of ${item.elementIdentifier} is byte for byte the fixture's`,
             sameBytes(item.raw, MDL_NON_PREFERRED.bytes.subarray(expected.start, expected.end)));
@@ -882,7 +882,7 @@ await section("2. readIssuerSigned", async () => {
 
     // indefinite lengths: the ranges come from the input, so they are still exact
     const indefinite = Mdoc.readIssuerSigned(MDL_INDEFINITE.bytes);
-    for (const item of indefinite.nameSpaces[MDL_NAMESPACE]) {
+    for (const item of indefinite.nameSpaces.get(MDL_NAMESPACE)) {
         const expected = MDL_INDEFINITE.items.get(MDL_NAMESPACE).find((entry) => entry.elementIdentifier === item.elementIdentifier);
         check(`an indefinite-length IssuerSigned: the slice of ${item.elementIdentifier} is exact`,
             sameBytes(item.raw, MDL_INDEFINITE.bytes.subarray(expected.start, expected.end)));
@@ -898,7 +898,7 @@ await section("2. readIssuerSigned", async () => {
     equal("and its MSO comes out of the bstr payload", tagged.issuerAuth.mso.get("docType"), DOC_TYPE);
     equal("the tagged COSE_Sign1's raw slice is the fixture's", hex(tagged.issuerAuth.raw),
         hex(MDL_TAGGED_COSE.bytes.subarray(MDL_TAGGED_COSE.issuerAuthRange.start, MDL_TAGGED_COSE.issuerAuthRange.end)));
-    equal("its elements are read as well", tagged.nameSpaces[MDL_NAMESPACE].length, Object.keys(MDL_ELEMENTS[MDL_NAMESPACE]).length);
+    equal("its elements are read as well", tagged.nameSpaces.get(MDL_NAMESPACE).length, Object.keys(MDL_ELEMENTS[MDL_NAMESPACE]).length);
 
     // the one shape that must be refused: a bstr holding a bare MSO map, with no tag 24
     let refused = null;
@@ -1243,7 +1243,7 @@ await section("2c. COSE header labels and typed lookups in readIssuerSigned", as
     // a namespace named "__proto__" is a namespace like any other: its items are checked, never hidden
     const proto = buildIssuerSigned({ docType: DOC_TYPE, holder: HOLDER_A_JWK,
         elements: { [MDL_NAMESPACE]: { given_name: "Lorem" }, ["__proto__"]: { proto_element: "a value" } }, tamper: "proto_element" });
-    readsAs("readIssuerSigned lists a \"__proto__\" namespace", proto.bytes, (read) => Object.keys(read.nameSpaces).sort(),
+    readsAs("readIssuerSigned lists a \"__proto__\" namespace", proto.bytes, (read) => [...read.nameSpaces.keys()].sort(),
         ["__proto__", MDL_NAMESPACE].sort());
     const protoVerdict = await verdictOf(proto);
     check("and checkKeepable checks its items: a changed one is refused", protoVerdict.ok === false && protoVerdict.code === "digest",
@@ -1294,7 +1294,7 @@ await section("2e. key equivalence and value types in readIssuerSigned and check
         shaped({ rawItems: { family_name: element(Buffer.from("a2f9000001f9800002", "hex")) } }), "issuer-signed", /duplicate map key/);
     const nans = shaped({ rawItems: { family_name: element(Buffer.from("a2f97e0001f97e0102", "hex")) } });
     await keeps("an element value whose two NaN keys have distinct significands", nans);
-    equal("and reads both of its keys", Mdoc.readIssuerSigned(nans.bytes).nameSpaces[MDL_NAMESPACE][0].elementValue.size, 2);
+    equal("and reads both of its keys", Mdoc.readIssuerSigned(nans.bytes).nameSpaces.get(MDL_NAMESPACE)[0].elementValue.size, 2);
     await refuses("an element value {1: \"a\", #6.2(h'01'): \"b\"}", shaped({ rawItems: { family_name: element(cat(head(5, 2),
         head(0, 1), tstr("a"), [0xc2, 0x41, 0x01], tstr("b"))) } }), "issuer-signed", /bignum/);
 
@@ -1378,7 +1378,7 @@ await section("3. Certify's own IssuerSigned", async () => {
     equal("the DSC-only x5chain arrives as a single bstr and is read as one certificate", read.issuerAuth.x5chain.length, 1);
     check("and it is a real DER certificate, not a placeholder", read.issuerAuth.x5chain[0].length > 300,
         String(read.issuerAuth.x5chain[0].length));
-    const items = read.nameSpaces[MDL_NAMESPACE];
+    const items = read.nameSpaces.get(MDL_NAMESPACE);
     equal("mdl-a carries the 15 elements the demo issues to mdl-demo-1 (plan 4.12)",
         items.map((item) => item.elementIdentifier).sort(), MDL_DEMO_1_ELEMENTS.slice().sort());
     for (const item of items) {
@@ -2037,8 +2037,17 @@ const REQUEST = { clientId: "x509_san_dns:verifier.example", nonce: "n-0S6_WzA2M
     responseUri: "https://verifier.example/response" };
 /** The elements plan 4.7's example query asks for, in the order the demo mDL keeps them. */
 const SHOWN = ["family_name", "birth_date", "portrait", "age_over_18"].map((identifier) => [MDL_NAMESPACE, identifier]);
-/** A 32-byte thumbprint for the encrypted-response form of the transcript (RFC 7638 over a P-256 JWK). */
-const RESPONSE_KEY_THUMBPRINT = hash("sha256", Buffer.from("{\"crv\":\"P-256\",\"kty\":\"EC\"}"));
+/**
+ * The verifier's response-encryption JWK the encrypted-response transcripts below thumbprint: the OpenID4VP 1.0
+ * Appendix B.2.6.1 example P-256 key, so its RFC 7638 thumbprint is the appendix's own 4283ec92…669047.
+ */
+const RESPONSE_KEY_JWK = { crv: "P-256", kty: "EC", x: "DxiH5Q4Yx3UrukE2lWCErq8N8bqC9CHLLrAwLz5BmE0",
+    y: "XtLM4-3h5o3HUH0MHVJV0kyq0iBlrBwlh8qEDMZ4-Pc" };
+/**
+ * That JWK's real RFC 7638 thumbprint: SHA-256 over the required members only, in lexicographic order
+ * (`{"crv","kty","x","y"}`), base64url-encoded by `transcriptRecord` - not a hash of a stand-in string.
+ */
+const RESPONSE_KEY_THUMBPRINT = hash("sha256", Buffer.from(JSON.stringify(RESPONSE_KEY_JWK)));
 const SAMPLES = process.env.WALLET_SAMPLES_DIR === undefined ? resolve(REPO, "target/wallet-samples")
     : resolve(process.env.WALLET_SAMPLES_DIR);
 
@@ -2122,6 +2131,8 @@ await section("20. the OpenID4VP 1.0 SessionTranscript (VP B.2.6.1)", async () =
     const responseUri = "https://example.com/response";
     equal("the example JWK's RFC 7638 thumbprint is the one the appendix prints", hex(EXAMPLE_THUMBPRINT),
         "4283ec927ae0f208daaa2d026a814f2b22dca52cf85ffa8f3f8626c6bd669047");
+    equal("the same JWK's thumbprint, computed from its {\"crv\",\"kty\",\"x\",\"y\"} members, is that thumbprint",
+        hex(RESPONSE_KEY_THUMBPRINT), hex(EXAMPLE_THUMBPRINT));
     equal("OpenID4VPHandoverInfo is CBOR([client_id, nonce, jwkThumbprint, response_uri])", hex(encodedArray([tstr(clientId),
         tstr(nonce), bstr(EXAMPLE_THUMBPRINT), tstr(responseUri)])),
         "847818783530395f73616e5f646e733a6578616d706c652e636f6d782b6578633767426b786a7831726463397564527276654b"
@@ -2196,7 +2207,7 @@ await section("21. the DeviceResponse (ISO/IEC 18013-5 8.3.2.1.2.2)", async () =
     const carried = nameSpaces.get(MDL_NAMESPACE);
     equal("four items are carried", carried.length, SHOWN.length);
     for (const [index, [namespace, identifier]] of SHOWN.entries()) {
-        const kept = KEPT.nameSpaces[namespace].find((item) => item.elementIdentifier === identifier);
+        const kept = KEPT.nameSpaces.get(namespace).find((item) => item.elementIdentifier === identifier);
         const slice = sliceAt(built.bytes, ["documents", 0, "issuerSigned", "nameSpaces", namespace, index]);
         check(`${identifier}: the DeviceResponse carries the kept IssuerSignedItemBytes byte for byte`,
             slice !== null && sameBytes(slice, kept.raw), slice === null ? "no slice" : hex(slice).slice(0, 40));
@@ -2225,7 +2236,7 @@ await section("21. the DeviceResponse (ISO/IEC 18013-5 8.3.2.1.2.2)", async () =
 
     // nothing of the eleven elements that were not chosen is anywhere in the bytes (plan 4.7, 4.14)
     const responseHex = hex(built.bytes);
-    const absent = KEPT.nameSpaces[MDL_NAMESPACE].filter((item) => !SHOWN.some(([, identifier]) => identifier === item.elementIdentifier));
+    const absent = KEPT.nameSpaces.get(MDL_NAMESPACE).filter((item) => !SHOWN.some(([, identifier]) => identifier === item.elementIdentifier));
     equal("eleven elements are not disclosed", absent.length, 11);
     let leaks = 0;
     let searched = 0;
@@ -2283,10 +2294,26 @@ await section("21. the DeviceResponse (ISO/IEC 18013-5 8.3.2.1.2.2)", async () =
 
 // 22. the algorithm label follows the verifier's deviceauth_alg_values (plan 4.7; HAIP 1.0 section 7)
 const RESPONSE_ALG9 = (await Mdoc.deviceResponse(CERTIFY_RECORD, [SHOWN[0], SHOWN[3]], TRANSCRIPT, { alg: -9 })).bytes;
-/** Plan 4.14's "a key from another credential": signed with another key, forced past the page's own check. */
-const OTHER_KEY_RESPONSE = (await Mdoc.deviceResponse({ ...CERTIFY_RECORD,
-    privateKey: await webcrypto.subtle.importKey("jwk", HOLDER_B_PRIVATE, { name: "ECDSA", namedCurve: "P-256" }, false,
-        ["sign"]) }, SHOWN, TRANSCRIPT, {})).bytes;
+const HOLDER_B_KEY = await webcrypto.subtle.importKey("jwk", HOLDER_B_PRIVATE,
+    { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+/**
+ * Plan 4.14's "a key from another credential": `mdl-a`'s record holding another holder's private key. The page now
+ * refuses to sign with it (the signature it makes does not verify under the record's own public key), so the bytes a
+ * verifier must reject are built here: the page's response with the same `Sig_structure` signed by `HOLDER_B` instead.
+ */
+function reSignedByAnotherKey(response, privateJwk) {
+    const signature = deviceSignatureOf(response);
+    const raw = sign("sha256", sigStructureOf(signature[0], deviceAuthenticationOf(TRANSCRIPT, DOC_TYPE)),
+        { key: createPrivateKey({ key: privateJwk, format: "jwk" }), dsaEncoding: "ieee-p1363" });
+    const range = responseSpans(response).ranges.find((entry) => JSON.stringify(entry.path)
+        === JSON.stringify(["documents", 0, "deviceSigned", "deviceAuth", "deviceSignature", 3]));
+    // the same-width replacement keeps every other byte of the response where it was
+    if (raw.length !== 64 || range === undefined || range.end - range.start !== 66) {
+        throw new Error(`cannot replace the device signature: ${raw.length} bytes, range ${JSON.stringify(range)}`);
+    }
+    return cat(response.subarray(0, range.start), bstr(raw), response.subarray(range.end));
+}
+const OTHER_KEY_RESPONSE = reSignedByAnotherKey(RESPONSE, HOLDER_B_PRIVATE);
 await section("22. {alg: -9} writes the ESP256 label and still signs the same payload", async () => {
     const signature = deviceSignatureOf(RESPONSE_ALG9);
     equal("the protected header is {1: -9}: a1 01 28", hex(signature[0]), "a10128");
@@ -2299,16 +2326,31 @@ await section("22. {alg: -9} writes the ESP256 label and still signs the same pa
 });
 
 // 23. a key from another credential, and the device signature over a transcript that is not the verifier's
-await section("23. a refusals and tampered transcripts", async () => {
+await section("23. key refusals and tampered transcripts", async () => {
     // 4.2 check 3 re-run before signing: the record's key must be the MSO's deviceKey
     await refusedAsync("a record kept with another credential's public key", () => Mdoc.deviceResponse(
         { ...CERTIFY_RECORD, publicJwk: HOLDER_B_JWK }, SHOWN, TRANSCRIPT, {}), /issued to another holder/);
-    await refusedAsync("a record whose public key is from another curve", () => Mdoc.deviceResponse(
+    await refusedAsync("a record whose public key mixes another key's x with this key's y", () => Mdoc.deviceResponse(
         { ...CERTIFY_RECORD, publicJwk: { kty: "EC", crv: "P-256", x: HOLDER_B_JWK.x, y: HOLDER_A_JWK.y } }, SHOWN,
         TRANSCRIPT, {}), /issued to another holder/);
+    // and a record whose public key is its own but whose private key belongs to another credential: the deviceKey
+    // check passes, so only verifying the signature the page just made can catch it (plan 4.7)
+    await refusedAsync("a record holding another credential's private key", () => Mdoc.deviceResponse(
+        { ...CERTIFY_RECORD, privateKey: HOLDER_B_KEY }, SHOWN, TRANSCRIPT, {}), /does not verify with the record's own public key/);
+    await refusedAsync("a record whose public key claims another curve", () => Mdoc.deviceResponse(
+        { ...CERTIFY_RECORD, publicJwk: { ...CERTIFY_PUBLIC_JWK, crv: "P-384" } }, SHOWN, TRANSCRIPT, {}),
+        /not an EC P-256 key/);
 
     check("a device signature from another key does not verify", verifiesDeviceSignature(OTHER_KEY_RESPONSE,
         { transcript: TRANSCRIPT }) === false);
+    const signatureRange = responseSpans(RESPONSE).ranges.find((entry) => JSON.stringify(entry.path)
+        === JSON.stringify(["documents", 0, "deviceSigned", "deviceAuth", "deviceSignature", 3]));
+    check("the other-key sample is the page's own response with only the device signature replaced",
+        OTHER_KEY_RESPONSE.length === RESPONSE.length
+        && sameBytes(OTHER_KEY_RESPONSE.subarray(0, signatureRange.start), RESPONSE.subarray(0, signatureRange.start))
+        && sameBytes(OTHER_KEY_RESPONSE.subarray(signatureRange.end), RESPONSE.subarray(signatureRange.end))
+        && !sameBytes(OTHER_KEY_RESPONSE.subarray(signatureRange.start, signatureRange.end),
+            RESPONSE.subarray(signatureRange.start, signatureRange.end)));
 
     // the transcript the verifier computes: each of its inputs is covered by the signature (VP B.2.6.1)
     for (const [label, verifier] of [["client_id", { ...REQUEST, clientId: "x509_san_dns:other.example" }],
@@ -2357,7 +2399,7 @@ await section("24. the samples for the independent verifiers", async () => {
     }
 
     // one disclosed item re-encoded (same value, another map key order): the digest no longer covers it
-    const item = KEPT.nameSpaces[MDL_NAMESPACE].find((entry) => entry.elementIdentifier === "family_name");
+    const item = KEPT.nameSpaces.get(MDL_NAMESPACE).find((entry) => entry.elementIdentifier === "family_name");
     const itemBytes = Cbor.decodeTyped(Cbor.tagged(item.raw).content);
     const reordered = new Map([...Cbor.decodeTyped(itemBytes).entries()].reverse());
     equal("the re-encoded item keeps every member", reordered.size, Cbor.decodeTyped(itemBytes).size);

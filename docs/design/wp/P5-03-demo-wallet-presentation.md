@@ -71,7 +71,7 @@ excluded.
 | WP | What | Size | After |
 | --- | --- | --- | --- |
 | P5-03a | keep issued mDLs: non-extractable key, IndexedDB, CBOR encoder and byte-exact reader, wallet page shell, CSP, harness infrastructure | ~750 planned, ~1,950 built (overrun noted in its section) | - |
-| P5-03b | DeviceResponse and the OpenID4VP 1.0 SessionTranscript; `@owf/mdoc` and Multipaz checks; fixtures | ~750 | a |
+| P5-03b | DeviceResponse and the OpenID4VP 1.0 SessionTranscript; `@owf/mdoc` and Multipaz checks; fixtures | ~750 planned, ~1,580 built (overrun noted in its section) | a |
 | P5-03c | request intake and verifier authentication: links, request_uri GET/POST, JAR, `x509_hash`/`x509_san_dns`, X.509 reader, request checks panel | ~800 | a |
 | P5-03d | DCQL and consent: matching, `trusted_authorities` (aki), `claim_sets`, `credential_sets`, `values`, unticking, test mode | ~600 | b, c |
 | P5-03e | the response: `direct_post`/`direct_post.jwt` (ECDH-ES JWE), delivery, `redirect_uri`, decline, replay guard, log; `jose` and Multipaz `VerificationSession` gates | ~700 | d |
@@ -709,15 +709,23 @@ proxy.
 `-Dwallet.fixture.record=true`, like the golden recorders) writes `docs/design/tools/fixtures/wallet/` through Certify's
 own `MdocFormatter`, with an Annex B IACA and DSC built by `certify-pki`. The bytes are Certify's.
 
-| File | What |
-| --- | --- |
-| `iaca.pem`, `iaca.crl` | the test IACA and its CRL (CRL DP `http://crl.wallet-ci.test/iaca.crl`, which the OIDF job serves; 4.14) |
-| `mdl-a.issuersigned`, `mdl-a.holder.jwk` | an `org.iso.18013.5.1.mDL` with the 15 demo elements of `mdl-demo-1`, and its holder's private JWK (`"comment": "TEST KEY - NOT SECRET"`) |
-| `mdl-b.issuersigned`, `mdl-b.holder.jwk` | a second mDL for another holder ("a key from another credential") |
-| `pid.issuersigned`, `pid.holder.jwk` | an `eu.europa.ec.eudi.pid.1` mdoc with four elements (a query for another doctype; `credential_sets` with two doctypes) |
-| `clock.txt` | an instant inside every fixture's validity, installed as the page's `Date.now()` by the harness |
-| `verifier/` | made by `make-verifier.sh` (OpenSSL; its output committed): a test CA; leaves `verifier.example` and `other.example` (dNSName SANs) with P-256 keys; a P-256 JWE key pair with `kid`; a README with the commands |
-| `hosted/` | the three request objects captured from `verifier-backend.eudiw.dev` on 2026-11-14 (`x509_hash`, ~23 KB, `verifier_info`) and one from `verifier.multipaz.org` (no `aud`, no `state`), for parsing tests under the faked clock |
+| File | What | Recorded by |
+| --- | --- | --- |
+| `iaca.pem` | the test IACA | P5-03b |
+| `iaca.crl` | the IACA's CRL (CRL DP `http://crl.wallet-ci.test/iaca.crl`, which the OIDF job serves; 4.14) | P5-03h, the only run that checks the DSC's revocation |
+| `mdl-a.issuersigned`, `mdl-a.holder.jwk` | an `org.iso.18013.5.1.mDL` with the 15 demo elements of `mdl-demo-1`, and its holder's private JWK (`"comment": "TEST KEY - NOT SECRET"`) | P5-03b |
+| `mdl-b.issuersigned`, `mdl-b.holder.jwk` | a second mDL for another holder (a second credential to choose between) | P5-03d |
+| `pid.issuersigned`, `pid.holder.jwk` | an `eu.europa.ec.eudi.pid.1` mdoc with four elements (a query for another doctype; `credential_sets` with two doctypes) | P5-03d |
+| `clock.txt` | an instant inside every fixture's validity. The harness pins it for the **verifiers** (`expected.json`'s `now`, the `@owf/mdoc` probe's `now` and the Multipaz `atTime`); the **page** is not given it, because the page makes no decision by the clock: it discloses what the user ticks and leaves the time checks to the verifier (P5-03e's expired-credential check is the exception, and it is outside test mode) | P5-03b |
+| `verifier/` | made by `make-verifier.sh` (OpenSSL; its output committed): a test CA; leaves `verifier.example` and `other.example` (dNSName SANs) with P-256 keys; a P-256 JWE key pair with `kid`; a README with the commands | P5-03c (the request objects it signs); P5-03e reads its JWE key |
+| `hosted/` | the three request objects captured from `verifier-backend.eudiw.dev` on 2026-11-14 (`x509_hash`, ~23 KB, `verifier_info`) and one from `verifier.multipaz.org` (no `aud`, no `state`), for parsing tests under the faked clock | P5-03c |
+
+**Deferred (owner decision, 2026-11-15).** P5-03b records `iaca.pem`, `mdl-a` and `clock.txt` only. `mdl-b`, `pid`,
+`iaca.crl`, `verifier/` and `make-verifier.sh` move to the slice that first reads each one, in the table's last column,
+and each slice's acceptance checklist names the files it must record before it starts. P5-03b's "a key from another
+credential" negative test therefore does **not** use `mdl-b`: the harness generates a `HOLDER_B` P-256 key, keeps
+`mdl-a`'s record with it and asserts the page refuses to sign, and a sample signed with that key is what both verifiers
+must reject.
 
 The committed fixture keeps the harness and the probes deterministic and offline. The CI interop jobs need fresh MSOs,
 so the recorder also runs in the normal build, writing to `certify-format-mdoc/target/wallet-fixture/` with the real
@@ -942,14 +950,20 @@ P5-03b and P5-03c reuse this reader and store rather than adding to them.
 
 ### P5-03b DeviceResponse and its independent verification
 
-Branch `wp/p5-03b-device-response`. Depends on P5-03a. About 750 lines, fixtures and lockfile excluded.
+Branch `wp/p5-03b-device-response`. Depends on P5-03a. About 750 lines planned; about 1,580 built, fixtures and
+lockfile excluded (413 of harness, 294 of probe, 323 of Java verifier, 260 of conformance test, 190 of `mdoc.js`).
+
+**Overrun.** Plan 4.14 names **two** independent verifiers for a DeviceResponse (`@owf/mdoc` in Node, Multipaz in Java),
+and each needs its own crypto context, its own named checks, its own reading of the disclosed set and its own negatives;
+that is the 750-line estimate's blind spot, not one package doing two jobs (owner decision, 2026-11-15, decision log).
 
 **Files.**
 
 - `static/offer/mdoc.js`: `Mdoc.oid4vpSessionTranscript({clientId, nonce, jwkThumbprint, responseUri})` and
   `Mdoc.deviceResponse(record, chosen, sessionTranscript, {alg})` (4.7).
 - New `certify-format-mdoc/src/test/java/io/mosip/certify/format/mdoc/WalletFixtureRecorder.java` and the committed
-  `docs/design/tools/fixtures/wallet/` (4.12), with `make-verifier.sh`.
+  `docs/design/tools/fixtures/wallet/{iaca.pem, mdl-a.issuersigned, mdl-a.holder.jwk, clock.txt}` (4.12). The rest of
+  4.12's files are the later slices' (owner decision, 2026-11-15).
 - `docs/design/tools/check-offer-wallet.mjs`: the presentation sections. It writes each DeviceResponse with its inputs
   to `$WALLET_SAMPLES_DIR` (default `target/wallet-samples/`) as `<name>/{device-response.cbor, transcript.json,
   expected.json, iaca.pem}`.
@@ -960,9 +974,11 @@ Branch `wp/p5-03b-device-response`. Depends on P5-03a. About 750 lines, fixtures
   sample's IACA; it returns the disclosed `(namespace, element)` set and named check results like
   `IndependentMdocVerifier`).
 - New `certify-conformance-mdoc/src/test/java/io/mosip/certify/conformance/mdoc/WalletPresentationConformanceTest.java`.
-- `.github/workflows/rebuild-ci.yml`: after the Node harness, run `npm ci` and `node probe.mjs` in `wallet-probe`, then
-  `mvn -pl certify-conformance-mdoc test -Dtest=WalletPresentationConformanceTest` over the samples. With `CI` set, no
-  samples is a failure.
+- `.github/workflows/rebuild-ci.yml`: after the Node harness, run `npm ci` once for `wallet-probe` (the storage
+  cross-check installs; the probe step reuses it), `node probe.mjs`, then
+  `mvn -pl certify-conformance-mdoc test -Dtest=WalletPresentationConformanceTest -Dwallet.samples.required=true` over
+  the samples. The property is what makes a missing samples directory a failure, and only that step passes it:
+  `mvn verify` runs before the harness, so it must skip there (review round 1, finding 1).
 
 **Acceptance checklist.**
 
@@ -990,8 +1006,10 @@ Branch `wp/p5-03b-device-response`. Depends on P5-03a. About 750 lines, fixtures
 - The transcript used another `nonce`, `client_id`, `response_uri` or thumbprint than the verifier's: the device
   signature fails.
 - One disclosed item is re-encoded (same value, other map key order): the digest does not match.
-- "A key from another credential": `mdl-a`'s record with `mdl-b`'s key is refused by the page before signing. A sample
-  forced past that check fails the device signature.
+- "A key from another credential": the page refuses to sign when the signature it makes does not verify under the
+  record's own public key, and when the record's public key is not the MSO's `deviceKey`. The harness generates a
+  `HOLDER_B` key for this test (`mdl-b` is P5-03d's, 4.12); a sample signed with it fails the device signature in both
+  libraries.
 - An unticked element is absent from the bytes, and both libraries report only the ticked set.
 - Namespaces with no chosen element are omitted, never sent as empty arrays (ISO5 `[+ IssuerSignedItemBytes]`).
 
@@ -1020,6 +1038,9 @@ Branch `wp/p5-03c-request-intake`. Depends on P5-03a; runs in parallel with P5-0
 
 **Acceptance checklist.**
 
+- [ ] The 4.12 fixtures this package reads are recorded first: `verifier/` (built by `make-verifier.sh`, committed with
+  its README) and `hosted/` (the captured EUDI and Multipaz request objects). They were deferred from P5-03b by the
+  owner decision of 2026-11-15, so this slice owns them.
 - [ ] Links: each accepted scheme; `https` with parameters; `?…` and `#://?…` same-device forms (the page replaces its
   history entry); `request=` by value; `redirect_uri:` plain parameters; a link without `client_id` (the client_id
   comes from the JAR and a finding is shown).
@@ -1066,6 +1087,10 @@ Branch `wp/p5-03d-dcql-consent`. Depends on P5-03b and P5-03c. About 600 lines.
 
 **Acceptance checklist.**
 
+- [ ] The 4.12 fixtures this package reads are recorded first: `mdl-b.issuersigned`/`mdl-b.holder.jwk` and
+  `pid.issuersigned`/`pid.holder.jwk`. They were deferred from P5-03b by the owner decision of 2026-11-15, so this
+  slice owns them: the second credential and the second doctype are what `credential_sets`, a query for another
+  doctype and "no matching credential" are about.
 - [ ] The EUDI UI's mDL query and the OIDF `mdl` query match `mdl-a` with exactly the requested rows ticked. No row is
   offered for an element that was not requested.
 - [ ] `claim_sets` `[["age"], ["dob"]]` over `age_over_18`/`birth_date` preselects `age`, and the user can switch to
@@ -1232,6 +1257,9 @@ Branch `wp/p5-03h-conformance`. Depends on P5-03e and P5-03f. About 600 lines, C
 
 **Acceptance checklist.**
 
+- [ ] The 4.12 fixture this package reads is recorded first: `iaca.crl` (CRL DP `http://crl.wallet-ci.test/iaca.crl`,
+  served by the job's static container). It was deferred from P5-03b by the owner decision of 2026-11-15; HAIP needs
+  the DSC's revocation state, and this job is the only run that checks it.
 - [ ] The OIDF `oid4vp-1final-wallet-haip-test-plan` (`iso_mdl`) passes every module that a wallet without the DC API
   can pass, with REVIEW only on the refusal modules, each backed by the harness proof that nothing was sent.
 - [ ] The plain plan passes with `x509_san_dns` + `direct_post`.

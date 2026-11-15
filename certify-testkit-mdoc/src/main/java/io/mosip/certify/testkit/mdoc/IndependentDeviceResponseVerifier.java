@@ -115,31 +115,29 @@ public final class IndependentDeviceResponseVerifier {
         Map<String, Set<String>> disclosed = new LinkedHashMap<>();
         List<VerificationReport.Check> checks = new ArrayList<>();
 
-        DeviceResponse parsed;
-        try {
-            DataItem responseItem = Cbor.INSTANCE.decode(deviceResponse);
-            parsed = await(c -> DeviceResponse.Companion.fromDataItem(responseItem, c));
-        } catch (Throwable e) {
-            rethrowIfFatal(e);
-            String reason = "not run: the DeviceResponse did not parse (" + describe(e) + ")";
-            List<VerificationReport.Check> unparsed = new ArrayList<>();
-            for (String name : CHECKS) {
-                unparsed.add(name.equals(CHECK_PARSE) ? VerificationReport.Check.fail(name, ERROR, describe(e))
-                        : VerificationReport.Check.fail(name, "notRun", reason));
-            }
-            return new Result(new VerificationReport(unparsed), disclosed);
-        }
-        final DeviceResponse response = parsed;
-        // Multipaz's DeviceResponse parses its documents while it verifies, so each is read here by Multipaz's own
-        // MdocDocument parser: the docType, the namespaces and the issuerAuth are available before any signature check
+        // Multipaz parses the response, and each document, inside a check: a malformed sample - one that does not
+        // decode, or whose status is not 0 and that therefore carries no documents - records this report's problems and
+        // leaves the suite running the next sample (review round 1, finding 5)
         List<MdocDocument> documents = new ArrayList<>();
-        for (DataItem item : Cbor.INSTANCE.decode(deviceResponse).get("documents").getAsArray()) {
-            documents.add(await(c -> MdocDocument.Companion.fromDataItem(item, c)));
-        }
+        DeviceResponse[] parsed = new DeviceResponse[1];
         checks.add(run(CHECK_PARSE, p -> {
+            DataItem responseItem = Cbor.INSTANCE.decode(deviceResponse);
+            parsed[0] = await(c -> DeviceResponse.Companion.fromDataItem(responseItem, c));
+            if (responseItem.hasKey("documents")) {
+                for (DataItem item : responseItem.get("documents").getAsArray()) {
+                    documents.add(await(c -> MdocDocument.Companion.fromDataItem(item, c)));
+                }
+            }
             if (documents.isEmpty()) p.add("noDocuments", "the response carries no documents");
-            return "Multipaz read " + documents.size() + " document(s), version " + response.getVersion();
+            return "Multipaz read " + documents.size() + " document(s), version " + parsed[0].getVersion();
         }));
+        if (parsed[0] == null) {
+            for (String name : CHECKS.subList(1, CHECKS.size())) {
+                checks.add(VerificationReport.Check.fail(name, "notRun", "the DeviceResponse did not parse"));
+            }
+            return new Result(new VerificationReport(checks), disclosed);
+        }
+        final DeviceResponse response = parsed[0];
         checks.add(run(CHECK_STATUS, p -> {
             if (!"1.0".equals(response.getVersion())) p.add("version", "version is " + response.getVersion());
             if (response.getStatus() != DeviceResponse.STATUS_OK) p.add("status", "status is " + response.getStatus());
@@ -194,6 +192,9 @@ public final class IndependentDeviceResponseVerifier {
                 p.add("noX5chain", "the issuerAuth's x5chain carries no certificate");
                 return null;
             }
+            // the third argument is Multipaz's `validateCaValidity`, which defaults to true in Kotlin: it makes the
+            // trust decision require that every CA certificate of the chain is inside its validity window at `instant`
+            // as well, not merely that a trust point matches
             TrustResult result = await(c -> trust.verify(chain.getCertificates(), instant, true, c));
             if (!result.isTrusted()) {
                 p.add("untrusted", "Multipaz does not trust the chain" + (result.getError() == null ? ""

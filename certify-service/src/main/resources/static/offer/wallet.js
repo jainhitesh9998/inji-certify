@@ -153,8 +153,8 @@
     if (bytes !== null) {
       try {
         var read = Mdoc.readIssuerSigned(bytes);
-        Object.keys(read.nameSpaces).sort().forEach(function (namespace) {
-          read.nameSpaces[namespace].forEach(function (item) {
+        [...read.nameSpaces.keys()].sort().forEach(function (namespace) {
+          read.nameSpaces.get(namespace).forEach(function (item) {
             var name = namespace + " / " + item.elementIdentifier;
             var rendered = valueNode(item.elementIdentifier, item.elementValue);
             var tr = document.createElement("tr");

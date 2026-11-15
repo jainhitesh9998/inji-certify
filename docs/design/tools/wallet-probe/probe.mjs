@@ -31,6 +31,11 @@
  * with `@noble/curves` (ES256/ESP256, which is what an mDL device signature and the demo's IssuerAuth carry). Versions
  * are exact in package.json and `npm ci` is the only install (plan invariant I6: nothing here is on the runtime
  * classpath).
+ *
+ * The trust step is Certify's, not a library's: `@owf/mdoc` leaves path validation to its caller, so
+ * `verifyCertificateChain` below builds the path from the fixture IACA and applies RFC 5280's CA constraints itself
+ * (`checkPathConstraints`). Multipaz's `TrustManager`, in `certify-conformance-mdoc`, is the independent trust decision
+ * the gate rests on (plan 4.14; decision log, P5-03b review round 1).
  */
 import { createHash, hkdfSync, webcrypto } from "node:crypto";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
@@ -88,7 +93,15 @@ async function verifyCertificateSignatureWithWebCrypto({ data, signatureP1363, s
     return subtle.verify({ name: "ECDSA", hash }, key, signatureP1363, data);
 }
 
-/** Path validation for the mdoc's x5chain: leaf first, each certificate signed by the next, ending at a trust anchor. */
+/**
+ * Path validation for the mdoc's x5chain: leaf first, each certificate signed by the next, ending at a trust anchor.
+ *
+ * This is the Node probe's own trust step, written here because `@owf/mdoc` leaves the decision to its caller (Credo
+ * has its own). Multipaz's `TrustManager` in `certify-conformance-mdoc` is the independent trust decision the gate
+ * rests on; this one exists so the probe fails a bad chain itself instead of reporting a signature result it would be
+ * wrong to believe. It checks what RFC 5280 asks of a path (section 6.1: validity, signatures, and the CA constraints
+ * of 4.2.1.3 and 4.2.1.9), not revocation: the fixtures are offline and carry no CRL.
+ */
 async function verifyCertificateChain({ trustedCertificates, x5chain, now }) {
     const trusted = trustedCertificates.map((der) => parseCertificate(der));
     const chain = x5chain.map((der) => parseCertificate(der));
@@ -102,7 +115,10 @@ async function verifyCertificateChain({ trustedCertificates, x5chain, now }) {
         if (current.notBefore.getTime() - skew > at.getTime() || current.notAfter.getTime() + skew < at.getTime()) {
             throw new Error(`the certificate ${current.subject.rfc4514} is outside its validity at ${at.toISOString()}`);
         }
-        if (isTrusted(current)) return { chain: path.map((certificate) => certificate.der) };
+        if (isTrusted(current)) {
+            checkPathConstraints(path);
+            return { chain: path.map((certificate) => certificate.der) };
+        }
         const candidates = [...chain.slice(1), ...trusted].filter((candidate) => !path.includes(candidate));
         let next = null;
         for (const candidate of candidates) {
@@ -120,6 +136,32 @@ async function verifyCertificateChain({ trustedCertificates, x5chain, now }) {
         path.push(next);
     }
     throw new Error("the x5chain does not end at a trust anchor");
+}
+
+/**
+ * RFC 5280 4.2.1.9, 4.2.1.3 and 6.1.4 (n)/(o): every certificate in a validated path that issued another one is a CA
+ * allowed to sign certificates, and its `pathLenConstraint`, where present, covers the intermediate CA certificates
+ * beneath it. A path that passes only because two names happen to match is not a trusted path.
+ */
+function checkPathConstraints(path) {
+    for (let index = 1; index < path.length; index += 1) {
+        const certificate = path[index];
+        const name = certificate.subject.rfc4514;
+        if (certificate.basicConstraints?.cA !== true) {
+            throw new Error(`the certificate ${name} issued a certificate in the path but is not a CA`
+                + " (basicConstraints cA is not TRUE, RFC 5280 4.2.1.9)");
+        }
+        if (certificate.keyUsage !== undefined && !certificate.keyUsage.includes("keyCertSign")) {
+            throw new Error(`the certificate ${name} issued a certificate in the path but its keyUsage does not allow`
+                + " signing certificates (keyCertSign, RFC 5280 4.2.1.3)");
+        }
+        const below = index - 1;
+        const limit = certificate.basicConstraints.pathLenConstraint;
+        if (limit !== undefined && below > limit) {
+            throw new Error(`the certificate ${name} allows ${limit} intermediate CA certificate(s) below it and the`
+                + ` path has ${below} (pathLenConstraint, RFC 5280 4.2.1.9)`);
+        }
+    }
 }
 
 /** The values of one subject field, by its short name or OID (e.g. `C`, `CN`, `2.5.4.6`). */
@@ -199,8 +241,11 @@ function disclosedFrom(result) {
 
 /** What the probe expects a rejection to say, so a sample cannot fail for the wrong reason. */
 const REJECTIONS = {
-    deviceSignature: [/device signature/i, /signature/i],
-    digest: [/digest/i],
+    // `@owf/mdoc`'s own words for these two checks, exactly: a bare /signature/ also matches "Unable to verify
+    // issuerAuth signature" and "Signature on MSO failed to verify", so a document signed by another DSC would pass
+    // a device-signature negative for the wrong reason (P5-03b review round 1, finding 3)
+    deviceSignature: [/^Unable to verify deviceAuth signature \(ECDSA\/EdDSA\): Device signature must be valid$/],
+    digest: [/^The calculated digest for .+ attribute must match the digest in the issuerAuth element$/],
 };
 
 async function probeSample(name) {
@@ -276,12 +321,47 @@ async function checkAppendixVectors() {
     console.log("ok    VP B.2.6.1's vector, computed by @owf/mdoc's own SessionTranscript.forOid4Vp");
 }
 
+/* ---------------------------------------------------------------- the trust step's own rules */
+
+/**
+ * The rules `checkPathConstraints` applies, exercised on the fixture IACA: an issuer that is not marked as a CA, one
+ * whose `keyUsage` does not allow signing certificates, and one whose `pathLenConstraint` does not cover the path
+ * beneath it are each refused, by name. Without this the trust step's rules would be the only part of the gate nothing
+ * tested (P5-03b review round 1, finding 4).
+ */
+function checkTrustConstraints() {
+    const anchor = parseCertificate(pemToDer(readFileSync(resolve(REPO,
+        "docs/design/tools/fixtures/wallet/iaca.pem"), "utf8")));
+    const leaf = { ...anchor, basicConstraints: undefined, keyUsage: ["digitalSignature"] };
+    const replaced = (overrides) => ({ ...anchor, ...overrides });
+    const refuses = (label, path, pattern) => {
+        let error = null;
+        try {
+            checkPathConstraints(path);
+        } catch (caught) {
+            error = caught;
+        }
+        if (error === null || !pattern.test(error.message)) {
+            throw new Error(`the trust step did not refuse ${label}: ${error === null ? "it passed" : error.message}`);
+        }
+        console.log(`ok    the trust step refuses ${label}`);
+    };
+    refuses("an issuer that is not a CA", [leaf, replaced({ basicConstraints: { cA: false } })], /is not a CA/);
+    refuses("an issuer whose keyUsage has no keyCertSign", [leaf, replaced({ keyUsage: ["digitalSignature"] })],
+        /keyCertSign/);
+    refuses("an issuer whose pathLenConstraint is too small",
+        [leaf, replaced({}), replaced({ basicConstraints: { cA: true, pathLenConstraint: 0 } })], /pathLenConstraint/);
+    // and the fixture's own path passes: the rules are not simply refusing everything
+    checkPathConstraints([leaf, anchor]);
+}
+
 /* ---------------------------------------------------------------- run */
 
 const SAMPLE_FILES = ["device-response.cbor", "transcript.json", "expected.json", "iaca.pem"];
 
 async function main() {
     await checkAppendixVectors();
+    checkTrustConstraints();
     const directories = existsSync(SAMPLES) ? readdirSync(SAMPLES, { withFileTypes: true })
         .filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort() : [];
     if (directories.length === 0) {
