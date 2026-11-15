@@ -583,6 +583,11 @@ DeviceResponse = {
   thumbprint is the 32-byte RFC 7638 SHA-256 of the JWK the response is encrypted to, or `null` for `direct_post`.
 - **`vp_token`**: `{ <credential query id>: [ base64url(DeviceResponse) ] }`, with one DeviceResponse holding one
   document per answered query (HAIP §5.3.1).
+- **Order, and how a chosen element is matched.** What this plan requires of the order is only that a namespace's
+  items keep their kept order (the code block's "in kept order", ISO5 9.1.3.4 hashes each item). The page also writes
+  the namespaces in the issuer's own order, because `readIssuerSigned` reads them into a `Map`: that is the page's own
+  choice, not a requirement, and it costs nothing. A chosen element is matched as a `[namespace, elementIdentifier]`
+  pair of members, never as a joined string, so a namespace that holds any separator cannot collide with another pair.
 
 ### 4.8 The response
 
@@ -999,6 +1004,9 @@ that is the 750-line estimate's blind spot, not one package doing two jobs (owne
   fails the expected check.
 - [ ] `WalletPresentationConformanceTest` verifies the same samples with Multipaz: issuer signature, chain to the IACA,
   device signature over the transcript, digests, docType and the disclosed set.
+- [ ] The order the issuer wrote survives, and a chosen pair is matched by its members: a credential whose namespaces
+  are `"10"` then `"2"` (the order a plain object cannot hold) comes back `"10"` then `"2"`, and `("a\u0000b", "c")`
+  beside `("a", "b\u0000c")` discloses exactly the pair that was chosen (4.7).
 - [ ] I1-I9 hold.
 
 **Negative tests.** Each is a harness check and a sample that both libraries must reject.
@@ -1012,6 +1020,29 @@ that is the 750-line estimate's blind spot, not one package doing two jobs (owne
   libraries.
 - An unticked element is absent from the bytes, and both libraries report only the ticked set.
 - Namespaces with no chosen element are omitted, never sent as empty arrays (ISO5 `[+ IssuerSignedItemBytes]`).
+
+**Review round 2.** Opus approved round 1 and left two minors, two nits and one wording nit; each is fixed here,
+with the check that kills its mutant named.
+
+- *A malformed `expected.json` no longer ends the Java run.* Both tests catch `RuntimeException | IOException` per
+  sample, exactly as they already caught `AssertionError`, so a sidecar without the members a sample needs (a
+  `NullPointerException` out of the transcript builder), a `now` that is not an instant and a missing file are that
+  sample's failure. `aMalformedSidecarFailsOnlyItsOwnSample` builds a temporary samples directory holding a good sample
+  and three malformed ones and requires three named failures and the good sample's own outcome.
+- *The namespace order and the pair key are now checked, not just fixed.* The two mutants that survived all 619 harness
+  checks - writing the namespaces in reverse order, and matching a chosen pair with the old `ns + "\u0000" + id` key -
+  each fail a new check in section 21b. That section's credential is built by `buildIssuerSigned`, whose `elements` may
+  now be a `Map`, because no plain object can hold `"10"` before `"2"`.
+- *The probe's trust step proves its own call.* `checkTrustConstraints` runs one refusal through
+  `verifyCertificateChain` itself, on a path `@owf/x509`'s `createCertificate` builds: an anchor, a **non-CA**
+  intermediate it signed, and a leaf that intermediate signed, refused by name; the same shape with a CA intermediate
+  builds a path of three, so the check is not a step that refuses everything. Deleting the `checkPathConstraints` call
+  from `verifyCertificateChain` fails the probe.
+- *Two wording nits.* The probe's rejection comment quotes `@owf/mdoc`'s own message (`Issuer auth signature is
+  invalid`) and leaves "Signature on MSO failed to verify" to Multipaz, which is whose wording it is. `mdoc.js`'s
+  namespace-order comment now says what 4.7 requires (items within a namespace) and that keeping the namespaces' order
+  is the page's own choice, and the record's `kty`/`crv` check moved before `subtle.sign`, so a record whose public key
+  is not an EC P-256 key is refused before the signature it would have to be checked against is made.
 
 **Non-goals.** Requests, verifier authentication, encryption, transport.
 

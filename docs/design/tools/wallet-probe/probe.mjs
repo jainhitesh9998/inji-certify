@@ -43,7 +43,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { CoseKey, SessionTranscript, Verifier } from "@owf/mdoc";
-import { parseCertificate, verifyCertificateSignature } from "@owf/x509";
+import { createCertificate, parseCertificate, verifyCertificateSignature } from "@owf/x509";
 import { p256 } from "@noble/curves/p256";
 
 const subtle = webcrypto.subtle;
@@ -241,9 +241,10 @@ function disclosedFrom(result) {
 
 /** What the probe expects a rejection to say, so a sample cannot fail for the wrong reason. */
 const REJECTIONS = {
-    // `@owf/mdoc`'s own words for these two checks, exactly: a bare /signature/ also matches "Unable to verify
-    // issuerAuth signature" and "Signature on MSO failed to verify", so a document signed by another DSC would pass
-    // a device-signature negative for the wrong reason (P5-03b review round 1, finding 3)
+    // `@owf/mdoc`'s own words for these two checks, exactly: a bare /signature/ also matches its issuer-auth message
+    // ("Issuer auth signature is invalid"; "Signature on MSO failed to verify" is Multipaz's wording for the same
+    // failure), so a document signed by another DSC would satisfy a device-signature negative for the wrong reason
+    // (P5-03b review round 1, finding 3)
     deviceSignature: [/^Unable to verify deviceAuth signature \(ECDSA\/EdDSA\): Device signature must be valid$/],
     digest: [/^The calculated digest for .+ attribute must match the digest in the issuerAuth element$/],
 };
@@ -326,18 +327,20 @@ async function checkAppendixVectors() {
 /**
  * The rules `checkPathConstraints` applies, exercised on the fixture IACA: an issuer that is not marked as a CA, one
  * whose `keyUsage` does not allow signing certificates, and one whose `pathLenConstraint` does not cover the path
- * beneath it are each refused, by name. Without this the trust step's rules would be the only part of the gate nothing
- * tested (P5-03b review round 1, finding 4).
+ * beneath it are each refused, by name. Then one refusal comes through {@link verifyCertificateChain} itself, on a path
+ * `@owf/x509`'s `createCertificate` built: an intermediate with `cA: false` that signs a leaf. Without that, the only
+ * thing tying the rules to the step the samples take would be a reader's eye on the one line that calls them
+ * (P5-03b review round 1, finding 4; round 2, finding 3).
  */
-function checkTrustConstraints() {
+async function checkTrustConstraints() {
     const anchor = parseCertificate(pemToDer(readFileSync(resolve(REPO,
         "docs/design/tools/fixtures/wallet/iaca.pem"), "utf8")));
-    const leaf = { ...anchor, basicConstraints: undefined, keyUsage: ["digitalSignature"] };
+    const plainLeaf = { ...anchor, basicConstraints: undefined, keyUsage: ["digitalSignature"] };
     const replaced = (overrides) => ({ ...anchor, ...overrides });
-    const refuses = (label, path, pattern) => {
+    const refuses = async (label, attempt, pattern) => {
         let error = null;
         try {
-            checkPathConstraints(path);
+            await attempt();
         } catch (caught) {
             error = caught;
         }
@@ -346,13 +349,65 @@ function checkTrustConstraints() {
         }
         console.log(`ok    the trust step refuses ${label}`);
     };
-    refuses("an issuer that is not a CA", [leaf, replaced({ basicConstraints: { cA: false } })], /is not a CA/);
-    refuses("an issuer whose keyUsage has no keyCertSign", [leaf, replaced({ keyUsage: ["digitalSignature"] })],
-        /keyCertSign/);
-    refuses("an issuer whose pathLenConstraint is too small",
-        [leaf, replaced({}), replaced({ basicConstraints: { cA: true, pathLenConstraint: 0 } })], /pathLenConstraint/);
+    await refuses("an issuer that is not a CA",
+        () => checkPathConstraints([plainLeaf, replaced({ basicConstraints: { cA: false } })]), /is not a CA/);
+    await refuses("an issuer whose keyUsage has no keyCertSign",
+        () => checkPathConstraints([plainLeaf, replaced({ keyUsage: ["digitalSignature"] })]), /keyCertSign/);
+    await refuses("an issuer whose pathLenConstraint is too small", () => checkPathConstraints([plainLeaf,
+        replaced({}), replaced({ basicConstraints: { cA: true, pathLenConstraint: 0 } })]), /pathLenConstraint/);
     // and the fixture's own path passes: the rules are not simply refusing everything
-    checkPathConstraints([leaf, anchor]);
+    checkPathConstraints([plainLeaf, anchor]);
+
+    // the same refusal, through the step a sample's own chain goes through: an intermediate the anchor signed and
+    // that itself signed the leaf, but that is not a CA - so `verifyCertificateChain` can only refuse it by calling
+    // `checkPathConstraints` on the path it built
+    const built = await nonCaIntermediatePath();
+    await refuses("a non-CA intermediate, through verifyCertificateChain", () => verifyCertificateChain({
+        trustedCertificates: [built.anchor.der], x5chain: [built.leaf.der, built.intermediate.der] }), /is not a CA/);
+    // the same shape with a CA intermediate passes, so the refusal above is about the intermediate's constraints
+    const accepted = await verifyCertificateChain({ trustedCertificates: [built.anchor.der],
+        x5chain: [built.leafUnderCa.der, built.intermediateCa.der] });
+    if (hex(accepted.chain[0]) !== hex(built.leafUnderCa.der) || accepted.chain.length !== 3) {
+        throw new Error(`verifyCertificateChain did not build [leaf, intermediate CA, anchor]: ${accepted.chain.length}`);
+    }
+    console.log("ok    verifyCertificateChain accepts the same path with a CA intermediate");
+}
+
+/** A P-256 key pair, its public JWK and a signer over it, for the certificates the trust checks build. */
+async function p256Pair() {
+    const pair = await subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+    return { publicJwk: await subtle.exportKey("jwk", pair.publicKey),
+        signer: async (tbs) => new Uint8Array(await subtle.sign({ name: "ECDSA", hash: "SHA-256" }, pair.privateKey,
+            tbs)) };
+}
+
+/**
+ * The path `verifyCertificateChain`'s own refusal is proved on, built with `@owf/x509`'s `createCertificate`: an anchor,
+ * a **non-CA** intermediate it signed (`cA: false`, which also leaves `keyUsage` at `digitalSignature`), and a leaf that
+ * intermediate signed. The anchor also signs a proper CA intermediate, so the check can show a path of the same shape
+ * passing; otherwise its refusal could be a step that refuses everything.
+ */
+async function nonCaIntermediatePath() {
+    const now = Date.now();
+    const notBefore = new Date(now - 24 * 60 * 60 * 1000);
+    const notAfter = new Date(now + 24 * 60 * 60 * 1000);
+    const anchorKeys = await p256Pair();
+    const notCaKeys = await p256Pair();
+    const caKeys = await p256Pair();
+    const certificate = async (serialNumber, commonName, subjectPublicKey, signer, extra) => createCertificate({
+        subject: [["countryName", "IN"], ["commonName", commonName]], subjectPublicKey, serialNumber, notBefore,
+        notAfter, signatureAlgorithm: "ES256", signer, ...extra });
+    const anchor = await certificate("01", "wallet-probe anchor", anchorKeys.publicJwk, anchorKeys.signer,
+        { basicConstraints: { cA: true } });
+    const intermediate = await certificate("02", "wallet-probe non-CA intermediate", notCaKeys.publicJwk,
+        anchorKeys.signer, { issuerCertificate: anchor.der, basicConstraints: { cA: false } });
+    const intermediateCa = await certificate("03", "wallet-probe intermediate CA", caKeys.publicJwk,
+        anchorKeys.signer, { issuerCertificate: anchor.der, basicConstraints: { cA: true } });
+    const leaf = await certificate("04", "wallet-probe leaf", notCaKeys.publicJwk, notCaKeys.signer,
+        { issuerCertificate: intermediate.der });
+    const leafUnderCa = await certificate("05", "wallet-probe leaf under a CA", caKeys.publicJwk, caKeys.signer,
+        { issuerCertificate: intermediateCa.der });
+    return { anchor, intermediate, intermediateCa, leaf, leafUnderCa };
 }
 
 /* ---------------------------------------------------------------- run */
@@ -361,7 +416,7 @@ const SAMPLE_FILES = ["device-response.cbor", "transcript.json", "expected.json"
 
 async function main() {
     await checkAppendixVectors();
-    checkTrustConstraints();
+    await checkTrustConstraints();
     const directories = existsSync(SAMPLES) ? readdirSync(SAMPLES, { withFileTypes: true })
         .filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort() : [];
     if (directories.length === 0) {

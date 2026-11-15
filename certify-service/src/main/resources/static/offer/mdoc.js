@@ -265,10 +265,12 @@ var Mdoc = (function () {
    * behind them: each is a shape the CDDL or RFC 9052 / RFC 9053 / RFC 9360 does not allow, read from the bytes the
    * page would carry.
    *
-   * Maps are read typed (`Map`), so `mso`, `nameSpaces` and each `elementValue` that is a map are `Map`s. A `Map`
-   * keeps the order the namespaces were written in and holds any text as a key, where an object would reorder the
-   * namespaces whose names look like integers ("2" before "10") and, with a prototype, hide a namespace named
-   * "__proto__": a DeviceResponse has to write them back in the order the issuer used (plan 4.7).
+   * Maps are read typed (`Map`), so `mso`, `nameSpaces` and each `elementValue` that is a map are `Map`s. Reading a
+   * `Map` is this page's own choice, and it keeps what the issuer wrote: the namespaces in their encoded order, and any
+   * text as a key. An object would reorder the namespaces whose names look like integers ("2" before "10") and, with a
+   * prototype, hide a namespace named "__proto__". What plan 4.7 requires is that the items of a namespace keep their
+   * order (encodings of the same items must not shuffle); keeping the namespaces' order too is the conservative reading,
+   * since the credential is written back with the items the user chose and the issuer's own order costs nothing.
    */
   function readIssuerSigned(input) {
     var bytes = bytesOf(input);
@@ -484,6 +486,12 @@ var Mdoc = (function () {
     if (DEVICE_SIGNATURE_ALGORITHMS.indexOf(alg) < 0) {
       throw new Error("a device signature carries the COSE algorithm -7 (ES256) or -9 (ESP256), not " + String(alg));
     }
+    // The signature made below is checked with the record's own public key, so the key has to be one WebCrypto can
+    // import: refuse anything else before signing rather than after
+    if (record.publicJwk.kty !== "EC" || record.publicJwk.crv !== "P-256") {
+      throw new Error("the record's public key is not an EC P-256 key, so the signature this page makes cannot be checked"
+        + " against it");
+    }
 
     // the disclosed items, grouped by namespace in the kept order (`read.nameSpaces` is a Map, so that order is the
     // issuer's); a namespace with nothing chosen is omitted. A pair's key is its JSON array: a join on any separator
@@ -537,10 +545,6 @@ var Mdoc = (function () {
     // The record's public key is the MSO's deviceKey (checked before signing), so a signature that does not verify under
     // it was made with another key: the record's private key is not the one its credential was issued to. Refuse rather
     // than present a response every verifier will reject (plan 4.7, "a record whose key was swapped refuses to sign").
-    if (record.publicJwk.kty !== "EC" || record.publicJwk.crv !== "P-256") {
-      throw new Error("the record's public key is not an EC P-256 key, so the signature this page made cannot be checked"
-        + " against it");
-    }
     var ownKey = await crypto.subtle.importKey("jwk",
       { kty: "EC", crv: "P-256", x: record.publicJwk.x, y: record.publicJwk.y },
       { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);

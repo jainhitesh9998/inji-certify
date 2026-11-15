@@ -17,6 +17,7 @@ import kotlin.jvm.functions.Function2;
 import kotlinx.coroutines.BuildersKt;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.multipaz.cbor.Bstr;
 import org.multipaz.cbor.Cbor;
 import org.multipaz.cbor.CborArray;
@@ -61,7 +62,10 @@ import static org.junit.jupiter.api.Assertions.fail;
  *   <li>verifies each response with {@link IndependentDeviceResponseVerifier} (Multipaz reads it, checks the issuer
  *       signature and chain to the IACA, every disclosed item's digest and the device signature over that transcript)
  *       and holds an accepted sample to exactly the elements it expects and a rejected one to the check it expects
- *       ({@code deviceSignature} or {@code digest}).</li>
+ *       ({@code deviceSignature} or {@code digest});</li>
+ *   <li>records a sample it cannot read - a malformed {@code expected.json}, a missing file, a {@code now} that is not
+ *       an instant - as that sample's failure and goes on to the next one: a harness defect in one sample must not stop
+ *       the gate from checking the others.</li>
  * </ul>
  *
  * <p>Whether samples must exist is the caller's call, not the environment's: with
@@ -96,62 +100,15 @@ class WalletPresentationConformanceTest {
 
     @Test
     void everySampleTheWalletProducedIsVerifiedByMultipaz() throws IOException {
-        List<Path> samples = samples();
-        if (samples.isEmpty()) {
-            if (SAMPLES_REQUIRED) {
-                fail(noSamples());
-            }
-            Assumptions.assumeTrue(false, noSamples());
-            return;
-        }
-        IndependentDeviceResponseVerifier verifier = new IndependentDeviceResponseVerifier();
-        List<String> failures = new ArrayList<>();
-        int accepted = 0;
-        int rejected = 0;
-        for (Path sample : samples) {
-            String name = sample.getFileName().toString();
-            try {
-                JsonObject expected = json(sample.resolve(SAMPLE_EXPECTED));
-                byte[] response = Files.readAllBytes(sample.resolve(SAMPLE_RESPONSE));
-                String iaca = Files.readString(sample.resolve(SAMPLE_IACA), StandardCharsets.US_ASCII);
-                JsonObject request = expected.getAsJsonObject("verifier");
-                byte[] transcript = transcriptOf(request);
-                String docType = expected.get("docType").getAsString();
-                Instant at = Instant.parse(expected.get("now").getAsString());
-                String expect = expected.get("expect").getAsString();
-                if ("accepted".equals(expect)) {
-                    IndependentDeviceResponseVerifier.Result result = verifier.verify(response, transcript, iaca, at,
-                            docType, elements(expected.getAsJsonArray("elements")));
-                    result.report().assertAllPassed();
-                    assertEquals(docType, mdocDocType(response), name + ": the docType Multipaz read");
-                    assertEquals(elements(expected.getAsJsonArray("elements")), result.disclosedElements(),
-                            name + ": the elements Multipaz read back");
-                    accepted += 1;
-                } else {
-                    // a negative sample may disclose whatever it does; what matters is the check that refuses it
-                    IndependentDeviceResponseVerifier.Result result = verifier.verify(response, transcript, iaca, at,
-                            docType, null);
-                    String rejectedBy = expected.get("rejectedBy").getAsString();
-                    VerificationReport.Check deviceAuth = result.report().check(
-                            IndependentDeviceResponseVerifier.CHECK_DEVICE_AUTH);
-                    assertFalse(deviceAuth.passed(), name + ": Multipaz accepted a response it must reject"
-                            + System.lineSeparator() + result.report());
-                    Pattern expectedPattern = "digest".equals(rejectedBy) ? DIGEST : DEVICE_SIGNATURE;
-                    assertTrue(expectedPattern.matcher(String.valueOf(deviceAuth.message())).find(),
-                            name + ": rejected as \"" + deviceAuth.message() + "\", not at the " + rejectedBy + " check");
-                    rejected += 1;
-                }
-            } catch (AssertionError e) {
-                failures.add(name + ": " + e.getMessage());
-            }
-        }
-        assertTrue(failures.isEmpty(), "independent DeviceResponse verification failed for "
-                + failures.size() + " of " + samples.size() + " samples:" + System.lineSeparator()
-                + String.join(System.lineSeparator(), failures));
-        assertTrue(accepted > 0 && rejected > 0, "the samples cover both outcomes: " + accepted + " accepted, "
-                + rejected + " rejected");
-        System.out.println("[wallet-presentation] Multipaz verified " + samples.size() + " samples: " + accepted
-                + " accepted, " + rejected + " rejected");
+        List<Path> samples = requiredSamples();
+        SampleReport report = verifySamples(samples);
+        assertTrue(report.failures.isEmpty(), "independent DeviceResponse verification failed for "
+                + report.failures.size() + " of " + samples.size() + " samples:" + System.lineSeparator()
+                + String.join(System.lineSeparator(), report.failures));
+        assertTrue(report.accepted > 0 && report.rejected > 0, "the samples cover both outcomes: " + report.accepted
+                + " accepted, " + report.rejected + " rejected");
+        System.out.println("[wallet-presentation] Multipaz verified " + samples.size() + " samples: "
+                + report.accepted + " accepted, " + report.rejected + " rejected");
     }
 
     /**
@@ -162,29 +119,72 @@ class WalletPresentationConformanceTest {
      */
     @Test
     void multipazComputesTheSameSessionTranscript() throws IOException {
-        List<Path> samples = samples();
-        if (samples.isEmpty()) {
-            if (SAMPLES_REQUIRED) {
-                fail(noSamples());
-            }
-            Assumptions.assumeTrue(false, noSamples());
-            return;
-        }
+        List<Path> samples = requiredSamples();
+        List<String> failures = new ArrayList<>();
         int checked = 0;
         for (Path sample : samples) {
-            JsonObject request = json(sample.resolve(SAMPLE_EXPECTED)).getAsJsonObject("verifier");
-            if (!request.get("jwkThumbprint").isJsonNull()) {
-                continue;
+            try {
+                JsonObject request = json(sample.resolve(SAMPLE_EXPECTED)).getAsJsonObject("verifier");
+                if (!request.get("jwkThumbprint").isJsonNull()) {
+                    continue;
+                }
+                String clientId = request.get("clientId").getAsString();
+                String nonce = request.get("nonce").getAsString();
+                String responseUri = request.get("responseUri").getAsString();
+                DataItem theirs = MultipazHandover.transcript(null, clientId, nonce, responseUri);
+                assertEquals(hex(transcriptOf(request)), hex(Cbor.INSTANCE.encode(theirs)),
+                        sample.getFileName() + ": this test's OpenID4VPHandover must be Multipaz's");
+                checked += 1;
+            } catch (AssertionError | RuntimeException | IOException e) {
+                failures.add(sample.getFileName() + ": " + describe(e));
             }
-            String clientId = request.get("clientId").getAsString();
-            String nonce = request.get("nonce").getAsString();
-            String responseUri = request.get("responseUri").getAsString();
-            DataItem theirs = MultipazHandover.transcript(null, clientId, nonce, responseUri);
-            assertEquals(hex(transcriptOf(request)), hex(Cbor.INSTANCE.encode(theirs)),
-                    sample.getFileName() + ": this test's OpenID4VPHandover must be Multipaz's");
-            checked += 1;
         }
+        assertTrue(failures.isEmpty(), "the transcript could not be cross-checked for " + failures.size() + " of "
+                + samples.size() + " samples:" + System.lineSeparator()
+                + String.join(System.lineSeparator(), failures));
         assertTrue(checked > 0, "no plaintext sample to cross-check the transcript against");
+    }
+
+    /**
+     * A sample the harness got wrong is that sample's failure, not the end of the run: a sidecar without the members a
+     * sample needs, a {@code now} that is not an instant, and a missing file are each reported against their own
+     * directory, and the good sample beside them is still verified (review round 2, finding 1). Before this, the first
+     * such sample threw out of {@link #transcriptOf} and stopped both tests.
+     */
+    @Test
+    void aMalformedSidecarFailsOnlyItsOwnSample(@TempDir Path directory) throws IOException {
+        List<Path> samples = requiredSamples();
+        Path source = samples.get(0);
+        Path good = copySample(source, directory.resolve("good-sample"));
+        Path sidecar = copySample(source, directory.resolve("bad-sidecar"));
+        Files.writeString(sidecar.resolve(SAMPLE_EXPECTED), "{\"expect\":\"accepted\"}" + System.lineSeparator(),
+                StandardCharsets.UTF_8);
+        Path clock = copySample(source, directory.resolve("bad-now"));
+        JsonObject wrongClock = json(clock.resolve(SAMPLE_EXPECTED));
+        wrongClock.addProperty("now", "yesterday");
+        Files.writeString(clock.resolve(SAMPLE_EXPECTED), wrongClock + System.lineSeparator(), StandardCharsets.UTF_8);
+        Path incomplete = copySample(source, directory.resolve("missing-iaca"));
+        Files.delete(incomplete.resolve(SAMPLE_IACA));
+
+        Outcome sourceOutcome = verifySample(new IndependentDeviceResponseVerifier(), source);
+        SampleReport report = verifySamples(samplesIn(directory));
+        assertEquals(4, report.accepted + report.rejected + report.failures.size(),
+                "every sample in the directory is accounted for: " + report.failures);
+        assertEquals(3, report.failures.size(), "one failure each, for the three malformed samples: " + report.failures);
+        for (String malformed : List.of("bad-now", "bad-sidecar", "missing-iaca")) {
+            assertTrue(report.failures.stream().anyMatch(failure -> failure.startsWith(malformed + ": ")),
+                    malformed + " is reported by name: " + report.failures);
+        }
+        assertTrue(report.failures.stream().noneMatch(failure -> failure.startsWith("good-sample: ")),
+                "the good sample is not reported as a failure: " + report.failures);
+        assertEquals(sourceOutcome == Outcome.ACCEPTED ? 1 : 0, report.accepted,
+                "the good sample beside them is still verified: " + report.failures);
+        assertEquals(sourceOutcome == Outcome.REJECTED ? 1 : 0, report.rejected,
+                "the good sample beside them is still verified: " + report.failures);
+        assertTrue(Files.isRegularFile(good.resolve(SAMPLE_RESPONSE)), "the good sample is a directory");
+        assertEquals(hex(Files.readAllBytes(source.resolve(SAMPLE_RESPONSE))),
+                hex(Files.readAllBytes(good.resolve(SAMPLE_RESPONSE))),
+                "the good sample is the one beside them, byte for byte");
     }
 
     /**
@@ -234,12 +234,112 @@ class WalletPresentationConformanceTest {
 
     /* ---------------------------------------------------------------- helpers */
 
+    /** What a run over a directory of samples found: the counts, and every sample that failed with why. */
+    static final class SampleReport {
+        int accepted;
+        int rejected;
+        final List<String> failures = new ArrayList<>();
+    }
+
+    /** What one sample was held to. */
+    enum Outcome { ACCEPTED, REJECTED }
+
+    /**
+     * The sample directories, or a skip when the harness has not written any - a failure when the step that ran this
+     * suite said the samples must exist. Every test here starts this way, so the decision lives in one place.
+     */
+    static List<Path> requiredSamples() throws IOException {
+        List<Path> samples = samples();
+        if (samples.isEmpty() && SAMPLES_REQUIRED) {
+            fail(noSamples());
+        }
+        Assumptions.assumeTrue(!samples.isEmpty(), noSamples());
+        return samples;
+    }
+
+    /**
+     * Verifies every sample of a directory, recording a failure against the sample it came from: a malformed
+     * {@code expected.json}, a missing file, or a {@code now} that is not an instant is that sample's report entry and
+     * the run goes on to the next one (review round 2, finding 1).
+     */
+    static SampleReport verifySamples(List<Path> samples) {
+        IndependentDeviceResponseVerifier verifier = new IndependentDeviceResponseVerifier();
+        SampleReport report = new SampleReport();
+        for (Path sample : samples) {
+            try {
+                if (verifySample(verifier, sample) == Outcome.ACCEPTED) {
+                    report.accepted += 1;
+                } else {
+                    report.rejected += 1;
+                }
+            } catch (AssertionError | RuntimeException | IOException e) {
+                report.failures.add(sample.getFileName() + ": " + describe(e));
+            }
+        }
+        return report;
+    }
+
+    /** One sample, held to its {@code expected.json}; throws instead of returning an outcome when it fails. */
+    static Outcome verifySample(IndependentDeviceResponseVerifier verifier, Path sample) throws IOException {
+        String name = sample.getFileName().toString();
+        JsonObject expected = json(sample.resolve(SAMPLE_EXPECTED));
+        byte[] response = Files.readAllBytes(sample.resolve(SAMPLE_RESPONSE));
+        String iaca = Files.readString(sample.resolve(SAMPLE_IACA), StandardCharsets.US_ASCII);
+        JsonObject request = expected.getAsJsonObject("verifier");
+        byte[] transcript = transcriptOf(request);
+        String docType = expected.get("docType").getAsString();
+        Instant at = Instant.parse(expected.get("now").getAsString());
+        String expect = expected.get("expect").getAsString();
+        if ("accepted".equals(expect)) {
+            IndependentDeviceResponseVerifier.Result result = verifier.verify(response, transcript, iaca, at,
+                    docType, elements(expected.getAsJsonArray("elements")));
+            result.report().assertAllPassed();
+            assertEquals(docType, mdocDocType(response), name + ": the docType Multipaz read");
+            assertEquals(elements(expected.getAsJsonArray("elements")), result.disclosedElements(),
+                    name + ": the elements Multipaz read back");
+            return Outcome.ACCEPTED;
+        }
+        // a negative sample may disclose whatever it does; what matters is the check that refuses it
+        IndependentDeviceResponseVerifier.Result result = verifier.verify(response, transcript, iaca, at, docType, null);
+        String rejectedBy = expected.get("rejectedBy").getAsString();
+        VerificationReport.Check deviceAuth = result.report().check(IndependentDeviceResponseVerifier.CHECK_DEVICE_AUTH);
+        assertFalse(deviceAuth.passed(), name + ": Multipaz accepted a response it must reject"
+                + System.lineSeparator() + result.report());
+        Pattern expectedPattern = "digest".equals(rejectedBy) ? DIGEST : DEVICE_SIGNATURE;
+        assertTrue(expectedPattern.matcher(String.valueOf(deviceAuth.message())).find(),
+                name + ": rejected as \"" + deviceAuth.message() + "\", not at the " + rejectedBy + " check");
+        return Outcome.REJECTED;
+    }
+
+    /** A failure as one line: an assertion's own message, or the exception's kind and message when it has none. */
+    static String describe(Throwable failure) {
+        String message = failure.getMessage() == null ? "" : failure.getMessage().trim();
+        if (failure instanceof AssertionError) {
+            return message.isEmpty() ? "assertion failed" : message;
+        }
+        return message.isEmpty() ? failure.getClass().getSimpleName()
+                : failure.getClass().getSimpleName() + ": " + message;
+    }
+
+    /** Copies a sample's files, so a test can break a copy of it without touching the harness's own samples. */
+    static Path copySample(Path source, Path target) throws IOException {
+        Files.createDirectories(target);
+        for (String file : List.of(SAMPLE_RESPONSE, SAMPLE_EXPECTED, SAMPLE_IACA)) {
+            Files.copy(source.resolve(file), target.resolve(file));
+        }
+        return target;
+    }
+
     /** The sample directories, sorted; a sample is a directory holding a device-response.cbor. */
     static List<Path> samples() throws IOException {
-        if (!Files.isDirectory(SAMPLES)) {
+        return samplesIn(SAMPLES);
+    }
+
+    static List<Path> samplesIn(Path directory) throws IOException {
+        if (!Files.isDirectory(directory)) {
             return List.of();
         }
-        try (Stream<Path> entries = Files.list(SAMPLES)) {
+        try (Stream<Path> entries = Files.list(directory)) {
             return entries.filter(entry -> Files.isRegularFile(entry.resolve(SAMPLE_RESPONSE)))
                     .sorted().toList();
         }

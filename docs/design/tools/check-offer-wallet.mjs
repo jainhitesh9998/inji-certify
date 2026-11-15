@@ -153,6 +153,10 @@ function coseKey(jwk, override) {
  * bstr's content; its digest is taken over the tag-24 item that wraps them), for a key or a digestID `Cbor.encode`
  * would never write; `itemForms` also takes `"tag24tagged"` (`#6.24(#6.99(bstr))`); `msoTag` wraps the MSO map in a
  * tag inside its bstr, and `msoContentTag` wraps that bstr in a tag inside the tag 24.
+ *
+ * P5-03b review round 2: `elements` may be a `Map` of `[namespace, elements]` instead of an object, for a namespace
+ * order or a namespace name an object cannot express: JS writes `"2"` before `"10"` in an object's own keys, and a
+ * P5-03b check needs the issuer's order, "10" then "2".
  */
 function buildIssuerSigned(options) {
     const forms = options.forms || {};
@@ -163,10 +167,13 @@ function buildIssuerSigned(options) {
     const itemParts = new Map();
     const digests = new Map();
     let digestId = 0;
-    for (const namespace of Object.keys(options.elements)) {
+    // an object's own keys are reordered for integer-like names; a Map keeps what the caller wrote
+    const namespaceEntries = options.elements instanceof Map ? [...options.elements]
+        : Object.entries(options.elements);
+    for (const [namespace, namespaceElements] of namespaceEntries) {
         const byDigestId = new Map();
         const items = [];
-        for (const [identifier, value] of Object.entries(options.elements[namespace])) {
+        for (const [identifier, value] of Object.entries(namespaceElements)) {
             const itemMap = (elementValue) => Cbor.encode(new Map([
                 ["digestID", digestId],
                 ["random", new Uint8Array(16).fill(digestId + 1)],
@@ -2290,6 +2297,55 @@ await section("21. the DeviceResponse (ISO/IEC 18013-5 8.3.2.1.2.2)", async () =
     equal("with nothing chosen no nameSpaces key is written", firstDocument(bare.bytes).get("issuerSigned").has("nameSpaces"), false);
     equal("the device signature is still there", deviceSignatureOf(bare.bytes).length, 4);
     check("and it still verifies", verifiesDeviceSignature(bare.bytes, { transcript: TRANSCRIPT }));
+});
+
+// 21b. the namespace order the issuer wrote, and two pairs an old-style key would read alike (plan 4.7)
+/** `CERTIFY_RECORD`'s shape for a credential built here: its own key, so the page will sign with it. */
+const recordOf = (built) => ({ docType: DOC_TYPE, issuerSigned: built.bytes, privateKey: CERTIFY_PRIVATE_KEY,
+    publicJwk: CERTIFY_PUBLIC_JWK });
+/**
+ * Namespaces named `"10"` and `"2"`, in that order: an object's own keys put `"2"` first, and the page writes back the
+ * order it read. `elements` is a `Map` here because no plain object can express this order.
+ */
+const ORDERED_NAMESPACES = buildIssuerSigned({ docType: DOC_TYPE, holder: CERTIFY_PUBLIC_JWK, elements: new Map([
+    ["10", { family_name: "Ipsum" }],
+    ["2", { family_name: "Ipsum" }]]) });
+/**
+ * `("a\u0000b", "c")` and `("a", "b\u0000c")`: both read `a\u0000b\u0000c` to a `namespace + "\u0000" +
+ * identifier` key, which is what a chosen pair must not be matched by.
+ */
+const COLLIDING_PAIRS = buildIssuerSigned({ docType: DOC_TYPE, holder: CERTIFY_PUBLIC_JWK, elements: new Map([
+    ["a\u0000b", { c: "chosen" }],
+    ["a", { "b\u0000c": "other" }]]) });
+
+await section("21b. the issuer's namespace order, and a pair an old-style key would confuse", async () => {
+    equal("the credential's own nameSpaces are \"10\" then \"2\", as written",
+        [...Mdoc.readIssuerSigned(ORDERED_NAMESPACES.bytes).nameSpaces.keys()], ["10", "2"]);
+    const ordered = await Mdoc.deviceResponse(recordOf(ORDERED_NAMESPACES), [["10", "family_name"],
+        ["2", "family_name"]], TRANSCRIPT, {});
+    equal("the DeviceResponse writes them in the issuer's order, \"10\" then \"2\"",
+        [...firstDocument(ordered.bytes).get("issuerSigned").get("nameSpaces").keys()], ["10", "2"]);
+    equal("and discloses the two items in that order", ordered.disclosed,
+        [["10", "family_name"], ["2", "family_name"]]);
+    check("the ordered response's device signature still verifies", verifiesDeviceSignature(ordered.bytes,
+        { transcript: TRANSCRIPT }));
+
+    const chosenItem = COLLIDING_PAIRS.items.get("a\u0000b")[0];
+    const otherItem = COLLIDING_PAIRS.items.get("a")[0];
+    const chosenBytes = COLLIDING_PAIRS.bytes.subarray(chosenItem.start, chosenItem.end);
+    const otherBytes = COLLIDING_PAIRS.bytes.subarray(otherItem.start, otherItem.end);
+    check("the two elements are different IssuerSignedItemBytes", sameBytes(chosenBytes, otherBytes) === false,
+        hex(chosenBytes).slice(0, 40));
+    const firstPair = await Mdoc.deviceResponse(recordOf(COLLIDING_PAIRS), [["a\u0000b", "c"]], TRANSCRIPT, {});
+    equal("choosing (\"a\\u0000b\", \"c\") discloses exactly that pair", firstPair.disclosed, [["a\u0000b", "c"]]);
+    equal("and the response carries exactly its namespace", [...firstDocument(firstPair.bytes).get("issuerSigned")
+        .get("nameSpaces").keys()], ["a\u0000b"]);
+    check("the pair that joins alike is not in the response", hex(firstPair.bytes).includes(hex(otherBytes)) === false,
+        hex(otherBytes).slice(0, 40));
+    const secondPair = await Mdoc.deviceResponse(recordOf(COLLIDING_PAIRS), [["a", "b\u0000c"]], TRANSCRIPT, {});
+    equal("choosing (\"a\", \"b\\u0000c\") discloses exactly that pair", secondPair.disclosed, [["a", "b\u0000c"]]);
+    check("and the other pair is not in the response", hex(secondPair.bytes).includes(hex(chosenBytes)) === false,
+        hex(chosenBytes).slice(0, 40));
 });
 
 // 22. the algorithm label follows the verifier's deviceauth_alg_values (plan 4.7; HAIP 1.0 section 7)
