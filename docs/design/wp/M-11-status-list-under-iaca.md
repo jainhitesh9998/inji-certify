@@ -1374,15 +1374,37 @@ Branch `wp/m-11f-status-ops`. Depends on M-11e. About 600 lines.
 throws `TrustedRevocationCertificatesMustContainAtleastOneCertificateError` before it fetches the list. Supplying the
 presented top certificate for both halves is the faithful "Paradym trusts the mDL's own Document Signer" configuration
 and is what makes Credo's equal-chain rule the effective test: a list signed by any other key fails with "no trusted
-certificate was found in the chain" as well as on the equal-chain check. (2) The probe's lockfile overrides
-`@owf/cose` to 0.6.2 for the whole tree. `npm`'s flat `node_modules` keeps `@owf/token-status-list`'s exact
-`@owf/cose@0.6.0` beside `@owf/mdoc`'s `0.6.2`, and the two copies register their CBOR tag decoders in the one deduped
+certificate was found in the chain" as well as on the equal-chain check. (2) The probe's tree is installed with
+`install-strategy=nested` (`owf-probe/.npmrc`), not `npm`'s flat `node_modules`. Flat, one copy of `@owf/cose`
+lands beside the versions the packages pinned, and the two copies register their CBOR tag decoders in the one deduped
 `cbor-x`; the copy that loads last then decodes tag 24 for both, and `IssuerSigned.decode` sees a `DataItem` that is not
-its own class, so every sample fails to parse. Paradym's pnpm tree does not share the problem (each package gets its own
-`cbor-x`). (3) The probe skips a sample whose `.gaps` declares `issuerAuth.untagged:tagged` - the draft-13 Document
+its own class, so every sample fails to parse. Isolated, `@owf/token-status-list` 0.6.0 keeps its exact `@owf/cose`
+0.6.0 and its own `cbor-x`, `@owf/mdoc` 0.9.1 gets `@owf/cose` 0.6.2, and no `overrides` entry is needed - the same
+shape Paradym's pnpm install produces. `@owf/cose` is also a top-level dependency because the probe imports `Sign1`,
+`CoseKey` and the CBOR codec itself. (3) The probe skips a sample whose `.gaps` declares `issuerAuth.untagged:tagged` - the draft-13 Document
 wrapper, which `@owf/mdoc` refuses before it reads any status list. That deviation is the sample's own declared one, not
 a status-list finding, and the CWT form itself is verified on the same list by `verify_status_list.py`, which reads the
 wrapper.
+
+**Review round 1 (Opus, minors, all fixed in `wp/m-11f-smoke-docs`).** (a) The probe now runs its own negative
+controls in the same CI step: in-memory mutants of the `-oid4vci` sample (re-signed by another key with the DSC's
+`x5chain`; the `-revoked` sample's validly signed list, whose bit at `idx` is set; a `lst` changed after signing; the
+IACA in the `x5chain` instead of the Document Signer; a JWT body under `application/statuslist+jwt` and under
+`application/statuslist+cwt`), each of which must fail the check it is aimed at, so a probe whose signature, chain,
+bit or media-type check regressed cannot stay green. `Sign1.decode` moved inside the `try`, so one unreadable sidecar
+is one failing check and the run continues. (b) `verify_status_list.py` has `Report.skipped`: a check with nothing to
+decide it prints `SKIP <check>: <reason>` and is **not** a PASS, and `noAnchorSupplied` (no `--iaca`) is documented
+as the FAIL it is. (c) `test_smoke_mdl.py` gained one test per smoke CWT check (the bit at `idx`, the bit order,
+`sub`, the `typ`, tag 18, `bits`, an expired `exp`, a future `iat`), each mutation-checked against the check it
+covers, and a `verify_status_leaf` test that runs the real `openssl verify -x509_strict -crl_check` over a
+generated IACA, a Document Signer with a CRL distribution point and a CRL (pass, revoked, expired). (d) A skipped
+leaf check is a FAIL under `--status-signer dedicated` - nothing else in that run has verified the signer - and a
+SKIP, never a PASS, for the mDL's own Document Signer; the run's table has a SKIP column and counts skips apart
+from failures. (e) The probe's dependency tree is the isolated one of correction (2) (D-M11-8's row says so), and
+the nits are closed: `decode_status_list_cwt` no longer returns an unused `unprotected` bstr, the test fixtures'
+`_certificate(ca=...)` honours `ca` (a Document Signer is not a CA), the Python CI step no longer reinstalls the
+venv's requirements a second time, and G49's "extra decoding per allocation" is recorded as partial in
+`20-mdl-issuer.md` rather than claimed fixed.
 
 ### M-11g (optional) Status-list signer profile and CLI (certify-pki, certify-cli)
 
@@ -1469,7 +1491,7 @@ Branch `wp/m-11h-status-signer-mode`. Depends on M-11e and M-11g. About 450 line
 | D-M11-5 | Status purposes for `mso_mdoc` | (a) only `revocation` (ISO2 12.3.6.1), refused otherwise at v2 save and at issuance; (b) allow `suspension` lists, which mDL verifiers would read as INVALID | **(a)** |
 | D-M11-6 | The demo's mDLs issued before M-11 | (a) reissue; their JWT lists stay as they are; (b) re-sign the old shared JWT lists as CWT under the current DSC | **(a)**: the MSOs last 30 days (`mso-validity=P30D`), and (b) would change bytes for SD-JWT entries sharing those lists. |
 | D-M11-7 | A list whose pinned signer expired | (a) serve as stored until its `exp`, then `410 Gone`; (b) `503` + `Retry-After` as today; (c) re-sign with the current DSC | **(a)**: every mDL on it has expired (D7), so retrying cannot help; (c) breaks Credo's rule. |
-| D-M11-8 | Paradym-equivalent check in CI | (a) Java emulation of Credo's rule only; (b) also a gating Node probe running `@owf/mdoc` and `@owf/token-status-list` at Paradym's exact versions (a new npm lockfile under `docs/design/tools/owf-probe`) | **(b)**: the failure we saw is in that library, and non-negotiable 2 asks for third-party verifiers. Node is already set up in CI (`rebuild-ci.yml:196`). |
+| D-M11-8 | Paradym-equivalent check in CI | (a) Java emulation of Credo's rule only; (b) also a gating Node probe running `@owf/mdoc` and `@owf/token-status-list` at Paradym's exact versions (a new npm lockfile under `docs/design/tools/owf-probe`) | **(b)**: the failure we saw is in that library, and non-negotiable 2 asks for third-party verifiers. Node is already set up in CI (`rebuild-ci.yml:196`). The probe's tree is installed isolated (`docs/design/tools/owf-probe/.npmrc`: `install-strategy=nested`), so `@owf/token-status-list` 0.6.0 keeps the exact `@owf/cose` 0.6.0 it pins beside `@owf/mdoc` 0.9.1's 0.6.2, each with its own `cbor-x` - the tree Paradym's pnpm install makes, with no `overrides` entry and no version pushed onto a package that pinned another. |
 | D-M11-9 | Dedicated-signer profile (only with (b)/(c) of D-M11-1) | EKU critical or not; validity cap 457 days (DS cap) or 1095; may the EKU also carry the DS OID; published in JWKS | **EKU `.45` only, critical; at most 457 days; not with the DS OID; not published** (4.8) |
 | D-M11-10 | `status_list.certificate` in the MSO | (a) never; (b) the signer certificate, as the ISO2 12.3.6.2 trust point | **(a)**: the IACA fallback already works; (b) pins one signer for the MSO's life, adds about 500 bytes, and `@owf/mdoc` ignores it. |
 

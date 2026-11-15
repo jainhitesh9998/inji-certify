@@ -27,8 +27,9 @@ metadata say:
      over `["Signature1", protected, b"", payload]`, `sub` = the MSO's uri, `iat` not ahead, `exp` present and not
      passed, `bits` 1, `lst` inflating with the bit at `idx` clear, and the token's `x5chain` equal to the IssuerAuth's -
      the one rule Credo's receipt applies without dedicated status certificates, which `--status-signer dedicated`
-     skips and reports as skipped. The signer leaf is held to `openssl verify -x509_strict -crl_check` against the IACA
-     and the CRL the run downloaded. `--status-format jwt` keeps the JWT check of a deployment running
+     skips and prints as SKIP. The signer leaf is held to `openssl verify -x509_strict -crl_check` against the IACA
+     and the CRL the run downloaded (with neither, that check is a SKIP for the mDL's own Document Signer and a FAIL
+     for a dedicated signer). `--status-format jwt` keeps the JWT check of a deployment running
      `mdoc.token-format=jwt`; then
      docs/design/tools/verify_mdoc.py (pymdoccbor, a verifier Certify does not maintain) with --doctype, --holder (the
      proof key) and --iaca: the IACA named by the Document Signer's CRL distribution point, downloaded from
@@ -48,8 +49,10 @@ From the repository root:
 The base URL must be the one the stack was started with (CERTIFY_PUBLIC_URL): the offer's credential_issuer and every
 endpoint derive from it.
 
-Exit status 0 when every check passes. The credentials, holder keys, IACA and CRL are kept in --out (a new temporary
-directory by default) for a second look.
+Exit status 0 when every check passes or is skipped: the run reports each check as PASS, FAIL or SKIP, and a SKIP is a
+check it could not make (with no IACA and CRL downloaded, the status list's signer, unless the list's signer is a
+dedicated one, where it is a FAIL - nothing else in the run has checked that leaf). The credentials, holder keys, IACA
+and CRL are kept in --out (a new temporary directory by default) for a second look.
 """
 import argparse
 import base64
@@ -107,12 +110,23 @@ CWT_ALGORITHMS = {-7: hashes.SHA256, -35: hashes.SHA384, -36: hashes.SHA512}
 
 results = []
 
+# The three outcomes a check can have: a SKIP is a check the run could not make, and it is not a pass.
+RESULT = {True: "PASS", False: "FAIL", None: "SKIP"}
+
 
 def check(step, ok, detail=""):
     ok = bool(ok)
     results.append((step, ok, detail))
     print(("PASS " if ok else "FAIL ") + step + (": " + str(detail)[:400] if detail not in ("", None) else ""), flush=True)
     return ok
+
+
+def skip(step, detail=""):
+    """A check this run could not make - nothing to make it on, or a mode that declares it out of scope. Printed SKIP: it
+    neither fails the run nor counts as a pass, so a skipped check cannot hide a regression behind a green table."""
+    results.append((step, None, detail))
+    print("SKIP " + step + (": " + str(detail)[:400] if detail not in ("", None) else ""), flush=True)
+    return None
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -398,7 +412,7 @@ def decode_status_list_cwt(body):
     section 5.2; ISO/IEC 18013-5 second edition 12.3.6.3): tag 18 around a COSE_Sign1 [protected, unprotected, payload,
     signature], the protected header carrying `typ` 16 and `x5chain` 33. Raises ValueError with the reason, so a shape
     the draft does not allow is a reported problem rather than a traceback. Returns the parts as the wire has them:
-    {"protected": bytes, "unprotected": bytes, "payload": bytes, "signature": bytes, "header": dict,
+    {"protected": bytes, "payload": bytes, "signature": bytes, "header": dict,
     "unprotected_header": dict, "claims": dict, "x5chain": [DER, ...]}."""
     if not isinstance(body, (bytes, bytearray)) or not body:
         raise ValueError("the body is empty")
@@ -984,19 +998,29 @@ class Smoke:
                       "idx": entry["idx"]}):
             return
         if dedicated:
-            check("status list x5chain is the mDL's IssuerAuth chain (Credo's receipt rule)", True,
-                  "skipped: --status-signer dedicated (D-M11-1 (b)); Credo needs the IACA configured as a status "
-                  "certificate to accept a dedicated signer")
+            skip("status list x5chain is the mDL's IssuerAuth chain (Credo's receipt rule)",
+                 "--status-signer dedicated (D-M11-1 (b)): Credo needs the IACA configured as a status certificate to "
+                 "accept a dedicated signer, so this run cannot check the rule")
         self.verify_status_leaf(x509.load_der_x509_certificate(decode_status_list_cwt(body)["x5chain"][0]))
 
     def verify_status_leaf(self, leaf):
         """The list's signer, under the IACA and the CRL this run already downloaded (TSL 11.3, ISO2 12.3.6.2): the
-        same check the mDL's Document Signer gets, and the one isomdl walks to the IACA for a list."""
+        same check the mDL's Document Signer gets, and the one isomdl walks to the IACA for a list.
+
+        With no IACA and CRL to judge it against this is a SKIP for the Document Signer's own list - that leaf is the
+        mDL's Document Signer, which the same command verified in trust() - and a FAIL for a dedicated signer, whose
+        leaf nothing else in the run has checked."""
         name = "status list leaf: openssl verify -x509_strict -crl_check under the mDL's IACA and its CRL"
         crl = self.out / "iaca.crl.pem"
         if self.iaca_path is None or not crl.is_file():
-            check(name, True, "skipped: this run downloaded no IACA and CRL (the mDL's Document Signer carries no CRL "
-                              "distribution point, or --iaca was refused)")
+            reason = ("this run downloaded no IACA and CRL (the mDL's Document Signer carries no CRL distribution point, "
+                      "or --iaca was refused)")
+            if self.status_signer == "dedicated":
+                check(name, False, reason + ": nothing else in this run has verified a dedicated signer's leaf "
+                                            "(D-M11-1 (b))")
+            else:
+                skip(name, reason + "; the list is signed by the mDL's own Document Signer, whose leaf the same "
+                                    "command verified above")
             return
         path = self.out / "status-list-leaf.pem"
         path.write_bytes(leaf.public_bytes(serialization.Encoding.PEM))
@@ -1064,10 +1088,11 @@ def table():
     print(f"| {'#':>3} | {'step'.ljust(width)} | res  |")
     print(rule)
     for i, (step, ok, _) in enumerate(results, 1):
-        print(f"| {i:>3} | {step.ljust(width)} | {'PASS' if ok else 'FAIL'} |")
+        print(f"| {i:>3} | {step.ljust(width)} | {RESULT[ok]:<4} |")
     print(rule)
-    failed = [r for r in results if not r[1]]
-    print(f"{len(results)} checks, {len(failed)} failed")
+    failed = [r for r in results if r[1] is False]
+    skipped = [r for r in results if r[1] is None]
+    print(f"{len(results)} checks, {len(failed)} failed" + (f", {len(skipped)} skipped" if skipped else ""))
     return failed
 
 

@@ -290,12 +290,12 @@ jobs:
         # producer recorded beside the sample and checks the shape (tag 18, a protected typ and x5chain), the signature
         # with pycose and with the raw Sig_structure, the chain to the sample's IACA, the claims, the bit at idx, and the
         # token's x5chain against the mDL's IssuerAuth one (Credo's receipt rule). It exits 1 on any problem, so a list a
-        # wallet would refuse cannot merge. The verifier's own mutations (test_verify_status_list.py) ran with the mDoc
-        # verifier's tests in the step above, in the same venv.
+        # wallet would refuse cannot merge, and it prints SKIP - never PASS - for a check it did not decide. The
+        # verifier's own mutations (test_verify_status_list.py) ran with the mDoc verifier's tests in the step above, in
+        # the same venv: the requirements are installed there, once.
         run: |
           py="$RUNNER_TEMP/verify-mdoc/bin/python"
           "$py" --version
-          "$py" -m pip install --quiet -r docs/design/tools/requirements-verify.txt
           shopt -s nullglob
           lists=(*/target/mdoc-samples/*.statuslist.cwt)
           if [ ${#lists[@]} -eq 0 ]; then
@@ -320,11 +320,14 @@ jobs:
 
       - name: Paradym-equivalent status-list probe (@owf/mdoc, @owf/token-status-list)
         # M-11f, owner decision D-M11-8 (b): the library Paradym Wallet verifies with, at the exact versions Paradym locks
-        # (@owf/mdoc 0.9.1, @owf/token-status-list 0.6.0; package-lock.json, `npm ci` from it only), over the M-11e samples:
-        # it must accept each mDL and the CWT list its MSO points at with Paradym's trust (the top of the presented
-        # issuance chain), and Credo's equal-chain rule must hold certificate for certificate. This is the failure the
-        # demo saw (G23), so a list Paradym would refuse cannot merge. A list signed by another key and a JWT list are
-        # the negative controls (run locally, docs/design/tools/owf-probe/probe.mjs).
+        # (@owf/mdoc 0.9.1, @owf/token-status-list 0.6.0; package-lock.json, `npm ci` from it only, and `.npmrc`'s
+        # `install-strategy=nested` so each package keeps its own dependencies as Paradym's pnpm tree does), over the
+        # M-11e samples: it must accept each mDL and the CWT list its MSO points at with Paradym's trust (the top of the
+        # presented issuance chain), and Credo's equal-chain rule must hold certificate for certificate. This is the
+        # failure the demo saw (G23), so a list Paradym would refuse cannot merge. The step then runs probe.mjs's own
+        # negative controls - in-memory mutants of the -oid4vci sample, each of which must fail the check it is aimed at
+        # (another key with the DSC's x5chain, a revoked or tampered lst, a different chain, a JWT body) - and exits 1 if
+        # one of them passes, so a probe whose signature, chain, bit or media-type check regressed cannot stay green.
         working-directory: docs/design/tools/owf-probe
         run: |
           npm ci --ignore-scripts --no-audit --no-fund

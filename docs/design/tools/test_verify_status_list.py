@@ -9,6 +9,8 @@ describe — so a token that passes is one this tool's own reading accepts, and 
     .venv-verify/bin/python -m unittest docs/design/tools/test_verify_status_list.py
 """
 import cbor2
+import contextlib
+import io
 import tempfile
 import unittest
 import zlib
@@ -242,9 +244,12 @@ class Case(unittest.TestCase):
         report = v.verify(self.f.token(), v.MEDIA_TYPE, URI, IDX, other_path, self.mdoc_path, 0, NOW)
         self.assertProblems(report, {"statusList.chain": ["untrusted"]})
 
-    def test_without_an_iaca_the_chain_is_not_decided(self):
+    def test_without_an_iaca_the_chain_is_a_fail(self):
+        # a trust point was not supplied: the tool decides nothing about the signer and says so with the Java harness's
+        # code, which is a FAIL and not a SKIP (the check had everything a FAIL needs, the run just did not supply it)
         report = self.report(self.f.token(), iaca=False)
         self.assertProblems(report, {"statusList.chain": ["noAnchorSupplied"]})
+        self.assertFalse(report.unchecked.get("statusList.chain"), "it was decided (and refused), not left unchecked")
 
     def test_a_certificate_outside_its_validity_fails_the_chain(self):
         expired_key = key()
@@ -364,6 +369,38 @@ class Case(unittest.TestCase):
         bad.write_bytes(self.f.token(protected={1: -7, 16: "wrong", 33: der(self.f.dsc)}))
         self.assertEqual(1, v.main(["--list", str(bad), "--content-type", v.MEDIA_TYPE, "--mdoc",
                                     str(self.mdoc_path), "--iaca", str(self.iaca_path), "--at", NOW.isoformat()]))
+
+    # ---- what the run did not give the tool to decide ------------------------------------------------------------
+
+    def test_a_check_with_nothing_to_decide_it_is_skipped_and_never_passes(self):
+        report = self.report(self.f.token(), mdoc=False)
+        self.assertFalse(report.failed_any(), {c: report.problems[c] for c in v.CHECKS if report.problems[c]})
+        for check in v.MDOC_CHECKS:
+            self.assertNotIn(check, report.ran, f"{check} did not run, so it is not a pass")
+            self.assertIn(check, report.unchecked)
+            self.assertTrue(report.unchecked[check])
+        self.assertEqual(set(v.CHECKS) - set(v.MDOC_CHECKS), report.ran)
+
+    def test_the_command_line_prints_skip_lines_and_still_exits_0(self):
+        good = self.directory / "skip.cwt"
+        good.write_bytes(self.f.token())
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            status = v.main(["--list", str(good), "--content-type", v.MEDIA_TYPE, "--iaca", str(self.iaca_path),
+                             "--at", NOW.isoformat()])
+        lines = output.getvalue().splitlines()
+        skipped = [line for line in lines if line.startswith("SKIP ")]
+        self.assertEqual([f"SKIP {check}" for check in v.MDOC_CHECKS], [line.split(":")[0] for line in skipped], lines)
+        for line in skipped:
+            self.assertIn("--mdoc", line)  # the reason, so a SKIP is never a bare pass
+        self.assertEqual(0, status, "a SKIP is not a problem: the exit status stays 0")
+        self.assertEqual(len(v.CHECKS) - len(v.MDOC_CHECKS), len([line for line in lines if line.startswith("PASS ")]))
+
+    def test_a_token_that_does_not_parse_reports_the_rest_as_skipped(self):
+        report = self.report(b"not cbor")
+        self.assertEqual(["notTagged18"], report.problem_codes("statusList.envelope"))
+        self.assertNotIn("statusList.claims", report.ran)
+        self.assertIn("statusList.claims", report.unchecked)
 
     def test_the_problem_codes_are_the_java_tables(self):
         # the same map ProblemCodeRegistryTest holds IndependentStatusListVerifier.PROBLEM_CODES to

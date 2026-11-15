@@ -6,12 +6,14 @@ smoke run accepts as equal to holders.json and as a valid status list, without a
 """
 import base64
 import json
+import shutil
 import sys
+import tempfile
 import time
 import types
 import unittest
 import zlib
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import cbor2
@@ -313,17 +315,38 @@ class IssuerHint(unittest.TestCase):
         self.assertIsNotNone(s.issuer_hint("http://localhost:80", "http://localhost:8091/v1/certify/oid4vci"))
 
 
-def _certificate(subject_key, common_name, issuer=None, issuer_key=None, ca=False):
+def _certificate(subject_key, common_name, issuer=None, issuer_key=None, ca=False, crl_uri=None, not_before=None,
+                 not_after=None):
+    """A certificate for the fixtures: `ca` makes it a CA (basicConstraints and keyCertSign/cRLSign), and anything else a
+    leaf with digitalSignature, so a Document Signer fixture is not a CA."""
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes
     from cryptography.x509.oid import NameOID
-    from datetime import datetime, timezone
     now = datetime.fromtimestamp(NOW, timezone.utc)
     subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+    key_usage = (x509.KeyUsage(digital_signature=False, content_commitment=False, key_encipherment=False,
+                               data_encipherment=False, key_agreement=False, key_cert_sign=ca, crl_sign=ca,
+                               encipher_only=False, decipher_only=False)
+                 if ca else
+                 x509.KeyUsage(digital_signature=True, content_commitment=False, key_encipherment=False,
+                               data_encipherment=False, key_agreement=False, key_cert_sign=False, crl_sign=False,
+                               encipher_only=False, decipher_only=False))
     builder = (x509.CertificateBuilder().subject_name(subject).issuer_name(issuer or subject)
                .public_key(subject_key.public_key()).serial_number(x509.random_serial_number())
-               .not_valid_before(now - timedelta(days=1)).not_valid_after(now + timedelta(days=365))
-               .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True))
+               .not_valid_before(not_before or now - timedelta(days=1))
+               .not_valid_after(not_after or now + timedelta(days=365))
+               .add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True)
+               .add_extension(key_usage, critical=True))
+    if ca:
+        builder = builder.add_extension(x509.SubjectKeyIdentifier.from_public_key(subject_key.public_key()), critical=False)
+    else:
+        authority = issuer_key or subject_key
+        builder = builder.add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(authority.public_key()),
+                                        critical=False)
+    if crl_uri:
+        builder = builder.add_extension(x509.CRLDistributionPoints([x509.DistributionPoint(
+            full_name=[x509.UniformResourceIdentifier(crl_uri)], relative_name=None, reasons=None, crl_issuer=None)]),
+            critical=False)
     return builder.sign(issuer_key or subject_key, hashes.SHA256())
 
 
@@ -334,7 +357,7 @@ class Cwt:
     def __init__(self):
         from cryptography.hazmat.primitives.asymmetric import ec
         self.iaca_key, self.dsc_key = ec.generate_private_key(ec.SECP256R1()), ec.generate_private_key(ec.SECP256R1())
-        self.iaca = _certificate(self.iaca_key, "Lorem Ipsum Demo IACA")
+        self.iaca = _certificate(self.iaca_key, "Lorem Ipsum Demo IACA", ca=True)
         self.dsc = _certificate(self.dsc_key, "Lorem Ipsum Demo Document Signer", issuer=self.iaca.subject,
                                 issuer_key=self.iaca_key)
 
@@ -382,8 +405,9 @@ class StatusListCwtParser(unittest.TestCase):
         self.chain = [self.cwt.dsc]
 
     def problems(self, body, **kwargs):
-        return s.status_list_cwt_problems(body, kwargs.pop("content_type", s.STATUS_LIST_CWT), self.cwt.URI,
-                                          self.cwt.INDEX, kwargs.pop("chain", self.chain), self.cwt.NOW, **kwargs)
+        return s.status_list_cwt_problems(body, kwargs.pop("content_type", s.STATUS_LIST_CWT),
+                                          kwargs.pop("uri", self.cwt.URI), kwargs.pop("index", self.cwt.INDEX),
+                                          kwargs.pop("chain", self.chain), self.cwt.NOW, **kwargs)
 
     def test_the_fixtures_token_has_no_problem(self):
         self.assertEqual([], self.problems(self.cwt.token()))
@@ -415,6 +439,164 @@ class StatusListCwtParser(unittest.TestCase):
         from cryptography.hazmat.primitives.asymmetric import ec
         body = self.cwt.token(key=ec.generate_private_key(ec.SECP256R1()))
         self.assertTrue(any(problem.startswith("the signature does not verify") for problem in self.problems(body)))
+
+    def test_the_bit_at_idx_is_read_least_significant_bit_first(self):
+        # TSL 4.1: bits 1, indexed from the least significant bit. 0x80 at idx 0 and 0x01 at idx 7 are 0: an MSB-first
+        # reader reports 1 at both and refuses two valid lists
+        for index, byte, refused in ((0, 0x80, False), (7, 0x01, False), (3, 0x08, True), (0, 0x01, True)):
+            body = self.cwt.token(claims=self.cwt.claims({65533: {"lst": zlib.compress(bytes([byte])), "bits": 1}}))
+            problems = self.problems(body, index=index)
+            self.assertEqual(refused, any(problem.startswith(f"bit {index} is 1") for problem in problems),
+                             (index, byte, problems))
+
+    def test_the_bit_set_at_idx_is_refused(self):
+        index = self.cwt.INDEX
+        body = self.cwt.token(claims=self.cwt.claims({65533: {"lst": zlib.compress(bytes([1 << index])), "bits": 1}}))
+        self.assertIn(f"bit {index} is 1, not 0 (valid)", self.problems(body))
+        self.assertEqual([], self.problems(self.cwt.token(), index=index), "the same idx of a valid list passes")
+
+    def test_sub_must_be_the_msos_uri(self):
+        problems = self.problems(self.cwt.token(claims=self.cwt.claims({2: "https://issuer.example/elsewhere"})))
+        self.assertTrue(any(problem.startswith("sub (2)") for problem in problems), problems)
+
+    def test_the_protected_typ_must_be_the_status_list_cwt_one(self):
+        body = self.cwt.token(protected={1: -7, 16: "statuslist+jwt", 33: self.cwt.der(self.cwt.dsc)})
+        self.assertTrue(any("protected typ (16)" in problem for problem in self.problems(body)), self.problems(body))
+
+    def test_tag_18_is_required(self):
+        for tags in ((), (61,)):
+            problems = self.problems(self.cwt.token(tags=tags))
+            self.assertTrue(any("COSE_Sign1_Tagged (18)" in problem or "tagged 61" in problem for problem in problems),
+                            (tags, problems))
+
+    def test_bits_must_be_one(self):
+        body = self.cwt.token(claims=self.cwt.claims({65533: {"lst": zlib.compress(bytes(16)), "bits": 2}}))
+        self.assertTrue(any("is not 1" in problem for problem in self.problems(body)), self.problems(body))
+
+    def test_an_expired_exp_is_refused(self):
+        body = self.cwt.token(claims=self.cwt.claims({4: self.cwt.NOW - 10}))
+        self.assertTrue(any(problem.startswith("exp (4)") and "has passed" in problem
+                            for problem in self.problems(body)), self.problems(body))
+
+    def test_a_future_iat_is_refused(self):
+        body = self.cwt.token(claims=self.cwt.claims({6: self.cwt.NOW + s.CLOCK_SKEW + 1}))
+        self.assertTrue(any(problem.startswith("iat (6)") and "in the future" in problem
+                            for problem in self.problems(body)), self.problems(body))
+
+
+def _crl(iaca_key, iaca_subject, revoked=(), now=None):
+    """A CRL signed by the IACA, revoking the certificates given (TSL 11.3, ISO2 12.3.6.2)."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    now = now or datetime.now(timezone.utc)
+    builder = (x509.CertificateRevocationListBuilder().issuer_name(iaca_subject)
+               .last_update(now - timedelta(days=1)).next_update(now + timedelta(days=30)))
+    for certificate in revoked:
+        builder = builder.add_revoked_certificate(x509.RevokedCertificateBuilder()
+                                                  .serial_number(certificate.serial_number)
+                                                  .revocation_date(now - timedelta(hours=1)).build())
+    return builder.sign(iaca_key, hashes.SHA256())
+
+
+class StatusLeafVerify(unittest.TestCase):
+    """`Smoke.verify_status_leaf` over real `openssl verify -x509_strict -crl_check` (M-11f, TSL 11.3, ISO2 12.3.6.2):
+    an IACA, a Document Signer whose CRL distribution point the CRL answers, and a CRL signed here, so the pass and the
+    two refusals are openssl's own. A leaf the run cannot judge (no IACA and CRL downloaded) is a SKIP for the mDL's own
+    Document Signer - that leaf is the DSC, already verified by the same command - and a FAIL for a dedicated signer,
+    whose leaf nothing else in the run has checked (D-M11-1)."""
+
+    def setUp(self):
+        if shutil.which("openssl") is None:
+            self.skipTest("openssl is not installed")
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        self.directory = Path(tempfile.mkdtemp(prefix="status-leaf-"))
+        self.now = datetime.now(timezone.utc)
+        self.iaca_key, self.dsc_key = ec.generate_private_key(ec.SECP256R1()), ec.generate_private_key(ec.SECP256R1())
+        self.iaca = _certificate(self.iaca_key, "Lorem Ipsum Test IACA", ca=True,
+                                 not_before=self.now - timedelta(days=2), not_after=self.now + timedelta(days=3650))
+        self.dsc = self.dsc_named("Lorem Ipsum Test Document Signer")
+        (self.directory / "iaca.pem").write_bytes(self.iaca.public_bytes(serialization.Encoding.PEM))
+        self.write_crl()
+
+    def dsc_named(self, common_name, not_before=None, not_after=None):
+        return _certificate(self.dsc_key, common_name, issuer=self.iaca.subject, issuer_key=self.iaca_key,
+                            crl_uri="http://localhost:8091/v1/certify/mdoc/iaca/test.crl",
+                            not_before=not_before or self.now - timedelta(days=1),
+                            not_after=not_after or self.now + timedelta(days=365))
+
+    def write_crl(self, revoked=()):
+        from cryptography.hazmat.primitives import serialization
+        crl = _crl(self.iaca_key, self.iaca.subject, revoked)
+        (self.directory / "iaca.crl.pem").write_bytes(crl.public_bytes(serialization.Encoding.PEM))
+
+    def verify(self, leaf, signer="document-signer", iaca=True):
+        s.results.clear()
+        smoke = s.Smoke("http://localhost:1", s.MDL_DOCTYPE, "mdl-demo-1", self.directory, status_signer=signer)
+        smoke.iaca_path = self.directory / "iaca.pem" if iaca else None
+        smoke.verify_status_leaf(leaf)
+        results = list(s.results)
+        s.results.clear()
+        self.assertEqual(1, len(results), results)
+        self.assertTrue(results[0][0].startswith("status list leaf: openssl verify -x509_strict -crl_check"), results)
+        return results[0]
+
+    def test_a_leaf_the_iaca_issued_and_the_crl_does_not_revoke_passes(self):
+        _, ok, detail = self.verify(self.dsc)
+        self.assertTrue(ok, detail)
+        self.assertTrue(detail.endswith("OK"), detail)  # openssl's own verdict over the PEM this run wrote
+
+    def test_a_revoked_leaf_fails(self):
+        self.write_crl([self.dsc])
+        _, ok, detail = self.verify(self.dsc)
+        self.assertFalse(ok, detail)
+        self.assertIn("certificate revoked", detail)
+
+    def test_an_expired_leaf_fails(self):
+        expired = self.dsc_named("Expired Document Signer", not_before=self.now - timedelta(days=30),
+                                 not_after=self.now - timedelta(days=1))
+        _, ok, detail = self.verify(expired)
+        self.assertFalse(ok, detail)
+        self.assertIn("certificate has expired", detail)
+
+    def test_without_an_iaca_the_mdls_own_document_signer_is_skipped_not_passed(self):
+        no_crl = self.directory / "no-crl"
+        no_crl.mkdir()
+        s.results.clear()
+        smoke = s.Smoke("http://localhost:1", s.MDL_DOCTYPE, "mdl-demo-1", no_crl)
+        smoke.verify_status_leaf(self.dsc)
+        results = list(s.results)
+        s.results.clear()
+        self.assertEqual(1, len(results), results)
+        self.assertIsNone(results[0][1], "a check that did not run is a SKIP, never a PASS")
+        self.assertIn("no IACA and CRL", results[0][2])
+
+    def test_without_an_iaca_a_dedicated_signers_leaf_fails(self):
+        # nothing else in the run has checked a dedicated signer's leaf, so skipping it would leave it unverified
+        _, ok, detail = self.verify(self.dsc, signer="dedicated", iaca=False)
+        self.assertFalse(ok, detail)
+        self.assertIn("nothing else in this run has verified", detail)
+
+
+class Table(unittest.TestCase):
+    """A SKIP is neither a pass nor a failure: the table shows it, and only a FAIL fails the run."""
+
+    def test_the_table_counts_a_skip_as_neither_pass_nor_fail(self):
+        import contextlib
+        import io
+        s.results.clear()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            s.check("a verified check", True)
+            s.skip("an unverifiable check", "nothing to decide it on")
+            s.check("a failing check", False)
+            outcomes = [s.RESULT[ok] for _, ok, _ in s.results]
+            failed = s.table()
+        s.results.clear()
+        self.assertEqual(["PASS", "SKIP", "FAIL"], outcomes)
+        self.assertEqual([("a failing check", False)], [(step, ok) for step, ok, _ in failed])
+        self.assertIn("| SKIP |", output.getvalue())
+        self.assertIn("3 checks, 1 failed, 1 skipped", output.getvalue())
 
 
 class SmokeStatusExpectation(unittest.TestCase):
@@ -470,7 +652,7 @@ class SmokeStatusExpectation(unittest.TestCase):
 
     def test_a_cwt_signed_by_the_mdls_document_signer_passes(self):
         steps = self.status(self.body())
-        self.assertTrue(all(ok for _, ok in steps), steps)
+        self.assertTrue(all(ok is not False for _, ok in steps), steps)
 
     def test_a_cwt_signed_by_another_key_fails(self):
         from cryptography.hazmat.primitives.asymmetric import ec
@@ -484,7 +666,7 @@ class SmokeStatusExpectation(unittest.TestCase):
     def test_a_missing_status_entry_fails_present_and_passes_absent(self):
         self.assertFalse(all(ok for _, ok in self.status(b"", entry=None, expect="present")))
         steps = self.status(b"", entry=None, expect="absent")
-        self.assertTrue(all(ok for _, ok in steps), steps)
+        self.assertTrue(all(ok is not False for _, ok in steps), steps)
 
     def test_the_jwt_format_option_keeps_the_jwt_check(self):
         # --status-format jwt is a deployment on mdoc.token-format=jwt: a CWT body is not the JWT its run expects

@@ -6,7 +6,8 @@ at with Multipaz's `CompressedStatusList.fromCwt` and Authlete's COSE verifier. 
 opinion the plan's section 4.9 asks for: `pycose` 1.1.0 for the COSE_Sign1 signature, `cbor2` 5.9.0 for the CBOR and
 `cryptography` 50.0.2 for the X.509 chain, all pinned in `requirements-verify.txt`. It implements the M-11b table except
 the checks only Multipaz can decide (its `fromCwt` maximimum validity and its own `validateCwt` order) and the
-`duplicateKey` walk Authlete's pair-keeping decoder does; those are reported as skipped, never as passing.
+`duplicateKey` walk Authlete's pair-keeping decoder does; those print SKIP, as does any check the run gave this tool
+nothing to decide, and a SKIP is never a PASS.
 
     python3.12 -m venv .venv-verify && .venv-verify/bin/pip install -r docs/design/tools/requirements-verify.txt
     .venv-verify/bin/python docs/design/tools/verify_status_list.py --list sample.statuslist.cwt \\
@@ -34,9 +35,10 @@ Which parts of the M-11b table are decided:
   statusList.list            bits 1, the zlib lst, idx in range, the status at idx
   statusList.signerPurpose   EKU 1.3.6.1.5.5.7.3.45 and digitalSignature when the signer is not the mDL's own key
 
-Skipped, with the reason printed: `statusList.chain` without `--iaca` (`noAnchorSupplied`), the `duplicateKey` walk,
-and everything that needs the mdoc (`statusList.mso`, `statusList.issuanceChain`, `statusList.signerPurpose`) without
-`--mdoc`.
+Printed SKIP, with the reason, and never counted as a pass: the `duplicateKey` walk, and everything that needs the mdoc
+(`statusList.mso`, `statusList.issuanceChain`, `statusList.signerPurpose`) without `--mdoc`. `statusList.chain` without
+`--iaca` is not skipped: with no trust point supplied the signer cannot be judged, which is a FAIL (`noAnchorSupplied`,
+the Java harness's code).
 """
 import argparse
 import io
@@ -85,17 +87,23 @@ MDOC_CHECKS = ["statusList.mso", "statusList.issuanceChain", "statusList.signerP
 
 
 class Report:
-    """One entry per check of the table: the problems it found, and whether it ran at all."""
+    """One entry per check of the table: the problems it found, whether it ran, and why not when it did not."""
 
     def __init__(self):
         self.problems = {check: [] for check in CHECKS}
         self.ran = set()
+        self.unchecked = {}
         self.notes = {}
 
     def done(self, check, note=""):
         self.ran.add(check)
         if note:
             self.notes[check] = note
+
+    def skipped(self, check, note=""):
+        """The check decided nothing: nothing to decide it on, or a walk only the Java harness makes. Printed SKIP - not
+        PASS - and it does not change the exit status: a FAIL is a problem found, a SKIP is a check that did not run."""
+        self.unchecked[check] = note or "not run"
 
     def failed(self, check, code, message=""):
         self.ran.add(check)
@@ -228,7 +236,8 @@ def verify_http(content_type, report):
 def verify_envelope(shape, report):
     for code, message in shape:
         report.failed("statusList.envelope", code, message)
-    report.done("statusList.envelope", "the duplicateKey walk is the Java harness's (Authlete keeps every pair of a map)")
+    report.done("statusList.envelope", "shape only: the duplicateKey walk is the Java harness's (Authlete keeps every "
+                                        "pair of a map)")
 
 
 def verify_typ(token, report):
@@ -293,7 +302,7 @@ def sig_structure(token):
 
 def verify_signature(token, report):
     if not token.x5chain:
-        report.done("statusList.signature", "not run: no readable x5chain names the key")
+        report.skipped("statusList.signature", "no readable x5chain names the key")
         return
     leaf = token.leaf()
     algorithm = token.header.get(1)
@@ -336,7 +345,7 @@ def verify_chain(token, iaca, at, report):
                       "no --iaca was given, so there is no trust point to judge the signer against (D16)")
         return
     if not token.x5chain:
-        report.done("statusList.chain", "not run: no readable x5chain")
+        report.skipped("statusList.chain", "no readable x5chain")
         return
     certificates = [x509.load_der_x509_certificate(der) for der in token.x5chain]
     untrusted = []
@@ -362,10 +371,10 @@ def verify_chain(token, iaca, at, report):
 
 def verify_issuance_chain(token, issuer_auth_chain, report):
     if issuer_auth_chain is None:
-        report.done("statusList.issuanceChain", "not run: no --mdoc gives the IssuerAuth chain")
+        report.skipped("statusList.issuanceChain", "no --mdoc gives the IssuerAuth chain")
         return
     if not token.x5chain:
-        report.done("statusList.issuanceChain", "not run: no readable x5chain")
+        report.skipped("statusList.issuanceChain", "no readable x5chain")
         return
     expected = [certificate.public_bytes(serialization.Encoding.DER) for certificate in issuer_auth_chain]
     if token.x5chain != expected:
@@ -450,10 +459,10 @@ def verify_signer_purpose(token, issuer_auth_chain, report):
     """Credo's `assertStatusListSignerKeyPurpose` (1.4-25): a list key that is not the credential's own key needs the
     status-signing EKU and digitalSignature; a list signed by the mDL's Document Signer needs neither."""
     if issuer_auth_chain is None:
-        report.done("statusList.signerPurpose", "not run: no --mdoc to compare the signer with")
+        report.skipped("statusList.signerPurpose", "no --mdoc to compare the signer with")
         return
     if not token.x5chain or not issuer_auth_chain:
-        report.done("statusList.signerPurpose", "not run: no readable x5chain")
+        report.skipped("statusList.signerPurpose", "no readable x5chain")
         return
     leaf = token.leaf()
     credential_leaf = issuer_auth_chain[0]
@@ -540,14 +549,14 @@ def read_mdoc(blob, uri, idx, report):
     try:
         chain, mso = mdoc_issuer_auth(mdoc_issuer_signed(blob))
     except Exception as e:  # noqa: BLE001 - an unreadable credential is M-01's finding, not a status-list one
-        report.done("statusList.mso", f"not run: the credential's IssuerAuth or MSO cannot be read ({e})")
+        report.skipped("statusList.mso", f"the credential's IssuerAuth or MSO cannot be read ({e})")
         return None, None
     reference, problem = mso_status_reference(mso)
     if problem:
         report.failed("statusList.mso", "malformed", problem)
         return chain, None
     if reference is None:
-        report.done("statusList.mso", "the MSO carries no status.status_list")
+        report.skipped("statusList.mso", "the MSO carries no status.status_list")
         return chain, None
     if uri is not None and reference["uri"] != uri:
         report.failed("statusList.mso", "malformed",
@@ -590,7 +599,7 @@ def verify(body, content_type, uri=None, idx=None, iaca_pem=None, mdoc=None, exp
             idx = reference["idx"] if idx is None else idx
     else:
         for check in MDOC_CHECKS:
-            report.done(check, "not run: no --mdoc was given")
+            report.skipped(check, "no --mdoc was given")
     if idx is None:
         idx = 0
     verify_http(content_type, report)
@@ -599,16 +608,16 @@ def verify(body, content_type, uri=None, idx=None, iaca_pem=None, mdoc=None, exp
         for code, message in shape:
             report.failed("statusList.envelope", code, message)
         for check in CHECKS:
-            if check not in report.ran:
-                report.done(check, "not run: the token does not parse")
+            if check not in report.ran and check not in report.unchecked:
+                report.skipped(check, "the token does not parse")
         return report
     verify_envelope(shape, report)
     if shape:
         # a body that is not a COSE_Sign1 of a Status List Token leaves nothing below it to check (the Java harness
         # reports the other token checks notRun for the same reason)
         for check in CHECKS:
-            if check not in report.ran:
-                report.done(check, "not run: the envelope is defective")
+            if check not in report.ran and check not in report.unchecked:
+                report.skipped(check, "the envelope is defective")
         return report
     verify_typ(token, report)
     verify_x5chain(token, report)
@@ -660,7 +669,7 @@ def main(argv=None):
         elif check in report.ran:
             print(f"PASS {check}" + (f": {report.notes[check]}" if report.notes.get(check) else ""))
         else:
-            print(f"SKIP {check}")
+            print(f"SKIP {check}" + (f": {report.unchecked[check]}" if report.unchecked.get(check) else ""))
     print(f"{len(CHECKS)} checks, {failed} problem(s)")
     return 1 if failed else 0
 
