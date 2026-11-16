@@ -13,6 +13,11 @@
 #
 # Every validity range is written with an explicit -not_before/-not_after, because three of the checks are about the
 # clock: an expired leaf, a leaf that is not valid yet, and a leaf valid now whatever the machine's clock says.
+#
+# Serials are OpenSSL's own: a random 20-octet positive integer, the size RFC 5280 section 4.1.2.2 allows up to and what
+# the certificates in the hosted captures carry (EUDI's leaf is 20 octets). Three certificates are given a serial whose
+# first octet has its top bit set, which DER writes with a leading 0x00: a reader that folds the serial into a
+# JavaScript number cannot hold either shape, and one that reads the high bit as a sign refuses the second.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -27,25 +32,34 @@ rm -f "$OUT"/*.pem "$OUT"/kid.txt
 NOW_BEFORE="20260101000000Z"
 NOW_AFTER="20360101000000Z"
 
+# A 20-octet serial whose first octet has its top bit set: DER writes the INTEGER with a leading 0x00 pad octet, so it
+# is 21 octets on the wire and positive (X.690 sections 8.3.1 and 8.3.2).
+TOP_BIT_SERIAL="0xC0FFEE00C0FFEE00C0FFEE00C0FFEE00C0FFEE00"
+
 # --- keys -----------------------------------------------------------------------------------------------------------------
 p256() { openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$1" 2>/dev/null; }
 p384() { openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-384 -out "$1" 2>/dev/null; }
 p521() { openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-521 -out "$1" 2>/dev/null; }
-rsa()  { openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$1" 2>/dev/null; }
+rsa()  { openssl genpkey -algorithm RSA -pkeyopt "rsa_keygen_bits:${1:-2048}" -out "$2" 2>/dev/null; }
 
 # --- one X.509 certificate ------------------------------------------------------------------------------------------
-# cert <name> <key> <subject> <issuer-name|self> <serial> <not-before> <not-after> <extensions>
+# cert <name> <key> <subject> <issuer-name|self> <serial|-> <not-before> <not-after> <extensions> [openssl argument…]
+# A `-` serial leaves the choice to OpenSSL, which writes a random 20-octet one. The trailing arguments reach
+# `openssl x509` unchanged, which is how a certificate is signed with RSA-PSS (`-sigopt rsa_padding_mode:pss`).
 cert() {
     local name="$1" key="$2" subject="$3" issuer="$4" serial="$5" before="$6" after="$7" ext="$8"
+    shift 8
+    local serials=()
+    [ "$serial" = - ] || serials=(-set_serial "$serial")
     openssl req -new -key "$key" -subj "$subject" -out "$WORK/$name.csr" 2>/dev/null
     printf '%s\n' "$ext" > "$WORK/$name.ext"
     if [ "$issuer" = self ]; then
-        openssl x509 -req -in "$WORK/$name.csr" -signkey "$key" -set_serial "$serial" \
+        openssl x509 -req -in "$WORK/$name.csr" -signkey "$key" ${serials[@]+"${serials[@]}"} "$@" \
             -not_before "$before" -not_after "$after" -extfile "$WORK/$name.ext" -out "$OUT/$name.pem" 2>/dev/null
     else
         openssl x509 -req -in "$WORK/$name.csr" -CA "$OUT/$issuer.pem" -CAkey "$OUT/$issuer.key.pem" \
-            -set_serial "$serial" -not_before "$before" -not_after "$after" -extfile "$WORK/$name.ext" \
-            -out "$OUT/$name.pem" 2>/dev/null
+            ${serials[@]+"${serials[@]}"} "$@" -not_before "$before" -not_after "$after" \
+            -extfile "$WORK/$name.ext" -out "$OUT/$name.pem" 2>/dev/null
     fi
     openssl x509 -in "$OUT/$name.pem" -noout -subject -issuer > /dev/null
 }
@@ -62,38 +76,62 @@ leaf_ext() {
 
 D="DNS:"
 U="URI:"
+CA_SUBJECT="/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Verifier CA"
 
 # --- the CAs --------------------------------------------------------------------------------------------------------------
 p256 "$OUT/ca.key.pem"
-cert ca "$OUT/ca.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Verifier CA" self 0x1001 \
+cert ca "$OUT/ca.key.pem" "$CA_SUBJECT" self - \
     "20260101000000Z" "20460101000000Z" "$(ca_ext ',pathlen:2')"
 
 p256 "$OUT/impostor-ca.key.pem"
-cert impostor-ca "$OUT/impostor-ca.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Other CA" self 0x1002 \
+cert impostor-ca "$OUT/impostor-ca.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Other CA" self - \
     "20260101000000Z" "20460101000000Z" "$(ca_ext '')"
+
+# Four certificates that carry the CA's own subject name and a different key, so each one reaches the CA checks of
+# RFC 5280 section 6.1.4 (which read a certificate's own extensions) instead of the name check. The page runs those
+# before the signature link, and the harness pairs each with the leaf it is meant to catch. One key serves all four:
+# none of them ever signs a certificate.
+p256 "$OUT/ca-variant.key.pem"
+# no `cA` at all: basicConstraints says this certificate is not a CA
+cert nonca "$OUT/ca-variant.key.pem" "$CA_SUBJECT" self - "20260101000000Z" "20460101000000Z" \
+    'basicConstraints=critical,CA:FALSE
+keyUsage=critical,keyCertSign,cRLSign
+subjectKeyIdentifier=hash'
+# a CA whose keyUsage leaves out keyCertSign (RFC 5280 section 4.2.1.3)
+cert nokeycertsign "$OUT/ca-variant.key.pem" "$CA_SUBJECT" self - "20260101000000Z" "20460101000000Z" \
+    'basicConstraints=critical,CA:TRUE
+keyUsage=critical,digitalSignature,cRLSign
+subjectKeyIdentifier=hash'
+# a CA with a critical extension the page does not know (RFC 5280 section 4.2: an unrecognised critical extension)
+cert unknown-critical "$OUT/ca-variant.key.pem" "$CA_SUBJECT" self - "20260101000000Z" "20460101000000Z" \
+    "$(ca_ext ',pathlen:2')
+1.2.3.4.5.6.7=critical,DER:05:00"
+# a CA that permits no CA below it (RFC 5280 section 4.2.1.9, pathLenConstraint)
+cert tight-pathlen "$OUT/ca-variant.key.pem" "$CA_SUBJECT" self - "20260101000000Z" "20460101000000Z" \
+    "$(ca_ext ',pathlen:0')"
 
 # `ca-twin`: a second CA with the *same* subject name as `ca` and a different key. The chain it heads has the leaf's
 # issuer name and not its issuer, which is the only way to exercise the signature half of RFC 5280 6.1.3 (a)(1) rather
 # than the name half (a)(4).
 p256 "$OUT/ca-twin.key.pem"
-cert ca-twin "$OUT/ca-twin.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Verifier CA" self 0x1006 \
+cert ca-twin "$OUT/ca-twin.key.pem" "$CA_SUBJECT" self - \
     "20260101000000Z" "20460101000000Z" "$(ca_ext ',pathlen:2')"
 
-rsa "$OUT/rsa-ca.key.pem"
-cert rsa-ca "$OUT/rsa-ca.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture RSA CA" self 0x1003 \
+rsa "" "$OUT/rsa-ca.key.pem"
+cert rsa-ca "$OUT/rsa-ca.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture RSA CA" self - \
     "20260101000000Z" "20460101000000Z" "$(ca_ext '')"
 
 p384 "$OUT/p384-ca.key.pem"
-cert p384-ca "$OUT/p384-ca.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture P-384 CA" self 0x1004 \
+cert p384-ca "$OUT/p384-ca.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture P-384 CA" self - \
     "20260101000000Z" "20460101000000Z" "$(ca_ext '')"
 
 p521 "$OUT/p521-ca.key.pem"
-cert p521-ca "$OUT/p521-ca.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture P-521 CA" self 0x1005 \
+cert p521-ca "$OUT/p521-ca.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture P-521 CA" self - \
     "20260101000000Z" "20460101000000Z" "$(ca_ext '')"
 
 # an intermediate the CA signed: the three-certificate chain (leaf, intermediate, ca)
 p256 "$OUT/intermediate.key.pem"
-cert intermediate "$OUT/intermediate.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Intermediate" ca 0x1010 \
+cert intermediate "$OUT/intermediate.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Intermediate" ca - \
     "20260101000000Z" "20410101000000Z" "$(ca_ext ',pathlen:0')
 authorityKeyIdentifier=keyid:always
 subjectKeyIdentifier=hash"
@@ -102,45 +140,68 @@ subjectKeyIdentifier=hash"
 # `verifier`: the client_id `x509_san_dns:verifier.example` names its dNSName SAN. It also carries a URI SAN, as EUDI's
 # leaf does.
 p256 "$OUT/verifier.key.pem"
-cert verifier "$OUT/verifier.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Verifier" ca 0x2001 \
+cert verifier "$OUT/verifier.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Verifier" ca - \
     "$NOW_BEFORE" "$NOW_AFTER" "$(leaf_ext "subjectAltName=${D}verifier.example,${U}https://verifier.example/v1/certify/offer/wallet" always)"
 
-# `other`: a second name under the same CA, so a request signed by it is a well-formed chain with the wrong name.
+# `other`: a second name under the same CA, so a request signed by it is a well-formed chain with the wrong name. Its
+# serial has its top bit set.
 p256 "$OUT/other.key.pem"
-cert other "$OUT/other.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Other Verifier" ca 0x2002 \
+cert other "$OUT/other.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Other Verifier" ca "$TOP_BIT_SERIAL" \
     "$NOW_BEFORE" "$NOW_AFTER" "$(leaf_ext "subjectAltName=${D}other.example,${U}https://other.example/" always)"
 
 p256 "$OUT/expired.key.pem"
-cert expired "$OUT/expired.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Expired Verifier" ca 0x2003 \
+cert expired "$OUT/expired.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Expired Verifier" ca - \
     "20190101000000Z" "20200101000000Z" \
     "$(leaf_ext "subjectAltName=${D}verifier.example" always)"
 
 p256 "$OUT/future.key.pem"
-cert future "$OUT/future.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Future Verifier" ca 0x2004 \
+cert future "$OUT/future.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Future Verifier" ca - \
     "20400101000000Z" "20450101000000Z" \
     "$(leaf_ext "subjectAltName=${D}verifier.example" always)"
 
 p256 "$OUT/leaf-under-intermediate.key.pem"
 cert leaf-under-intermediate "$OUT/leaf-under-intermediate.key.pem" \
-    "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Verifier (Intermediate)" intermediate 0x2005 \
+    "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Verifier (Intermediate)" intermediate - \
     "$NOW_BEFORE" "$NOW_AFTER" "$(leaf_ext "subjectAltName=${D}verifier.example" always)"
 
-rsa "$OUT/rsa-leaf.key.pem"
-cert rsa-leaf "$OUT/rsa-leaf.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture RSA Verifier" rsa-ca 0x2006 \
+rsa "" "$OUT/rsa-leaf.key.pem"
+cert rsa-leaf "$OUT/rsa-leaf.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture RSA Verifier" rsa-ca - \
     "$NOW_BEFORE" "$NOW_AFTER" "$(leaf_ext "subjectAltName=${D}verifier.example" always)"
+
+# the same RSA CA signing with RSA-PSS and SHA-256: signatureAlgorithm 1.2.840.113549.1.1.10 with its parameters, which
+# is one of the two shapes RFC 4055 section 3.1 defines and the one a reader that only knows PKCS#1 v1.5 cannot check
+rsa "" "$OUT/rsa-pss-leaf.key.pem"
+cert rsa-pss-leaf "$OUT/rsa-pss-leaf.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture PSS Verifier" rsa-ca - \
+    "$NOW_BEFORE" "$NOW_AFTER" "$(leaf_ext "subjectAltName=${D}verifier.example" always)" \
+    -sha256 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32
+
+# a 1024-bit RSA chain: RFC 7518 section 3.3 requires a key of 2048 bits or more for RS256/PS256
+rsa 1024 "$OUT/rsa-small-ca.key.pem"
+cert rsa-small-ca "$OUT/rsa-small-ca.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Small RSA CA" self - \
+    "20260101000000Z" "20460101000000Z" "$(ca_ext '')"
+rsa 1024 "$OUT/rsa-small-leaf.key.pem"
+cert rsa-small-leaf "$OUT/rsa-small-leaf.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Small RSA Verifier" \
+    rsa-small-ca - "$NOW_BEFORE" "$NOW_AFTER" "$(leaf_ext "subjectAltName=${D}verifier.example" always)"
 
 p384 "$OUT/p384-leaf.key.pem"
-cert p384-leaf "$OUT/p384-leaf.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture P-384 Verifier" p384-ca 0x2007 \
+cert p384-leaf "$OUT/p384-leaf.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture P-384 Verifier" p384-ca - \
     "$NOW_BEFORE" "$NOW_AFTER" "$(leaf_ext "subjectAltName=${D}verifier.example" always)"
 
 p521 "$OUT/p521-leaf.key.pem"
-cert p521-leaf "$OUT/p521-leaf.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture P-521 Verifier" p521-ca 0x2008 \
+cert p521-leaf "$OUT/p521-leaf.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture P-521 Verifier" p521-ca - \
     "$NOW_BEFORE" "$NOW_AFTER" "$(leaf_ext "subjectAltName=${D}verifier.example" always)"
+
+# `names`: a self-signed leaf whose `CN` is four characters. The harness rewrites that one string's tag, keeping every
+# length identical, to reach the two string types a name attribute may use that no fixture would otherwise carry:
+# NumericString (tag 18) and UniversalString (tag 28, UCS-4). `X509.parse` does not verify signatures.
+p256 "$OUT/names.key.pem"
+cert names "$OUT/names.key.pem" "/C=IN/O=Inji Demo Certify/CN=1234" self - \
+    "$NOW_BEFORE" "$NOW_AFTER" "$(leaf_ext "subjectAltName=${D}verifier.example" self)"
 
 # `self-signed`: one certificate, its own issuer. HAIP section 5 forbids the verifier signing with a self-signed
 # certificate; the page reports it as a finding, not a refusal.
 p256 "$OUT/self-signed.key.pem"
-cert self-signed "$OUT/self-signed.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Self-Signed" self 0x2009 \
+cert self-signed "$OUT/self-signed.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Self-Signed" self - \
     "$NOW_BEFORE" "$NOW_AFTER" "$(leaf_ext "subjectAltName=${D}verifier.example" self)"
 
 # --- the JWE key pair (P5-03e reads it; recorded here because this is the verifier's material) --------------------------

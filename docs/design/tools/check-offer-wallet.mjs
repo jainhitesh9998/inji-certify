@@ -407,9 +407,9 @@ const summary = (fake) => credentialsIn(fake).map((record) => [record.format, re
  * scripts. `walletConfig: false` makes `wallet/config` answer 404, as it does with the wallet switched off. Every fetch
  * the page makes is recorded in `requests` (I9).
  *
- * P5-03c adds: `pageUrl`, so a same-device invocation can arrive in the query or the fragment; `relayHosts`, which is
- * what `wallet/config` publishes; `respond`, the answers to every other request (`{status, body, contentType}` or
- * `"throw"`); and `clock`, the instant the page's `new Date()` reads, so the request checks run under a faked clock.
+ * P5-03c adds: `pageUrl`, so a same-device invocation can arrive in the query or the fragment;
+ * `respond`, the answers to every other request (`{status, body, contentType, contentLength}` or `"throw"`); and
+ * `clock`, the instant the page's `new Date()` reads, so the request checks run under a faked clock.
  */
 function openWallet(indexedDB, options = {}) {
     const source = readFileSync(resolve(STATIC, "wallet.html"), "utf8");
@@ -422,7 +422,6 @@ function openWallet(indexedDB, options = {}) {
     const requests = [];
     const replacedUrls = [];
     const pageUrl = new URL(options.pageUrl || "https://credentials.example/v1/certify/offer/wallet");
-    const relayHosts = options.relayHosts || [];
     const fetch = async (url, init = {}) => {
         const target = new URL(String(url), pageUrl).href;
         const request = {
@@ -435,22 +434,40 @@ function openWallet(indexedDB, options = {}) {
         requests.push(request);
         if (target === "https://credentials.example/v1/certify/offer/wallet/config") {
             const enabled = options.walletConfig === undefined ? true : options.walletConfig;
+            const text = JSON.stringify({ enabled });
             return enabled
-                ? { status: 200, text: async () => JSON.stringify({ relay: { hosts: relayHosts } }) }
-                : { status: 404, text: async () => "" };
+                ? { status: 200, headers: { get: () => null }, body: null, text: async () => text }
+                : { status: 404, headers: { get: () => null }, body: null, text: async () => "" };
         }
         if (typeof options.respond === "function") {
             const answer = options.respond(request);
             if (answer === "throw") throw new TypeError("fetch failed");
             if (answer !== undefined) {
+                const text = typeof answer.body === "string" ? answer.body
+                    : JSON.stringify(answer.body === undefined ? "" : answer.body);
                 return {
                     status: answer.status,
-                    headers: { get: (name) => (String(name).toLowerCase() === "content-type" ? answer.contentType || "" : null) },
-                    text: async () => (typeof answer.body === "string" ? answer.body : JSON.stringify(answer.body === undefined ? "" : answer.body)),
+                    headers: { get: (name) => {
+                        const header = String(name).toLowerCase();
+                        if (header === "content-type") return answer.contentType || "";
+                        if (header === "content-length") return answer.contentLength === undefined ? null : String(answer.contentLength);
+                        return null;
+                    } },
+                    body: {
+                        getReader() {
+                            let sent = false;
+                            return {
+                                read: async () => (sent ? { done: true, value: undefined }
+                                    : (sent = true, { done: false, value: new TextEncoder().encode(text) })),
+                                cancel: async () => {},
+                            };
+                        },
+                    },
+                    text: async () => text,
                 };
             }
         }
-        return { status: 404, text: async () => "" };
+        return { status: 404, headers: { get: () => null }, body: null, text: async () => "" };
     };
     // a faked clock: `new Date()` answers the pinned instant, every other Date call is the real one
     const PinnedDate = options.clock === undefined ? Date : class extends Date {
@@ -894,22 +911,49 @@ function refusesWith(label, result, rule, fragment) {
         result.ok ? "it was accepted" : String(result.message));
 }
 
-/** A `fetch` for `Oid4vp.fetchRequest`, answering from a table of URLs and recording every call. */
+/**
+ * A `fetch` for `Oid4vp.fetchRequest`, answering from a table of URLs and recording every call. The answer carries a
+ * real `body` stream, because the page reads a request object under a byte cap rather than calling `text()`: `body`
+ * is what a `Response` has, and `answer.contentLength` sets the header the page checks first.
+ */
 function scriptedFetch(answers) {
     const calls = [];
+    const counted = { textCalls: 0 };
     const impl = async (url, init = {}) => {
         const target = String(url);
         calls.push({ url: target, method: (init.method || "GET").toUpperCase(), headers: Object.assign({}, init.headers || {}),
             body: init.body, redirect: init.redirect });
         const answer = answers[target];
         if (answer === undefined || answer === "throw") throw new TypeError("Failed to fetch");
+        const chunks = typeof answer.body === "string" ? [new TextEncoder().encode(answer.body)]
+            : Array.isArray(answer.body) ? answer.body.map((part) => (part instanceof Uint8Array ? part : new TextEncoder().encode(String(part))))
+            : [new TextEncoder().encode("")];
         return {
             status: answer.status,
-            headers: { get: (name) => (String(name).toLowerCase() === "content-type" ? answer.contentType || "" : null) },
-            text: async () => answer.body,
+            headers: { get: (name) => {
+                const header = String(name).toLowerCase();
+                if (header === "content-type") return answer.contentType || "";
+                if (header === "content-length") return answer.contentLength === undefined ? null : String(answer.contentLength);
+                return null;
+            } },
+            body: {
+                getReader() {
+                    let index = 0;
+                    return {
+                        read: async () => (index >= chunks.length ? { done: true, value: undefined }
+                            : { done: false, value: chunks[index++] }),
+                        cancel: async () => {},
+                    };
+                },
+            },
+            // the page must never read a verifier's body through this: the count is what proves it
+            text: async () => {
+                counted.textCalls++;
+                return answer.body;
+            },
         };
     };
-    return { impl, calls };
+    return { impl, calls, counted };
 }
 
 
@@ -2159,6 +2203,21 @@ await section("19. a closing message never overwrites another tab's newer one", 
 // --------------------------------------------------------------------------------------------- P5-03c sections
 
 await section("20. X.509 certificates, signatures and the verifier's chain (P5-03c)", async () => {
+    // The serial comes first, because it is the field a reader is most tempted to fold into a JavaScript number
+    // (RFC 5280 4.1.2.2 allows 20 octets, and every fixture and both hosted captures carry more than 2^53). Reaching it
+    // through a helper keeps a refusal a named check rather than an abandoned section.
+    const serialAt = (name) => {
+        try {
+            const certificate = X509.parse(derOf(name));
+            return [certificate.serialBytes.length, certificate.serialNumber];
+        } catch (error) {
+            return "threw: " + error.message;
+        }
+    };
+    equal("a 20-octet serial is read whole, its top bit and all", serialAt("other"),
+        [20, "C0FFEE00C0FFEE00C0FFEE00C0FFEE00C0FFEE00"]);
+    equal("the fixture CA's serial is the 20 random octets OpenSSL writes by default", serialAt("ca")[0], 20);
+    equal("and the leaf's is 20 too", serialAt("verifier")[0], 20);
     const leaf = X509.parse(derOf("verifier"));
     equal("the leaf's subject is the fixture's", leaf.subject.text, "C=IN, O=Inji Demo Certify, CN=Wallet Fixture Verifier");
     equal("the leaf's issuer is the test CA", leaf.issuer.text, "C=IN, O=Inji Demo Certify, CN=Wallet Fixture Verifier CA");
@@ -2169,11 +2228,16 @@ await section("20. X.509 certificates, signatures and the verifier's chain (P5-0
         leaf.sans, { dnsNames: ["verifier.example"], uris: ["https://verifier.example/v1/certify/offer/wallet"] });
     equal("it is a version 3 leaf, not a CA, and can only sign",
         [leaf.version, leaf.ca, leaf.keyUsageText], [3, false, "digitalSignature"]);
+    check("its serial is read as hex octets, not as a number",
+        /^[0-9A-F]+$/.test(leaf.serialNumber) && leaf.serialNumber.length % 2 === 0
+            && leaf.serialNumber.length === leaf.serialBytes.length * 2, leaf.serialNumber);
     equal("its key is the P-256 EC key it carries", leaf.publicKey, { kind: "ec", curve: "P-256" });
     equal("its AKI is the CA's SKI (RFC 5280 4.2.1.1)", hex(leaf.aki), hex(X509.parse(derOf("ca")).ski));
     equal("its own SKI is 20 bytes", leaf.ski.length, 20);
     equal("the CA's basic constraints carry cA and pathLen 2",
         [X509.parse(derOf("ca")).ca, X509.parse(derOf("ca")).pathLength], [true, 2]);
+    equal("a CA's keyUsage names keyCertSign", X509.parse(derOf("ca")).keyUsage, ["keyCertSign", "cRLSign"]);
+    equal("and only the extensions RFC 5280 defines keep it readable as critical", X509.parse(derOf("ca")).unknownCritical, []);
     equal("the intermediate's pathLen is 0", X509.parse(derOf("intermediate")).pathLength, 0);
     equal("the RSA leaf's key is named by its size", X509.parse(derOf("rsa-leaf")).publicKey, { kind: "rsa", bits: 2048 });
 
@@ -2194,6 +2258,10 @@ await section("20. X.509 certificates, signatures and the verifier's chain (P5-0
     equal("the leaf under the intermediate is signed by it", await issuedBy("leaf-under-intermediate", "intermediate"), true);
     equal("the CA did not sign that leaf", await issuedBy("leaf-under-intermediate", "ca"), false);
     equal("the RSA chain verifies", await issuedBy("rsa-leaf", "rsa-ca"), true);
+    equal("a certificate signed with RSA-PSS and SHA-256 verifies (RFC 4055 section 3.1)",
+        await issuedBy("rsa-pss-leaf", "rsa-ca"), true);
+    equal("and the PSS AlgorithmIdentifier's parameters are read, not guessed at",
+        X509.parse(derOf("rsa-pss-leaf")).signatureAlgorithm, "1.2.840.113549.1.1.10");
     equal("the P-384 chain verifies", await issuedBy("p384-leaf", "p384-ca"), true);
     equal("the P-521 chain verifies", await issuedBy("p521-leaf", "p521-ca"), true);
     equal("a self-signed certificate verifies with its own key", await issuedBy("self-signed", "self-signed"), true);
@@ -2223,6 +2291,11 @@ await section("20. X.509 certificates, signatures and the verifier's chain (P5-0
     parseRefuses("a truncated certificate", derOf("verifier").subarray(0, 60), /DER|runs past the end/);
     parseRefuses("an indefinite length (BER, not DER)", Uint8Array.of(0x30, 0x80, 0x00, 0x00), /indefinite length is BER/);
     parseRefuses("a certificate whose outer tag is not a SEQUENCE", Uint8Array.of(0x04, 0x01, 0x00), /Certificate/);
+    // X.690 section 10.1: the length must be the shortest encoding of its value, so a long form below 128, or one
+    // padded in front, is not DER. Both spellings of one certificate would otherwise pass for two different ones.
+    parseRefuses("a long-form length below 128", Uint8Array.of(0x30, 0x81, 0x03, 0x02, 0x01, 0x01), /long form/);
+    parseRefuses("a length padded with a leading 0x00 octet", Uint8Array.of(0x30, 0x82, 0x00, 0x03, 0x02, 0x01, 0x01),
+        /leading 0x00 octet/);
 
     // an ECDSA signature in DER as the fixed-width r || s WebCrypto verifies (RFC 3279 2.2.3, RFC 7518 3.4)
     equal("the leaf's DER signature converts to 64 bytes on P-256", X509.derEcdsaToRaw(leaf.signatureValue, 32).length, 64);
@@ -2233,6 +2306,75 @@ await section("20. X.509 certificates, signatures and the verifier's chain (P5-0
         wide = error.message;
     }
     check("a signature integer wider than its curve is refused", /wider than its curve/.test(String(wide)), String(wide));
+    const rawRefuses = (label, bytes, fragment) => {
+        let message = null;
+        try {
+            X509.derEcdsaToRaw(new Uint8Array(bytes), 32);
+        } catch (error) {
+            message = error.message;
+        }
+        check(`an ECDSA signature ${label}: refused`, message !== null && fragment.test(message), String(message));
+    };
+    // DER SEQUENCE { INTEGER r, INTEGER s } with 1-octet values, so only the rule under test can refuse them
+    rawRefuses("with a trailing octet after the SEQUENCE", [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x00],
+        /exactly one SEQUENCE/);
+    rawRefuses("whose integer is negative", [0x30, 0x06, 0x02, 0x01, 0x81, 0x02, 0x01, 0x01], /negative/);
+    rawRefuses("whose integer is padded non-minimally", [0x30, 0x07, 0x02, 0x02, 0x00, 0x01, 0x02, 0x01, 0x01], /not minimal/);
+    rawRefuses("whose integer is empty", [0x30, 0x05, 0x02, 0x00, 0x02, 0x01, 0x01], /is empty/);
+    rawRefuses("whose integer is zero", [0x30, 0x06, 0x02, 0x01, 0x00, 0x02, 0x01, 0x01], /is zero/);
+    equal("a minimal integer with a 0x00 pad for its top bit is still read",
+        hex(X509.derEcdsaToRaw(Uint8Array.of(0x30, 0x07, 0x02, 0x02, 0x00, 0x81, 0x02, 0x01, 0x01), 32)).slice(0, 4), "0000");
+
+    // RFC 5280 6.1.3 (g) and 6.1.4: what each certificate of a path must be, read from its own extensions. The four
+    // `*-variant` certificates carry the CA's own subject name, so each reaches the CA checks instead of the name check.
+    const faultOf = (name, position) => X509.certificateFault(X509.parse(derOf(name)), position);
+    equal("a genuine CA passes the path checks", faultOf("ca", 1), null);
+    check("a certificate that says cA:FALSE cannot issue another", /is not a CA/.test(String(faultOf("nonca", 1))),
+        String(faultOf("nonca", 1)));
+    check("a CA whose keyUsage omits keyCertSign cannot sign certificates",
+        /without keyCertSign/.test(String(faultOf("nokeycertsign", 1))), String(faultOf("nokeycertsign", 1)));
+    check("an unknown critical extension ends the path (RFC 5280 6.1.3 (g))",
+        /1\.2\.3\.4\.5\.6\.7/.test(String(faultOf("unknown-critical", 1))), String(faultOf("unknown-critical", 1)));
+    check("a pathLenConstraint of 0 is refused when a CA follows it", /pathLenConstraint/.test(String(faultOf("tight-pathlen", 2))),
+        String(faultOf("tight-pathlen", 2)));
+    equal("and a leaf is held to nothing here beyond its own extensions", faultOf("verifier", 0), null);
+
+    // RFC 5280 4.1.2.4 names DirectoryString, which no certificate here writes: the two string types it also allows are
+    // reached by rewriting one four-character attribute's tag in place, so every length in the certificate stays the
+    // same and only the string type changes (X509.parse does not check signatures).
+    const RETYPED = (tag, value) => {
+        const bytes = derOf("names").slice();
+        const pattern = [0x0c, 0x04, ...Buffer.from("1234")];
+        let found = 0;
+        for (let at = 0; at + pattern.length <= bytes.length; at++) {
+            if (!pattern.every((byte, offset) => bytes[at + offset] === byte)) continue;
+            // the fixture is self-signed, so its issuer and subject carry the same four characters: both are rewritten
+            bytes[at] = tag;
+            bytes.set(value, at + 2);
+            found++;
+        }
+        check("the fixture's four-character CN is found twice in its DER, as issuer and subject", found === 2, String(found));
+        return bytes;
+    };
+    const subjectOf = (bytes) => {
+        try {
+            return X509.parse(bytes).subject.text;
+        } catch (error) {
+            return "threw: " + error.message;
+        }
+    };
+    equal("a NumericString attribute is read (tag 18)", subjectOf(RETYPED(18, Buffer.from("1234"))),
+        "C=IN, O=Inji Demo Certify, CN=1234");
+    equal("a UniversalString attribute is read as UCS-4 (tag 28)",
+        subjectOf(RETYPED(28, Buffer.from([0x00, 0x00, 0x00, 0x41]))), "C=IN, O=Inji Demo Certify, CN=A");
+    let badString = null;
+    try {
+        X509.parse(RETYPED(28, Buffer.from([0x00, 0x11, 0x00, 0x00])));
+    } catch (error) {
+        badString = error.message;
+    }
+    check("a UniversalString code point beyond Unicode is refused", /beyond Unicode/.test(String(badString)),
+        String(badString));
 
     const fingerprint = await X509.fingerprintSha256(derOf("verifier"));
     equal("the fingerprint is 32 colon-separated uppercase hex pairs", /^([0-9A-F]{2}:){31}[0-9A-F]{2}$/.test(fingerprint), true);
@@ -2271,6 +2413,23 @@ await section("21. links: the schemes, the forms and the 8 KiB limit (plan 4.4)"
     check("a link parameter this page does not read is a finding, not a refusal",
         extra.ok === true && extra.findings.some((finding) => finding.includes("\"flow\"")), JSON.stringify(extra.findings));
 
+    // the form the hosted Multipaz verifier's begin answer carries: its scheme (`haip-vp://`) with the fragment it built
+    // (`://?…`) appended. WHATWG URL parsing refuses it as written, and the captured answer is why it is folded away.
+    const multipazBegin = JSON.parse(readFileSync(resolve(HOSTED_DIR, "mp-begin-response.json"), "utf8"));
+    check("the begin answer's uri is the doubled-separator form", /^haip-vp:\/\/:\/\/\?/.test(multipazBegin.uri), multipazBegin.uri);
+    const doubledLink = Oid4vp.parseLink(multipazBegin.uri);
+    equal("and it is read as the haip-vp request_uri link it stands for", [doubledLink.ok, doubledLink.kind, doubledLink.scheme,
+        doubledLink.params.clientId, doubledLink.params.requestUri], [true, "request_uri", "haip-vp",
+        "x509_san_dns:verifier.multipaz.org", "https://verifier.multipaz.org/verifier/openid4vpRequest?sessionId=kC67qddJ7k_Ut_X9"]);
+    equal("with a finding that says so", doubledLink.findings.filter((finding) => /separator is doubled/.test(finding)).length, 1);
+    const eudiInit = JSON.parse(readFileSync(resolve(HOSTED_DIR, "eudi-init-get.json"), "utf8"));
+    const eudiLink = Oid4vp.parseLink(eudiInit.authorization_request_uri);
+    equal("the hosted EUDI init answer's authorization_request_uri is read as it stands",
+        [eudiLink.ok, eudiLink.scheme, eudiLink.params.clientId === eudiInit.client_id,
+            eudiLink.params.requestUri === eudiInit.request_uri], [true, "haip-vp", true, true]);
+    equal("the post form's init answer too", Oid4vp.parseLink(JSON.parse(readFileSync(resolve(HOSTED_DIR, "eudi-init-post.json"),
+        "utf8")).authorization_request_uri).params.requestUriMethod, "post");
+
     const refusesLink = (label, text, fragment) => {
         const result = Oid4vp.parseLink(text);
         check(`${label}: refused`, result.ok === false && fragment.test(String(result.message)),
@@ -2286,32 +2445,38 @@ await section("21. links: the schemes, the forms and the 8 KiB limit (plan 4.4)"
     refusesLink("a scheme that is not a wallet invocation scheme", "ftp://verifier.example/request",
         /not a wallet invocation scheme/);
     refusesLink("request_uri_method=put", `openid4vp://?${query}&request_uri_method=put`, /accepts get or post/);
+    refusesLink("a parameter that appears twice (RFC 6749 section 3.1)", `openid4vp://?${query}&client_id=x509_hash:abc`,
+        /more than once/);
     refusesLink("an empty field", "   ", /the field is empty/);
     refusesLink("neither a link nor a request object", "please present your licence", /neither a link nor a request object/);
+    refusesLink("a doubled separator on an https link (only the wallet schemes are folded)",
+        "https://://?request_uri=" + encodeURIComponent(requestUri), /not a wallet invocation scheme|neither a link/);
+
 });
 
 await section("22. fetching the request object, once (plan 4.4)", async () => {
     const requestUri = "https://verifier.example/request.jwt/1";
-    const relayUrl = "https://credentials.example/v1/certify/offer/wallet/relay";
     const text = jar(withMembers({}));
 
     const get = scriptedFetch({ [requestUri]: { status: 200, body: text, contentType: "application/oauth-authz-req+jwt" } });
     const fetched = new Set();
-    const answer = await Oid4vp.fetchRequest({ requestUri, method: "get", pageUrl: PUBLIC_PAGE, relayHosts: [], relayUrl,
-        fetched, fetchImpl: get.impl });
+    const answer = await Oid4vp.fetchRequest({ requestUri, method: "get", pageUrl: PUBLIC_PAGE, fetched, fetchImpl: get.impl });
     equal("a 200 answer is read", [answer.ok, answer.text, answer.via], [true, text, "direct"]);
     equal("one GET, with the JWT Accept header and redirect: \"error\"",
         [get.calls.length, get.calls[0].method, get.calls[0].headers.Accept, get.calls[0].redirect, get.calls[0].body],
         [1, "GET", "application/oauth-authz-req+jwt", "error", undefined]);
-    const again = await Oid4vp.fetchRequest({ requestUri, method: "get", pageUrl: PUBLIC_PAGE, relayHosts: [], relayUrl,
-        fetched, fetchImpl: get.impl });
+    const again = await Oid4vp.fetchRequest({ requestUri, method: "get", pageUrl: PUBLIC_PAGE, fetched, fetchImpl: get.impl });
     equal("a second fetch of the same request_uri is refused and makes no request",
         [again.ok, again.state, get.calls.length], [false, "alreadyFetched", 1]);
+    const withFragment = await Oid4vp.fetchRequest({ requestUri: requestUri + "#frag", pageUrl: PUBLIC_PAGE, fetched,
+        fetchImpl: get.impl });
+    equal("the fetched-once set is keyed by the URL without its fragment (RFC 3986 3.5)",
+        [withFragment.ok, withFragment.state, get.calls.length], [false, "alreadyFetched", 1]);
 
     const nonce = "wallet-nonce-".padEnd(43, "x");
     const post = scriptedFetch({ [requestUri]: { status: 200, body: text, contentType: "application/oauth-authz-req+jwt" } });
     const posted = await Oid4vp.fetchRequest({ requestUri, method: "post", walletNonce: nonce, pageUrl: PUBLIC_PAGE,
-        relayHosts: [], relayUrl, fetched: new Set(), fetchImpl: post.impl });
+        fetched: new Set(), fetchImpl: post.impl });
     const form = post.calls[0].body;
     equal("a posted request carries wallet_nonce and nothing else, form-encoded",
         [posted.ok, post.calls[0].method, post.calls[0].headers["Content-Type"],
@@ -2321,57 +2486,48 @@ await section("22. fetching the request object, once (plan 4.4)", async () => {
 
     for (const status of [404, 500]) {
         const failing = scriptedFetch({ [requestUri]: { status, body: "no" } });
-        const refused = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, relayHosts: [], relayUrl,
-            fetched: new Set(), fetchImpl: failing.impl });
+        const refused = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, fetched: new Set(), fetchImpl: failing.impl });
         check(`a ${status} answer stops the process (VP 5.10.2)`,
             refused.ok === false && new RegExp("answered " + status).test(refused.message), refused.message);
     }
     const redirecting = scriptedFetch({ [requestUri]: "throw" });
-    const redirected = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, relayHosts: [], relayUrl,
-        fetched: new Set(), fetchImpl: redirecting.impl });
+    const redirected = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, fetched: new Set(), fetchImpl: redirecting.impl });
     equal("a redirect is an explicit unreachable state, never a fetch of where it points (redirect: \"error\")",
         [redirected.ok, redirected.state], [false, "unreachable"]);
-    check("and the state says what to do about a verifier without CORS", /CORS/.test(redirected.message), redirected.message);
+    check("and the state says what to do about a verifier without CORS, offering the paste field",
+        /CORS/.test(redirected.message) && /pasted/.test(redirected.message), redirected.message);
 
     const insecure = scriptedFetch({});
     equal("an http request_uri on an https page is refused before any request",
-        [(await Oid4vp.fetchRequest({ requestUri: "http://verifier.example/r", pageUrl: PUBLIC_PAGE, relayHosts: [],
-            relayUrl, fetched: new Set(), fetchImpl: insecure.impl })).ok, insecure.calls.length], [false, 0]);
+        [(await Oid4vp.fetchRequest({ requestUri: "http://verifier.example/r", pageUrl: PUBLIC_PAGE,
+            fetched: new Set(), fetchImpl: insecure.impl })).ok, insecure.calls.length], [false, 0]);
     const local = scriptedFetch({ "http://localhost:8090/request.jwt": { status: 200, body: text, contentType: "application/jwt" } });
     equal("and it is allowed while the page itself is served from localhost",
-        (await Oid4vp.fetchRequest({ requestUri: "http://localhost:8090/request.jwt", pageUrl: LOCAL_PAGE, relayHosts: [],
-            relayUrl, fetched: new Set(), fetchImpl: local.impl })).ok, true);
+        (await Oid4vp.fetchRequest({ requestUri: "http://localhost:8090/request.jwt", pageUrl: LOCAL_PAGE,
+            fetched: new Set(), fetchImpl: local.impl })).ok, true);
 
-    const relayed = scriptedFetch({ [relayUrl]: { status: 200, contentType: "application/json",
-        body: JSON.stringify({ status: 200, content_type: "application/oauth-authz-req+jwt", body: text }) } });
-    const viaRelay = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, relayHosts: ["verifier.example"],
-        relayUrl, fetched: new Set(), fetchImpl: relayed.impl });
-    equal("a listed host is read through the relay only, never directly",
-        [viaRelay.ok, viaRelay.via, relayed.calls.length, relayed.calls[0].url], [true, "relay", 1, relayUrl]);
-    equal("the relay request names the operation, the uri and the method, and carries no verifier header",
-        [JSON.parse(relayed.calls[0].body), relayed.calls[0].headers.Accept],
-        [{ op: "request-object", uri: requestUri, method: "get" }, "application/json"]);
-    const relayedPost = scriptedFetch({ [relayUrl]: { status: 200, body: JSON.stringify({ status: 200, body: text }) } });
-    await Oid4vp.fetchRequest({ requestUri, method: "post", walletNonce: nonce, pageUrl: PUBLIC_PAGE,
-        relayHosts: ["verifier.example"], relayUrl, fetched: new Set(), fetchImpl: relayedPost.impl });
-    equal("a posted request through the relay forwards wallet_nonce and nothing else",
-        JSON.parse(relayedPost.calls[0].body), { op: "request-object", uri: requestUri, method: "post", wallet_nonce: nonce });
-    const relayError = scriptedFetch({ [relayUrl]: { status: 200, body: JSON.stringify({ status: 400, body: "" }) } });
-    const relayedRefusal = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, relayHosts: ["verifier.example"],
-        relayUrl, fetched: new Set(), fetchImpl: relayError.impl });
-    check("a verifier error reported through the relay stops the process",
-        relayedRefusal.ok === false && /answered 400/.test(relayedRefusal.message), relayedRefusal.message);
-    const relayDown = scriptedFetch({ [relayUrl]: { status: 502, body: "no" } });
-    const relayedDown = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, relayHosts: ["verifier.example"],
-        relayUrl, fetched: new Set(), fetchImpl: relayDown.impl });
-    check("a relay that answers an error is refused", relayedDown.ok === false && /relay answered 502/.test(relayedDown.message),
-        relayedDown.message);
-
-    const oversized = scriptedFetch({ [requestUri]: { status: 200, body: "a".repeat(64 * 1024 + 1) } });
-    const tooLarge = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, relayHosts: [], relayUrl,
-        fetched: new Set(), fetchImpl: oversized.impl });
-    check("a request object over 64 KiB is refused after it is read", tooLarge.ok === false && /64 KiB limit/.test(tooLarge.message),
-        tooLarge.message);
+    // plan 4.4's request-object limit, which a verifier does not get to decide: Content-Length is checked first, and a
+    // body that declares none is read chunk by chunk and abandoned at the cap rather than read whole first
+    const declared = scriptedFetch({ [requestUri]: { status: 200, body: "a".repeat(64 * 1024 + 1), contentLength: 64 * 1024 + 1 } });
+    const tooLargeDeclared = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, fetched: new Set(),
+        fetchImpl: declared.impl });
+    check("a declared Content-Length over 64 KiB is refused before a byte of the body is read",
+        tooLargeDeclared.ok === false && /64 KiB limit/.test(tooLargeDeclared.message), tooLargeDeclared.message);
+    const reading = scriptedFetch({ [requestUri]: { status: 200, body: "a".repeat(64 * 1024 + 1) } });
+    const tooLargeStreamed = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, fetched: new Set(), fetchImpl: reading.impl });
+    check("a body with no declared length is refused at the cap",
+        tooLargeStreamed.ok === false && /64 KiB limit/.test(tooLargeStreamed.message), tooLargeStreamed.message);
+    const chunked = scriptedFetch({ [requestUri]: { status: 200, body: ["a".repeat(40 * 1024), "b".repeat(40 * 1024)] } });
+    const overChunks = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, fetched: new Set(), fetchImpl: chunked.impl });
+    check("the cap counts the whole stream, not one chunk", overChunks.ok === false && /64 KiB limit/.test(overChunks.message),
+        overChunks.message);
+    check("and no body is ever read through answer.text(), on any of those", declared.counted.textCalls === 0
+        && reading.counted.textCalls === 0 && chunked.counted.textCalls === 0 && get.counted.textCalls === 0,
+        [declared.counted.textCalls, reading.counted.textCalls, chunked.counted.textCalls, get.counted.textCalls].join(","));
+    const notUtf8 = scriptedFetch({ [requestUri]: { status: 200, body: [new Uint8Array([0xff, 0xfe])] } });
+    const undecodable = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, fetched: new Set(), fetchImpl: notUtf8.impl });
+    check("a body that is not UTF-8 is refused, not decoded leniently", undecodable.ok === false && /not UTF-8/.test(undecodable.message),
+        undecodable.message);
 });
 
 await section("23. the request checks R1-R11 and the findings (plan 4.5)", async () => {
@@ -2411,6 +2567,23 @@ await section("23. the request checks R1-R11 and the findings (plan 4.5)", async
     refusesWith("a request object with no typ", await checkRequestOf(jar(withMembers({}), { header: { typ: undefined } })),
         "R2", /typ is absent/);
     refusesWith("typ JWT", await checkRequestOf(jar(withMembers({}), { header: { typ: "JWT" } })), "R2", /"JWT"/);
+    refusesWith("typ in another case", await checkRequestOf(jar(withMembers({}), { header: { typ: "OAUTH-AUTHZ-REQ+JWT" } })),
+        "R2", /OAUTH-AUTHZ-REQ\+JWT/);
+
+    // R1: the JWS crit header (RFC 7515 section 4.1.11). This page understands no JWS extension, so a crit ends it, and
+    // a crit that is not a non-empty array of names is refused for being that. `crit: ["b64"], b64: false` is RFC 7797's
+    // unencoded payload: the signature is then over bytes the payload's meaning does not describe, which is exactly what
+    // 4.1.11 exists to prevent a reader from walking into.
+    refusesWith("a crit the page does not understand",
+        await checkRequestOf(jar(withMembers({}), { header: { crit: ["foo"] } })), "R1", /understands no JWS extension/);
+    refusesWith("crit [\"b64\"] with b64:false (RFC 7797)",
+        await checkRequestOf(jar(withMembers({}), { header: { crit: ["b64"], b64: false } })), "R1", /\["b64"\]/);
+    refusesWith("a crit that is not an array",
+        await checkRequestOf(jar(withMembers({}), { header: { crit: "b64" } })), "R1", /non-empty array of header names/);
+    refusesWith("an empty crit", await checkRequestOf(jar(withMembers({}), { header: { crit: [] } })), "R1",
+        /non-empty array of header names/);
+    refusesWith("a crit with a non-string entry",
+        await checkRequestOf(jar(withMembers({}), { header: { crit: [1] } })), "R1", /non-empty array of header names/);
 
     // R3 and R4: the link's and the object's client_id, and the echoed wallet_nonce (VP 5.10.1)
     refusesWith("a link whose client_id differs from the request object's",
@@ -2526,12 +2699,40 @@ await section("23. the request checks R1-R11 and the findings (plan 4.5)", async
         true);
     refusesWith("a request object with no response_uri", await checkRequestOf(jar(withMembers({ response_uri: undefined }))),
         "R8", /carries no response_uri/);
+    refusesWith("a response_uri with userinfo",
+        await checkRequestOf(jar(withMembers({ response_uri: "https://user:secret@verifier.example/response" }))), "R8",
+        /user name or password/);
+
+    // R10: the CA requirements of RFC 5280 6.1.3 (g) and 6.1.4. Each variant below carries the CA's own subject name,
+    // so the chain reaches the CA checks rather than the name check, which run before any signature is tried.
+    refusesWith("an issuer certificate that says cA:FALSE",
+        await checkRequestOf(jar(withMembers({}), { x5c: [x5cOf("verifier"), x5cOf("nonca")] })), "R10", /is not a CA/);
+    refusesWith("a CA whose keyUsage omits keyCertSign",
+        await checkRequestOf(jar(withMembers({}), { x5c: [x5cOf("verifier"), x5cOf("nokeycertsign")] })), "R10",
+        /without keyCertSign/);
+    refusesWith("an issuer certificate with an unknown critical extension",
+        await checkRequestOf(jar(withMembers({}), { x5c: [x5cOf("verifier"), x5cOf("unknown-critical")] })), "R10",
+        /1\.2\.3\.4\.5\.6\.7/);
+    refusesWith("a chain one CA longer than the top certificate permits",
+        await checkRequestOf(jar(withMembers({}), { keyName: "leaf-under-intermediate",
+            x5c: [x5cOf("leaf-under-intermediate"), x5cOf("intermediate"), x5cOf("tight-pathlen")] })), "R10",
+        /pathLenConstraint/);
+    refusesWith("an RSA leaf under 2048 bits (RFC 7518 3.3)",
+        await checkRequestOf(jar(withMembers({}), { alg: "RS256", keyName: "rsa-small-leaf",
+            x5c: [x5cOf("rsa-small-leaf"), x5cOf("rsa-small-ca")] })), "R10", /1024 bits; RS256 requires 2048 or more/);
+    equal("a leaf certificate signed with RSA-PSS still verifies as a chain link",
+        (await checkRequestOf(jar(withMembers({}), { alg: "RS256", keyName: "rsa-pss-leaf",
+            x5c: [x5cOf("rsa-pss-leaf"), x5cOf("rsa-ca")] }))).ok, true);
 
     // R11: the response type and mode this wallet implements (VP 5.6, 8.2)
     refusesWith("response_type=id_token", await checkRequestOf(jar(withMembers({ response_type: "id_token" }))),
         "R11", /section 5.6 has vp_token/);
+    refusesWith("response_type absent (VP 5.1 requires it)",
+        await checkRequestOf(jar(withMembers({ response_type: undefined }))), "R11", /section 5.1 requires it/);
     refusesWith("response_mode=query", await checkRequestOf(jar(withMembers({ response_mode: "query" }))),
         "R11", /implements direct_post and direct_post.jwt/);
+    refusesWith("response_mode absent (VP 8.2 defaults it to fragment)",
+        await checkRequestOf(jar(withMembers({ response_mode: undefined }))), "R11", /defaults to fragment/);
 
     // the findings of plan 4.5: shown, never blocking
     const haipPlain = await checkRequestOf(jar(withMembers({ response_mode: "direct_post" })), { link: linkParams({ scheme: "haip-vp" }) });
@@ -2542,6 +2743,13 @@ await section("23. the request checks R1-R11 and the findings (plan 4.5)", async
     check("a request object served as application/json is a finding",
         mediaType.ok === true && mediaType.findings.some((finding) => finding.includes("media type")),
         JSON.stringify(mediaType.findings));
+    const genericMedia = await checkRequestOf(jar(withMembers({})), { contentType: "application/jwt" });
+    check("application/jwt is a finding too: VP 5.10 names the specific type, and application/jwt is the generic one",
+        genericMedia.ok === true
+            && genericMedia.findings.some((finding) => finding.includes("media type") && finding.includes("application/jwt")),
+        JSON.stringify(genericMedia.findings));
+    equal("application/oauth-authz-req+jwt itself raises no media-type finding",
+        good.findings.filter((finding) => finding.includes("media type")), []);
     const algValues = await checkRequestOf(jar(withMembers({ client_metadata: { vp_formats_supported:
         { mso_mdoc: { issuerauth_alg_values: [-9] } } } })), { keptIssuerAuthAlgs: [-7] });
     check("issuerauth_alg_values that do not list the held credential's algorithm is a finding",
@@ -2560,12 +2768,18 @@ await section("23. the request checks R1-R11 and the findings (plan 4.5)", async
         missingClientId.ok === true && missingClientId.request.clientId === "x509_san_dns:verifier.example"
             && missingClientId.findings.some((finding) => finding.includes("named no client_id")),
         JSON.stringify(missingClientId.findings));
+    const pastedObject = await checkRequestOf(jar(withMembers({})), { link: { scheme: null, kind: "by_value", findings: [] } });
+    check("a request object pasted by itself words its no-client_id finding for what happened, not for a link",
+        pastedObject.ok === true && pastedObject.findings.some((finding) => finding.startsWith("this request object was pasted"))
+            && !pastedObject.findings.some((finding) => finding.includes("the link named no client_id")),
+        JSON.stringify(pastedObject.findings));
 
     // a redirect_uri: request, which cannot be signed, through the plain path
     const redirectClientId = "redirect_uri:https://verifier.example/response";
+    const plainParams = { client_id: redirectClientId, response_uri: "https://verifier.example/response", nonce: "n1",
+        state: "s1", response_type: "vp_token", response_mode: "direct_post", dcql_query: { credentials: [] } };
     const plain = await Oid4vp.checkRequest({
-        plain: { client_id: redirectClientId, response_uri: "https://verifier.example/response", nonce: "n1", state: "s1",
-            response_mode: "direct_post", dcql_query: { credentials: [] } },
+        plain: plainParams,
         link: linkParams({ clientId: redirectClientId, kind: "plain" }),
         pageUrl: PUBLIC_PAGE,
         now: NOW,
@@ -2574,10 +2788,36 @@ await section("23. the request checks R1-R11 and the findings (plan 4.5)", async
     check("and the findings say the request is unsigned", plain.findings.some((finding) => finding.includes("unsigned")),
         JSON.stringify(plain.findings));
     const plainElsewhere = await Oid4vp.checkRequest({
-        plain: { client_id: redirectClientId, response_uri: "https://other.example/response", nonce: "n1" },
+        plain: Object.assign({}, plainParams, { response_uri: "https://other.example/response" }),
         link: linkParams({ clientId: redirectClientId, kind: "plain" }), pageUrl: PUBLIC_PAGE, now: NOW,
     });
     refusesWith("a redirect_uri: request whose response_uri is not the client_id", plainElsewhere, "R8", /they must be the same URI/);
+    // VP 5.9.3: the two are the same URI, not merely the same origin and path
+    const plainTrailingSlash = await Oid4vp.checkRequest({
+        plain: Object.assign({}, plainParams, { response_uri: "https://verifier.example/response/" }),
+        link: linkParams({ clientId: redirectClientId, kind: "plain" }), pageUrl: PUBLIC_PAGE, now: NOW,
+    });
+    refusesWith("a response_uri that differs from the client_id by one character", plainTrailingSlash, "R8",
+        /they must be the same URI/);
+    // the limits of plan 4.4 apply to a query string as much as to a payload
+    refusesWith("a plain request whose DCQL has 21 credential queries", await Oid4vp.checkRequest({
+        plain: Object.assign({}, plainParams, { dcql_query: { credentials: Array.from({ length: 21 }, (_, index) =>
+            ({ id: "q" + index, format: "mso_mdoc", meta: { doctype_value: DOC_TYPE } })) } }),
+        link: linkParams({ clientId: redirectClientId, kind: "plain" }), pageUrl: PUBLIC_PAGE, now: NOW,
+    }), "R1", /21 credential queries/);
+    refusesWith("a plain request with no response_type", await Oid4vp.checkRequest({
+        plain: Object.assign({}, plainParams, { response_type: undefined }),
+        link: linkParams({ clientId: redirectClientId, kind: "plain" }), pageUrl: PUBLIC_PAGE, now: NOW,
+    }), "R11", /section 5.1 requires it/);
+    const plainWithLinkFindings = await Oid4vp.checkRequest({
+        plain: plainParams,
+        link: linkParams({ clientId: redirectClientId, kind: "plain", findings: ["the link carried a parameter this page does not read."] }),
+        pageUrl: PUBLIC_PAGE, now: NOW,
+    });
+    check("the link's own findings reach the plain request's panel too",
+        plainWithLinkFindings.ok === true
+            && plainWithLinkFindings.findings.some((finding) => finding.includes("does not read")),
+        JSON.stringify(plainWithLinkFindings.ok ? plainWithLinkFindings.findings : plainWithLinkFindings.message));
 });
 
 await section("24. the four error cases, and the button that sends one (plan 4.5, VP 8.5)", async () => {
@@ -2629,34 +2869,69 @@ await section("24. the four error cases, and the button that sends one (plan 4.5
     }
 });
 
-await section("25. the hosted request objects' shapes (plan 4.12)", async () => {
-    const eudiText = readFileSync(resolve(HOSTED_DIR, "eudi.request.jwt"), "utf8").trim();
-    check("the EUDI-shaped request object is about 23 KB, as EUDI's is", eudiText.length > 20000 && eudiText.length < 30000,
-        String(eudiText.length));
-    const eudiHash = "x509_hash:" + leafHashOf("verifier");
-    const eudi = await checkRequestOf(eudiText, { link: linkParams({ clientId: eudiHash }) });
-    equal("it passes R1-R11 under the pinned clock", [eudi.ok, eudi.error], [true, null]);
-    equal("its card shows the leaf's subject, issuer and fingerprint",
-        [eudi.card.subject.map((a) => a.short + "=" + a.value).join(", "), eudi.card.fingerprints.leaf],
-        ["C=IN, O=Inji Demo Certify, CN=Wallet Fixture Verifier", await X509.fingerprintSha256(derOf("verifier"))]);
-    equal("it raises no finding about aud or state", eudi.findings.filter((finding) => /no aud|no state/.test(finding)), []);
-    equal("its card names the client_name the verifier gives itself", eudi.card.clientName, "EUDI Reference Verifier (fixture)");
-    check("its verifier_info registration certificate is shown, labelled unverified",
-        eudi.card.verifierInfo !== null && eudi.card.verifierInfo[0].type === "registration_cert"
-            && eudi.card.verifierInfo[0].text.length > 100, JSON.stringify(eudi.card.verifierInfo && eudi.card.verifierInfo[0] && eudi.card.verifierInfo[0].text.slice(0, 40)));
-    equal("the request object is 23 KB without the page fetching anything else", eudi.request.responseMode, "direct_post.jwt");
+await section("25. the hosted verifiers' captured request objects (plan 4.12)", async () => {
+    // The real bytes: captured once by hand from the two hosted verifiers on 2026-11-16 (hosted/PROVENANCE.md), never
+    // fetched by a test. They are read under a faked clock at the capture instant, which is inside the leaves' validity.
+    const EUDI_AT = new Date("2026-11-16T05:30:33Z");
+    const MULTIPAZ_AT = new Date("2026-11-16T05:31:09Z");
+    const leafOf = (text) => {
+        const header = JSON.parse(Buffer.from(text.split(".")[0], "base64url"));
+        return X509.parse(new Uint8Array(Buffer.from(header.x5c[0], "base64")));
+    };
+    const eudiRequest = readFileSync(resolve(HOSTED_DIR, "eudi-request-get.jwt"), "utf8").trim();
+    const eudiLeaf = leafOf(eudiRequest);
+    check("the EUDI request object is about 23 KB, as the live one is", eudiRequest.length > 20000 && eudiRequest.length < 30000,
+        String(eudiRequest.length));
+    // the property the synthetic shapes missed: a 20-octet serial, which no JavaScript number holds
+    equal("its leaf carries a 20-octet serial (RFC 5280 4.1.2.2)", [eudiLeaf.serialBytes.length, eudiLeaf.serialNumber],
+        [20, "606F16D48D021AC3A3E68F2E44F636AE3B786699"]);
+    equal("its leaf's only subject alternative name is a URI, so x509_hash is the prefix that fits it",
+        eudiLeaf.sans, { dnsNames: [], uris: ["https://verifier.eudiw.dev"] });
+    const eudiHash = "x509_hash:" + createHash("sha256").update(leafOf(eudiRequest).der).digest("base64url");
+    check("and the x509_hash the capture names is the SHA-256 of that leaf",
+        eudiHash === JSON.parse(readFileSync(resolve(HOSTED_DIR, "eudi-init-get.json"), "utf8")).client_id, eudiHash);
+    const eudi = await checkRequestOf(eudiRequest, { link: linkParams({ clientId: eudiHash, scheme: "haip-vp" }), now: EUDI_AT });
+    equal("the captured EUDI JAR passes R1-R11 under the clock it was captured at", [eudi.ok, eudi.error], [true, null]);
+    equal("its card shows the leaf's subject, issuer and SHA-256", [eudi.card.subject.map((a) => a.short + "=" + a.value).join(", "),
+        eudi.card.issuer.map((a) => a.short + "=" + a.value).join(", "), eudi.card.fingerprints.leaf],
+        ["CN=Web Verifier (PROD), C=EU, O=NiScy, 2.5.4.97=LEIXG-529900T8BM49AURSDO55",
+            "CN=PID Issuer CA 02, O=EUDI Wallet Reference Implementation, C=EU",
+            await X509.fingerprintSha256(eudiLeaf.der)]);
+    equal("it raises no finding about aud, state, response_mode or its media type",
+        eudi.findings.filter((finding) => /no aud|no state|no response_mode|media type/.test(finding)), []);
+    check("its verifier_info registration certificate is decoded and shown, labelled unverified",
+        eudi.card.verifierInfo !== null && eudi.card.verifierInfo[0].format === "registration_cert"
+            && /"name": "Web Verifier \(PROD\)"/.test(eudi.card.verifierInfo[0].text),
+        JSON.stringify(eudi.card.verifierInfo && eudi.card.verifierInfo[0] && eudi.card.verifierInfo[0].text.slice(0, 60)));
+    equal("and the response mode it names is read from the object", eudi.request.responseMode, "direct_post.jwt");
 
-    const multipazText = readFileSync(resolve(HOSTED_DIR, "multipaz.request.jwt"), "utf8").trim();
-    const multipaz = await checkRequestOf(multipazText, { link: linkParams({ clientId: "x509_san_dns:verifier.example" }) });
-    equal("the Multipaz-shaped request object passes R1-R11 under the pinned clock", [multipaz.ok, multipaz.error], [true, null]);
+    const postRequest = readFileSync(resolve(HOSTED_DIR, "eudi-request-post.jwt"), "utf8").trim();
+    const posted = await checkRequestOf(postRequest, { link: linkParams({ clientId: eudiHash, scheme: "haip-vp",
+        requestUriMethod: "post", walletNonce: "capture-wallet-nonce-20261116" }), now: EUDI_AT });
+    equal("the captured post-form JAR passes R1-R11 with the wallet_nonce it echoes", [posted.ok, posted.request.walletNonce],
+        [true, "capture-wallet-nonce-20261116"]);
+    const wrongNonce = await checkRequestOf(postRequest, { link: linkParams({ clientId: eudiHash, scheme: "haip-vp",
+        requestUriMethod: "post", walletNonce: "another-nonce" }), now: EUDI_AT });
+    refusesWith("and R4 refuses it when the wallet sent another nonce", wrongNonce, "R4", /carries "capture-wallet-nonce-20261116"/);
+
+    const multipazRequest = readFileSync(resolve(HOSTED_DIR, "mp-request.jwt"), "utf8").trim();
+    const multipazLeaf = leafOf(multipazRequest);
+    equal("the Multipaz capture's leaf carries a 13-octet serial and a dNSName SAN",
+        [multipazLeaf.serialBytes.length, multipazLeaf.serialNumber, multipazLeaf.sans],
+        [13, "0CDDC57CEE96CA929BD70EE9AB", { dnsNames: ["verifier.multipaz.org"], uris: [] }]);
+    const multipaz = await checkRequestOf(multipazRequest, { link: linkParams({
+        clientId: "x509_san_dns:verifier.multipaz.org", scheme: "haip-vp" }), now: MULTIPAZ_AT });
+    equal("the captured Multipaz JAR passes R1-R11 under the clock it was captured at", [multipaz.ok, multipaz.error], [true, null]);
     check("it raises the findings plan 2.1 records: no aud and no state",
-        multipaz.ok && multipaz.findings.some((finding) => finding.startsWith("no aud"))
+        multipaz.findings.some((finding) => finding.startsWith("no aud"))
             && multipaz.findings.some((finding) => finding.startsWith("no state")), JSON.stringify(multipaz.findings));
     equal("its client_id is the x509_san_dns prefix Multipaz sends", multipaz.request.prefix, "x509_san_dns");
-    equal("its response_uri is on the client's DNS name", multipaz.card.responseUriHost, "verifier.example");
-    const stale = await checkRequestOf(multipazText, { link: linkParams({ clientId: "x509_san_dns:verifier.example" }),
-        now: new Date("2027-06-01T00:00:00Z") });
-    refusesWith("the same Multipaz-shaped object a year later", stale, "R5", /expired at/);
+    equal("its response_uri is on the client's DNS name", multipaz.card.responseUriHost, "verifier.multipaz.org");
+    equal("and its leaf's critical extendedKeyUsage is read as a known extension, not an unknown one",
+        multipazLeaf.unknownCritical, []);
+    const stale = await checkRequestOf(multipazRequest, { link: linkParams({ clientId: "x509_san_dns:verifier.multipaz.org",
+        scheme: "haip-vp" }), now: new Date("2027-06-01T00:00:00Z") });
+    refusesWith("the same captured object three months after its leaf expired", stale, "R10", /is expired/);
 });
 
 await section("26. an x5chain only in the protected header is refused (ISO 18013-5 9.1.2.4)", async () => {
@@ -2752,7 +3027,8 @@ await section("27. the wallet page takes a request in (plan 4.4, I9)", async () 
     const plain = openWallet(new FakeIndexedDB(), { clock: NOW });
     await waitFor(() => plain.el("readRequest").disabled === false);
     plain.el("requestText").value = "openid4vp://?client_id=" + encodeURIComponent("redirect_uri:https://verifier.example/response")
-        + "&response_uri=" + encodeURIComponent("https://verifier.example/response") + "&nonce=n1&state=s1&dcql_query="
+        + "&response_uri=" + encodeURIComponent("https://verifier.example/response") + "&nonce=n1&state=s1"
+        + "&response_type=vp_token&response_mode=direct_post&dcql_query="
         + encodeURIComponent(JSON.stringify({ credentials: [] }));
     await plain.el("readRequest").fire("click");
     check("a redirect_uri: link's plain parameters reach a card with no certificate",
@@ -2770,6 +3046,33 @@ await section("27. the wallet page takes a request in (plan 4.4, I9)", async () 
     equal("with the wallet switched off (I4) the page reads no request at all",
         off.requests.filter((request) => request.url !== "https://credentials.example/v1/certify/offer/wallet/config").length, 0);
     check("and it says so", off.el("storageStatus").textContent.includes("switched off"), off.el("storageStatus").textContent);
+    equal("the address bar is left clean all the same, so a reload cannot replay the link", off.replacedUrls,
+        ["/v1/certify/offer/wallet"]);
+    equal("and the paste field and its button are off together with the switch",
+        [off.el("requestText").disabled, off.el("readRequest").disabled], [true, true]);
+
+    // no IndexedDB at all: there is nothing a presentation could take from, but the verifier's same-device invocation is
+    // still read, and the address bar is still cleared before anything else (plan 4.4: the request object is single use)
+    const noStoreUri = "https://verifier.example/request.jwt/3";
+    const noStore = openWallet(undefined, {
+        clock: NOW,
+        pageUrl: "https://credentials.example/v1/certify/offer/wallet?client_id=x509_san_dns:verifier.example&request_uri="
+            + encodeURIComponent(noStoreUri),
+        respond: (request) => (request.url === noStoreUri
+            ? { status: 200, body: text, contentType: "application/oauth-authz-req+jwt" } : undefined),
+    });
+    check("the wallet page's scripts ran without a store", noStore.scriptError === null,
+        noStore.scriptError && String(noStore.scriptError.stack));
+    const readWithoutStore = await waitFor(() => noStore.el("verifierCard").hidden === false);
+    check("with IndexedDB unavailable the same-device invocation is still read and its card shown",
+        readWithoutStore, noStore.el("intakeStatus").textContent);
+    equal("the page said why nothing can be kept", /IndexedDB is unavailable/.test(noStore.el("storageStatus").textContent), true);
+    equal("and the invocation left the address bar before the request was fetched", noStore.replacedUrls,
+        ["/v1/certify/offer/wallet"]);
+    equal("the request object was fetched once, and nothing else was requested",
+        noStore.requests.filter((request) => request.url === noStoreUri).length, 1);
+    equal("the paste field and its button are off together, as with the switch off",
+        [noStore.el("requestText").disabled, noStore.el("readRequest").disabled], [true, true]);
 });
 
 } finally {

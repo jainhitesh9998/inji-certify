@@ -27,13 +27,13 @@
   var busy = 0;
   // the blob URL of the portrait the details view last rendered, released when another one replaces it
   var portraitObjectUrls = [];
-  // P5-03c: what `GET offer/wallet/config` published (the relay's host allow-list), the request_uris this page has
-  // already fetched (a request object is read once, plan 4.4), and the request the card is showing
-  var relayHosts = [];
+  // P5-03c: the request_uris this page has already fetched (a request object is read once, plan 4.4), the request the
+  // card is showing, and whether the intake can be used at all: with the wallet switched off, or with no IndexedDB to
+  // hold what a presentation would take from, the paste field and its button stay off together
   var fetchedRequestUris = new Set();
   var pendingRequest = null;
   var pendingErrorResponse = null;
-  var WALLET_URL = location.origin + location.pathname.replace(/\/+$/, "");
+  var intakeUsable = true;
 
   function status(id, message, ok) {
     var node = el(id);
@@ -63,7 +63,9 @@
   function syncControls() {
     el("deleteAll").disabled = busy > 0 || db === null || records.length === 0;
     el("delete").disabled = busy > 0 || db === null || selected === null;
-    el("readRequest").disabled = busy > 0;
+    var intakeOff = busy > 0 || !intakeUsable;
+    el("readRequest").disabled = intakeOff;
+    if (el("requestText") !== null) el("requestText").disabled = intakeOff;
   }
 
   function renderList() {
@@ -332,8 +334,7 @@
   /**
    * I4: the wallet's own switch decides whether this browser stores anything. The page is meant to be reached at
    * `offer/wallet`, which answers 404 with the switch off; asking `wallet/config` (the endpoint the offer page asks
-   * too) before opening the store keeps that true whatever path served these bytes. The same answer carries the relay's
-   * host allow-list (P5-03f): a verifier on it is read through the relay and never directly (plan 4.4).
+   * too) before opening the store keeps that true whatever path served these bytes.
    */
   async function readWalletConfig() {
     var answer;
@@ -343,14 +344,7 @@
       return { enabled: false };
     }
     if (answer.status !== 200) return { enabled: false };
-    var document = null;
-    try {
-      document = JSON.parse(await answer.text());
-    } catch (e) {
-      document = null;
-    }
-    var hosts = document && document.relay && Array.isArray(document.relay.hosts) ? document.relay.hosts : [];
-    return { enabled: true, relayHosts: hosts.map(function (host) { return String(host); }) };
+    return { enabled: true };
   }
 
   /* ---------------------------------------------------------------- request intake (P5-03c) */
@@ -489,8 +483,6 @@
           method: link.params.requestUriMethod,
           walletNonce: walletNonce,
           pageUrl: new URL(location.href),
-          relayHosts: relayHosts,
-          relayUrl: WALLET_URL + "/relay",
           fetched: fetchedRequestUris,
           fetchImpl: fetch,
         });
@@ -585,29 +577,32 @@
    */
   (async function start() {
     renderList();
+    // ahead of the store: a verifier's same-device invocation is the one thing a page with no store can still do, and
+    // its parameters must leave the address bar whatever happens next (plan 4.4)
+    var query = invocationQuery();
+    if (query !== null) forgetInvocation();
     if (typeof WalletStore === "undefined" || !WalletStore.available()) {
+      intakeUsable = false;
       status("storageStatus", "This browser cannot keep credentials: IndexedDB is unavailable.", false);
       el("empty").hidden = false;
+      syncControls();
+      if (query !== null) await readRequest(location.origin + location.pathname + "?" + query);
       return;
     }
     setBusy(true);
-    var query = null;
     try {
       var config = await readWalletConfig();
       if (!config.enabled) {
+        intakeUsable = false;
         status("storageStatus", "The demo wallet is switched off on this deployment, so nothing is kept in this browser.", false);
         el("empty").hidden = false;
         return;
       }
-      relayHosts = config.relayHosts || [];
-      // ahead of the store: a verifier's same-device invocation must be read, and its parameters taken out of the
-      // address bar, whatever the store does next
-      query = invocationQuery();
-      if (query !== null) forgetInvocation();
       try {
         db = await connect();
         await refresh();
       } catch (e) {
+        intakeUsable = false;
         status("storageStatus", "This browser could not open its credential store: " + e.message, false);
       }
       if (query !== null) await readRequest(location.origin + location.pathname + "?" + query);

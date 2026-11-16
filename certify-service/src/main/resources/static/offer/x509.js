@@ -30,7 +30,9 @@ var X509 = (function () {
    * One DER element at `offset`: its class, tag number, constructed bit and the boundaries of its header and content.
    * The high-tag-number form (tag number 31) is refused: no field of a certificate uses it, and refusing it keeps a
    * tag's identity one byte. An indefinite length is refused too: that is BER, and DER requires the length to be
-   * definite (X.690 sections 10.1 and 9.1).
+   * definite (X.690 sections 10.1 and 9.1). The long form must be the *shortest* encoding of its length (section 10.1:
+   * "the minimum number of octets shall be used"), so a long-form length below 128, or one padded with a leading 0x00
+   * octet, is refused as well: the same value has two spellings, and a signature is checked over these bytes.
    */
   function element(bytes, offset) {
     var first = bytes[offset];
@@ -50,11 +52,15 @@ var X509 = (function () {
     } else {
       var count = octet & 0x7f;
       if (count > 3) throw new Error("a DER length longer than three octets");
+      if (bytes[pos] === 0x00) throw new Error("a DER length carries a leading 0x00 octet (X.690 section 10.1)");
       length = 0;
       for (var i = 0; i < count; i++) {
         var byte = bytes[pos++];
         if (byte === undefined) throw new Error("a DER length is truncated");
         length = length * 256 + byte;
+      }
+      if (count === 1 && length < 0x80) {
+        throw new Error("a DER length below 128 uses the long form (X.690 section 10.1)");
       }
     }
     var end = pos + length;
@@ -110,6 +116,31 @@ var X509 = (function () {
     return [x, first - 40 * x].concat(arcs).join(".");
   }
 
+  /**
+   * A non-negative INTEGER's content octets, without the 0x00 pad DER puts in front of a value whose top bit is set
+   * (X.690 section 8.3.2), and with the minimal encoding DER requires. The version and a pathLenConstraint are read
+   * through `integer()` below; a serial is kept as these octets, because it may be 20 of them and no JavaScript number
+   * holds that (RFC 5280 section 4.1.2.2).
+   */
+  function integerOctets(bytes, el) {
+    requireTag(el, UNIVERSAL, 2, "an INTEGER");
+    var value = content(bytes, el);
+    if (!value.length) throw new Error("an INTEGER is empty");
+    if (value[0] & 0x80) throw new Error("a negative INTEGER where none is allowed");
+    if (value.length > 1 && value[0] === 0x00) {
+      if (!(value[1] & 0x80)) throw new Error("an INTEGER carries a non-minimal leading 0x00 octet (X.690 section 8.3.2)");
+      return value.subarray(1);
+    }
+    return value;
+  }
+
+  /** Those octets as uppercase hex, two characters per octet (how every other tool prints a serial). */
+  function hexOctets(value) {
+    var text = "";
+    for (var i = 0; i < value.length; i++) text += (value[i] < 16 ? "0" : "") + value[i].toString(16).toUpperCase();
+    return text;
+  }
+
   /** A non-negative INTEGER as a number, refusing what does not fit one (no field the page reads is that large). */
   function integer(bytes, el) {
     requireTag(el, UNIVERSAL, 2, "an INTEGER");
@@ -146,7 +177,11 @@ var X509 = (function () {
     "1.2.840.113549.1.9.1": "emailAddress", "0.9.2342.19200300.100.1.25": "DC",
   };
 
-  /** A DirectoryString/IA5String's text, by the string type's own tag (X.680 section 30, X.690 section 8.20). */
+  /**
+   * A DirectoryString/IA5String's text, by the string type's own tag (X.680 section 30, X.690 section 8.20).
+   * `DirectoryString` is `teletexString / printableString / universalString / utf8String / bmpString`; a certificate
+   * also writes numericString and IA5String where a name attribute is free-form, so both are read here.
+   */
   function directoryString(bytes, el) {
     var value = content(bytes, el);
     var text;
@@ -154,12 +189,22 @@ var X509 = (function () {
       case 12: // UTF8String
         text = new TextDecoder("utf-8", { fatal: true }).decode(value);
         break;
+      case 18: // NumericString: the digits and the space, one per octet (X.680 section 41)
       case 19: // PrintableString
       case 20: // TeletexString: read as latin1, which is what every certificate that uses it means
       case 22: // IA5String
       case 26: // VisibleString
         text = "";
         for (var i = 0; i < value.length; i++) text += String.fromCharCode(value[i]);
+        break;
+      case 28: // UniversalString: UCS-4, four octets per code point, big endian (X.690 section 8.23.8)
+        text = "";
+        if (value.length % 4) throw new Error("a UniversalString is not a whole number of code points");
+        for (var k = 0; k < value.length; k += 4) {
+          var point = ((value[k] << 24) | (value[k + 1] << 16) | (value[k + 2] << 8) | value[k + 3]) >>> 0;
+          if (point > 0x10ffff) throw new Error("a UniversalString carries a code point beyond Unicode");
+          text += String.fromCodePoint(point);
+        }
         break;
       case 30: // BMPString: UTF-16BE
         text = "";
@@ -229,6 +274,32 @@ var X509 = (function () {
   };
 
   /**
+   * The extension types this page knows, critical or not. RFC 5280 section 4.2 defines these, and every other critical
+   * extension is refused: section 6.1.3 (g) says a certificate with an unrecognised critical extension MUST be
+   * rejected, because that extension may constrain the certificate in a way the reader cannot honour. The hosted
+   * captures are why the list is longer than the five extensions the page reads: Multipaz's leaf marks its
+   * extendedKeyUsage critical, and EUDI's marks its basicConstraints and keyUsage critical. A known extension the page
+   * reads nothing from decides nothing; it just does not end the path.
+   */
+  var KNOWN_EXTENSIONS = [
+    "2.5.29.14", // subjectKeyIdentifier
+    "2.5.29.15", // keyUsage
+    "2.5.29.17", // subjectAltName
+    "2.5.29.19", // basicConstraints
+    "2.5.29.30", // nameConstraints
+    "2.5.29.31", // cRLDistributionPoints
+    "2.5.29.32", // certificatePolicies
+    "2.5.29.33", // policyMappings
+    "2.5.29.35", // authorityKeyIdentifier
+    "2.5.29.36", // policyConstraints
+    "2.5.29.37", // extKeyUsage
+    "2.5.29.46", // freshestCRL
+    "2.5.29.54", // inhibitAnyPolicy
+    "1.3.6.1.5.5.7.1.1", // authorityInfoAccess
+    "1.3.6.1.5.5.7.1.11", // subjectInfoAccess
+  ];
+
+  /**
    * The GeneralNames the page reads: dNSName [2] and URI [6], both IA5String (RFC 5280 section 4.2.1.6). `extnValue`
    * is the extension's OCTET STRING content, and every offset below is relative to it: a certificate's extension is
    * its own small DER document, so it is read as one.
@@ -246,7 +317,11 @@ var X509 = (function () {
     return sans;
   }
 
-  /** The extensions of a certificate, by OID, each with the DER of its own extnValue octets. */
+  /**
+   * The extensions of a certificate, by OID, each with the DER of its own extnValue octets and its criticality flag
+   * (RFC 5280 section 4.2: `Extension ::= SEQUENCE { extnID, critical BOOLEAN DEFAULT FALSE, extnValue OCTET STRING }`,
+   * so the BOOLEAN is there only when it is TRUE).
+   */
   function extensions(bytes, list) {
     var found = new Map();
     list.forEach(function (extension) {
@@ -254,16 +329,29 @@ var X509 = (function () {
       var parts = children(bytes, extension);
       if (parts.length < 2) throw new Error("an Extension has fewer than two elements");
       var id = oid(bytes, parts[0]);
+      var critical = false;
       var value = parts[parts.length - 1];
+      if (parts.length === 3) {
+        requireTag(parts[1], UNIVERSAL, 1, "a critical flag");
+        var flag = content(bytes, parts[1]);
+        if (flag.length !== 1 || (flag[0] !== 0x00 && flag[0] !== 0xff)) {
+          throw new Error("a critical flag is not the DER BOOLEAN it has to be (X.690 section 11.1)");
+        }
+        critical = flag[0] === 0xff;
+      }
       requireTag(value, UNIVERSAL, 4, "an extnValue");
-      found.set(id, content(bytes, value));
+      found.set(id, { value: content(bytes, value), critical: critical });
     });
     return found;
   }
 
   /* ---------------------------------------------------------------- the certificate */
 
-  /** The signature algorithms a certificate may name here, and the WebCrypto parameters each one needs. */
+  /**
+   * The signature algorithms a certificate may name here, and the WebCrypto parameters each one needs. RSA-PSS
+   * (`rsassaPss`) carries its hash, mask generation function and salt length in the algorithm's own parameters, so
+   * those are read from the certificate (RFC 4055 section 3.1) rather than fixed here.
+   */
   var SIGNATURE_ALGORITHMS = {
     "1.2.840.10045.4.3.2": { kind: "ec", hash: "SHA-256" },      // ecdsa-with-SHA256
     "1.2.840.10045.4.3.3": { kind: "ec", hash: "SHA-384" },      // ecdsa-with-SHA384
@@ -271,7 +359,15 @@ var X509 = (function () {
     "1.2.840.113549.1.1.11": { kind: "rsa", hash: "SHA-256" },   // sha256WithRSAEncryption
     "1.2.840.113549.1.1.12": { kind: "rsa", hash: "SHA-384" },   // sha384WithRSAEncryption
     "1.2.840.113549.1.1.13": { kind: "rsa", hash: "SHA-512" },   // sha512WithRSAEncryption
+    "1.2.840.113549.1.1.10": { kind: "pss" },                     // rsassaPss (RFC 4055 section 3.1)
   };
+
+  /** The digests an RSASSA-PSS-params may name, by OID, and their WebCrypto names (RFC 4055 section 2.1). */
+  var DIGESTS = {
+    "1.3.14.3.2.26": "SHA-1", "2.16.840.1.101.3.4.2.4": "SHA-224", "2.16.840.1.101.3.4.2.1": "SHA-256",
+    "2.16.840.1.101.3.4.2.2": "SHA-384", "2.16.840.1.101.3.4.2.3": "SHA-512",
+  };
+  var OID_MGF1 = "1.2.840.113549.1.1.8";
 
   var CURVE_OIDS = {
     "1.2.840.10045.3.1.7": "P-256", "1.3.132.0.34": "P-384", "1.3.132.0.35": "P-521",
@@ -282,8 +378,13 @@ var X509 = (function () {
 
   /**
    * One certificate, read from its DER (RFC 5280 section 4.1):
-   * `{der, subject, issuer, notBefore, notAfter, serialNumber, version, sans, ca, pathLength, keyUsageText, ski, aki,
-   * spki, publicKey, signatureAlgorithm, tbs, signatureValue, selfIssued}`.
+   * `{der, subject, issuer, notBefore, notAfter, serialNumber, serialBytes, version, sans, ca, pathLength, keyUsage,
+   * keyUsagePresent, keyUsageText, unknownCritical, ski, aki, spki, publicKey, signatureAlgorithm,
+   * signatureAlgorithmDer, tbs, tbsSignatureAlgorithm, tbsSignatureAlgorithmDer, signatureValue, selfIssued}`.
+   *
+   * `serialNumber` is the upper-case hex of the serial's octets, never a number: RFC 5280 section 4.1.2.2 allows up to
+   * 20 octets, and both of the hosted captures' certificates carry serials no JavaScript number holds (EUDI's is 20
+   * octets, Multipaz's 13). `serialBytes` is the same value unpadded, which is what the card can show.
    *
    * `selfIssued` is the Name comparison only (RFC 5280 section 4.1.2.4); whether the certificate really signed itself
    * is `verifyIssuedBy(certificate, certificate)`, which is what the trust-path check asks.
@@ -308,8 +409,12 @@ var X509 = (function () {
       version = integer(bytes, children(bytes, fields[0])[0]) + 1;
       index = 1;
     }
-    var serialNumber = integer(bytes, fields[index++]);
-    var tbsSignature = oid(bytes, children(bytes, requireTag(fields[index++], UNIVERSAL, 16, "a signature"))[0]);
+    var serialBytes = integerOctets(bytes, fields[index++]);
+    var serialNumber = hexOctets(serialBytes);
+    // the TBS's own AlgorithmIdentifier, kept whole so that two spellings of the same OID - RSA-PSS's parameters
+    // differ per hash and salt length - compare as the certificate wrote them (RFC 5280 section 4.1.1.2)
+    var tbsSignatureElement = requireTag(fields[index++], UNIVERSAL, 16, "a signature");
+    var tbsSignature = oid(bytes, children(bytes, tbsSignatureElement)[0]);
     var issuerName = name(bytes, requireTag(fields[index++], UNIVERSAL, 16, "an issuer"));
     var validity = children(bytes, requireTag(fields[index++], UNIVERSAL, 16, "a Validity"));
     if (validity.length !== 2) throw new Error("a Validity is not a pair of times");
@@ -333,12 +438,12 @@ var X509 = (function () {
 
     var sans = { dnsNames: [], uris: [] };
     if (found.has(EXTENSION.subjectAltName)) {
-      sans = generalNames(found.get(EXTENSION.subjectAltName));
+      sans = generalNames(found.get(EXTENSION.subjectAltName).value);
     }
     var ca = false;
     var pathLength = null;
     if (found.has(EXTENSION.basicConstraints)) {
-      var constraintsValue = found.get(EXTENSION.basicConstraints);
+      var constraintsValue = found.get(EXTENSION.basicConstraints).value;
       children(constraintsValue, element(constraintsValue, 0)).forEach(function (member) {
         if (member.cls === UNIVERSAL && member.tag === 1) ca = content(constraintsValue, member)[0] !== 0;
         if (member.cls === UNIVERSAL && member.tag === 2) pathLength = integer(constraintsValue, member);
@@ -346,29 +451,33 @@ var X509 = (function () {
     }
     var ski = null;
     if (found.has(EXTENSION.subjectKeyIdentifier)) {
-      var skiValue = found.get(EXTENSION.subjectKeyIdentifier);
+      var skiValue = found.get(EXTENSION.subjectKeyIdentifier).value;
       ski = content(skiValue, element(skiValue, 0));
     }
     var aki = null;
     if (found.has(EXTENSION.authorityKeyIdentifier)) {
       // AuthorityKeyIdentifier ::= SEQUENCE { keyIdentifier [0] IMPLICIT OCTET STRING OPTIONAL, ... }
-      var akiValue = found.get(EXTENSION.authorityKeyIdentifier);
+      var akiValue = found.get(EXTENSION.authorityKeyIdentifier).value;
       children(akiValue, element(akiValue, 0)).forEach(function (member) {
         if (member.cls === CONTEXT && member.tag === 0 && aki === null) aki = content(akiValue, member);
       });
     }
-    var keyUsageText = "";
-    if (found.has(EXTENSION.keyUsage)) {
-      var usageValue = found.get(EXTENSION.keyUsage);
+    var keyUsagePresent = found.has(EXTENSION.keyUsage);
+    var keyUsage = [];
+    if (keyUsagePresent) {
+      // KeyUsage ::= BIT STRING, named by bit position (RFC 5280 section 4.2.1.3)
+      var usageValue = found.get(EXTENSION.keyUsage).value;
       var bits = content(usageValue, element(usageValue, 0));
       var names = ["digitalSignature", "nonRepudiation", "keyEncipherment", "dataEncipherment", "keyAgreement",
         "keyCertSign", "cRLSign", "encipherOnly", "decipherOnly"];
-      var text = [];
       for (var bit = 0; bit < names.length; bit++) {
-        if (bits.length > 1 + (bit >> 3) && (bits[1 + (bit >> 3)] & (0x80 >> (bit & 7)))) text.push(names[bit]);
+        if (bits.length > 1 + (bit >> 3) && (bits[1 + (bit >> 3)] & (0x80 >> (bit & 7)))) keyUsage.push(names[bit]);
       }
-      keyUsageText = text.join(", ");
     }
+    var unknownCritical = [];
+    found.forEach(function (extension, id) {
+      if (extension.critical && KNOWN_EXTENSIONS.indexOf(id) < 0) unknownCritical.push(id);
+    });
 
     var signatureAlgorithm = oid(bytes, children(bytes, signatureAlgorithmElement)[0]);
     var publicKey = publicKeyInfo(bytes, spkiElement);
@@ -381,6 +490,7 @@ var X509 = (function () {
       der: bytes,
       version: version,
       serialNumber: serialNumber,
+      serialBytes: serialBytes,
       subject: subjectName,
       issuer: issuerName,
       notBefore: notBefore,
@@ -388,13 +498,18 @@ var X509 = (function () {
       sans: sans,
       ca: ca,
       pathLength: pathLength,
-      keyUsageText: keyUsageText,
+      keyUsage: keyUsage,
+      keyUsagePresent: keyUsagePresent,
+      keyUsageText: keyUsage.join(", "),
+      unknownCritical: unknownCritical,
       ski: ski,
       aki: aki,
       spki: bytes.subarray(spkiElement.start, spkiElement.end),
       publicKey: publicKey,
       signatureAlgorithm: signatureAlgorithm,
+      signatureAlgorithmDer: bytes.subarray(signatureAlgorithmElement.start, signatureAlgorithmElement.end),
       tbsSignatureAlgorithm: tbsSignature,
+      tbsSignatureAlgorithmDer: bytes.subarray(tbsSignatureElement.start, tbsSignatureElement.end),
       tbs: bytes.subarray(tbsElement.start, tbsElement.end),
       signatureValue: signatureValue.subarray(1),
       selfIssued: sameName,
@@ -457,9 +572,17 @@ var X509 = (function () {
   /**
    * Whether `signature` is `certificate`'s signature over `signingInput` under `alg`. An ECDSA JWS signature is `r || s`
    * raw (RFC 7518 section 3.4), which is what WebCrypto returns and expects; a certificate's own ECDSA signature is the
-   * DER SEQUENCE (RFC 3279 section 2.2.3), which `derEcdsaToRaw` converts.
+   * DER SEQUENCE (RFC 3279 section 2.2.3), which `derEcdsaToRaw` converts. An RSA key below 2048 bits is refused before
+   * the signature is tried: RFC 7518 section 3.3 requires 2048 or more for RS256 and PS256, and WebCrypto would happily
+   * verify a 1024-bit signature that the specification does not allow.
    */
   async function verifyJws(signingInput, signature, certificate, alg) {
+    var spec = JWS_ALGORITHMS[alg];
+    if (spec !== undefined && spec.kind === "rsa" && certificate.publicKey.kind === "rsa"
+        && certificate.publicKey.bits < 2048) {
+      throw new Error("the leaf certificate's RSA key is " + certificate.publicKey.bits + " bits; RFC 7518 section 3.3 "
+        + "requires 2048 or more for " + alg);
+    }
     var imported;
     try {
       imported = await importPublicKey(certificate.spki, alg);
@@ -478,17 +601,29 @@ var X509 = (function () {
     }
   }
 
-  /** An ECDSA signature in DER (`SEQUENCE { INTEGER r, INTEGER s }`) as the fixed-width `r || s` WebCrypto expects. */
+  /**
+   * An ECDSA signature in DER (`SEQUENCE { INTEGER r, INTEGER s }`) as the fixed-width `r || s` WebCrypto expects
+   * (RFC 3279 section 2.2.3, RFC 7518 section 3.4). The DER is held to its own rules: the SEQUENCE is the whole input,
+   * both integers are non-empty and positive (X.690 sections 8.3.1 and 8.3.2), and each is at most as wide as the curve
+   * it belongs to. A signature that is two unequal spellings of the same value would otherwise verify twice.
+   */
   function derEcdsaToRaw(der, width) {
     var outer = element(der, 0);
     requireTag(outer, UNIVERSAL, 16, "an ECDSA signature");
+    if (outer.end !== der.length) throw new Error("an ECDSA signature is not exactly one SEQUENCE");
     var pair = children(der, outer);
     if (pair.length !== 2) throw new Error("an ECDSA signature is not a pair of integers");
     var raw = new Uint8Array(width * 2);
     [pair[0], pair[1]].forEach(function (part, index) {
       var value = content(der, requireTag(part, UNIVERSAL, 2, "an ECDSA signature integer"));
+      if (!value.length) throw new Error("an ECDSA signature integer is empty");
+      if (value[0] & 0x80) throw new Error("an ECDSA signature integer is negative");
       var first = 0;
       while (first < value.length - 1 && value[first] === 0) first++;
+      if (first > 0 && !(value[first] & 0x80)) {
+        throw new Error("an ECDSA signature integer is not minimal (X.690 section 8.3.2)");
+      }
+      if (value.length === 1 && value[0] === 0) throw new Error("an ECDSA signature integer is zero");
       var significant = value.subarray(first);
       if (significant.length > width) throw new Error("an ECDSA signature integer is wider than its curve");
       raw.set(significant, index * width + (width - significant.length));
@@ -499,9 +634,63 @@ var X509 = (function () {
   var CURVE_WIDTH = { "P-256": 32, "P-384": 48, "P-521": 66 };
 
   /**
+   * An RSASSA-PSS AlgorithmIdentifier's parameters (RFC 4055 section 3.1):
+   * `RSASSA-PSS-params ::= SEQUENCE { hashAlgorithm [0] HashAlgorithm DEFAULT sha1, maskGenAlgorithm [1] MaskGenAlgorithm
+   * DEFAULT mgf1SHA1, saltLength [2] INTEGER DEFAULT 20, trailerField [3] TrailerField DEFAULT trailerFieldBC }`.
+   * Absent parameters mean all four defaults, so a certificate may name the algorithm with no parameters at all.
+   */
+  function pssParameters(bytes, algorithm) {
+    var spec = { hash: "SHA-1", mgfHash: "SHA-1", saltLength: 20 };
+    if (algorithm.length < 2) return spec;
+    var parameters = requireTag(algorithm[1], UNIVERSAL, 16, "RSASSA-PSS-params");
+    children(bytes, parameters).forEach(function (member) {
+      if (member.cls !== CONTEXT) throw new Error("an RSASSA-PSS-params field has the wrong DER class");
+      var inner = childOf(bytes, member, "an RSASSA-PSS-params field");
+      if (member.tag === 0) {
+        spec.hash = digestOf(bytes, inner);
+      } else if (member.tag === 1) {
+        // MGF1's parameters are the digest's AlgorithmIdentifier itself (RFC 4055 section 2.1: MGF1Parameters ::=
+        // HashAlgorithm), not a SEQUENCE around it
+        var mgf = children(bytes, requireTag(inner, UNIVERSAL, 16, "a maskGenAlgorithm"));
+        if (oid(bytes, mgf[0]) !== OID_MGF1) throw new Error("the RSASSA-PSS mask generation function is not MGF1");
+        if (mgf.length < 2) throw new Error("MGF1 names no digest");
+        spec.mgfHash = digestOf(bytes, mgf[1]);
+      } else if (member.tag === 2) {
+        spec.saltLength = integer(bytes, inner);
+      } else if (member.tag === 3) {
+        if (integer(bytes, inner) !== 1) throw new Error("the RSASSA-PSS trailerField is not 1 (RFC 4055 section 3.1)");
+      } else {
+        throw new Error("an RSASSA-PSS-params field the structure does not define");
+      }
+    });
+    if (spec.mgfHash !== spec.hash) {
+      throw new Error("RSASSA-PSS uses MGF1 with " + spec.mgfHash + " over a " + spec.hash + " digest, which this page "
+        + "does not verify");
+    }
+    if (spec.saltLength < 0) throw new Error("the RSASSA-PSS salt length is negative");
+    return spec;
+  }
+
+  /** The one element a context-specific EXPLICIT field wraps. */
+  function childOf(bytes, el, what) {
+    var wrapped = children(bytes, el);
+    if (wrapped.length !== 1) throw new Error(what + " is not one EXPLICIT value");
+    return wrapped[0];
+  }
+
+  /** The digest an AlgorithmIdentifier names, as the hash's WebCrypto name (RFC 4055 section 2.1). */
+  function digestOf(bytes, el) {
+    var parts = children(bytes, requireTag(el, UNIVERSAL, 16, "a digest AlgorithmIdentifier"));
+    var id = oid(bytes, parts[0]);
+    if (DIGESTS[id] === undefined) throw new Error("the digest " + id + " is not one this page reads");
+    return DIGESTS[id];
+  }
+
+  /**
    * Whether `issuer` issued `certificate`: the algorithm, then the signature over the TBSCertificate with the issuer's
-   * key (RFC 5280 section 6.1.3 (a)(1)). The outer `signatureAlgorithm` must be the one the TBS names, or the
-   * certificate says two different things about how it was signed (RFC 5280 section 4.1.1.2) and is refused.
+   * key (RFC 5280 section 6.1.3 (a)(1)). The outer `signatureAlgorithm` must be the AlgorithmIdentifier the TBS names,
+   * parameters included, or the certificate says two different things about how it was signed (RFC 5280 section
+   * 4.1.1.2) and is refused: with RSA-PSS those parameters are the hash and the salt length.
    */
   async function verifyIssuedBy(certificate, issuer) {
     var spec = SIGNATURE_ALGORITHMS[certificate.signatureAlgorithm];
@@ -509,7 +698,8 @@ var X509 = (function () {
       throw new Error("the certificate is signed with " + certificate.signatureAlgorithm
         + ", which this page does not verify");
     }
-    if (certificate.tbsSignatureAlgorithm !== certificate.signatureAlgorithm) {
+    if (certificate.tbsSignatureAlgorithm !== certificate.signatureAlgorithm
+        || !bytesEqual(certificate.tbsSignatureAlgorithmDer, certificate.signatureAlgorithmDer)) {
       throw new Error("the certificate's outer and inner signature algorithms differ (RFC 5280 section 4.1.1.2)");
     }
     var key;
@@ -525,12 +715,58 @@ var X509 = (function () {
       signature = derEcdsaToRaw(certificate.signatureValue, CURVE_WIDTH[issuer.publicKey.curve]);
     } else {
       if (issuer.publicKey.kind !== "rsa") throw new Error("an RSA certificate is signed by a non-RSA key");
-      key = await crypto.subtle.importKey("spki", issuer.spki, { name: "RSASSA-PKCS1-v1_5", hash: spec.hash }, false,
-        ["verify"]);
-      parameters = { name: "RSASSA-PKCS1-v1_5" };
       signature = certificate.signatureValue;
+      if (spec.kind === "pss") {
+        var pss = pssParameters(certificate.signatureAlgorithmDer, children(certificate.signatureAlgorithmDer,
+          element(certificate.signatureAlgorithmDer, 0)));
+        key = await crypto.subtle.importKey("spki", issuer.spki, { name: "RSA-PSS", hash: pss.hash }, false,
+          ["verify"]);
+        parameters = { name: "RSA-PSS", saltLength: pss.saltLength };
+      } else {
+        key = await crypto.subtle.importKey("spki", issuer.spki, { name: "RSASSA-PKCS1-v1_5", hash: spec.hash },
+          false, ["verify"]);
+        parameters = { name: "RSASSA-PKCS1-v1_5" };
+      }
     }
     return await crypto.subtle.verify(parameters, key, signature, certificate.tbs);
+  }
+
+  /* ---------------------------------------------------------------- what a path member must be */
+
+  /**
+   * RFC 5280 sections 6.1.3 (g) and 6.1.4, on one certificate of a path: what its own extensions have to say about
+   * the role the chain gives it. `position` is its index in `x5c`, the leaf being 0.
+   *
+   * - every certificate that issues another must be a CA (basicConstraints cA=TRUE) and, when it carries a keyUsage at
+   *   all, must assert keyCertSign (sections 4.2.1.3 and 6.1.4 (k));
+   * - a pathLenConstraint bounds how many non-self-issued intermediate CA certificates may follow it (section 4.2.1.9);
+   *   with `position` certificates below it, `position - 1` of them are intermediate CAs;
+   * - a critical extension the page does not recognise ends the path (section 6.1.3 (g)).
+   *
+   * Returns the sentence that says what is wrong, or null.
+   */
+  function certificateFault(certificate, position) {
+    var subject = certificate.subject.text;
+    if (certificate.unknownCritical.length) {
+      return "x5c certificate " + position + " (" + subject + ") marks " + certificate.unknownCritical.join(", ")
+        + " critical, and this page does not read " + (certificate.unknownCritical.length > 1 ? "them" : "it")
+        + " (RFC 5280 sections 4.2 and 6.1.3 (g)).";
+    }
+    if (position === 0) return null;
+    if (!certificate.ca) {
+      return "x5c certificate " + position + " (" + subject + ") is not a CA: basicConstraints cA=TRUE is required of "
+        + "a certificate that issues another (RFC 5280 sections 4.2.1.9 and 6.1.4 (k)).";
+    }
+    if (certificate.keyUsagePresent && certificate.keyUsage.indexOf("keyCertSign") < 0) {
+      return "x5c certificate " + position + " (" + subject + ") has a keyUsage without keyCertSign, so it may not "
+        + "sign certificates (RFC 5280 sections 4.2.1.3 and 6.1.4 (k)).";
+    }
+    if (certificate.pathLength !== null && position - 1 > certificate.pathLength) {
+      return "x5c certificate " + position + " (" + subject + ") permits " + certificate.pathLength
+        + " intermediate CA certificate(s) below it and the chain has " + (position - 1) + " (RFC 5280 section "
+        + "4.2.1.9, pathLenConstraint).";
+    }
+    return null;
   }
 
   /* ---------------------------------------------------------------- display */
@@ -556,11 +792,13 @@ var X509 = (function () {
     importPublicKey: importPublicKey,
     verifyJws: verifyJws,
     verifyIssuedBy: verifyIssuedBy,
+    certificateFault: certificateFault,
     fingerprintSha256: fingerprintSha256,
     validityOf: validityOf,
     derEcdsaToRaw: derEcdsaToRaw,
     JWS_ALGORITHMS: JWS_ALGORITHMS,
     SIGNATURE_ALGORITHMS: SIGNATURE_ALGORITHMS,
+    KNOWN_EXTENSIONS: KNOWN_EXTENSIONS,
     element: element,
     children: children,
     bytesEqual: bytesEqual,

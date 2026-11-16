@@ -426,7 +426,8 @@ harness calls them directly and also drives them through the page.
     once, then calls `history.replaceState` back to the bare wallet URL, so a reload never re-fetches a single-use
     request object.
 - **Accepted links.** Schemes `openid4vp`, `haip-vp`, `eudi-openid4vp`, `mdoc-openid4vp` and `https` (for `https` the
-  link only carries parameters); at most 8 KiB.
+  link only carries parameters); at most 8 KiB; a parameter that appears more than once is refused (RFC 6749 §3.1).
+  Multipaz's scheme field produces `haip-vp://://?…`, the separator doubled; it is read as `haip-vp://?…`.
   - Parameters: `client_id`, `request_uri` and `request_uri_method` (`get` by default, or `post`); or `request` (a JAR
     by value); or, only with the `redirect_uri:` prefix, plain unsigned parameters.
   - A link without `client_id`, such as Paradym's `https://paradym.id/invitation?request_uri=…`, is accepted. The
@@ -438,7 +439,9 @@ harness calls them directly and also drives them through the page.
     `127.0.0.1` (local stacks, the CI jobs).
   - When its host is on the relay list (`GET /offer/wallet/config`, 4.9), the page fetches **only** through the relay;
     otherwise **only** directly, with `redirect: "error"`. Never both, and never twice: the page keeps the set of
-    request URIs it has fetched.
+    request URIs it has fetched, keyed by the URL without its fragment, and reads the body under the 64 KiB cap below
+    rather than handing it to the platform whole. (P5-03c reads directly; the relay half of this line arrives with
+    P5-03f, together with the server that makes an entry on the list mean something.)
   - The request carries `Accept: application/oauth-authz-req+jwt`.
   - For `post`, the form body is `wallet_nonce=<16 random bytes, base64url>` and nothing else. `wallet_metadata` is
     not sent (VP §5.10 makes both optional), because EUDI refuses a `wallet_metadata` that omits fields it treats as
@@ -454,17 +457,17 @@ harness calls them directly and also drives them through the page.
 
 | # | Rule | Source |
 | --- | --- | --- |
-| R1 | the request object is not a compact JWS of three base64url parts, or its header or payload is not a JSON object, or it is over a limit (4.4); the request_uri answered non-200 | VP §5.10.2 |
+| R1 | the request object is not a compact JWS of three base64url parts, or its header or payload is not a JSON object, or it is over a limit (4.4); its `crit` header is present (this page understands no JWS extension, and a `crit` that is not a non-empty array of header names is not one at all); the request_uri answered non-200 | VP §5.10.2, RFC 7515 §4.1.11 |
 | R2 | header `typ` is absent or not `oauth-authz-req+jwt` | VP §5 |
 | R3 | the link's `client_id` differs from the JAR's (when the link has one) | VP §5.10.1 |
 | R4 | `wallet_nonce` sent and the JAR's is missing or different | VP §5.10.1 |
 | R5 | `aud` present and not `https://self-issued.me/v2` (the page sends no wallet metadata, so static discovery applies); `exp` in the past; `iat` more than 5 minutes ahead | VP §5.8, RFC 9101 |
 | R6 | `x509_san_dns`: no `x5c`; the leaf has no dNSName SAN equal to the client_id value; the JWS does not verify with the leaf's key | VP §5.9.3 |
 | R7 | `x509_hash`: base64url(SHA-256(leaf DER)) differs from the client_id value; the JWS does not verify with the leaf's key | VP §5.9.3 |
-| R8 | `response_uri` is missing or not `https` (`http` only for a localhost page); for `x509_san_dns` its host differs from the DNS name; for `redirect_uri:` it differs from the client_id value | VP §5.9.3, §8.2 |
+| R8 | `response_uri` is missing, not `https` (`http` only for a localhost page), or carries userinfo; for `x509_san_dns` its host differs from the DNS name; for `redirect_uri:` it differs from the client_id value as written | VP §5.9.3, §8.2 |
 | R9 | prefixes: `origin` refused (VP says MUST NOT); `redirect_uri` with a signed request refused; `decentralized_identifier`, `verifier_attestation`, `openid_federation` and pre-registered (no prefix) refused as "not supported by this demo wallet" (D-P5-03-9) | VP §5.9.3 |
-| R10 | `x5c`: a certificate that does not parse; the leaf outside its validity (5 minutes skew); a certificate whose signature does not verify with the next one's key (ECDSA P-256/384/521 or RSA, WebCrypto); a JWS `alg` other than ES256/ES384/ES512/PS256/RS256 | VP §5.9.3 |
-| R11 | `response_type` other than `vp_token`; `response_mode` other than `direct_post`/`direct_post.jwt` | VP §5.6, §8.2 |
+| R10 | `x5c`: a certificate that does not parse or carries an unrecognised critical extension; a certificate outside its validity (5 minutes skew); a certificate after the first that is not a CA (`basicConstraints cA=TRUE`), whose `keyUsage` omits `keyCertSign`, or that permits fewer intermediate CAs below it than the chain has; a certificate whose signature does not verify with the next one's key (ECDSA P-256/384/521 or RSA, PKCS#1 v1.5 and PSS, WebCrypto); a JWS `alg` other than ES256/ES384/ES512/PS256/RS256, or an RSA key below 2048 bits | VP §5.9.3, RFC 5280 §6.1.3 (g), §6.1.4, RFC 7518 §3.3 |
+| R11 | `response_type` absent or other than `vp_token`; `response_mode` absent (which §8.2 defaults to `fragment`) or other than `direct_post`/`direct_post.jwt` | VP §5.1, §5.6, §8.2 |
 
 **Answered with an error response** (VP §8.5). After the checks above pass, the page shows the error and a button
 "Send error response", which posts `error`, `error_description` and `state` to `response_uri`. These are exactly the
@@ -716,8 +719,8 @@ own `MdocFormatter`, with an Annex B IACA and DSC built by `certify-pki`. The by
 | `mdl-b.issuersigned`, `mdl-b.holder.jwk` | a second mDL for another holder ("a key from another credential") |
 | `pid.issuersigned`, `pid.holder.jwk` | an `eu.europa.ec.eudi.pid.1` mdoc with four elements (a query for another doctype; `credential_sets` with two doctypes) |
 | `clock.txt` | an instant inside every fixture's validity, installed as the page's `Date.now()` by the harness |
-| `verifier/` | made by `make-verifier.sh` (OpenSSL; its output committed): a test CA; leaves `verifier.example` and `other.example` (dNSName SANs) with P-256 keys; a P-256 JWE key pair with `kid`; a README with the commands |
-| `hosted/` | the three request objects captured from `verifier-backend.eudiw.dev` on 2026-11-14 (`x509_hash`, ~23 KB, `verifier_info`) and one from `verifier.multipaz.org` (no `aud`, no `state`), for parsing tests under the faked clock |
+| `verifier/` | made by `make-verifier.sh` (OpenSSL; its output committed): a test CA with `keyCertSign`; leaves `verifier.example`, `other.example`, an expired one and one not valid yet, with P-256 keys; an intermediate; RSA, P-384 and P-521 chains; an RSA-PSS-signed leaf; a 1024-bit RSA chain; four `ca-variant` certificates for the RFC 5280 §6.1.4 refusals; a self-signed leaf; a P-256 JWE key pair with `kid`; a README with the commands. Serials are OpenSSL's default 20 octets, three of them with the top bit set |
+| `hosted/` | the request objects **captured once by hand** from `verifier-backend.eudiw.dev` on 2026-11-16 (get and post forms, `x509_hash`, a 20-octet leaf serial, a URI-only SAN, `verifier_info`, ~23 KB) and from `verifier.multipaz.org` (`x509_san_dns`, no `aud`, no `state`, a 13-octet leaf serial, and the `haip-vp://://?` link form), with their init/begin answers and `PROVENANCE.md`; for parsing tests under a faked clock at the capture instant |
 
 The committed fixture keeps the harness and the probes deterministic and offline. The CI interop jobs need fresh MSOs,
 so the recorder also runs in the normal build, writing to `certify-format-mdoc/target/wallet-fixture/` with the real
@@ -1020,22 +1023,28 @@ Branch `wp/p5-03c-request-intake`. Depends on P5-03a; runs in parallel with P5-0
 
 **Acceptance checklist.**
 
-- [ ] Links: each accepted scheme; `https` with parameters; `?…` and `#://?…` same-device forms (the page replaces its
+- [x] Links: each accepted scheme; `https` with parameters; `?…` and `#://?…` same-device forms (the page replaces its
   history entry); `request=` by value; `redirect_uri:` plain parameters; a link without `client_id` (the client_id
   comes from the JAR and a finding is shown).
-- [ ] `request_uri_method=post` sends exactly `wallet_nonce` (form) with the `Accept` header, and checks the echo.
-- [ ] A pasted request object (compact JWS) goes through the same checks as a fetched one.
-- [ ] A request object is fetched at most once per page lifetime: a second scan of the same link says "already
+- [x] `request_uri_method=post` sends exactly `wallet_nonce` (form) with the `Accept` header, and checks the echo.
+- [x] A pasted request object (compact JWS) goes through the same checks as a fetched one.
+- [x] A request object is fetched at most once per page lifetime: a second scan of the same link says "already
   fetched", and nothing is requested.
-- [ ] The captured hosted EUDI JAR (`x509_hash`) and Multipaz JAR (`x509_san_dns`) pass R1-R11 under the faked clock.
+- [x] The captured hosted EUDI JAR (`x509_hash`) and Multipaz JAR (`x509_san_dns`) pass R1-R11 under the faked clock.
   Their cards show the leaf subject, issuer and fingerprints. Multipaz shows the findings "no aud" and "no state".
-- [ ] Each of the four error cases of 4.5 offers "Send error response", and the POST it sends carries `error`,
+- [x] Each of the four error cases of 4.5 offers "Send error response", and the POST it sends carries `error`,
   `error_description` and `state`.
-- [ ] A kept credential whose IssuerAuth carries `x5chain` only in the protected header is refused before its chain is
+- [x] A kept credential whose IssuerAuth carries `x5chain` only in the protected header is refused before its chain is
   read or validated: ISO5 9.1.2.4 puts `x5chain` in the unprotected header. P5-03a still reads it from either bucket
   (it validates no chain) and refuses a label in both; the deferral is the decision log's P5-03a review round 3 row.
   P5-03d's `trusted_authorities` `aki` filter relies on this: it matches the chain this check has placed.
-- [ ] I1-I9 hold. In particular, no flow in this package sends anything to `response_uri` without a press.
+- [x] I1-I9 hold. In particular, no flow in this package sends anything to `response_uri` without a press.
+
+**Ticked by `wp/p5-03c-request-intake`** (review round 1, 2026-11-16), each with the harness check that proves it:
+`check-offer-wallet.mjs` sections 21, 22, 23, 24, 25 and 27. The hosted fixtures are the verifiers' own captured bytes
+(`hosted/PROVENANCE.md`); no test contacts a verifier, and both are read under a faked clock at their capture instant.
+The relay named as a non-goal below is not here at all: `fetchRequest` reads the `request_uri` directly, and P5-03f
+brings the relay together with the server half that gives its answers meaning.
 
 **Negative tests.** Each refuses, names the rule, and the fetch log shows no request to `response_uri`.
 

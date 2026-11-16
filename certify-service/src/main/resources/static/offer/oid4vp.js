@@ -8,10 +8,12 @@
  *    identifier prefix, which cannot be signed (VP section 5.9.3) - plain parameters.
  * 2. `fetchRequest` reads the request object a `request_uri` names, once per page lifetime and never twice (EUDI's
  *    object is single use, plan 2.2), with `redirect: "error"` so a redirect is a refusal and not a fetch of somewhere
- *    else. A host whose verifier sends no CORS headers is read through the relay when the deployment lists it
- *    (P5-03f); the page never tries both.
+ *    else, and with the body read under a 64 KiB cap instead of whole.
  * 3. `checkRequest` checks the request and the verifier: R1-R11 of plan 4.5 (refusals), the four error cases a wallet
  *    answers with an error response (VP section 8.5), and the findings the page shows without blocking.
+ *
+ * A verifier that sends no CORS headers is P5-03f's: the page reads it by having its request object pasted, and the
+ * relay that would read it instead arrives with the server half that gives its answers meaning.
  *
  * Nothing here sends anything. The only request this module makes is the fetch of the request object the protocol
  * names (I9): there is no response, no error post and no probe. `wallet.js` posts an error response only when the
@@ -35,11 +37,18 @@ var Oid4vp = (function () {
     CREDENTIAL_SETS: 20,
     X5C_CERTIFICATES: 5,
     X5C_CERTIFICATE_BYTES: 8 * 1024,
-    RELAY_RESPONSE_BYTES: 64 * 1024,
   };
 
   /** The invocation schemes VP section 9 allows a wallet to receive; `https` only carries parameters here. */
   var SCHEMES = ["openid4vp", "haip-vp", "eudi-openid4vp", "mdoc-openid4vp", "https"];
+
+  /**
+   * Multipaz's scheme field produces `haip-vp://://?client_id=…`, with the separator doubled: what it hands the browser
+   * is its scheme (`haip-vp://`) with the fragment it built (`://?…`) appended. That is not a URL (WHATWG URL parsing
+   * refuses it), and it is what the hosted verifier's begin answer carries, so the extra separator is folded away before
+   * the link is read. Only the wallet invocation schemes are folded: an `https` link gets no such generosity.
+   */
+  var DOUBLED_SEPARATOR = /^([A-Za-z][A-Za-z0-9+.-]*):\/\/:\/\//;
 
   /** The client identifier prefixes of VP section 5.9.3, plus the none-prefix case. */
   var PREFIXES = ["x509_san_dns", "x509_hash", "redirect_uri", "origin", "decentralized_identifier",
@@ -166,12 +175,6 @@ var Oid4vp = (function () {
       && /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*$/.test(value);
   }
 
-  /** A URL's origin and path, so two spellings of one endpoint compare equal and a query does not. */
-  function originAndPath(uri) {
-    var url = new URL(uri);
-    return url.origin + (url.pathname.replace(/\/+$/, "") || "/");
-  }
-
   var PREFIX_EXPLANATIONS = {
     "x509_san_dns": "x509_san_dns: the verifier's leaf certificate carries this DNS name as a dNSName subject "
       + "alternative name, and the request is signed with that certificate's key (OpenID4VP 1.0 section 5.9.3).",
@@ -216,9 +219,17 @@ var Oid4vp = (function () {
       return { ok: true, kind: "by_value", params: { clientId: undefined, request: raw }, scheme: null, findings: findings };
     }
 
+    var doubled = DOUBLED_SEPARATOR.exec(raw);
+    var target = raw;
+    if (doubled !== null && SCHEMES.indexOf(doubled[1].toLowerCase()) >= 0 && doubled[1].toLowerCase() !== "https") {
+      target = raw.replace(DOUBLED_SEPARATOR, doubled[1] + "://");
+      findings.push("this link's separator is doubled (" + doubled[1] + "://://?…), which is the form the hosted Multipaz "
+        + "verifier hands out; it is read as " + doubled[1] + "://?… .");
+    }
+
     var url;
     try {
-      url = new URL(raw);
+      url = new URL(target);
     } catch (error) {
       return refusedLink("this is neither a link nor a request object: a request object is three base64url parts "
         + "separated by dots.", findings);
@@ -232,15 +243,26 @@ var Oid4vp = (function () {
     var params = new URLSearchParams(url.search);
     var link = { clientId: undefined, requestUri: undefined, requestUriMethod: "get", request: undefined, plain: null };
     var seen = [];
+    var duplicated = [];
     params.forEach(function (value, name) {
+      if (seen.indexOf(name) >= 0) {
+        if (duplicated.indexOf(name) < 0) duplicated.push(name);
+        return;
+      }
       seen.push(name);
       if (name === "client_id") link.clientId = value;
       if (name === "request_uri") link.requestUri = value;
       if (name === "request_uri_method") link.requestUriMethod = value;
       if (name === "request") link.request = value;
     });
-    seen.filter(function (name, index) {
-      return ["client_id", "request_uri", "request_uri_method", "request"].indexOf(name) < 0 && seen.indexOf(name) === index;
+    if (duplicated.length) {
+      // RFC 6749 section 3.1: "Request and response parameters MUST NOT be included more than once." Which of two
+      // values a reader takes is a choice no specification makes, so the link is refused rather than guessed at.
+      return refusedLink("the link carries " + duplicated.join(", ") + " more than once; a request parameter appears "
+        + "once (RFC 6749 section 3.1).", findings);
+    }
+    seen.filter(function (name) {
+      return ["client_id", "request_uri", "request_uri_method", "request"].indexOf(name) < 0;
     }).forEach(function (name) {
       findings.push("the link carries the parameter " + JSON.stringify(name) + ", which this page does not read.");
     });
@@ -284,13 +306,66 @@ var Oid4vp = (function () {
   }
 
   /**
+   * Reads at most `limit` bytes of a Response's body. The declared `Content-Length` is checked first, and the body is
+   * then read chunk by chunk and abandoned the moment it goes over the limit, so a body that declares no length (a
+   * chunked one, which is what a verifier streaming its request object sends) still costs at most one chunk past the
+   * cap. A response is never read whole on the chance that it is small: a verifier does not get to choose how much
+   * memory this page spends. Returns `{bytes}` or `{over}` with the byte count that broke the limit.
+   */
+  async function readCapped(answer, limit) {
+    var declared = answer.headers && typeof answer.headers.get === "function"
+      ? String(answer.headers.get("content-length") || "").trim() : "";
+    if (/^\d+$/.test(declared) && Number(declared) > limit) return { over: Number(declared) };
+    if (!answer.body || typeof answer.body.getReader !== "function") {
+      // no body at all: a 204, or an answer a test handed in without one
+      return { bytes: new Uint8Array(0) };
+    }
+    var reader = answer.body.getReader();
+    var chunks = [];
+    var total = 0;
+    for (;;) {
+      var step = await reader.read();
+      if (step.done) break;
+      var chunk = step.value instanceof Uint8Array ? step.value : new Uint8Array(step.value);
+      total += chunk.length;
+      if (total > limit) {
+        try {
+          await reader.cancel();
+        } catch (error) {
+          // the stream is abandoned either way; the refusal is the same
+        }
+        return { over: total };
+      }
+      chunks.push(chunk);
+    }
+    var bytes = new Uint8Array(total);
+    var at = 0;
+    chunks.forEach(function (chunk) {
+      bytes.set(chunk, at);
+      at += chunk.length;
+    });
+    return { bytes: bytes };
+  }
+
+  /** The key a request_uri's "already fetched" test uses: the URL itself, with its fragment taken off (RFC 3986 3.5). */
+  function fetchedKeyOf(url) {
+    var copy = new URL(url.href);
+    copy.hash = "";
+    return copy.href;
+  }
+
+  /**
    * Fetches the request object `requestUri` names. Returns `{ok, text, contentType, via}` or
    * `{ok: false, message, state}`; `state` is `"unreachable"` when the browser refused to let the page read the answer
    * (CORS, or a redirect seen through `redirect: "error"`), which is a state the page must report as such (plan 2.1:
    * Multipaz and Credo send no CORS headers).
    *
-   * Options: `requestUri`, `method` (`get`/`post`), `walletNonce` (sent for a post, and only that), `pageUrl`,
-   * `relayHosts`, `relayUrl`, `fetched` (a Set of request URIs already fetched), `fetchImpl`.
+   * This is the page's only outgoing request (I9): nothing is sent to the verifier, and the response_uri is never
+   * touched from here. Reading a verifier that sends no CORS headers through Certify's relay is P5-03f's, together
+   * with the server half that would make the relay's answer mean anything.
+   *
+   * Options: `requestUri`, `method` (`get`/`post`), `walletNonce` (sent for a post, and only that), `pageUrl`, `fetched`
+   * (a Set of request URIs already fetched), `fetchImpl`.
    */
   async function fetchRequest(options) {
     var requestUri = String(options.requestUri === undefined ? "" : options.requestUri);
@@ -306,53 +381,33 @@ var Oid4vp = (function () {
       return { ok: false, message: "request_uri is " + url.protocol + "//" + url.host + "; https is required"
         + (isLocalHost(pageUrl.hostname) ? "." : ", and http is allowed only while this page is served from localhost.") };
     }
-    if (options.fetched !== undefined && options.fetched.has(requestUri)) {
+    var fetchedKey = fetchedKeyOf(url);
+    if (options.fetched !== undefined && options.fetched.has(fetchedKey)) {
       return { ok: false, state: "alreadyFetched", message: "this request_uri was already fetched. A request object is "
         + "read once (plan 4.4: EUDI's is single use), so the page never fetches one twice." };
     }
     // recorded before the fetch: an attempt that failed may still have consumed the verifier's only copy
-    if (options.fetched !== undefined) options.fetched.add(requestUri);
+    if (options.fetched !== undefined) options.fetched.add(fetchedKey);
 
     var method = String(options.method || "get").toLowerCase() === "post" ? "POST" : "GET";
-    var relayHosts = (options.relayHosts || []).map(function (host) { return String(host).toLowerCase(); });
-    var relayed = relayHosts.indexOf(url.hostname.toLowerCase()) >= 0 && typeof options.relayUrl === "string";
 
-    function finish(text, contentType, via) {
-      if (utf8Length(text) > LIMITS.REQUEST_BYTES) {
-        return { ok: false, via: via, message: "the request object is " + utf8Length(text) + " bytes, over the 64 KiB "
-          + "limit (plan 4.4)." };
+    /** The answer's body, within the request object's limit, decoded as the UTF-8 text it has to be. */
+    async function finish(answer, via) {
+      var read = await readCapped(answer, LIMITS.REQUEST_BYTES);
+      if (read.over !== undefined) {
+        return { ok: false, via: via, message: "the request object is " + read.over + " bytes, over the 64 KiB limit "
+          + "(plan 4.4); it is not read any further." };
       }
-      return { ok: true, text: text, contentType: contentType, via: via };
+      var text;
+      try {
+        text = new TextDecoder("utf-8", { fatal: true }).decode(read.bytes);
+      } catch (error) {
+        return { ok: false, via: via, message: "the request object is not UTF-8 (OpenID4VP 1.0 section 5.10)." };
+      }
+      return { ok: true, text: text, contentType: contentTypeOf(answer), via: via };
     }
 
     try {
-      if (relayed) {
-        var body = { op: "request-object", uri: requestUri, method: method.toLowerCase() };
-        if (method === "POST") body.wallet_nonce = options.walletNonce;
-        var relayedAnswer = await fetchImpl(options.relayUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Accept: "application/json" },
-          body: JSON.stringify(body),
-          cache: "no-store",
-          credentials: "same-origin",
-          redirect: "error",
-        });
-        if (relayedAnswer.status !== 200) {
-          return { ok: false, via: "relay", message: "the relay answered " + relayedAnswer.status + " for "
-            + url.hostname + "." };
-        }
-        var reply = JSON.parse(await relayedAnswer.text());
-        if (!isObject(reply) || typeof reply.body !== "string") {
-          return { ok: false, via: "relay", message: "the relay answered something that is not a request object." };
-        }
-        if (reply.status !== 200) {
-          return { ok: false, via: "relay", contentType: String(reply.content_type || ""),
-            message: "the verifier answered " + reply.status + " through the relay; any HTTP error ends the process "
-              + "(OpenID4VP 1.0 section 5.10.2)." };
-        }
-        return finish(reply.body, String(reply.content_type || ""), "relay");
-      }
-
       var init = {
         method: method,
         headers: { Accept: "application/oauth-authz-req+jwt" },
@@ -372,13 +427,12 @@ var Oid4vp = (function () {
         return { ok: false, via: "direct", message: "the request_uri answered " + answer.status + "; any HTTP error ends "
           + "the process (OpenID4VP 1.0 section 5.10.2)." };
       }
-      return finish(await answer.text(), contentTypeOf(answer), "direct");
+      return await finish(answer, "direct");
     } catch (error) {
-      return { ok: false, via: relayed ? "relay" : "direct", state: "unreachable",
+      return { ok: false, via: "direct", state: "unreachable",
         message: "the request object could not be read: the answer redirected (this page refuses redirects), or "
           + url.hostname + " does not let a page on this origin read it (no CORS headers). "
-          + (relayed ? "The relay reported the same." : "Plan 4.9's relay is what reads such a verifier; the request "
-            + "object can also be pasted here.") };
+          + "Such a verifier's request object can also be pasted here." };
     }
   }
 
@@ -541,11 +595,28 @@ var Oid4vp = (function () {
         + " (plan 4.4).", findings);
     }
 
-    // R2: the JWS type VP section 5 requires, and without which a wallet must not process the object
+    // R2: the JWS type VP section 5 requires, and without which a wallet must not process the object. The comparison is
+    // case-sensitive on purpose: VP pins the exact value "oauth-authz-req+jwt", and JWS `typ` is a media type whose
+    // case a reader may not fold here without also accepting `JWT`-style spellings the text does not name.
     if (header.typ !== "oauth-authz-req+jwt") {
       return refused("R2", "the JWS typ is " + (header.typ === undefined ? "absent" : JSON.stringify(header.typ))
         + "; OpenID4VP 1.0 section 5 requires oauth-authz-req+jwt, and a wallet must not process a request object "
         + "without it.", findings);
+    }
+
+    // R1: the JWS `crit` header (RFC 7515 section 4.1.11). A `crit` entry names an extension the receiver must
+    // understand before it may process the object, and this page understands none: refusing the object is the only
+    // answer that cannot end in a signature or a claim being read under rules the page did not apply. A `crit` that is
+    // not a non-empty array of strings is not a `crit` at all, and is refused for that reason.
+    if (header.crit !== undefined) {
+      if (!Array.isArray(header.crit) || !header.crit.length
+          || !header.crit.every(function (name) { return typeof name === "string" && name.length > 0; })) {
+        return refused("R1", "the JWS crit is not a non-empty array of header names (RFC 7515 section 4.1.11).",
+          findings);
+      }
+      return refused("R1", "the JWS crit lists " + JSON.stringify(header.crit) + ", and this page understands no "
+        + "JWS extension: RFC 7515 section 4.1.11 says a wallet must refuse such a request object rather than process "
+        + "it with the extension ignored.", findings);
     }
 
     // R3: the link's client_id and the request object's must be identical, prefix included (VP section 5.10.1)
@@ -558,8 +629,14 @@ var Oid4vp = (function () {
         + "5.10.1).", findings);
     }
     if (link.clientId === undefined) {
-      findings.push("the link named no client_id, so this page took it from the request object (OpenID4VP 1.0 section "
-        + "5.1 allows a request_uri link without one).");
+      // a pasted request object never had a link to name one, which is a different thing to say than a link that could
+      // have named one and did not
+      findings.push(link.kind === "by_value" && !link.scheme
+        ? "this request object was pasted on its own, so nothing outside it named a client_id; this page took the one "
+          + "the object carries, and the verifier's own signature is what stands behind it (OpenID4VP 1.0 section "
+          + "5.9.3)."
+        : "the link named no client_id, so this page took it from the request object (OpenID4VP 1.0 section "
+          + "5.1 allows a request_uri link without one).");
     }
 
     // R4: a wallet_nonce the page sent must be the one the request object carries (VP section 5.10.1)
@@ -675,6 +752,12 @@ var Oid4vp = (function () {
       }
     }
     var leaf = certificates[0];
+    // RFC 7518 section 3.3: RS256 and PS256 need a key of 2048 bits or more. WebCrypto verifies a 1024-bit signature
+    // without complaint, so the size is checked before the key is imported.
+    if (X509.JWS_ALGORITHMS[header.alg].kind === "rsa" && leaf.publicKey.kind === "rsa" && leaf.publicKey.bits < 2048) {
+      return refused("R10", "the leaf certificate's RSA key is " + leaf.publicKey.bits + " bits; " + header.alg
+        + " requires 2048 or more (RFC 7518 section 3.3).", findings);
+    }
     if (prefix === "x509_san_dns") {
       if (!isDnsName(split.value)) {
         return refused("R6", "the client_id's value " + JSON.stringify(split.value) + " is not a DNS name (OpenID4VP "
@@ -712,13 +795,20 @@ var Oid4vp = (function () {
         findings);
     }
 
-    // R10: the chain, each certificate to the next, and every validity
+    // R10: what each certificate in the path must be (RFC 5280 sections 6.1.3 (g) and 6.1.4), then its validity, then
+    // the link to the next one. The role a certificate's own extensions claim is read before any signature is tried: a
+    // certificate that says it is not a CA, may not sign certificates, or permits fewer CAs below it than the chain has,
+    // is wrong whatever its signature turns out to be.
     for (var position = 0; position < certificates.length; position++) {
-      var state = X509.validityOf(certificates[position], now, VALIDITY_SKEW_MS);
+      var fault = X509.certificateFault(certificates[position], position);
+      if (fault !== null) return refused("R10", fault, findings);
+    }
+    for (var ensured = 0; ensured < certificates.length; ensured++) {
+      var state = X509.validityOf(certificates[ensured], now, VALIDITY_SKEW_MS);
       if (state !== "valid") {
-        return refused("R10", "x5c certificate " + position + " (" + certificates[position].subject.text + ") is "
-          + (state === "expired" ? "expired: it ended " + isoOf(certificates[position].notAfter)
-            : "not valid yet: it begins " + isoOf(certificates[position].notBefore))
+        return refused("R10", "x5c certificate " + ensured + " (" + certificates[ensured].subject.text + ") is "
+          + (state === "expired" ? "expired: it ended " + isoOf(certificates[ensured].notAfter)
+            : "not valid yet: it begins " + isoOf(certificates[ensured].notBefore))
           + " (RFC 5280 section 6.1.3 (a)(2), with a 5-minute skew).", findings);
       }
     }
@@ -759,23 +849,35 @@ var Oid4vp = (function () {
       return refused("R8", "response_uri is " + target.protocol + "//" + target.host + "; https is required"
         + (localPage ? "." : ", and http is allowed only while this page is served from localhost."), findings);
     }
+    if (target.username || target.password) {
+      // a response_uri the client may use as its redirect_uri carries no userinfo (VP section 5.9.3 delegates to RFC
+      // 6749 section 3.1.2, and a URL with credentials in it is not one this page will post a credential to)
+      return refused("R8", "response_uri carries a user name or password; a response URI names a host and a path, and "
+        + "nothing is posted to a URL with credentials in it (OpenID4VP 1.0 sections 5.9.3 and 8.2).", findings);
+    }
     if (prefix === "x509_san_dns" && target.hostname.toLowerCase() !== split.value.toLowerCase()) {
       return refused("R8", "response_uri is on " + target.hostname + " and the client_id's DNS name is " + split.value
         + "; OpenID4VP 1.0 section 8.2 requires a response_uri the client may use as its redirect_uri, and section "
         + "5.9.3 ties that to the client identifier's name.", findings);
     }
 
-    // R11: the response type and mode this wallet implements (VP 5.6, 8.2)
-    if (payload.response_type !== undefined && payload.response_type !== "vp_token") {
-      return refused("R11", "the request object's response_type is " + JSON.stringify(payload.response_type)
-        + "; OpenID4VP 1.0 section 5.6 has vp_token.", findings);
+    // R11: the response type and mode this wallet implements (VP 5.6, 8.2). Both must be there: VP section 5.1 lists
+    // response_type as required, and an absent response_mode defaults to `fragment` (VP section 8.2), which this page
+    // cannot answer at all - so a request object that omits either is refused rather than read as if it had said
+    // `vp_token` and `direct_post`.
+    if (payload.response_type !== "vp_token") {
+      return refused("R11", "the request object's response_type is " + (payload.response_type === undefined
+        ? "absent, and OpenID4VP 1.0 section 5.1 requires it" : JSON.stringify(payload.response_type)
+          + "; section 5.6 has vp_token") + ".", findings);
     }
-    if (payload.response_mode !== undefined && RESPONSE_MODES.indexOf(payload.response_mode) < 0) {
-      return refused("R11", "the request object's response_mode is " + JSON.stringify(payload.response_mode)
-        + "; this wallet implements " + RESPONSE_MODES.join(" and ") + " (OpenID4VP 1.0 section 8.2).", findings);
+    if (RESPONSE_MODES.indexOf(payload.response_mode) < 0) {
+      return refused("R11", "the request object's response_mode is " + (payload.response_mode === undefined
+        ? "absent, which OpenID4VP 1.0 section 8.2 defaults to fragment, and this wallet answers nothing that way"
+        : JSON.stringify(payload.response_mode) + "; this wallet implements " + RESPONSE_MODES.join(" and ")
+          + " (OpenID4VP 1.0 section 8.2)") + ".", findings);
     }
 
-    var responseMode = payload.response_mode === undefined ? "direct_post" : payload.response_mode;
+    var responseMode = payload.response_mode;
     var request = {
       signed: true,
       clientId: payload.client_id,
@@ -785,7 +887,7 @@ var Oid4vp = (function () {
       state: payload.state,
       responseUri: payload.response_uri,
       responseMode: responseMode,
-      responseType: payload.response_type === undefined ? "vp_token" : payload.response_type,
+      responseType: payload.response_type,
       aud: payload.aud,
       iat: payload.iat,
       exp: payload.exp,
@@ -862,10 +964,6 @@ var Oid4vp = (function () {
       findings.push("no state: OpenID4VP 1.0 section 5.1 makes state optional, and without it a response cannot be "
         + "correlated with a session.");
     }
-    if (payload.response_mode === undefined) {
-      findings.push("no response_mode: OpenID4VP 1.0 section 8.2 has the verifier name direct_post or direct_post.jwt; "
-        + "this page treats an absent one as direct_post.");
-    }
     if (link.scheme === "haip-vp" && (request.link.kind !== "request_uri" || request.responseMode !== "direct_post.jwt")) {
       findings.push("a haip-vp link whose request is not signed by request_uri or is not direct_post.jwt; HAIP 1.0 "
         + "section 5.1 wants both.");
@@ -884,9 +982,13 @@ var Oid4vp = (function () {
       }
     }
     var mediaType = String(options.contentType || "").split(";")[0].trim().toLowerCase();
-    if (mediaType && mediaType !== "application/oauth-authz-req+jwt" && mediaType !== "application/jwt") {
+    if (mediaType && mediaType !== "application/oauth-authz-req+jwt") {
       findings.push("the request object's media type is " + JSON.stringify(mediaType) + ", not "
-        + "application/oauth-authz-req+jwt (OpenID4VP 1.0 section 5.10).");
+        + "application/oauth-authz-req+jwt (OpenID4VP 1.0 section 5.10 names that media type, and the page asks for it "
+        + "with its Accept header)." + (mediaType === "application/jwt"
+          ? " application/jwt is the generic JOSE type a verifier falls back to; the request object is still checked, but "
+            + "a verifier that names the specific type is the one VP 5.10 describes."
+          : ""));
     }
     var algValues = payload.client_metadata && isObject(payload.client_metadata)
       && isObject(payload.client_metadata.vp_formats_supported)
@@ -907,14 +1009,16 @@ var Oid4vp = (function () {
 
   /**
    * Checks a request that is not a request object at all: the plain parameters of a `redirect_uri:` client identifier,
-   * which VP section 5.9.3 says cannot be signed. R1-R7 and R10 are about a JWS and do not apply; R8 is the check
-   * that binds the response_uri to the client identifier, and it is the one that matters here.
+   * which VP section 5.9.3 says cannot be signed. R1's JWS shape, R2, R3, R4 and R10 are about a JWS and do not apply;
+   * R8 is the check that binds the response_uri to the client identifier, R11 is about the response itself, and the
+   * limits of plan 4.4 still are: a query string is as good a place to hide a hostile DCQL document as a payload is,
+   * so `jsonDepth` and `dcqlLimitBreach` run here too.
    */
   async function checkPlainRequest(options) {
-    var now = options.now instanceof Date ? options.now : new Date();
     var pageUrl = options.pageUrl instanceof URL ? options.pageUrl : new URL(String(options.pageUrl));
     var localPage = isLocalHost(pageUrl.hostname);
-    var findings = (options.findings || []).slice();
+    // the link's own findings travel with the request, as they do for a signed one: the intake panel shows them
+    var findings = (options.findings || (options.link && options.link.findings) || []).slice();
     // a plain request's parameters arrive as the query string's text: the DCQL query is JSON inside one of them
     var params = Object.assign({}, options.plain);
     if (typeof params.dcql_query === "string") {
@@ -943,27 +1047,39 @@ var Oid4vp = (function () {
       return refused("R8", "response_uri is " + target.protocol + "//" + target.host + "; https is required"
         + (localPage ? "." : ", and http is allowed only while this page is served from localhost."), findings);
     }
-    if (params.response_mode !== undefined && RESPONSE_MODES.indexOf(params.response_mode) < 0) {
-      return refused("R11", "response_mode is " + JSON.stringify(params.response_mode) + "; this wallet implements "
-        + RESPONSE_MODES.join(" and ") + " (OpenID4VP 1.0 section 8.2).", findings);
+    if (target.username || target.password) {
+      return refused("R8", "response_uri carries a user name or password; nothing is posted to a URL with credentials "
+        + "in it (OpenID4VP 1.0 sections 5.9.3 and 8.2).", findings);
     }
-    if (params.response_type !== undefined && params.response_type !== "vp_token") {
-      return refused("R11", "response_type is " + JSON.stringify(params.response_type) + "; OpenID4VP 1.0 section 5.6 "
-        + "has vp_token.", findings);
+    var depth = jsonDepth(params, LIMITS.JSON_DEPTH);
+    if (depth > LIMITS.JSON_DEPTH) {
+      return refused("R1", "the request nests " + depth + " levels, over the limit of " + LIMITS.JSON_DEPTH
+        + " (plan 4.4).", findings);
     }
-    var sameAsClientId;
-    try {
-      sameAsClientId = originAndPath(params.response_uri) === originAndPath(split.value);
-    } catch (error) {
-      sameAsClientId = false;
+    var breach = dcqlLimitBreach(params.dcql_query);
+    if (breach !== null) return refused("R1", "the DCQL query has " + breach + " (plan 4.4).", findings);
+    // R11: both halves of the response have to be named, as in `checkSignedRequest`: VP section 5.1 requires
+    // response_type, and an absent response_mode defaults to `fragment` (section 8.2), which nothing is sent to
+    if (RESPONSE_MODES.indexOf(params.response_mode) < 0) {
+      return refused("R11", "response_mode is " + (params.response_mode === undefined
+        ? "absent, which OpenID4VP 1.0 section 8.2 defaults to fragment"
+        : JSON.stringify(params.response_mode) + "; this wallet implements " + RESPONSE_MODES.join(" and ")
+          + " (OpenID4VP 1.0 section 8.2)") + ".", findings);
     }
-    if (!sameAsClientId) {
+    if (params.response_type !== "vp_token") {
+      return refused("R11", "response_type is " + (params.response_type === undefined
+        ? "absent, and OpenID4VP 1.0 section 5.1 requires it" : JSON.stringify(params.response_type)
+          + "; section 5.6 has vp_token") + ".", findings);
+    }
+    // VP section 5.9.3: with this prefix the response_uri is the client identifier, so it is the same URI. Compared as
+    // written, not by origin and path: the identifier is a URI, and two spellings of one endpoint are two identifiers.
+    if (params.response_uri !== split.value) {
       return refused("R8", "response_uri is " + params.response_uri + " and the client_id is " + clientId + "; with the "
         + "redirect_uri: prefix they must be the same URI (OpenID4VP 1.0 sections 5.9.3 and 8.2).", findings);
     }
     findings.push("this request is unsigned: the redirect_uri: client identifier prefix cannot be signed (OpenID4VP "
       + "1.0 section 5.9.3), so there is no verifier certificate to show.");
-    var responseMode = params.response_mode === undefined ? "direct_post" : params.response_mode;
+    var responseMode = params.response_mode;
     var request = {
       signed: false,
       clientId: clientId,
@@ -973,7 +1089,7 @@ var Oid4vp = (function () {
       state: params.state,
       responseUri: params.response_uri,
       responseMode: responseMode,
-      responseType: params.response_type === undefined ? "vp_token" : params.response_type,
+      responseType: params.response_type,
       aud: params.aud,
       walletNonce: undefined,
       dcqlQuery: params.dcql_query,

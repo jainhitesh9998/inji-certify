@@ -63,40 +63,54 @@ own chain and client-identifier checks (plan 4.5, R6/R7/R10) run offline against
 
 | File | What it is |
 |---|---|
-| `ca.pem` (`.key.pem`) | the test CA: EC P-256, `CN=Wallet Fixture Verifier CA`, `cA` with `pathlen:2`, valid 2026-01-01..2046-01-01 |
+| `ca.pem` (`.key.pem`) | the test CA: EC P-256, `CN=Wallet Fixture Verifier CA`, `cA` with `pathlen:2` and `keyCertSign`, valid 2026-01-01..2046-01-01 |
 | `intermediate.pem` (`.key.pem`) | an intermediate the CA signed, `pathlen:0`, for the three-certificate chain |
 | `verifier.pem` (`.key.pem`) | the verifier's leaf: `CN=Wallet Fixture Verifier`, `DNS:verifier.example` **and** `URI:https://verifier.example/v1/certify/offer/wallet` (EUDI's leaf carries a URI SAN too), valid 2026-01-01..2036-01-01 |
-| `other.pem` (`.key.pem`) | a second name under the same CA (`DNS:other.example`): a well-formed chain with the wrong name |
+| `other.pem` (`.key.pem`) | a second name under the same CA (`DNS:other.example`): a well-formed chain with the wrong name. Its serial has the top bit set |
 | `expired.pem` (`.key.pem`) | `DNS:verifier.example`, valid 2019-01-01..2020-01-01 |
 | `future.pem` (`.key.pem`) | `DNS:verifier.example`, valid 2040-01-01..2045-01-01 |
 | `leaf-under-intermediate.pem` (`.key.pem`) | a leaf the intermediate signed, for the three-certificate chain |
 | `rsa-ca.pem`, `rsa-leaf.pem` (`.key.pem`) | an RSA 2048 chain, for RS256 and PS256 |
+| `rsa-pss-leaf.pem` (`.key.pem`) | the same RSA CA signing the leaf with RSA-PSS and SHA-256: signatureAlgorithm `1.2.840.113549.1.1.10` with its parameters (RFC 4055 §3.1) |
+| `rsa-small-ca.pem`, `rsa-small-leaf.pem` (`.key.pem`) | a 1024-bit RSA chain: RS256 and PS256 must refuse it (RFC 7518 §3.3) |
 | `p384-ca.pem`, `p384-leaf.pem` (`.key.pem`) | a P-384 chain, for ES384 |
 | `p521-ca.pem`, `p521-leaf.pem` (`.key.pem`) | a P-521 chain, for ES512 |
 | `impostor-ca.pem` (`.key.pem`) | a second CA that signed none of the leaves: the chain link that does not verify |
 | `self-signed.pem` (`.key.pem`) | one self-signed certificate with `DNS:verifier.example`: HAIP §5's finding, not a refusal |
+| `ca-variant.key.pem` + `nonca.pem`, `nokeycertsign.pem`, `unknown-critical.pem`, `tight-pathlen.pem` | four certificates carrying the CA's own subject name and not its key, one for each RFC 5280 §6.1.4 path rule the page enforces: `cA` not set, a `keyUsage` without `keyCertSign`, an unrecognised critical extension, and a `pathLenConstraint` of 0. The page reads a certificate's own extensions before it tries the signature link, so each one reaches the CA check it is there for; one key serves all four, and none of them signs anything |
+| `names.pem` (`.key.pem`) | a self-signed leaf whose `CN` is four characters, so the harness can rewrite that one string's tag in place and reach the two name string types no certificate here writes: NumericString (tag 18) and UniversalString (tag 28) |
 | `jwe.key.pem`, `jwe.pub.pem`, `kid.txt` | the verifier's response-encryption key pair and the `kid` it names (P5-03e reads these) |
+
+Serials are OpenSSL's own 20 random octets - the size RFC 5280 §4.1.2.2 allows up to, and what the hosted captures
+carry - except `other`, `intermediate` and `leaf-under-intermediate`, whose first octet has its top bit set, so DER
+writes a leading `0x00` pad. Both shapes are why the page keeps a serial as bytes and hex rather than as a number.
 
 Every validity range is written with an explicit `-not_before`/`-not_after`, because three checks are about the clock.
 The harness pins "now" at **2026-11-15T09:00:00Z**, which is inside every leaf's validity except `expired` and `future`.
 
 ## The verifiers' request objects: `hosted/` (P5-03c)
 
-`docs/design/tools/fixtures/wallet/make-hosted.mjs` writes them, and the output is committed:
+**These are the real bytes.** The coordinator captured them once, by hand, from the two hosted verifiers on
+2026-11-16, and `PROVENANCE.md` beside them records how, when, and what each leaf carries. No test contacts a verifier;
+the checks only read these files. Nothing regenerates them: a capture is a deliberate act, not a build step (the
+synthetic `make-hosted.mjs` that stood here first is deleted, and the decision log's 2026-11-16 row says why).
 
-```bash
-node docs/design/tools/fixtures/wallet/make-hosted.mjs
-```
-
-**These are the verifiers' shapes, not their captured bytes.** Plan 4.12 names `hosted/` as the request objects captured
-from `verifier-backend.eudiw.dev` and `verifier.multipaz.org`; those captures are not in this repository, and no test may
-contact a real verifier. So the shapes plan 2.1 records are reproduced here and signed with the fixture leaf:
-
-| File | Shape |
+| File | What it is |
 |---|---|
-| `eudi.request.jwt` | `x509_hash:<SHA-256 of the leaf>`, `aud: https://self-issued.me/v2`, `state`, `nonce`, `direct_post.jwt`, `client_metadata` with a `jwks` (ECDH-ES P-256, `kid`) and both `issuerauth_alg_values`/`deviceauth_alg_values`, a 10-claim mDL DCQL query, and a `verifier_info` registration certificate - 23 KB, as EUDI's is |
-| `multipaz.request.jwt` | `x509_san_dns:verifier.example`, `expected_origins`, `direct_post.jwt`, a `jwks`, a 6-claim mDL DCQL query, and **no `aud` and no `state`**, which is what Multipaz sends and what the card reports as findings |
+| `eudi-request-get.jwt` | `verifier-backend.eudiw.dev`'s request object, fetched with `request_uri_method=get` (~23 KB) |
+| `eudi-request-post.jwt` | the same verifier's object for `request_uri_method=post`; its `wallet_nonce` is `capture-wallet-nonce-20261116` |
+| `eudi-init-get.json`, `eudi-init-post.json` | the verifier's transaction-init answers: `client_id`, `request_uri`, and the `haip-vp://` `authorization_request_uri` the page reads |
+| `mp-request.jwt` | `verifier.multipaz.org`'s request object: `x509_san_dns:verifier.multipaz.org`, no `aud`, no `state` |
+| `mp-begin-response.json` | that verifier's begin answer, whose `uri` is the doubled-separator form `haip-vp://://?…` |
+| `PROVENANCE.md` | how each file was captured, when, and the leaf certificates' serials, names and validity |
 
-Their timestamps sit around the harness's pinned instant. What the checks prove with them is that the page reads these
-shapes - R1-R11, the card's subject/issuer/fingerprints, and Multipaz's two findings - not that these are the verifiers'
-bytes.
+What they carry that a shape signed with our own leaf could not:
+
+- **EUDI**: `client_id` `x509_hash:<SHA-256 of the leaf>`, a **20-octet serial** (`606F16D48D021AC3A3E68F2E44F636AE3B786699`),
+  an **URI-only** subject alternative name (`https://verifier.eudiw.dev`, no dNSName), and a `verifier_info` holding a
+  registration certificate.
+- **Multipaz**: `x509_san_dns:verifier.multipaz.org`, no `aud` and no `state` (both findings on the card), a 13-octet
+  serial, and a **critical** `extendedKeyUsage` the page has to know to read the leaf at all.
+
+Both are evaluated under a faked clock at the instant they were captured (2026-11-16T05:30:33Z and 05:31:09Z), because
+that is when the request `iat` and the leaves' validity mean anything.
