@@ -101,6 +101,10 @@ var X509 = (function () {
     var current = 0;
     var started = false;
     for (var i = 0; i < value.length; i++) {
+      // X.690 section 8.19.2: a subidentifier is in the fewest octets, so it never starts with 0x80 (a second
+      // spelling of the same OID, and of the certificate's x509_hash); arcs past 2^53 are not read as numbers
+      if (!started && value[i] === 0x80) throw new Error("an OBJECT IDENTIFIER subidentifier is not minimal");
+      if (current > (Number.MAX_SAFE_INTEGER - 127) / 128) throw new Error("an OBJECT IDENTIFIER arc is too large");
       current = current * 128 + (value[i] & 0x7f);
       started = true;
       if (!(value[i] & 0x80)) {
@@ -337,6 +341,13 @@ var X509 = (function () {
     "1.3.6.1.5.5.7.1.1", // authorityInfoAccess
     "1.3.6.1.5.5.7.1.11", // subjectInfoAccess
   ];
+
+  /**
+   * The extendedKeyUsage purposes under which a leaf's key may sign a request object, when that extension is critical:
+   * anyExtendedKeyUsage (RFC 5280 section 4.2.1.12), the ISO/IEC 18013-5 mdoc reader authentication purpose and the
+   * ISO/IEC TS 23220-4 one, which Multipaz's verifier leaf carries. A non-critical extendedKeyUsage decides nothing.
+   */
+  var LEAF_PURPOSES = ["2.5.29.37.0", "1.0.18013.5.1.6", "1.0.23220.4.1.6"];
 
   /** Names for the extensions a refusal is likeliest to name, so a message says more than an OID. */
   var EXTENSION_NAMES = {
@@ -582,6 +593,16 @@ var X509 = (function () {
         if (bits.length > 1 + (bit >> 3) && (bits[1 + (bit >> 3)] & (0x80 >> (bit & 7)))) keyUsage.push(names[bit]);
       }
     }
+    // ExtKeyUsageSyntax ::= SEQUENCE SIZE (1..MAX) OF KeyPurposeId (RFC 5280 section 4.2.1.12)
+    var extKeyUsage = [];
+    var extKeyUsageCritical = false;
+    if (found.has("2.5.29.37")) {
+      var ekuValue = found.get("2.5.29.37").value;
+      var ekuSequence = requireTag(single(ekuValue, "extKeyUsage"), UNIVERSAL, 16, "extKeyUsage");
+      children(ekuValue, ekuSequence).forEach(function (purpose) { extKeyUsage.push(oid(ekuValue, purpose)); });
+      if (!extKeyUsage.length) throw new Error("an extKeyUsage names no purpose");
+      extKeyUsageCritical = found.get("2.5.29.37").critical;
+    }
     var unknownCritical = [];
     found.forEach(function (extension, id) {
       if (extension.critical && KNOWN_EXTENSIONS.indexOf(id) < 0) unknownCritical.push(id);
@@ -610,6 +631,8 @@ var X509 = (function () {
       keyUsage: keyUsage,
       keyUsagePresent: keyUsagePresent,
       keyUsageText: keyUsage.join(", "),
+      extKeyUsage: extKeyUsage,
+      extKeyUsageCritical: extKeyUsageCritical,
       unknownCritical: unknownCritical,
       ski: ski,
       aki: aki,
@@ -913,6 +936,14 @@ var X509 = (function () {
         return "x5c certificate 0 (" + subject + ") has a keyUsage of [" + certificate.keyUsage.join(", ")
           + "] without digitalSignature, so its key may not sign the request object (RFC 5280 section 4.2.1.3).";
       }
+      // a critical extendedKeyUsage is processed, not just recognised: its key "MUST only be used for one of the
+      // purposes indicated" (RFC 5280 section 4.2.1.12), and only these purposes sign a verifier's request object
+      if (certificate.extKeyUsageCritical && !certificate.extKeyUsage.some(function (purpose) {
+        return LEAF_PURPOSES.indexOf(purpose) >= 0;
+      })) {
+        return "x5c certificate 0 (" + subject + ") has a critical extendedKeyUsage of [" + certificate.extKeyUsage.join(", ")
+          + "], none of which is a purpose that signs a request object (RFC 5280 section 4.2.1.12).";
+      }
       return null;
     }
     if (!certificate.ca) {
@@ -960,6 +991,8 @@ var X509 = (function () {
     verifyJws: verifyJws,
     verifyIssuedBy: verifyIssuedBy,
     certificateFault: certificateFault,
+    oid: oid,
+    LEAF_PURPOSES: LEAF_PURPOSES,
     fingerprintSha256: fingerprintSha256,
     validityOf: validityOf,
     derEcdsaToRaw: derEcdsaToRaw,

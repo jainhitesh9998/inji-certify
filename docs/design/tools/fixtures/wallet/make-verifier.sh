@@ -217,6 +217,23 @@ authorityKeyIdentifier=keyid:always
 cert leaf-under-iap "$OUT/verifier.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Verifier (Policy)" \
     iap-intermediate - "$NOW_BEFORE" "$NOW_AFTER" "$(leaf_ext "subjectAltName=${D}verifier.example" always)"
 
+# a leaf whose critical extendedKeyUsage names codeSigning only: not a purpose that signs a request object, so the
+# page refuses it (RFC 5280 section 4.2.1.12); and one naming the ISO/IEC 18013-5 mdoc reader purpose, which it keeps
+cert codesign-leaf "$OUT/verifier.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Code Signing Verifier" ca - \
+    "$NOW_BEFORE" "$NOW_AFTER" 'basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature
+extendedKeyUsage=critical,codeSigning
+subjectAltName=DNS:verifier.example
+authorityKeyIdentifier=keyid:always
+subjectKeyIdentifier=hash'
+cert mdocreader-leaf "$OUT/verifier.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture mdoc Reader Verifier" ca - \
+    "$NOW_BEFORE" "$NOW_AFTER" 'basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature
+extendedKeyUsage=critical,1.0.18013.5.1.6
+subjectAltName=DNS:verifier.example
+authorityKeyIdentifier=keyid:always
+subjectKeyIdentifier=hash'
+
 # a leaf whose keyUsage is keyAgreement only: its key may not sign the request object (RFC 5280 section 4.2.1.3)
 cert keyagreement-leaf "$OUT/verifier.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Key Agreement Verifier" ca - \
     "$NOW_BEFORE" "$NOW_AFTER" 'basicConstraints=critical,CA:FALSE

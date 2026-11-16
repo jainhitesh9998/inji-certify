@@ -808,11 +808,11 @@ const LOCAL_PAGE = new URL("http://localhost:8090/v1/certify/offer/wallet");
 
 const pemText = (name) => readFileSync(resolve(VERIFIER_DIR, name + ".pem"), "utf8");
 /** A fixture certificate's DER. */
-const derOf = (name) => new Uint8Array(Buffer.from(pemText(name).replace(/-----[^-]+-----/g, "").replace(/\s+/g, ""), "base64"));
+const fixtureDer = (name) => new Uint8Array(Buffer.from(pemText(name).replace(/-----[^-]+-----/g, "").replace(/\s+/g, ""), "base64"));
 const signerOf = (name) => createPrivateKey(readFileSync(resolve(VERIFIER_DIR, name + ".key.pem"), "utf8"));
 /** An `x5c` entry: base64 of the DER, not base64url (RFC 7515 section 4.1.6). */
-const x5cOf = (name) => Buffer.from(derOf(name)).toString("base64");
-const leafHashOf = (name) => createHash("sha256").update(derOf(name)).digest("base64url");
+const x5cOf = (name) => Buffer.from(fixtureDer(name)).toString("base64");
+const leafHashOf = (name) => createHash("sha256").update(fixtureDer(name)).digest("base64url");
 const jsonPart = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
 
 /** The X.509 module exactly as the page loads it. */
@@ -2208,7 +2208,7 @@ await section("20. X.509 certificates, signatures and the verifier's chain (P5-0
     // through a helper keeps a refusal a named check rather than an abandoned section.
     const serialAt = (name) => {
         try {
-            const certificate = X509.parse(derOf(name));
+            const certificate = X509.parse(fixtureDer(name));
             return [certificate.serialBytes.length, certificate.serialNumber];
         } catch (error) {
             return "threw: " + error.message;
@@ -2218,7 +2218,7 @@ await section("20. X.509 certificates, signatures and the verifier's chain (P5-0
         [20, "C0FFEE00C0FFEE00C0FFEE00C0FFEE00C0FFEE00"]);
     equal("the fixture CA's serial is the 20 random octets OpenSSL writes by default", serialAt("ca")[0], 20);
     equal("and the leaf's is 20 too", serialAt("verifier")[0], 20);
-    const leaf = X509.parse(derOf("verifier"));
+    const leaf = X509.parse(fixtureDer("verifier"));
     equal("the leaf's subject is the fixture's", leaf.subject.text, "C=IN, O=Inji Demo Certify, CN=Wallet Fixture Verifier");
     equal("the leaf's issuer is the test CA", leaf.issuer.text, "C=IN, O=Inji Demo Certify, CN=Wallet Fixture Verifier CA");
     equal("the leaf's validity is read as the certificate wrote it",
@@ -2232,19 +2232,19 @@ await section("20. X.509 certificates, signatures and the verifier's chain (P5-0
         /^[0-9A-F]+$/.test(leaf.serialNumber) && leaf.serialNumber.length % 2 === 0
             && leaf.serialNumber.length === leaf.serialBytes.length * 2, leaf.serialNumber);
     equal("its key is the P-256 EC key it carries", leaf.publicKey, { kind: "ec", curve: "P-256" });
-    equal("its AKI is the CA's SKI (RFC 5280 4.2.1.1)", hex(leaf.aki), hex(X509.parse(derOf("ca")).ski));
+    equal("its AKI is the CA's SKI (RFC 5280 4.2.1.1)", hex(leaf.aki), hex(X509.parse(fixtureDer("ca")).ski));
     equal("its own SKI is 20 bytes", leaf.ski.length, 20);
     equal("the CA's basic constraints carry cA and pathLen 2",
-        [X509.parse(derOf("ca")).ca, X509.parse(derOf("ca")).pathLength], [true, 2]);
-    equal("a CA's keyUsage names keyCertSign", X509.parse(derOf("ca")).keyUsage, ["keyCertSign", "cRLSign"]);
-    equal("and only the extensions RFC 5280 defines keep it readable as critical", X509.parse(derOf("ca")).unknownCritical, []);
-    equal("the intermediate's pathLen is 0", X509.parse(derOf("intermediate")).pathLength, 0);
-    equal("the RSA leaf's key is named by its size", X509.parse(derOf("rsa-leaf")).publicKey, { kind: "rsa", bits: 2048 });
+        [X509.parse(fixtureDer("ca")).ca, X509.parse(fixtureDer("ca")).pathLength], [true, 2]);
+    equal("a CA's keyUsage names keyCertSign", X509.parse(fixtureDer("ca")).keyUsage, ["keyCertSign", "cRLSign"]);
+    equal("and only the extensions RFC 5280 defines keep it readable as critical", X509.parse(fixtureDer("ca")).unknownCritical, []);
+    equal("the intermediate's pathLen is 0", X509.parse(fixtureDer("intermediate")).pathLength, 0);
+    equal("the RSA leaf's key is named by its size", X509.parse(fixtureDer("rsa-leaf")).publicKey, { kind: "rsa", bits: 2048 });
 
     // each certificate's signature with the next one's key (RFC 5280 6.1.3 (a)(1))
     const issuedBy = async (child, parent) => {
         try {
-            return await X509.verifyIssuedBy(X509.parse(derOf(child)), X509.parse(derOf(parent)));
+            return await X509.verifyIssuedBy(X509.parse(fixtureDer(child)), X509.parse(fixtureDer(parent)));
         } catch (error) {
             return "threw: " + error.message;
         }
@@ -2261,7 +2261,7 @@ await section("20. X.509 certificates, signatures and the verifier's chain (P5-0
     equal("a certificate signed with RSA-PSS and SHA-256 verifies (RFC 4055 section 3.1)",
         await issuedBy("rsa-pss-leaf", "rsa-ca"), true);
     equal("and the PSS AlgorithmIdentifier's parameters are read, not guessed at",
-        X509.parse(derOf("rsa-pss-leaf")).signatureAlgorithm, "1.2.840.113549.1.1.10");
+        X509.parse(fixtureDer("rsa-pss-leaf")).signatureAlgorithm, "1.2.840.113549.1.1.10");
     equal("the P-384 chain verifies", await issuedBy("p384-leaf", "p384-ca"), true);
     equal("the P-521 chain verifies", await issuedBy("p521-leaf", "p521-ca"), true);
     equal("a self-signed certificate verifies with its own key", await issuedBy("self-signed", "self-signed"), true);
@@ -2269,7 +2269,7 @@ await section("20. X.509 certificates, signatures and the verifier's chain (P5-0
         /ECDSA certificate is signed by a non-EC key/.test(String(await issuedBy("verifier", "rsa-ca"))), true);
 
     // validity, and the doubling the check allows for (RFC 5280 6.1.3 (a)(2))
-    const stateAt = (name, when, skew) => X509.validityOf(X509.parse(derOf(name)), when, skew);
+    const stateAt = (name, when, skew) => X509.validityOf(X509.parse(fixtureDer(name)), when, skew);
     equal("the leaf is valid at the harness's instant", stateAt("verifier", NOW, 5 * 60 * 1000), "valid");
     equal("the expired leaf is expired", stateAt("expired", NOW, 5 * 60 * 1000), "expired");
     equal("the future leaf is not valid yet", stateAt("future", NOW, 5 * 60 * 1000), "notYetValid");
@@ -2288,7 +2288,7 @@ await section("20. X.509 certificates, signatures and the verifier's chain (P5-0
         check(`${label}: refused`, message !== null && fragment.test(message), String(message));
     };
     parseRefuses("a DER SEQUENCE that is not a Certificate", DUMMY_DER, /three elements/);
-    parseRefuses("a truncated certificate", derOf("verifier").subarray(0, 60), /DER|runs past the end/);
+    parseRefuses("a truncated certificate", fixtureDer("verifier").subarray(0, 60), /DER|runs past the end/);
     parseRefuses("an indefinite length (BER, not DER)", Uint8Array.of(0x30, 0x80, 0x00, 0x00), /indefinite length is BER/);
     parseRefuses("a certificate whose outer tag is not a SEQUENCE", Uint8Array.of(0x04, 0x01, 0x00), /Certificate/);
     // X.690 section 10.1: the length must be the shortest encoding of its value, so a long form below 128, or one
@@ -2327,7 +2327,7 @@ await section("20. X.509 certificates, signatures and the verifier's chain (P5-0
 
     // RFC 5280 4.2 and 6.1.4: what each certificate of a path must be, read from its own extensions. The four
     // `*-variant` certificates carry the CA's own subject name, so each reaches the CA checks instead of the name check.
-    const faultOf = (name, position) => X509.certificateFault(X509.parse(derOf(name)), position);
+    const faultOf = (name, position) => X509.certificateFault(X509.parse(fixtureDer(name)), position);
     equal("a genuine CA passes the path checks", faultOf("ca", 1), null);
     check("a certificate that says cA:FALSE cannot issue another", /is not a CA/.test(String(faultOf("nonca", 1))),
         String(faultOf("nonca", 1)));
@@ -2343,7 +2343,7 @@ await section("20. X.509 certificates, signatures and the verifier's chain (P5-0
     // reached by rewriting one four-character attribute's tag in place, so every length in the certificate stays the
     // same and only the string type changes (X509.parse does not check signatures).
     const RETYPED = (tag, value) => {
-        const bytes = derOf("names").slice();
+        const bytes = fixtureDer("names").slice();
         const pattern = [0x0c, 0x04, ...Buffer.from("1234")];
         let found = 0;
         for (let at = 0; at + pattern.length <= bytes.length; at++) {
@@ -2376,10 +2376,10 @@ await section("20. X.509 certificates, signatures and the verifier's chain (P5-0
     check("a UniversalString code point beyond Unicode is refused", /beyond Unicode/.test(String(badString)),
         String(badString));
 
-    const fingerprint = await X509.fingerprintSha256(derOf("verifier"));
+    const fingerprint = await X509.fingerprintSha256(fixtureDer("verifier"));
     equal("the fingerprint is 32 colon-separated uppercase hex pairs", /^([0-9A-F]{2}:){31}[0-9A-F]{2}$/.test(fingerprint), true);
     equal("and it is the DER's own SHA-256", fingerprint.replace(/:/g, ""),
-        createHash("sha256").update(derOf("verifier")).digest("hex").toUpperCase());
+        createHash("sha256").update(fixtureDer("verifier")).digest("hex").toUpperCase());
 });
 
 await section("20b. what the page refuses rather than ignores: critical extensions it cannot process, and strict DER", async () => {
@@ -2390,8 +2390,8 @@ await section("20b. what the page refuses rather than ignores: critical extensio
         ["2.5.29.33", "policyMappings"], ["2.5.29.36", "policyConstraints"], ["2.5.29.54", "inhibitAnyPolicy"]]) {
         equal(`${name} (${id}) is not an extension a critical marking may pass with`, X509.KNOWN_EXTENSIONS.includes(id), false);
     }
-    const faultOf = (name, position, chain) => X509.certificateFault(X509.parse(derOf(name)), position,
-        chain === undefined ? undefined : chain.map((member) => X509.parse(derOf(member))));
+    const faultOf = (name, position, chain) => X509.certificateFault(X509.parse(fixtureDer(name)), position,
+        chain === undefined ? undefined : chain.map((member) => X509.parse(fixtureDer(member))));
     check("an intermediate with a critical nameConstraints ends the path, naming the extension",
         /2\.5\.29\.30 \(nameConstraints\) critical, and this page does not process it/.test(String(faultOf("nc-intermediate", 1))),
         String(faultOf("nc-intermediate", 1)));
@@ -2415,6 +2415,25 @@ await section("20b. what the page refuses rather than ignores: critical extensio
     refusesWith("a request object signed by a keyAgreement-only leaf",
         await checkRequestOf(jar(withMembers({}), { x5c: [x5cOf("keyagreement-leaf"), x5cOf("ca")] })), "R10",
         /without digitalSignature/);
+    // RFC 5280 section 4.2.1.12: a critical extendedKeyUsage is processed, so a leaf whose only purpose is codeSigning
+    // may not sign the request object; the ISO/IEC 18013-5 mdoc reader purpose (Multipaz's leaf) may
+    check("a leaf whose critical extendedKeyUsage is codeSigning only may not sign the request object",
+        /critical extendedKeyUsage of \[1\.3\.6\.1\.5\.5\.7\.3\.3\]/.test(String(faultOf("codesign-leaf", 0))),
+        String(faultOf("codesign-leaf", 0)));
+    refusesWith("a request object signed by a codeSigning-only leaf",
+        await checkRequestOf(jar(withMembers({}), { x5c: [x5cOf("codesign-leaf"), x5cOf("ca")] })), "R10",
+        /critical extendedKeyUsage/);
+    equal("a leaf whose critical extendedKeyUsage is the mdoc reader purpose passes this rule",
+        String(faultOf("mdocreader-leaf", 0)), "null");
+    equal("and the hosted Multipaz leaf's critical extendedKeyUsage names the mdoc reader purposes",
+        X509.parse(new Uint8Array(Buffer.from(JSON.parse(Buffer.from(readFileSync(resolve(HOSTED_DIR, "mp-request.jwt"), "utf8")
+            .trim().split(".")[0], "base64url")).x5c[0], "base64"))).extKeyUsage.join(","), "1.0.18013.5.1.6,1.0.23220.4.1.6");
+    // X.690 section 8.19.2: a subidentifier starting with 0x80 is a second spelling of the same OID
+    const oidOf = (bytes) => { try { return X509.oid(bytes, X509.element(bytes, 0)); } catch (error) { return "refused: " + error.message; } };
+    equal("an OBJECT IDENTIFIER in its fewest octets reads", oidOf(new Uint8Array([0x06, 0x03, 0x55, 0x1d, 0x11])), "2.5.29.17");
+    check("an OBJECT IDENTIFIER whose subidentifier starts with 0x80 is refused",
+        /not minimal/.test(oidOf(new Uint8Array([0x06, 0x04, 0x55, 0x1d, 0x80, 0x11]))),
+        oidOf(new Uint8Array([0x06, 0x04, 0x55, 0x1d, 0x80, 0x11])));
     equal("and both hosted leaves assert digitalSignature, so they pass this rule",
         ["mp-request", "eudi-request-get"].map((name) => {
             const text = readFileSync(resolve(HOSTED_DIR, name + ".jwt"), "utf8").trim();
@@ -2432,8 +2451,8 @@ await section("20b. what the page refuses rather than ignores: critical extensio
 
     const issuedBy = async (child, parent) => {
         try {
-            return await X509.verifyIssuedBy(child instanceof Uint8Array ? X509.parse(child) : X509.parse(derOf(child)),
-                X509.parse(derOf(parent)));
+            return await X509.verifyIssuedBy(child instanceof Uint8Array ? X509.parse(child) : X509.parse(fixtureDer(child)),
+                X509.parse(fixtureDer(parent)));
         } catch (error) {
             return "threw: " + error.message;
         }
@@ -2464,7 +2483,7 @@ await section("20b. what the page refuses rather than ignores: critical extensio
         });
     };
     const rewritten = (name, edit) => {
-        const bytes = derOf(name).slice();
+        const bytes = fixtureDer(name).slice();
         edit(bytes);
         return bytes;
     };
@@ -2489,7 +2508,7 @@ await section("20b. what the page refuses rather than ignores: critical extensio
         bytes[constraints.parts[0].end - 1] = 0x0f;
     }), /2\.5\.29\.15 appears more than once/);
     check("and the vector is what it says: the rewritten certificate names keyUsage twice", (() => {
-        const bytes = derOf("verifier").slice();
+        const bytes = fixtureDer("verifier").slice();
         const constraints = extensionsOf(bytes).find((extension) => extension.oid === BASIC_CONSTRAINTS);
         bytes[constraints.parts[0].end - 1] = 0x0f;
         return extensionsOf(bytes).filter((extension) => extension.oid === KEY_USAGE).length === 2;
@@ -2508,7 +2527,7 @@ await section("20b. what the page refuses rather than ignores: critical extensio
     parseRefuses("an extension's critical flag written as FALSE", rewritten("verifier", (bytes) => {
         bytes[extensionsOf(bytes).find((extension) => extension.oid === BASIC_CONSTRAINTS).parts[1].contentStart] = 0x00;
     }), /critical flag is written as FALSE, its DEFAULT/);
-    equal("the unrewritten CA still reads as a CA", X509.parse(derOf("ca")).ca, true);
+    equal("the unrewritten CA still reads as a CA", X509.parse(fixtureDer("ca")).ca, true);
 
     // RFC 5280 section 4.1.2.1: version 0, 1 or 2; v1 is the DEFAULT, and only v3 carries extensions
     const versionAt = (bytes) => X509.children(bytes, tbsFieldsOf(bytes)[0])[0].contentStart;
@@ -2529,7 +2548,7 @@ await section("20b. what the page refuses rather than ignores: critical extensio
         /UTCTime names no instant/);
     parseRefuses("a UTCTime on 30 February", rewritten("verifier", (bytes) => ascii(bytes, timeAt(bytes, 0) + 2, "0230")),
         /UTCTime names no instant \(260230000000Z\)/);
-    const generalized = X509.parse(derOf("generalized-time"));
+    const generalized = X509.parse(fixtureDer("generalized-time"));
     equal("a GeneralizedTime notAfter (2051, which RFC 5280 writes so) is read as the instant it names",
         generalized.notAfter.toISOString(), "2051-01-01T00:00:00.000Z");
     parseRefuses("a GeneralizedTime in month 13", rewritten("generalized-time", (bytes) => ascii(bytes, timeAt(bytes, 1) + 4, "13")),
@@ -2551,7 +2570,7 @@ await section("20b. what the page refuses rather than ignores: critical extensio
     equal("a negative serial is read, kept as its octets and flagged rather than refused",
         typeof negative === "string" ? negative : [negative.serialNegative, negative.serialBytes.length, negative.serialNumber.slice(0, 2)],
         [true, 20, "80"]);
-    equal("and a positive one is flagged as such", X509.parse(derOf("verifier")).serialNegative, false);
+    equal("and a positive one is flagged as such", X509.parse(fixtureDer("verifier")).serialNegative, false);
     parseRefuses("a serial padded with a 0x00 it does not need", rewritten("verifier", (bytes) => {
         bytes[tbsFieldsOf(bytes)[1].contentStart] = 0x00;
     }), /minimal/);
@@ -2789,7 +2808,7 @@ await section("23. the request checks R1-R11 and the findings (plan 4.5)", async
         [good.card.clientId, good.card.subject.map((a) => a.short).join(","), good.card.issuer.map((a) => a.short).join(",")],
         ["x509_san_dns:verifier.example", "C,O,CN", "C,O,CN"]);
     check("its card carries the leaf's and the topmost certificate's SHA-256",
-        good.card.fingerprints.leaf === await X509.fingerprintSha256(derOf("verifier"))
+        good.card.fingerprints.leaf === await X509.fingerprintSha256(fixtureDer("verifier"))
             && good.card.fingerprints.top === good.card.fingerprints.leaf, JSON.stringify(good.card.fingerprints));
     equal("the card shows the response_uri's host", good.card.responseUriHost, "verifier.example");
     equal("a request with aud and state raises no finding about them",
@@ -2927,7 +2946,7 @@ await section("23. the request checks R1-R11 and the findings (plan 4.5)", async
         { keyName: "leaf-under-intermediate", x5c: [x5cOf("leaf-under-intermediate"), x5cOf("intermediate"), x5cOf("ca")] }));
     equal("a three-certificate chain that links is accepted", [chain3.ok, chain3.card.chainLength], [true, 3]);
     equal("its card shows the topmost certificate's fingerprint, which is the CA's",
-        chain3.card.fingerprints.top, await X509.fingerprintSha256(derOf("ca")));
+        chain3.card.fingerprints.top, await X509.fingerprintSha256(fixtureDer("ca")));
     for (const [label, alg, keyName] of [["ES384", "ES384", "p384-leaf"], ["ES512", "ES512", "p521-leaf"],
         ["RS256", "RS256", "rsa-leaf"], ["PS256", "PS256", "rsa-leaf"]]) {
         const signed = await checkRequestOf(jar(withMembers({}), { alg, keyName }));
