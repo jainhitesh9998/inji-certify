@@ -78,12 +78,24 @@ own chain and client-identifier checks (plan 4.5, R6/R7/R10) run offline against
 | `impostor-ca.pem` (`.key.pem`) | a second CA that signed none of the leaves: the chain link that does not verify |
 | `self-signed.pem` (`.key.pem`) | one self-signed certificate with `DNS:verifier.example`: HAIP §5's finding, not a refusal |
 | `ca-variant.key.pem` + `nonca.pem`, `nokeycertsign.pem`, `unknown-critical.pem`, `tight-pathlen.pem` | four certificates carrying the CA's own subject name and not its key, one for each RFC 5280 §6.1.4 path rule the page enforces: `cA` not set, a `keyUsage` without `keyCertSign`, an unrecognised critical extension, and a `pathLenConstraint` of 0. The page reads a certificate's own extensions before it tries the signature link, so each one reaches the CA check it is there for; one key serves all four, and none of them signs anything |
+| `nc-intermediate.pem` (`.key.pem`), `leaf-under-nc.pem` | an intermediate the CA signed with a **critical `nameConstraints`** permitting only `DNS:allowed.example`, and a leaf it signed for `DNS:verifier.example` (with `verifier`'s key). Every signature and validity is good; `openssl verify` refuses the chain (permitted subtree violation), and the page refuses it because it runs no name-constraint processing (RFC 5280 §4.2) |
+| `iap-intermediate.pem` (`.key.pem`), `leaf-under-iap.pem` | the same shape with a **critical `inhibitAnyPolicy`**: a policy extension the page does not process, so a critical one ends the path |
+| `keyagreement-leaf.pem` | a leaf under the CA whose `keyUsage` is `keyAgreement` only (with `verifier`'s key): it may not sign the request object (RFC 5280 §4.2.1.3) |
+| `rsa-pss-sha1-leaf.pem` | the RSA CA signing with RSA-PSS over SHA-1, MGF1-SHA-1 and a 20-octet salt, every parameter at its DEFAULT (with `rsa-pss-leaf`'s key): SHA-1 is refused whether it is spelled `sha1WithRSAEncryption` or RSA-PSS |
+| `rsa-leaf-under-small-ca.pem` | a 2048-bit leaf (with `rsa-leaf`'s key) signed by the 1024-bit `rsa-small-ca`: the 2048-bit floor holds for a certificate's signer too |
+| `generalized-time.pem` | a self-signed leaf (with `names`' key) whose `notAfter` is in 2051, which RFC 5280 §4.1.2.5 writes as GeneralizedTime; the harness rewrites its fields in place to reach that half of the time reader |
 | `names.pem` (`.key.pem`) | a self-signed leaf whose `CN` is four characters, so the harness can rewrite that one string's tag in place and reach the two name string types no certificate here writes: NumericString (tag 18) and UniversalString (tag 28) |
 | `jwe.key.pem`, `jwe.pub.pem`, `kid.txt` | the verifier's response-encryption key pair and the `kid` it names (P5-03e reads these) |
 
 Serials are OpenSSL's own 20 random octets - the size RFC 5280 §4.1.2.2 allows up to, and what the hosted captures
-carry - except `other`, `intermediate` and `leaf-under-intermediate`, whose first octet has its top bit set, so DER
-writes a leading `0x00` pad. Both shapes are why the page keeps a serial as bytes and hex rather than as a number.
+carry - except `other`, whose first octet has its top bit set, so DER writes a leading `0x00` pad. Both shapes are why
+the page keeps a serial as bytes and hex rather than as a number. A negative serial, which no fixture carries, is
+reached by rewriting the `verifier` serial's first octet in the harness.
+
+The harness reaches the strict-DER refusals the same way, by rewriting octets of a committed certificate in place so
+that every length stays the same: an extension that appears twice, `cA` written as `0x01` or as FALSE, a `critical`
+FALSE, a version of v1, 3 or v2-with-extensions, a month 13 or an hour 40 in either time type, and RSA-PSS parameters
+that write a DEFAULT or name SHA-224.
 
 Every validity range is written with an explicit `-not_before`/`-not_after`, because three checks are about the clock.
 The harness pins "now" at **2026-11-15T09:00:00Z**, which is inside every leaf's validity except `expired` and `future`.
@@ -112,5 +124,6 @@ What they carry that a shape signed with our own leaf could not:
 - **Multipaz**: `x509_san_dns:verifier.multipaz.org`, no `aud` and no `state` (both findings on the card), a 13-octet
   serial, and a **critical** `extendedKeyUsage` the page has to know to read the leaf at all.
 
-Both are evaluated under a faked clock at the instant they were captured (2026-11-16T05:30:33Z and 05:31:09Z), because
-that is when the request `iat` and the leaves' validity mean anything.
+Each is evaluated under a faked clock at the instant it was captured, its own `iat` (2026-11-16T05:30:33Z for EUDI's
+get form, 05:30:35Z for its post form, 05:31:09Z for Multipaz), because that is when the request `iat` and the leaves'
+validity mean anything.

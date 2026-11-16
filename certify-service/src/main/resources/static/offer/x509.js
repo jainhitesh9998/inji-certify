@@ -117,21 +117,30 @@ var X509 = (function () {
   }
 
   /**
-   * A non-negative INTEGER's content octets, without the 0x00 pad DER puts in front of a value whose top bit is set
-   * (X.690 section 8.3.2), and with the minimal encoding DER requires. The version and a pathLenConstraint are read
-   * through `integer()` below; a serial is kept as these octets, because it may be 20 of them and no JavaScript number
-   * holds that (RFC 5280 section 4.1.2.2).
+   * An INTEGER's content octets, held to the minimal encoding DER requires (X.690 section 8.3.2): the first nine bits
+   * are never all zeros or all ones, so a value has one spelling. Every INTEGER the page reads goes through here.
    */
-  function integerOctets(bytes, el) {
+  function minimalOctets(bytes, el) {
     requireTag(el, UNIVERSAL, 2, "an INTEGER");
     var value = content(bytes, el);
     if (!value.length) throw new Error("an INTEGER is empty");
-    if (value[0] & 0x80) throw new Error("a negative INTEGER where none is allowed");
-    if (value.length > 1 && value[0] === 0x00) {
-      if (!(value[1] & 0x80)) throw new Error("an INTEGER carries a non-minimal leading 0x00 octet (X.690 section 8.3.2)");
-      return value.subarray(1);
+    if (value.length > 1 && ((value[0] === 0x00 && !(value[1] & 0x80)) || (value[0] === 0xff && (value[1] & 0x80)))) {
+      throw new Error("an INTEGER is not minimally encoded (X.690 section 8.3.2)");
     }
     return value;
+  }
+
+  /**
+   * A serialNumber's octets (RFC 5280 section 4.1.2.2), kept as octets because a serial may be 20 of them and no
+   * JavaScript number holds that. A positive serial loses the 0x00 pad DER puts in front of a top bit. A negative one
+   * is a CA's mistake that section 4.1.2.2 asks a reader to handle gracefully ("Certificate users SHOULD be prepared
+   * to gracefully handle such certificates"), so its octets are kept as written, for display, and `negative` says so:
+   * the serial decides nothing on this page, and refusing the whole chain over it would be the opposite of graceful.
+   */
+  function serialOctets(bytes, el) {
+    var value = minimalOctets(bytes, el);
+    var negative = (value[0] & 0x80) !== 0;
+    return { octets: !negative && value.length > 1 && value[0] === 0x00 ? value.subarray(1) : value, negative: negative };
   }
 
   /** Those octets as uppercase hex, two characters per octet (how every other tool prints a serial). */
@@ -143,9 +152,7 @@ var X509 = (function () {
 
   /** A non-negative INTEGER as a number, refusing what does not fit one (no field the page reads is that large). */
   function integer(bytes, el) {
-    requireTag(el, UNIVERSAL, 2, "an INTEGER");
-    var value = content(bytes, el);
-    if (!value.length) throw new Error("an INTEGER is empty");
+    var value = minimalOctets(bytes, el);
     if (value[0] & 0x80) throw new Error("a negative INTEGER where none is allowed");
     var result = 0;
     for (var i = 0; i < value.length; i++) result = result * 256 + value[i];
@@ -245,25 +252,48 @@ var X509 = (function () {
 
   /* ---------------------------------------------------------------- time */
 
-  /** A UTCTime or GeneralizedTime, as an instant (RFC 5280 section 4.1.2.5, X.690 section 11.8). */
+  /**
+   * A UTCTime or GeneralizedTime, as an instant (RFC 5280 section 4.1.2.5, X.690 section 11.8). Each field is held
+   * to its range before any Date is made: `Date.UTC` would turn month 13 into January of the next year and hour 40 into
+   * the next afternoon, so a certificate that names no instant would be read as naming another one. The year is set
+   * with `setUTCFullYear` for the same reason (`Date.UTC` reads a year below 100 as 1900 + year).
+   */
   function time(bytes, el) {
     requireTag(el, UNIVERSAL, el.tag === 24 ? 24 : 23, "a Time");
     var text = "";
     var value = content(bytes, el);
     for (var i = 0; i < value.length; i++) text += String.fromCharCode(value[i]);
     var match;
+    var year;
+    var what;
     if (el.tag === 23) {
       // UTCTime "YYMMDDHHMMSSZ": YY 50..99 is 1950..1999 and 00..49 is 2000..2049 (RFC 5280 section 4.1.2.5.1)
+      what = "UTCTime";
       match = /^(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z$/.exec(text);
       if (!match) throw new Error("a UTCTime is not YYMMDDHHMMSSZ");
       var yy = Number(match[1]);
-      return new Date(Date.UTC(yy >= 50 ? 1900 + yy : 2000 + yy, Number(match[2]) - 1, Number(match[3]),
-        Number(match[4]), Number(match[5]), Number(match[6])));
+      year = yy >= 50 ? 1900 + yy : 2000 + yy;
+    } else {
+      what = "GeneralizedTime";
+      match = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z$/.exec(text);
+      if (!match) throw new Error("a GeneralizedTime is not YYYYMMDDHHMMSSZ");
+      year = Number(match[1]);
     }
-    match = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z$/.exec(text);
-    if (!match) throw new Error("a GeneralizedTime is not YYYYMMDDHHMMSSZ");
-    return new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(match[4]),
-      Number(match[5]), Number(match[6])));
+    var month = Number(match[2]);
+    var day = Number(match[3]);
+    var hour = Number(match[4]);
+    var minute = Number(match[5]);
+    var second = Number(match[6]);
+    var leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    var days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if (month < 1 || month > 12 || day < 1 || day > days[month - 1] || hour > 23 || minute > 59 || second > 59) {
+      throw new Error("a " + what + " names no instant (" + text + "): month 01-12, a day the month has, hour 00-23, "
+        + "minute and second 00-59 (RFC 5280 section 4.1.2.5)");
+    }
+    var date = new Date(0);
+    date.setUTCFullYear(year, month - 1, day);
+    date.setUTCHours(hour, minute, second, 0);
+    return date;
   }
 
   /* ---------------------------------------------------------------- extensions */
@@ -274,30 +304,55 @@ var X509 = (function () {
   };
 
   /**
-   * The extension types this page knows, critical or not. RFC 5280 section 4.2 defines these, and every other critical
-   * extension is refused: section 6.1.3 (g) says a certificate with an unrecognised critical extension MUST be
-   * rejected, because that extension may constrain the certificate in a way the reader cannot honour. The hosted
-   * captures are why the list is longer than the five extensions the page reads: Multipaz's leaf marks its
-   * extendedKeyUsage critical, and EUDI's marks its basicConstraints and keyUsage critical. A known extension the page
-   * reads nothing from decides nothing; it just does not end the path.
+   * The extension types this page may meet marked critical. RFC 5280 section 4.2: "A certificate-using system MUST
+   * reject the certificate if it encounters a critical extension it does not recognize or a critical extension that
+   * contains information that it cannot process" (and sections 6.1.4 (o) and 6.1.5 (f) for a path). So this list is
+   * not the extensions RFC 5280 defines; it is the ones whose criticality the page honours:
+   *
+   * - the five it reads and decides by: subjectKeyIdentifier, authorityKeyIdentifier, subjectAltName (R6),
+   *   basicConstraints and keyUsage (`certificateFault`). EUDI's leaf marks the last two critical;
+   * - extendedKeyUsage, which Multipaz's leaf marks critical (ISO/IEC 18013-5 mdoc reader authentication). A critical
+   *   one limits the purposes the key may serve (RFC 5280 section 4.2.1.12), and authenticating a verifier's request
+   *   is the purpose that leaf is issued for; no extended key usage is defined for signing a request object;
+   * - the four that only say where to look for revocation or for more certificates: cRLDistributionPoints,
+   *   freshestCRL, authorityInfoAccess, subjectInfoAccess. They constrain nothing the page decides, and the page
+   *   checks no revocation at all (plan section 6, deviation 1).
+   *
+   * The path-constraining extensions are deliberately absent: nameConstraints (2.5.29.30), certificatePolicies
+   * (.32), policyMappings (.33), policyConstraints (.36) and inhibitAnyPolicy (.54). The page runs none of the
+   * name-constraint or policy steps of sections 6.1.3 and 6.1.4, so a critical one ends the path rather than being
+   * read as if it were satisfied: an intermediate permitted only `DNS:allowed.example` must not be able to vouch for
+   * `DNS:verifier.example` here when `openssl verify` refuses the same chain. Neither hosted capture carries one
+   * (EUDI's leaf has a non-critical certificatePolicies, which a reader may ignore).
    */
   var KNOWN_EXTENSIONS = [
     "2.5.29.14", // subjectKeyIdentifier
     "2.5.29.15", // keyUsage
     "2.5.29.17", // subjectAltName
     "2.5.29.19", // basicConstraints
-    "2.5.29.30", // nameConstraints
     "2.5.29.31", // cRLDistributionPoints
-    "2.5.29.32", // certificatePolicies
-    "2.5.29.33", // policyMappings
     "2.5.29.35", // authorityKeyIdentifier
-    "2.5.29.36", // policyConstraints
     "2.5.29.37", // extKeyUsage
     "2.5.29.46", // freshestCRL
-    "2.5.29.54", // inhibitAnyPolicy
     "1.3.6.1.5.5.7.1.1", // authorityInfoAccess
     "1.3.6.1.5.5.7.1.11", // subjectInfoAccess
   ];
+
+  /** Names for the extensions a refusal is likeliest to name, so a message says more than an OID. */
+  var EXTENSION_NAMES = {
+    "2.5.29.30": "nameConstraints", "2.5.29.32": "certificatePolicies", "2.5.29.33": "policyMappings",
+    "2.5.29.36": "policyConstraints", "2.5.29.54": "inhibitAnyPolicy",
+  };
+
+  /**
+   * The one DER element an extension's OCTET STRING holds, which must fill it: an extnValue is its own DER document
+   * (RFC 5280 section 4.1), and octets after its value would be a second reading of the same extension.
+   */
+  function single(extnValue, what) {
+    var el = element(extnValue, 0);
+    if (el.end !== extnValue.length) throw new Error(what + " carries octets after its value");
+    return el;
+  }
 
   /**
    * The GeneralNames the page reads: dNSName [2] and URI [6], both IA5String (RFC 5280 section 4.2.1.6). `extnValue`
@@ -306,7 +361,7 @@ var X509 = (function () {
    */
   function generalNames(extnValue) {
     var sans = { dnsNames: [], uris: [] };
-    children(extnValue, element(extnValue, 0)).forEach(function (generalName) {
+    children(extnValue, single(extnValue, "subjectAltName")).forEach(function (generalName) {
       if (generalName.cls !== CONTEXT) return;
       if (generalName.tag !== 2 && generalName.tag !== 6) return;
       var text = "";
@@ -318,28 +373,42 @@ var X509 = (function () {
   }
 
   /**
+   * A DER BOOLEAN that is there only because it is TRUE: a field `BOOLEAN DEFAULT FALSE` is left out when FALSE (X.690
+   * section 11.5, "the encoding of a set value or sequence value shall not include an encoding for any component value
+   * which is equal to its default value"), and TRUE is the single octet 0xFF (section 11.1). Anything else is a second
+   * spelling of the same certificate.
+   */
+  function defaultFalseBoolean(bytes, el, what) {
+    requireTag(el, UNIVERSAL, 1, what);
+    var flag = content(bytes, el);
+    if (flag.length === 1 && flag[0] === 0x00) {
+      throw new Error(what + " is written as FALSE, its DEFAULT, which DER leaves out (X.690 section 11.5)");
+    }
+    if (flag.length !== 1 || flag[0] !== 0xff) {
+      throw new Error(what + " is not the DER BOOLEAN TRUE, the single octet 0xFF (X.690 section 11.1)");
+    }
+    return true;
+  }
+
+  /**
    * The extensions of a certificate, by OID, each with the DER of its own extnValue octets and its criticality flag
    * (RFC 5280 section 4.2: `Extension ::= SEQUENCE { extnID, critical BOOLEAN DEFAULT FALSE, extnValue OCTET STRING }`,
-   * so the BOOLEAN is there only when it is TRUE).
+   * so the BOOLEAN is there only when it is TRUE). Section 4.2: "A certificate MUST NOT include more than one instance
+   * of a particular extension", and a reader that kept either one would decide by a value the other contradicts.
    */
   function extensions(bytes, list) {
     var found = new Map();
     list.forEach(function (extension) {
       requireTag(extension, UNIVERSAL, 16, "an Extension");
       var parts = children(bytes, extension);
-      if (parts.length < 2) throw new Error("an Extension has fewer than two elements");
+      if (parts.length !== 2 && parts.length !== 3) throw new Error("an Extension is not two or three elements");
       var id = oid(bytes, parts[0]);
-      var critical = false;
+      var critical = parts.length === 3 && defaultFalseBoolean(bytes, parts[1], "an Extension's critical flag");
       var value = parts[parts.length - 1];
-      if (parts.length === 3) {
-        requireTag(parts[1], UNIVERSAL, 1, "a critical flag");
-        var flag = content(bytes, parts[1]);
-        if (flag.length !== 1 || (flag[0] !== 0x00 && flag[0] !== 0xff)) {
-          throw new Error("a critical flag is not the DER BOOLEAN it has to be (X.690 section 11.1)");
-        }
-        critical = flag[0] === 0xff;
-      }
       requireTag(value, UNIVERSAL, 4, "an extnValue");
+      if (found.has(id)) {
+        throw new Error("the extension " + id + " appears more than once (RFC 5280 section 4.2)");
+      }
       found.set(id, { value: content(bytes, value), critical: critical });
     });
     return found;
@@ -362,10 +431,13 @@ var X509 = (function () {
     "1.2.840.113549.1.1.10": { kind: "pss" },                     // rsassaPss (RFC 4055 section 3.1)
   };
 
-  /** The digests an RSASSA-PSS-params may name, by OID, and their WebCrypto names (RFC 4055 section 2.1). */
+  /**
+   * The digests an RSASSA-PSS-params may name here, by OID, and their WebCrypto names (RFC 4055 section 2.1). The
+   * same three as the PKCS#1 v1.5 algorithms above: SHA-1 and SHA-224 are left out, so a certificate cannot get past
+   * the refusal of `sha1WithRSAEncryption` by naming RSA-PSS with SHA-1 instead (RFC 4055's own default).
+   */
   var DIGESTS = {
-    "1.3.14.3.2.26": "SHA-1", "2.16.840.1.101.3.4.2.4": "SHA-224", "2.16.840.1.101.3.4.2.1": "SHA-256",
-    "2.16.840.1.101.3.4.2.2": "SHA-384", "2.16.840.1.101.3.4.2.3": "SHA-512",
+    "2.16.840.1.101.3.4.2.1": "SHA-256", "2.16.840.1.101.3.4.2.2": "SHA-384", "2.16.840.1.101.3.4.2.3": "SHA-512",
   };
   var OID_MGF1 = "1.2.840.113549.1.1.8";
 
@@ -378,13 +450,19 @@ var X509 = (function () {
 
   /**
    * One certificate, read from its DER (RFC 5280 section 4.1):
-   * `{der, subject, issuer, notBefore, notAfter, serialNumber, serialBytes, version, sans, ca, pathLength, keyUsage,
-   * keyUsagePresent, keyUsageText, unknownCritical, ski, aki, spki, publicKey, signatureAlgorithm,
+   * `{der, subject, issuer, notBefore, notAfter, serialNumber, serialBytes, serialNegative, version, sans, ca,
+   * pathLength, keyUsage, keyUsagePresent, keyUsageText, unknownCritical, ski, aki, spki, publicKey, signatureAlgorithm,
    * signatureAlgorithmDer, tbs, tbsSignatureAlgorithm, tbsSignatureAlgorithmDer, signatureValue, selfIssued}`.
    *
    * `serialNumber` is the upper-case hex of the serial's octets, never a number: RFC 5280 section 4.1.2.2 allows up to
    * 20 octets, and both of the hosted captures' certificates carry serials no JavaScript number holds (EUDI's is 20
-   * octets, Multipaz's 13). `serialBytes` is the same value unpadded, which is what the card can show.
+   * octets, Multipaz's 13). `serialBytes` is the same value unpadded, which is what the card can show; a negative
+   * serial keeps its two's-complement octets as written, and `serialNegative` says so (`serialOctets`).
+   *
+   * The DER is held to the rules a second spelling of the same certificate would break (X.690 sections 10 and 11): no
+   * field equal to its DEFAULT is written (a `version` of v1, an Extension's `critical` FALSE, basicConstraints' `cA`
+   * FALSE), a BOOLEAN TRUE is 0xFF, every INTEGER is minimal, the TBSCertificate's optional fields come in their
+   * order and at most once, and no extension appears twice.
    *
    * `selfIssued` is the Name comparison only (RFC 5280 section 4.1.2.4); whether the certificate really signed itself
    * is `verifyIssuedBy(certificate, certificate)`, which is what the trust-path check asks.
@@ -405,11 +483,21 @@ var X509 = (function () {
     var index = 0;
     var version = 1;
     if (fields[0].cls === CONTEXT && fields[0].tag === 0) {
-      // version [0] EXPLICIT Version DEFAULT v1: the INTEGER inside says 0, 1 or 2
-      version = integer(bytes, children(bytes, fields[0])[0]) + 1;
+      // version [0] EXPLICIT Version DEFAULT v1: the INTEGER inside is 0, 1 or 2 (RFC 5280 section 4.1.2.1), and DER
+      // leaves v1 out because it is the DEFAULT (X.690 section 11.5)
+      var versionNumber = integer(bytes, childOf(bytes, fields[0], "the version"));
+      if (versionNumber === 0) {
+        throw new Error("the version is written as v1, its DEFAULT, which DER leaves out (X.690 section 11.5)");
+      }
+      if (versionNumber !== 1 && versionNumber !== 2) {
+        throw new Error("the version INTEGER is " + versionNumber + "; RFC 5280 section 4.1.2.1 defines 0, 1 and 2 "
+          + "(v1, v2, v3)");
+      }
+      version = versionNumber + 1;
       index = 1;
     }
-    var serialBytes = integerOctets(bytes, fields[index++]);
+    var serial = serialOctets(bytes, fields[index++]);
+    var serialBytes = serial.octets;
     var serialNumber = hexOctets(serialBytes);
     // the TBS's own AlgorithmIdentifier, kept whole so that two spellings of the same OID - RSA-PSS's parameters
     // differ per hash and salt length - compare as the certificate wrote them (RFC 5280 section 4.1.1.2)
@@ -424,16 +512,26 @@ var X509 = (function () {
     var spkiElement = requireTag(fields[index++], UNIVERSAL, 16, "a SubjectPublicKeyInfo");
 
     var found = new Map();
+    var previousTag = 0;
     for (; index < fields.length; index++) {
       var field = fields[index];
-      if (field.cls !== CONTEXT) throw new Error("a TBSCertificate field the certificate does not define");
+      // issuerUniqueID [1], subjectUniqueID [2] and extensions [3], each at most once and in that order
+      if (field.cls !== CONTEXT || field.tag < 1 || field.tag > 3 || field.tag <= previousTag) {
+        throw new Error("a TBSCertificate field the certificate does not define, or one out of its order");
+      }
+      previousTag = field.tag;
       if (field.tag === 3) {
-        // extensions [3] EXPLICIT Extensions
+        // extensions [3] EXPLICIT Extensions, which only a v3 certificate carries (RFC 5280 section 4.1.2.9)
+        if (version !== 3) throw new Error("a version " + version + " certificate carries extensions, which need v3 "
+          + "(RFC 5280 section 4.1.2.9)");
         var sequence = children(bytes, field);
         if (sequence.length !== 1) throw new Error("the extensions are not one SEQUENCE");
         found = extensions(bytes, children(bytes, requireTag(sequence[0], UNIVERSAL, 16, "Extensions")));
+      } else if (version < 2) {
+        // the unique identifiers carry nothing this page decides by, and only v2 or v3 has them (RFC 5280 4.1.2.8)
+        throw new Error("a version 1 certificate carries a unique identifier, which needs v2 or v3 (RFC 5280 section "
+          + "4.1.2.8)");
       }
-      // issuerUniqueID [1] and subjectUniqueID [2] carry nothing this page decides by (RFC 5280 4.1.2.8)
     }
 
     var sans = { dnsNames: [], uris: [] };
@@ -443,22 +541,32 @@ var X509 = (function () {
     var ca = false;
     var pathLength = null;
     if (found.has(EXTENSION.basicConstraints)) {
+      // BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER (0..MAX) OPTIONAL }, in
+      // that order and nothing else (RFC 5280 section 4.2.1.9)
       var constraintsValue = found.get(EXTENSION.basicConstraints).value;
-      children(constraintsValue, element(constraintsValue, 0)).forEach(function (member) {
-        if (member.cls === UNIVERSAL && member.tag === 1) ca = content(constraintsValue, member)[0] !== 0;
-        if (member.cls === UNIVERSAL && member.tag === 2) pathLength = integer(constraintsValue, member);
-      });
+      var members = children(constraintsValue, requireTag(single(constraintsValue, "basicConstraints"), UNIVERSAL, 16,
+        "basicConstraints"));
+      var at = 0;
+      if (at < members.length && members[at].cls === UNIVERSAL && members[at].tag === 1) {
+        ca = defaultFalseBoolean(constraintsValue, members[at++], "basicConstraints' cA");
+      }
+      if (at < members.length && members[at].cls === UNIVERSAL && members[at].tag === 2) {
+        pathLength = integer(constraintsValue, members[at++]);
+      }
+      if (at !== members.length) throw new Error("basicConstraints carries a member RFC 5280 section 4.2.1.9 does not "
+        + "define");
     }
     var ski = null;
     if (found.has(EXTENSION.subjectKeyIdentifier)) {
       var skiValue = found.get(EXTENSION.subjectKeyIdentifier).value;
-      ski = content(skiValue, element(skiValue, 0));
+      ski = content(skiValue, requireTag(single(skiValue, "subjectKeyIdentifier"), UNIVERSAL, 4,
+        "subjectKeyIdentifier"));
     }
     var aki = null;
     if (found.has(EXTENSION.authorityKeyIdentifier)) {
       // AuthorityKeyIdentifier ::= SEQUENCE { keyIdentifier [0] IMPLICIT OCTET STRING OPTIONAL, ... }
       var akiValue = found.get(EXTENSION.authorityKeyIdentifier).value;
-      children(akiValue, element(akiValue, 0)).forEach(function (member) {
+      children(akiValue, single(akiValue, "authorityKeyIdentifier")).forEach(function (member) {
         if (member.cls === CONTEXT && member.tag === 0 && aki === null) aki = content(akiValue, member);
       });
     }
@@ -467,7 +575,7 @@ var X509 = (function () {
     if (keyUsagePresent) {
       // KeyUsage ::= BIT STRING, named by bit position (RFC 5280 section 4.2.1.3)
       var usageValue = found.get(EXTENSION.keyUsage).value;
-      var bits = content(usageValue, element(usageValue, 0));
+      var bits = content(usageValue, requireTag(single(usageValue, "keyUsage"), UNIVERSAL, 3, "keyUsage"));
       var names = ["digitalSignature", "nonRepudiation", "keyEncipherment", "dataEncipherment", "keyAgreement",
         "keyCertSign", "cRLSign", "encipherOnly", "decipherOnly"];
       for (var bit = 0; bit < names.length; bit++) {
@@ -491,6 +599,7 @@ var X509 = (function () {
       version: version,
       serialNumber: serialNumber,
       serialBytes: serialBytes,
+      serialNegative: serial.negative,
       subject: subjectName,
       issuer: issuerName,
       notBefore: notBefore,
@@ -569,19 +678,25 @@ var X509 = (function () {
     return { key: key, spec: spec };
   }
 
+  /** The smallest RSA modulus the page verifies a signature with, the request's or a certificate's. */
+  var RSA_MINIMUM_BITS = 2048;
+
   /**
    * Whether `signature` is `certificate`'s signature over `signingInput` under `alg`. An ECDSA JWS signature is `r || s`
    * raw (RFC 7518 section 3.4), which is what WebCrypto returns and expects; a certificate's own ECDSA signature is the
-   * DER SEQUENCE (RFC 3279 section 2.2.3), which `derEcdsaToRaw` converts. An RSA key below 2048 bits is refused before
-   * the signature is tried: RFC 7518 section 3.3 requires 2048 or more for RS256 and PS256, and WebCrypto would happily
-   * verify a 1024-bit signature that the specification does not allow.
+   * DER SEQUENCE (RFC 3279 section 2.2.3), which `derEcdsaToRaw` converts.
+   *
+   * An RSA key below 2048 bits is refused, by a throw and not a `false`, before the signature is tried: RFC 7518
+   * section 3.3 requires 2048 or more for RS256 and PS256, and WebCrypto would happily verify a 1024-bit signature
+   * that the specification does not allow. This is the one place that rule lives; `checkRequest` reports the throw as
+   * R10. Everything else that keeps a signature from verifying (a key of the wrong type or curve, bad bytes) is `false`.
    */
   async function verifyJws(signingInput, signature, certificate, alg) {
     var spec = JWS_ALGORITHMS[alg];
     if (spec !== undefined && spec.kind === "rsa" && certificate.publicKey.kind === "rsa"
-        && certificate.publicKey.bits < 2048) {
-      throw new Error("the leaf certificate's RSA key is " + certificate.publicKey.bits + " bits; RFC 7518 section 3.3 "
-        + "requires 2048 or more for " + alg);
+        && certificate.publicKey.bits < RSA_MINIMUM_BITS) {
+      throw new Error("the leaf certificate's RSA key is " + certificate.publicKey.bits + " bits; " + alg
+        + " requires " + RSA_MINIMUM_BITS + " or more (RFC 7518 section 3.3).");
     }
     var imported;
     try {
@@ -604,8 +719,9 @@ var X509 = (function () {
   /**
    * An ECDSA signature in DER (`SEQUENCE { INTEGER r, INTEGER s }`) as the fixed-width `r || s` WebCrypto expects
    * (RFC 3279 section 2.2.3, RFC 7518 section 3.4). The DER is held to its own rules: the SEQUENCE is the whole input,
-   * both integers are non-empty and positive (X.690 sections 8.3.1 and 8.3.2), and each is at most as wide as the curve
-   * it belongs to. A signature that is two unequal spellings of the same value would otherwise verify twice.
+   * both integers are non-empty and positive (X.690 sections 8.3.1 and 8.3.2), each carries at most the one 0x00 pad a
+   * top bit needs, and each is at most as wide as the curve it belongs to. A signature that is two unequal spellings
+   * of the same value would otherwise verify twice, and a certificate would have two DERs and two `x509_hash` values.
    */
   function derEcdsaToRaw(der, width) {
     var outer = element(der, 0);
@@ -618,13 +734,14 @@ var X509 = (function () {
       var value = content(der, requireTag(part, UNIVERSAL, 2, "an ECDSA signature integer"));
       if (!value.length) throw new Error("an ECDSA signature integer is empty");
       if (value[0] & 0x80) throw new Error("an ECDSA signature integer is negative");
-      var first = 0;
-      while (first < value.length - 1 && value[first] === 0) first++;
-      if (first > 0 && !(value[first] & 0x80)) {
+      // X.690 section 8.3.2: a leading 0x00 is allowed only in front of an octet whose top bit is set, so `00 00 80`
+      // (a second pad) and `00 01` (a pad nothing needs) are both refused. The test is on the second octet itself, not
+      // on the first non-zero one, which is what let `00 00 80` through: skipping every leading zero finds 0x80 there.
+      if (value.length > 1 && value[0] === 0x00 && !(value[1] & 0x80)) {
         throw new Error("an ECDSA signature integer is not minimal (X.690 section 8.3.2)");
       }
       if (value.length === 1 && value[0] === 0) throw new Error("an ECDSA signature integer is zero");
-      var significant = value.subarray(first);
+      var significant = value[0] === 0x00 ? value.subarray(1) : value;
       if (significant.length > width) throw new Error("an ECDSA signature integer is wider than its curve");
       raw.set(significant, index * width + (width - significant.length));
     });
@@ -637,14 +754,25 @@ var X509 = (function () {
    * An RSASSA-PSS AlgorithmIdentifier's parameters (RFC 4055 section 3.1):
    * `RSASSA-PSS-params ::= SEQUENCE { hashAlgorithm [0] HashAlgorithm DEFAULT sha1, maskGenAlgorithm [1] MaskGenAlgorithm
    * DEFAULT mgf1SHA1, saltLength [2] INTEGER DEFAULT 20, trailerField [3] TrailerField DEFAULT trailerFieldBC }`.
-   * Absent parameters mean all four defaults, so a certificate may name the algorithm with no parameters at all.
+   *
+   * Section 3.1 says the parameters "MUST be present when used in the algorithm identifier associated with a signature
+   * value", which is the only place this reads them, so their absence is refused. Every default is SHA-1 or follows
+   * from it, and SHA-1 is not a digest this page verifies (`DIGESTS`), so a hashAlgorithm and a maskGenAlgorithm must
+   * be written; a saltLength of 20 and a trailerField of 1 are their DEFAULTs, which DER leaves out (X.690 section
+   * 11.5), and trailerField has no other value it may take. The fields come in their order, each at most once.
    */
   function pssParameters(bytes, algorithm) {
-    var spec = { hash: "SHA-1", mgfHash: "SHA-1", saltLength: 20 };
-    if (algorithm.length < 2) return spec;
+    var spec = { hash: null, mgfHash: null, saltLength: 20 };
+    if (algorithm.length !== 2) {
+      throw new Error("an RSASSA-PSS signature algorithm carries no parameters; RFC 4055 section 3.1 requires them "
+        + "with a signature value");
+    }
     var parameters = requireTag(algorithm[1], UNIVERSAL, 16, "RSASSA-PSS-params");
+    var previousTag = -1;
     children(bytes, parameters).forEach(function (member) {
       if (member.cls !== CONTEXT) throw new Error("an RSASSA-PSS-params field has the wrong DER class");
+      if (member.tag <= previousTag) throw new Error("the RSASSA-PSS-params fields are out of their order, or repeated");
+      previousTag = member.tag;
       var inner = childOf(bytes, member, "an RSASSA-PSS-params field");
       if (member.tag === 0) {
         spec.hash = digestOf(bytes, inner);
@@ -657,12 +785,26 @@ var X509 = (function () {
         spec.mgfHash = digestOf(bytes, mgf[1]);
       } else if (member.tag === 2) {
         spec.saltLength = integer(bytes, inner);
+        if (spec.saltLength === 20) {
+          throw new Error("the RSASSA-PSS saltLength is written as 20, its DEFAULT, which DER leaves out (X.690 "
+            + "section 11.5)");
+        }
       } else if (member.tag === 3) {
-        if (integer(bytes, inner) !== 1) throw new Error("the RSASSA-PSS trailerField is not 1 (RFC 4055 section 3.1)");
+        throw new Error(integer(bytes, inner) === 1
+          ? "the RSASSA-PSS trailerField is written as 1, its DEFAULT, which DER leaves out (X.690 section 11.5)"
+          : "the RSASSA-PSS trailerField is not 1 (RFC 4055 section 3.1)");
       } else {
         throw new Error("an RSASSA-PSS-params field the structure does not define");
       }
     });
+    if (spec.hash === null) {
+      throw new Error("RSASSA-PSS names no hashAlgorithm, so it is SHA-1 (RFC 4055 section 3.1's DEFAULT), which "
+        + "this page does not verify");
+    }
+    if (spec.mgfHash === null) {
+      throw new Error("RSASSA-PSS names no maskGenAlgorithm, so it is MGF1 with SHA-1 (RFC 4055 section 3.1's "
+        + "DEFAULT), which this page does not verify");
+    }
     if (spec.mgfHash !== spec.hash) {
       throw new Error("RSASSA-PSS uses MGF1 with " + spec.mgfHash + " over a " + spec.hash + " digest, which this page "
         + "does not verify");
@@ -691,6 +833,10 @@ var X509 = (function () {
    * key (RFC 5280 section 6.1.3 (a)(1)). The outer `signatureAlgorithm` must be the AlgorithmIdentifier the TBS names,
    * parameters included, or the certificate says two different things about how it was signed (RFC 5280 section
    * 4.1.1.2) and is refused: with RSA-PSS those parameters are the hash and the salt length.
+   *
+   * An issuer's RSA key below 2048 bits is refused here as it is for the request's own signature (`verifyJws`): no
+   * RFC sets a floor for a certificate signature, but a chain is as strong as its weakest key, and a 1024-bit CA would
+   * otherwise vouch for a 2048-bit leaf the page then accepts.
    */
   async function verifyIssuedBy(certificate, issuer) {
     var spec = SIGNATURE_ALGORITHMS[certificate.signatureAlgorithm];
@@ -715,6 +861,10 @@ var X509 = (function () {
       signature = derEcdsaToRaw(certificate.signatureValue, CURVE_WIDTH[issuer.publicKey.curve]);
     } else {
       if (issuer.publicKey.kind !== "rsa") throw new Error("an RSA certificate is signed by a non-RSA key");
+      if (issuer.publicKey.bits < RSA_MINIMUM_BITS) {
+        throw new Error("the issuing certificate's RSA key is " + issuer.publicKey.bits + " bits, and this page "
+          + "verifies no signature with an RSA key under " + RSA_MINIMUM_BITS + " bits (plan 4.5 R10)");
+      }
       signature = certificate.signatureValue;
       if (spec.kind === "pss") {
         var pss = pssParameters(certificate.signatureAlgorithmDer, children(certificate.signatureAlgorithmDer,
@@ -734,37 +884,54 @@ var X509 = (function () {
   /* ---------------------------------------------------------------- what a path member must be */
 
   /**
-   * RFC 5280 sections 6.1.3 (g) and 6.1.4, on one certificate of a path: what its own extensions have to say about
-   * the role the chain gives it. `position` is its index in `x5c`, the leaf being 0.
+   * RFC 5280 sections 6.1.4 and 6.1.5, on one certificate of a path: what its own extensions have to say about the
+   * role the chain gives it. `position` is its index in `x5c`, the leaf being 0, and `chain` is the whole `x5c` as
+   * parsed (optional: without it every certificate between the leaf and this one counts as an intermediate CA).
    *
-   * - every certificate that issues another must be a CA (basicConstraints cA=TRUE) and, when it carries a keyUsage at
-   *   all, must assert keyCertSign (sections 4.2.1.3 and 6.1.4 (k));
-   * - a pathLenConstraint bounds how many non-self-issued intermediate CA certificates may follow it (section 4.2.1.9);
-   *   with `position` certificates below it, `position - 1` of them are intermediate CAs;
-   * - a critical extension the page does not recognise ends the path (section 6.1.3 (g)).
+   * - a critical extension the page does not process ends the path (sections 4.2, 6.1.4 (o) and 6.1.5 (f));
+   * - the leaf, when it carries a keyUsage, must assert digitalSignature, because its key signs the request object
+   *   (section 4.2.1.3: digitalSignature is the bit for "verifying digital signatures, other than signatures on
+   *   certificates (bit 5) and CRLs (bit 6)");
+   * - every certificate that issues another must be a CA (basicConstraints cA=TRUE, section 6.1.4 (k)) and, when it
+   *   carries a keyUsage at all, must assert keyCertSign (sections 4.2.1.3 and 6.1.4 (n));
+   * - a pathLenConstraint bounds how many non-self-issued intermediate certificates may follow it (sections 4.2.1.9 and
+   *   6.1.4 (l)-(m)): a self-issued one (a CA's key rollover, issuer and subject the same name) does not count, and the
+   *   leaf is not an intermediate.
    *
    * Returns the sentence that says what is wrong, or null.
    */
-  function certificateFault(certificate, position) {
+  function certificateFault(certificate, position, chain) {
     var subject = certificate.subject.text;
     if (certificate.unknownCritical.length) {
-      return "x5c certificate " + position + " (" + subject + ") marks " + certificate.unknownCritical.join(", ")
-        + " critical, and this page does not read " + (certificate.unknownCritical.length > 1 ? "them" : "it")
-        + " (RFC 5280 sections 4.2 and 6.1.3 (g)).";
+      return "x5c certificate " + position + " (" + subject + ") marks " + certificate.unknownCritical.map(function (id) {
+        return EXTENSION_NAMES[id] === undefined ? id : id + " (" + EXTENSION_NAMES[id] + ")";
+      }).join(", ") + " critical, and this page does not process " + (certificate.unknownCritical.length > 1
+        ? "them" : "it") + " (RFC 5280 sections 4.2, 6.1.4 (o) and 6.1.5 (f)).";
     }
-    if (position === 0) return null;
+    if (position === 0) {
+      if (certificate.keyUsagePresent && certificate.keyUsage.indexOf("digitalSignature") < 0) {
+        return "x5c certificate 0 (" + subject + ") has a keyUsage of [" + certificate.keyUsage.join(", ")
+          + "] without digitalSignature, so its key may not sign the request object (RFC 5280 section 4.2.1.3).";
+      }
+      return null;
+    }
     if (!certificate.ca) {
       return "x5c certificate " + position + " (" + subject + ") is not a CA: basicConstraints cA=TRUE is required of "
         + "a certificate that issues another (RFC 5280 sections 4.2.1.9 and 6.1.4 (k)).";
     }
     if (certificate.keyUsagePresent && certificate.keyUsage.indexOf("keyCertSign") < 0) {
       return "x5c certificate " + position + " (" + subject + ") has a keyUsage without keyCertSign, so it may not "
-        + "sign certificates (RFC 5280 sections 4.2.1.3 and 6.1.4 (k)).";
+        + "sign certificates (RFC 5280 sections 4.2.1.3 and 6.1.4 (n)).";
     }
-    if (certificate.pathLength !== null && position - 1 > certificate.pathLength) {
+    var intermediates = position - 1;
+    if (Array.isArray(chain)) {
+      intermediates = 0;
+      for (var below = 1; below < position; below++) if (!chain[below].selfIssued) intermediates++;
+    }
+    if (certificate.pathLength !== null && intermediates > certificate.pathLength) {
       return "x5c certificate " + position + " (" + subject + ") permits " + certificate.pathLength
-        + " intermediate CA certificate(s) below it and the chain has " + (position - 1) + " (RFC 5280 section "
-        + "4.2.1.9, pathLenConstraint).";
+        + " intermediate CA certificate(s) below it and the chain has " + intermediates + " that are not self-issued "
+        + "(RFC 5280 sections 4.2.1.9 and 6.1.4 (l), pathLenConstraint).";
     }
     return null;
   }

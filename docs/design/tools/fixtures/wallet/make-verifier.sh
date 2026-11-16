@@ -15,9 +15,13 @@
 # clock: an expired leaf, a leaf that is not valid yet, and a leaf valid now whatever the machine's clock says.
 #
 # Serials are OpenSSL's own: a random 20-octet positive integer, the size RFC 5280 section 4.1.2.2 allows up to and what
-# the certificates in the hosted captures carry (EUDI's leaf is 20 octets). Three certificates are given a serial whose
-# first octet has its top bit set, which DER writes with a leading 0x00: a reader that folds the serial into a
+# the certificates in the hosted captures carry (EUDI's leaf is 20 octets). One certificate, `other`, is given a serial
+# whose first octet has its top bit set, which DER writes with a leading 0x00: a reader that folds the serial into a
 # JavaScript number cannot hold either shape, and one that reads the high bit as a sign refuses the second.
+#
+# Re-running this script re-records every file. The certificates added in P5-03c review round 2 (from `nc-intermediate`
+# to `generalized-time`) were recorded by running only their block against the committed CA keys, so the files the
+# earlier rounds committed kept their bytes.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -190,6 +194,51 @@ cert p384-leaf "$OUT/p384-leaf.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fix
 p521 "$OUT/p521-leaf.key.pem"
 cert p521-leaf "$OUT/p521-leaf.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture P-521 Verifier" p521-ca - \
     "$NOW_BEFORE" "$NOW_AFTER" "$(leaf_ext "subjectAltName=${D}verifier.example" always)"
+
+# --- what the page must refuse rather than ignore ---------------------------------------------------------------------
+# RFC 5280 section 4.2: a reader MUST reject a critical extension it cannot process. The page runs no name-constraint or
+# policy processing, so two real intermediates (signed by the CA, each with a leaf of its own) carry one such extension
+# marked critical. Each chain is otherwise valid end to end, which is what makes it a test of that rule and nothing else:
+# `openssl verify` refuses the nameConstraints one (the leaf's DNS:verifier.example is outside DNS:allowed.example).
+# The leaves sign with `verifier`'s key, so the harness signs their request objects with it.
+p256 "$OUT/nc-intermediate.key.pem"
+cert nc-intermediate "$OUT/nc-intermediate.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Constrained Intermediate" \
+    ca - "20260101000000Z" "20410101000000Z" "$(ca_ext ',pathlen:0')
+authorityKeyIdentifier=keyid:always
+nameConstraints=critical,permitted;DNS:allowed.example"
+cert leaf-under-nc "$OUT/verifier.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Verifier (Constrained)" \
+    nc-intermediate - "$NOW_BEFORE" "$NOW_AFTER" "$(leaf_ext "subjectAltName=${D}verifier.example" always)"
+# inhibitAnyPolicy, which RFC 5280 section 4.2.1.14 says conforming CAs MUST mark critical, written as its DER (SkipCerts 0)
+p256 "$OUT/iap-intermediate.key.pem"
+cert iap-intermediate "$OUT/iap-intermediate.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Policy Intermediate" \
+    ca - "20260101000000Z" "20410101000000Z" "$(ca_ext ',pathlen:0')
+authorityKeyIdentifier=keyid:always
+2.5.29.54=critical,DER:02:01:00"
+cert leaf-under-iap "$OUT/verifier.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Verifier (Policy)" \
+    iap-intermediate - "$NOW_BEFORE" "$NOW_AFTER" "$(leaf_ext "subjectAltName=${D}verifier.example" always)"
+
+# a leaf whose keyUsage is keyAgreement only: its key may not sign the request object (RFC 5280 section 4.2.1.3)
+cert keyagreement-leaf "$OUT/verifier.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture Key Agreement Verifier" ca - \
+    "$NOW_BEFORE" "$NOW_AFTER" 'basicConstraints=critical,CA:FALSE
+keyUsage=critical,keyAgreement
+subjectAltName=DNS:verifier.example
+authorityKeyIdentifier=keyid:always
+subjectKeyIdentifier=hash'
+
+# RSA-PSS with SHA-1, MGF1-SHA-1 and a 20-octet salt: every RSASSA-PSS-params field at its DEFAULT, so OpenSSL writes
+# the parameters as an empty SEQUENCE. The page refuses sha1WithRSAEncryption, and must refuse this spelling of SHA-1 too.
+cert rsa-pss-sha1-leaf "$OUT/rsa-pss-leaf.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture PSS SHA-1 Verifier" rsa-ca - \
+    "$NOW_BEFORE" "$NOW_AFTER" "$(leaf_ext "subjectAltName=${D}verifier.example" always)" \
+    -sha1 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:20
+
+# a 2048-bit leaf under the 1024-bit CA: the request's own key is large enough, the key that vouches for it is not
+cert rsa-leaf-under-small-ca "$OUT/rsa-leaf.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture RSA Verifier (Small CA)" \
+    rsa-small-ca - "$NOW_BEFORE" "$NOW_AFTER" "$(leaf_ext "subjectAltName=${D}verifier.example" always)"
+
+# a notAfter in 2051, which RFC 5280 section 4.1.2.5 writes as GeneralizedTime: the harness rewrites its fields in place
+# to reach the GeneralizedTime half of the time reader (every other fixture ends before 2050, so it is all UTCTime)
+cert generalized-time "$OUT/names.key.pem" "/C=IN/O=Inji Demo Certify/CN=Wallet Fixture GeneralizedTime" self - \
+    "$NOW_BEFORE" "20510101000000Z" "$(leaf_ext "subjectAltName=${D}verifier.example" self)"
 
 # `names`: a self-signed leaf whose `CN` is four characters. The harness rewrites that one string's tag, keeping every
 # length identical, to reach the two string types a name attribute may use that no fixture would otherwise carry:

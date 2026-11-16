@@ -391,6 +391,17 @@
   }
 
   /**
+   * The parameters a verifier put on this page's own URL, as a link `Oid4vp.parseLink` reads. The page's own scheme is
+   * not the invocation's: a page served from `http://localhost` (a local stack, the CI jobs) would hand the link reader
+   * an `http:` URL, which is not a wallet invocation scheme (VP section 9) and is refused. The parameters are the
+   * invocation, so they go under `openid4vp://`, the scheme VP section 13.1.2 names for a wallet with static
+   * configuration, whatever origin served the page.
+   */
+  function invocationLink(query) {
+    return "openid4vp://?" + query;
+  }
+
+  /**
    * Takes the request parameters out of the address bar before anything else happens, so a reload cannot fetch a
    * single-use request object a second time (plan 4.4: EUDI's is fetchable once). `history.replaceState` keeps no entry
    * behind, which `pushState` would.
@@ -478,7 +489,7 @@
       var contentType = "";
       if (link.kind === "request_uri") {
         var walletNonce = link.params.requestUriMethod === "post" ? randomNonce() : undefined;
-        var fetched = await Oid4vp.fetchRequest({
+        var fetched = await Oid4vp.fetchRequestObject({
           requestUri: link.params.requestUri,
           method: link.params.requestUriMethod,
           walletNonce: walletNonce,
@@ -586,7 +597,7 @@
       status("storageStatus", "This browser cannot keep credentials: IndexedDB is unavailable.", false);
       el("empty").hidden = false;
       syncControls();
-      if (query !== null) await readRequest(location.origin + location.pathname + "?" + query);
+      if (query !== null) await readRequest(invocationLink(query));
       return;
     }
     setBusy(true);
@@ -605,7 +616,7 @@
         intakeUsable = false;
         status("storageStatus", "This browser could not open its credential store: " + e.message, false);
       }
-      if (query !== null) await readRequest(location.origin + location.pathname + "?" + query);
+      if (query !== null) await readRequest(invocationLink(query));
     } finally {
       setBusy(false);
     }

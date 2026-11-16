@@ -432,7 +432,7 @@ function openWallet(indexedDB, options = {}) {
             redirect: init.redirect,
         };
         requests.push(request);
-        if (target === "https://credentials.example/v1/certify/offer/wallet/config") {
+        if (target === new URL("/v1/certify/offer/wallet/config", pageUrl).href) {
             const enabled = options.walletConfig === undefined ? true : options.walletConfig;
             const text = JSON.stringify({ enabled });
             return enabled
@@ -912,7 +912,7 @@ function refusesWith(label, result, rule, fragment) {
 }
 
 /**
- * A `fetch` for `Oid4vp.fetchRequest`, answering from a table of URLs and recording every call. The answer carries a
+ * A `fetch` for `Oid4vp.fetchRequestObject`, answering from a table of URLs and recording every call. The answer carries a
  * real `body` stream, because the page reads a request object under a byte cap rather than calling `text()`: `body`
  * is what a `Response` has, and `answer.contentLength` sets the header the page checks first.
  */
@@ -2325,7 +2325,7 @@ await section("20. X.509 certificates, signatures and the verifier's chain (P5-0
     equal("a minimal integer with a 0x00 pad for its top bit is still read",
         hex(X509.derEcdsaToRaw(Uint8Array.of(0x30, 0x07, 0x02, 0x02, 0x00, 0x81, 0x02, 0x01, 0x01), 32)).slice(0, 4), "0000");
 
-    // RFC 5280 6.1.3 (g) and 6.1.4: what each certificate of a path must be, read from its own extensions. The four
+    // RFC 5280 4.2 and 6.1.4: what each certificate of a path must be, read from its own extensions. The four
     // `*-variant` certificates carry the CA's own subject name, so each reaches the CA checks instead of the name check.
     const faultOf = (name, position) => X509.certificateFault(X509.parse(derOf(name)), position);
     equal("a genuine CA passes the path checks", faultOf("ca", 1), null);
@@ -2333,7 +2333,7 @@ await section("20. X.509 certificates, signatures and the verifier's chain (P5-0
         String(faultOf("nonca", 1)));
     check("a CA whose keyUsage omits keyCertSign cannot sign certificates",
         /without keyCertSign/.test(String(faultOf("nokeycertsign", 1))), String(faultOf("nokeycertsign", 1)));
-    check("an unknown critical extension ends the path (RFC 5280 6.1.3 (g))",
+    check("an unknown critical extension ends the path (RFC 5280 4.2 and 6.1.4 (o))",
         /1\.2\.3\.4\.5\.6\.7/.test(String(faultOf("unknown-critical", 1))), String(faultOf("unknown-critical", 1)));
     check("a pathLenConstraint of 0 is refused when a CA follows it", /pathLenConstraint/.test(String(faultOf("tight-pathlen", 2))),
         String(faultOf("tight-pathlen", 2)));
@@ -2382,6 +2382,225 @@ await section("20. X.509 certificates, signatures and the verifier's chain (P5-0
         createHash("sha256").update(derOf("verifier")).digest("hex").toUpperCase());
 });
 
+await section("20b. what the page refuses rather than ignores: critical extensions it cannot process, and strict DER", async () => {
+    // RFC 5280 section 4.2: "A certificate-using system MUST reject the certificate if it encounters a critical extension
+    // it does not recognize or a critical extension that contains information that it cannot process." The page runs
+    // no name-constraint or policy processing, so those five extensions are not on the list that lets a critical one by.
+    for (const [id, name] of [["2.5.29.30", "nameConstraints"], ["2.5.29.32", "certificatePolicies"],
+        ["2.5.29.33", "policyMappings"], ["2.5.29.36", "policyConstraints"], ["2.5.29.54", "inhibitAnyPolicy"]]) {
+        equal(`${name} (${id}) is not an extension a critical marking may pass with`, X509.KNOWN_EXTENSIONS.includes(id), false);
+    }
+    const faultOf = (name, position, chain) => X509.certificateFault(X509.parse(derOf(name)), position,
+        chain === undefined ? undefined : chain.map((member) => X509.parse(derOf(member))));
+    check("an intermediate with a critical nameConstraints ends the path, naming the extension",
+        /2\.5\.29\.30 \(nameConstraints\) critical, and this page does not process it/.test(String(faultOf("nc-intermediate", 1))),
+        String(faultOf("nc-intermediate", 1)));
+    check("an intermediate with a critical inhibitAnyPolicy ends the path, naming the extension",
+        /2\.5\.29\.54 \(inhibitAnyPolicy\)/.test(String(faultOf("iap-intermediate", 1))), String(faultOf("iap-intermediate", 1)));
+    // the reproduction: an intermediate permitted only DNS:allowed.example signs a leaf for DNS:verifier.example. Every
+    // signature and validity in the chain is good, `openssl verify` refuses it (permitted subtree violation), and so must
+    // the page, which cannot apply the constraint
+    refusesWith("a chain whose intermediate carries a critical nameConstraints",
+        await checkRequestOf(jar(withMembers({}), { x5c: [x5cOf("leaf-under-nc"), x5cOf("nc-intermediate"), x5cOf("ca")] })),
+        "R10", /x5c certificate 1 .*nameConstraints\) critical/);
+    refusesWith("a chain whose intermediate carries a critical inhibitAnyPolicy",
+        await checkRequestOf(jar(withMembers({}), { x5c: [x5cOf("leaf-under-iap"), x5cOf("iap-intermediate"), x5cOf("ca")] })),
+        "R10", /x5c certificate 1 .*inhibitAnyPolicy\) critical/);
+
+    // RFC 5280 section 4.2.1.3: the leaf's key signs the request object, so a keyUsage that leaves out digitalSignature
+    // forbids exactly that use
+    check("a leaf whose keyUsage is keyAgreement only may not sign the request object",
+        /keyUsage of \[keyAgreement\] without digitalSignature/.test(String(faultOf("keyagreement-leaf", 0))),
+        String(faultOf("keyagreement-leaf", 0)));
+    refusesWith("a request object signed by a keyAgreement-only leaf",
+        await checkRequestOf(jar(withMembers({}), { x5c: [x5cOf("keyagreement-leaf"), x5cOf("ca")] })), "R10",
+        /without digitalSignature/);
+    equal("and both hosted leaves assert digitalSignature, so they pass this rule",
+        ["mp-request", "eudi-request-get"].map((name) => {
+            const text = readFileSync(resolve(HOSTED_DIR, name + ".jwt"), "utf8").trim();
+            const leaf = X509.parse(new Uint8Array(Buffer.from(JSON.parse(Buffer.from(text.split(".")[0], "base64url")).x5c[0], "base64")));
+            return X509.certificateFault(leaf, 0, [leaf]);
+        }), [null, null]);
+
+    // RFC 5280 section 6.1.4 (l): a self-issued intermediate (issuer and subject the same name, a CA's key rollover) is
+    // not counted against a pathLenConstraint. `tight-pathlen` permits 0 intermediates below it.
+    equal("a self-issued certificate between the leaf and a pathLen-0 CA does not count against it",
+        faultOf("tight-pathlen", 2, ["verifier", "ca", "tight-pathlen"]), null);
+    check("an intermediate that is not self-issued still does",
+        /pathLenConstraint/.test(String(faultOf("tight-pathlen", 2, ["leaf-under-intermediate", "intermediate", "tight-pathlen"]))),
+        String(faultOf("tight-pathlen", 2, ["leaf-under-intermediate", "intermediate", "tight-pathlen"])));
+
+    const issuedBy = async (child, parent) => {
+        try {
+            return await X509.verifyIssuedBy(child instanceof Uint8Array ? X509.parse(child) : X509.parse(derOf(child)),
+                X509.parse(derOf(parent)));
+        } catch (error) {
+            return "threw: " + error.message;
+        }
+    };
+    // the 2048-bit floor holds for every RSA key that signs, not only the request's own (plan 4.5 R10)
+    check("a 2048-bit leaf signed by a 1024-bit CA is refused, not verified",
+        /issuing certificate's RSA key is 1024 bits/.test(String(await issuedBy("rsa-leaf-under-small-ca", "rsa-small-ca"))),
+        String(await issuedBy("rsa-leaf-under-small-ca", "rsa-small-ca")));
+    refusesWith("a request object whose 2048-bit leaf a 1024-bit CA vouches for",
+        await checkRequestOf(jar(withMembers({}), { alg: "RS256", keyName: "rsa-leaf",
+            x5c: [x5cOf("rsa-leaf-under-small-ca"), x5cOf("rsa-small-ca")] })), "R10", /RSA key is 1024 bits/);
+    // RSA-PSS may not bring back the SHA-1 that sha1WithRSAEncryption is refused for
+    check("a certificate signed with RSA-PSS over SHA-1 (every parameter at its DEFAULT) is refused",
+        /SHA-1/.test(String(await issuedBy("rsa-pss-sha1-leaf", "rsa-ca"))), String(await issuedBy("rsa-pss-sha1-leaf", "rsa-ca")));
+    refusesWith("a request object whose leaf is signed with RSA-PSS over SHA-1",
+        await checkRequestOf(jar(withMembers({}), { alg: "RS256", keyName: "rsa-pss-leaf",
+            x5c: [x5cOf("rsa-pss-sha1-leaf"), x5cOf("rsa-ca")] })), "R10", /SHA-1/);
+
+    // ---- strict DER: each vector rewrites octets of a committed certificate in place, so every length stays the same
+    // and only the rule under test can refuse it (X509.parse checks no signature; verifyIssuedBy reads the algorithm
+    // before it tries one)
+    const tbsFieldsOf = (der) => X509.children(der, X509.children(der, X509.element(der, 0))[0]);
+    const extensionsOf = (der) => {
+        const wrapper = tbsFieldsOf(der).find((field) => field.cls === 2 && field.tag === 3);
+        return X509.children(der, X509.children(der, wrapper)[0]).map((extension) => {
+            const parts = X509.children(der, extension);
+            return { parts, oid: hex(der.subarray(parts[0].contentStart, parts[0].end)) };
+        });
+    };
+    const rewritten = (name, edit) => {
+        const bytes = derOf(name).slice();
+        edit(bytes);
+        return bytes;
+    };
+    const parseError = (bytes) => {
+        try {
+            X509.parse(bytes);
+            return null;
+        } catch (error) {
+            return error.message;
+        }
+    };
+    const parseRefuses = (label, bytes, fragment) => check(`${label}: refused`, fragment.test(String(parseError(bytes))),
+        String(parseError(bytes)));
+    const BASIC_CONSTRAINTS = "551d13";
+    const KEY_USAGE = "551d0f";
+
+    // RFC 5280 section 4.2: one instance of an extension. The leaf's basicConstraints OID is rewritten to keyUsage's,
+    // which leaves two keyUsage extensions and no basicConstraints: a reader that keeps the last of two reads a
+    // certificate the CA never wrote.
+    parseRefuses("an extension that appears twice", rewritten("verifier", (bytes) => {
+        const constraints = extensionsOf(bytes).find((extension) => extension.oid === BASIC_CONSTRAINTS);
+        bytes[constraints.parts[0].end - 1] = 0x0f;
+    }), /2\.5\.29\.15 appears more than once/);
+    check("and the vector is what it says: the rewritten certificate names keyUsage twice", (() => {
+        const bytes = derOf("verifier").slice();
+        const constraints = extensionsOf(bytes).find((extension) => extension.oid === BASIC_CONSTRAINTS);
+        bytes[constraints.parts[0].end - 1] = 0x0f;
+        return extensionsOf(bytes).filter((extension) => extension.oid === KEY_USAGE).length === 2;
+    })());
+
+    // X.690 section 11.1: TRUE is 0xFF. And section 11.5: a component equal to its DEFAULT is not written, so cA FALSE
+    // and critical FALSE never appear in DER at all
+    const caFlagAt = (bytes) => {
+        const value = extensionsOf(bytes).find((extension) => extension.oid === BASIC_CONSTRAINTS).parts.at(-1);
+        return X509.children(bytes, X509.element(bytes, value.contentStart))[0].contentStart;
+    };
+    parseRefuses("basicConstraints cA written as the BOOLEAN 0x01", rewritten("ca", (bytes) => { bytes[caFlagAt(bytes)] = 0x01; }),
+        /cA is not the DER BOOLEAN TRUE/);
+    parseRefuses("basicConstraints cA written as FALSE", rewritten("ca", (bytes) => { bytes[caFlagAt(bytes)] = 0x00; }),
+        /cA is written as FALSE, its DEFAULT/);
+    parseRefuses("an extension's critical flag written as FALSE", rewritten("verifier", (bytes) => {
+        bytes[extensionsOf(bytes).find((extension) => extension.oid === BASIC_CONSTRAINTS).parts[1].contentStart] = 0x00;
+    }), /critical flag is written as FALSE, its DEFAULT/);
+    equal("the unrewritten CA still reads as a CA", X509.parse(derOf("ca")).ca, true);
+
+    // RFC 5280 section 4.1.2.1: version 0, 1 or 2; v1 is the DEFAULT, and only v3 carries extensions
+    const versionAt = (bytes) => X509.children(bytes, tbsFieldsOf(bytes)[0])[0].contentStart;
+    parseRefuses("a version INTEGER of 3", rewritten("verifier", (bytes) => { bytes[versionAt(bytes)] = 0x03; }),
+        /defines 0, 1 and 2/);
+    parseRefuses("a version written as v1, its DEFAULT", rewritten("verifier", (bytes) => { bytes[versionAt(bytes)] = 0x00; }),
+        /written as v1, its DEFAULT/);
+    parseRefuses("a version 2 certificate that carries extensions", rewritten("verifier", (bytes) => { bytes[versionAt(bytes)] = 0x01; }),
+        /need v3/);
+
+    // RFC 5280 section 4.1.2.5: a time names an instant; month 13 or hour 40 names none, and Date.UTC would quietly
+    // move it to another one
+    const timeAt = (bytes, which) => X509.children(bytes, tbsFieldsOf(bytes)[4])[which].contentStart;
+    const ascii = (bytes, at, text) => bytes.set(Buffer.from(text, "ascii"), at);
+    parseRefuses("a UTCTime in month 13", rewritten("verifier", (bytes) => ascii(bytes, timeAt(bytes, 0) + 2, "13")),
+        /UTCTime names no instant \(261301000000Z\)/);
+    parseRefuses("a UTCTime at hour 40", rewritten("verifier", (bytes) => ascii(bytes, timeAt(bytes, 0) + 6, "40")),
+        /UTCTime names no instant/);
+    parseRefuses("a UTCTime on 30 February", rewritten("verifier", (bytes) => ascii(bytes, timeAt(bytes, 0) + 2, "0230")),
+        /UTCTime names no instant \(260230000000Z\)/);
+    const generalized = X509.parse(derOf("generalized-time"));
+    equal("a GeneralizedTime notAfter (2051, which RFC 5280 writes so) is read as the instant it names",
+        generalized.notAfter.toISOString(), "2051-01-01T00:00:00.000Z");
+    parseRefuses("a GeneralizedTime in month 13", rewritten("generalized-time", (bytes) => ascii(bytes, timeAt(bytes, 1) + 4, "13")),
+        /GeneralizedTime names no instant \(20511301000000Z\)/);
+    parseRefuses("a GeneralizedTime at hour 40", rewritten("generalized-time", (bytes) => ascii(bytes, timeAt(bytes, 1) + 8, "40")),
+        /GeneralizedTime names no instant/);
+    equal("29 February is a day in a leap year", X509.parse(rewritten("verifier",
+        (bytes) => ascii(bytes, timeAt(bytes, 0), "280229"))).notBefore.toISOString(), "2028-02-29T00:00:00.000Z");
+
+    // RFC 5280 section 4.1.2.2: a negative serial is a CA's mistake to be handled gracefully. It is kept, as written, for
+    // display, and decides nothing.
+    const negative = (() => {
+        try {
+            return X509.parse(rewritten("verifier", (bytes) => { bytes[tbsFieldsOf(bytes)[1].contentStart] = 0x80; }));
+        } catch (error) {
+            return "threw: " + error.message;
+        }
+    })();
+    equal("a negative serial is read, kept as its octets and flagged rather than refused",
+        typeof negative === "string" ? negative : [negative.serialNegative, negative.serialBytes.length, negative.serialNumber.slice(0, 2)],
+        [true, 20, "80"]);
+    equal("and a positive one is flagged as such", X509.parse(derOf("verifier")).serialNegative, false);
+    parseRefuses("a serial padded with a 0x00 it does not need", rewritten("verifier", (bytes) => {
+        bytes[tbsFieldsOf(bytes)[1].contentStart] = 0x00;
+    }), /minimal/);
+
+    // X.690 section 8.3.2 for an ECDSA signature's integers: the one pad a top bit needs, never a second
+    const rawError = (bytes) => {
+        try {
+            X509.derEcdsaToRaw(new Uint8Array(bytes), 32);
+            return null;
+        } catch (error) {
+            return error.message;
+        }
+    };
+    check("an ECDSA signature integer with a second 0x00 pad (00 00 80) is refused",
+        /not minimal/.test(String(rawError([0x30, 0x08, 0x02, 0x03, 0x00, 0x00, 0x80, 0x02, 0x01, 0x01]))),
+        String(rawError([0x30, 0x08, 0x02, 0x03, 0x00, 0x00, 0x80, 0x02, 0x01, 0x01])));
+    equal("while the single pad (00 80) still reads as 0x80", hex(X509.derEcdsaToRaw(Uint8Array.of(0x30, 0x07, 0x02, 0x02,
+        0x00, 0x80, 0x02, 0x01, 0x01), 32)).slice(62, 64), "80");
+
+    // RFC 4055 section 3.1 under X.690 section 11.5: the PSS parameters' DEFAULTs are not written, and SHA-224 (like
+    // SHA-1) is not a digest the page verifies. Each rewrite touches both AlgorithmIdentifiers, the TBS's and the outer
+    // one, so the "outer and inner differ" refusal cannot be what answers.
+    const pssMembersOf = (bytes) => {
+        const outer = X509.children(bytes, X509.element(bytes, 0));
+        return [tbsFieldsOf(bytes)[2], outer[1]].map((identifier) =>
+            X509.children(bytes, X509.children(bytes, identifier)[1]));
+    };
+    const pssRewritten = (edit) => rewritten("rsa-pss-leaf", (bytes) => pssMembersOf(bytes).forEach((members) => edit(bytes, members)));
+    const SALT = (bytes, members) => members.find((member) => member.tag === 2);
+    check("an RSA-PSS trailerField written as 1, its DEFAULT, is refused",
+        /trailerField is written as 1, its DEFAULT/.test(String(await issuedBy(pssRewritten((bytes, members) => {
+            // [2] saltLength 32 (A2 03 02 01 20) becomes [3] trailerField 1 (A3 03 02 01 01): same length
+            bytes.set([0xa3, 0x03, 0x02, 0x01, 0x01], SALT(bytes, members).start);
+        }), "rsa-ca"))));
+    check("an RSA-PSS saltLength written as 20, its DEFAULT, is refused",
+        /saltLength is written as 20, its DEFAULT/.test(String(await issuedBy(pssRewritten((bytes, members) => {
+            bytes[SALT(bytes, members).end - 1] = 0x14;
+        }), "rsa-ca"))));
+    const sha224 = await issuedBy(pssRewritten((bytes, members) => {
+        // SHA-256 (2.16.840.1.101.3.4.2.1) becomes SHA-224 (…2.4) in hashAlgorithm and in MGF1's digest alike
+        for (let at = members[0].start; at < members[1].end; at++) {
+            if (hex(bytes.subarray(at, at + 11)) === "0609608648016503040201") bytes[at + 10] = 0x04;
+        }
+    }), "rsa-ca");
+    check("an RSA-PSS certificate over SHA-224 is refused by name, not answered false",
+        /2\.16\.840\.1\.101\.3\.4\.2\.4 is not one this page reads/.test(String(sha224)), String(sha224));
+    equal("the unrewritten PSS certificate still verifies", await issuedBy("rsa-pss-leaf", "rsa-ca"), true);
+});
+
 await section("21. links: the schemes, the forms and the 8 KiB limit (plan 4.4)", async () => {
     const requestUri = "https://verifier.example/request.jwt/1";
     const query = "client_id=x509_san_dns:verifier.example&request_uri=" + encodeURIComponent(requestUri);
@@ -2412,6 +2631,25 @@ await section("21. links: the schemes, the forms and the 8 KiB limit (plan 4.4)"
     const extra = Oid4vp.parseLink(`openid4vp://?${query}&flow=qr`);
     check("a link parameter this page does not read is a finding, not a refusal",
         extra.ok === true && extra.findings.some((finding) => finding.includes("\"flow\"")), JSON.stringify(extra.findings));
+    // a plain redirect_uri: link is the request itself, so its parameters are read, not "not read"; the ones a request
+    // does not define are reported once, by the request check, and the ones it does define are not reported at all
+    const plainFull = "openid4vp://?client_id=" + encodeURIComponent(redirectClientId)
+        + "&response_uri=" + encodeURIComponent("https://verifier.example/response") + "&nonce=n1&state=s1"
+        + "&response_type=vp_token&response_mode=direct_post&dcql_query=" + encodeURIComponent(JSON.stringify({ credentials: [] }));
+    const plainRead = Oid4vp.parseLink(plainFull);
+    equal("a plain redirect_uri: link raises no link-level \"does not read\" finding for the request's own parameters",
+        [plainRead.ok, plainRead.kind, plainRead.findings], [true, "plain", []]);
+    const plainChecked = await Oid4vp.checkRequest({ plain: plainRead.params.plain, link: { scheme: plainRead.scheme,
+        kind: plainRead.kind, clientId: plainRead.params.clientId, findings: plainRead.findings }, pageUrl: PUBLIC_PAGE, now: NOW });
+    equal("and the checked request's only finding is that it is unsigned",
+        plainChecked.ok ? plainChecked.findings.map((finding) => finding.split(":")[0]) : plainChecked.message,
+        ["this request is unsigned"]);
+    const plainExtra = Oid4vp.parseLink(plainFull + "&flow=qr");
+    const plainExtraChecked = await Oid4vp.checkRequest({ plain: plainExtra.params.plain, link: { scheme: plainExtra.scheme,
+        kind: plainExtra.kind, clientId: plainExtra.params.clientId, findings: plainExtra.findings }, pageUrl: PUBLIC_PAGE, now: NOW });
+    equal("a parameter no request defines is reported once, by the request check, and only that one",
+        plainExtraChecked.ok ? plainExtraChecked.findings.filter((finding) => finding.includes("does not read")) : plainExtraChecked.message,
+        ["the request carries 1 parameter(s) this page does not read: flow."]);
 
     // the form the hosted Multipaz verifier's begin answer carries: its scheme (`haip-vp://`) with the fragment it built
     // (`://?…`) appended. WHATWG URL parsing refuses it as written, and the captured answer is why it is folded away.
@@ -2460,22 +2698,22 @@ await section("22. fetching the request object, once (plan 4.4)", async () => {
 
     const get = scriptedFetch({ [requestUri]: { status: 200, body: text, contentType: "application/oauth-authz-req+jwt" } });
     const fetched = new Set();
-    const answer = await Oid4vp.fetchRequest({ requestUri, method: "get", pageUrl: PUBLIC_PAGE, fetched, fetchImpl: get.impl });
+    const answer = await Oid4vp.fetchRequestObject({ requestUri, method: "get", pageUrl: PUBLIC_PAGE, fetched, fetchImpl: get.impl });
     equal("a 200 answer is read", [answer.ok, answer.text, answer.via], [true, text, "direct"]);
     equal("one GET, with the JWT Accept header and redirect: \"error\"",
         [get.calls.length, get.calls[0].method, get.calls[0].headers.Accept, get.calls[0].redirect, get.calls[0].body],
         [1, "GET", "application/oauth-authz-req+jwt", "error", undefined]);
-    const again = await Oid4vp.fetchRequest({ requestUri, method: "get", pageUrl: PUBLIC_PAGE, fetched, fetchImpl: get.impl });
+    const again = await Oid4vp.fetchRequestObject({ requestUri, method: "get", pageUrl: PUBLIC_PAGE, fetched, fetchImpl: get.impl });
     equal("a second fetch of the same request_uri is refused and makes no request",
         [again.ok, again.state, get.calls.length], [false, "alreadyFetched", 1]);
-    const withFragment = await Oid4vp.fetchRequest({ requestUri: requestUri + "#frag", pageUrl: PUBLIC_PAGE, fetched,
+    const withFragment = await Oid4vp.fetchRequestObject({ requestUri: requestUri + "#frag", pageUrl: PUBLIC_PAGE, fetched,
         fetchImpl: get.impl });
     equal("the fetched-once set is keyed by the URL without its fragment (RFC 3986 3.5)",
         [withFragment.ok, withFragment.state, get.calls.length], [false, "alreadyFetched", 1]);
 
     const nonce = "wallet-nonce-".padEnd(43, "x");
     const post = scriptedFetch({ [requestUri]: { status: 200, body: text, contentType: "application/oauth-authz-req+jwt" } });
-    const posted = await Oid4vp.fetchRequest({ requestUri, method: "post", walletNonce: nonce, pageUrl: PUBLIC_PAGE,
+    const posted = await Oid4vp.fetchRequestObject({ requestUri, method: "post", walletNonce: nonce, pageUrl: PUBLIC_PAGE,
         fetched: new Set(), fetchImpl: post.impl });
     const form = post.calls[0].body;
     equal("a posted request carries wallet_nonce and nothing else, form-encoded",
@@ -2486,12 +2724,26 @@ await section("22. fetching the request object, once (plan 4.4)", async () => {
 
     for (const status of [404, 500]) {
         const failing = scriptedFetch({ [requestUri]: { status, body: "no" } });
-        const refused = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, fetched: new Set(), fetchImpl: failing.impl });
+        const refused = await Oid4vp.fetchRequestObject({ requestUri, pageUrl: PUBLIC_PAGE, fetched: new Set(), fetchImpl: failing.impl });
         check(`a ${status} answer stops the process (VP 5.10.2)`,
             refused.ok === false && new RegExp("answered " + status).test(refused.message), refused.message);
     }
+    // a success that is not 200 stops the process too, but it is not an HTTP error, and the message does not call it one
+    const noContent = scriptedFetch({ [requestUri]: { status: 204, body: "" } });
+    const refused204 = await Oid4vp.fetchRequestObject({ requestUri, pageUrl: PUBLIC_PAGE, fetched: new Set(), fetchImpl: noContent.impl });
+    check("a 204 answer stops the process, named as a success that is not 200 rather than as an HTTP error",
+        refused204.ok === false && /answered 204, a success that is not 200/.test(refused204.message)
+            && !/HTTP error/.test(refused204.message), refused204.message);
+    // a byte order mark is not part of a compact JWS (RFC 7515 7.1): it is kept in the text, not silently dropped, so the
+    // checks see the bytes the verifier sent and refuse them
+    const withBom = scriptedFetch({ [requestUri]: { status: 200, body: "\uFEFF" + text, contentType: "application/oauth-authz-req+jwt" } });
+    const bomRead = await Oid4vp.fetchRequestObject({ requestUri, pageUrl: PUBLIC_PAGE, fetched: new Set(), fetchImpl: withBom.impl });
+    equal("a body that starts with a UTF-8 byte order mark keeps it in the text it hands on",
+        [bomRead.ok, bomRead.ok && bomRead.text.charCodeAt(0), bomRead.ok && bomRead.text.slice(1) === text], [true, 0xfeff, true]);
+    refusesWith("and that text is refused by the request checks, not read as the JWS after it",
+        await checkRequestOf(bomRead.text), "R1", /not base64url JSON/);
     const redirecting = scriptedFetch({ [requestUri]: "throw" });
-    const redirected = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, fetched: new Set(), fetchImpl: redirecting.impl });
+    const redirected = await Oid4vp.fetchRequestObject({ requestUri, pageUrl: PUBLIC_PAGE, fetched: new Set(), fetchImpl: redirecting.impl });
     equal("a redirect is an explicit unreachable state, never a fetch of where it points (redirect: \"error\")",
         [redirected.ok, redirected.state], [false, "unreachable"]);
     check("and the state says what to do about a verifier without CORS, offering the paste field",
@@ -2499,33 +2751,33 @@ await section("22. fetching the request object, once (plan 4.4)", async () => {
 
     const insecure = scriptedFetch({});
     equal("an http request_uri on an https page is refused before any request",
-        [(await Oid4vp.fetchRequest({ requestUri: "http://verifier.example/r", pageUrl: PUBLIC_PAGE,
+        [(await Oid4vp.fetchRequestObject({ requestUri: "http://verifier.example/r", pageUrl: PUBLIC_PAGE,
             fetched: new Set(), fetchImpl: insecure.impl })).ok, insecure.calls.length], [false, 0]);
     const local = scriptedFetch({ "http://localhost:8090/request.jwt": { status: 200, body: text, contentType: "application/jwt" } });
     equal("and it is allowed while the page itself is served from localhost",
-        (await Oid4vp.fetchRequest({ requestUri: "http://localhost:8090/request.jwt", pageUrl: LOCAL_PAGE,
+        (await Oid4vp.fetchRequestObject({ requestUri: "http://localhost:8090/request.jwt", pageUrl: LOCAL_PAGE,
             fetched: new Set(), fetchImpl: local.impl })).ok, true);
 
     // plan 4.4's request-object limit, which a verifier does not get to decide: Content-Length is checked first, and a
     // body that declares none is read chunk by chunk and abandoned at the cap rather than read whole first
     const declared = scriptedFetch({ [requestUri]: { status: 200, body: "a".repeat(64 * 1024 + 1), contentLength: 64 * 1024 + 1 } });
-    const tooLargeDeclared = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, fetched: new Set(),
+    const tooLargeDeclared = await Oid4vp.fetchRequestObject({ requestUri, pageUrl: PUBLIC_PAGE, fetched: new Set(),
         fetchImpl: declared.impl });
     check("a declared Content-Length over 64 KiB is refused before a byte of the body is read",
         tooLargeDeclared.ok === false && /64 KiB limit/.test(tooLargeDeclared.message), tooLargeDeclared.message);
     const reading = scriptedFetch({ [requestUri]: { status: 200, body: "a".repeat(64 * 1024 + 1) } });
-    const tooLargeStreamed = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, fetched: new Set(), fetchImpl: reading.impl });
+    const tooLargeStreamed = await Oid4vp.fetchRequestObject({ requestUri, pageUrl: PUBLIC_PAGE, fetched: new Set(), fetchImpl: reading.impl });
     check("a body with no declared length is refused at the cap",
         tooLargeStreamed.ok === false && /64 KiB limit/.test(tooLargeStreamed.message), tooLargeStreamed.message);
     const chunked = scriptedFetch({ [requestUri]: { status: 200, body: ["a".repeat(40 * 1024), "b".repeat(40 * 1024)] } });
-    const overChunks = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, fetched: new Set(), fetchImpl: chunked.impl });
+    const overChunks = await Oid4vp.fetchRequestObject({ requestUri, pageUrl: PUBLIC_PAGE, fetched: new Set(), fetchImpl: chunked.impl });
     check("the cap counts the whole stream, not one chunk", overChunks.ok === false && /64 KiB limit/.test(overChunks.message),
         overChunks.message);
     check("and no body is ever read through answer.text(), on any of those", declared.counted.textCalls === 0
         && reading.counted.textCalls === 0 && chunked.counted.textCalls === 0 && get.counted.textCalls === 0,
         [declared.counted.textCalls, reading.counted.textCalls, chunked.counted.textCalls, get.counted.textCalls].join(","));
     const notUtf8 = scriptedFetch({ [requestUri]: { status: 200, body: [new Uint8Array([0xff, 0xfe])] } });
-    const undecodable = await Oid4vp.fetchRequest({ requestUri, pageUrl: PUBLIC_PAGE, fetched: new Set(), fetchImpl: notUtf8.impl });
+    const undecodable = await Oid4vp.fetchRequestObject({ requestUri, pageUrl: PUBLIC_PAGE, fetched: new Set(), fetchImpl: notUtf8.impl });
     check("a body that is not UTF-8 is refused, not decoded leniently", undecodable.ok === false && /not UTF-8/.test(undecodable.message),
         undecodable.message);
 });
@@ -2703,7 +2955,7 @@ await section("23. the request checks R1-R11 and the findings (plan 4.5)", async
         await checkRequestOf(jar(withMembers({ response_uri: "https://user:secret@verifier.example/response" }))), "R8",
         /user name or password/);
 
-    // R10: the CA requirements of RFC 5280 6.1.3 (g) and 6.1.4. Each variant below carries the CA's own subject name,
+    // R10: the CA requirements of RFC 5280 4.2 and 6.1.4. Each variant below carries the CA's own subject name,
     // so the chain reaches the CA checks rather than the name check, which run before any signature is tried.
     refusesWith("an issuer certificate that says cA:FALSE",
         await checkRequestOf(jar(withMembers({}), { x5c: [x5cOf("verifier"), x5cOf("nonca")] })), "R10", /is not a CA/);
@@ -2906,12 +3158,16 @@ await section("25. the hosted verifiers' captured request objects (plan 4.12)", 
     equal("and the response mode it names is read from the object", eudi.request.responseMode, "direct_post.jwt");
 
     const postRequest = readFileSync(resolve(HOSTED_DIR, "eudi-request-post.jwt"), "utf8").trim();
+    // the post form was captured two seconds later: its own iat, which PROVENANCE.md records as its capture instant
+    const EUDI_POST_AT = new Date("2026-11-16T05:30:35Z");
+    equal("the post-form capture's iat is the instant PROVENANCE.md records for it",
+        JSON.parse(Buffer.from(postRequest.split(".")[1], "base64url")).iat * 1000, EUDI_POST_AT.getTime());
     const posted = await checkRequestOf(postRequest, { link: linkParams({ clientId: eudiHash, scheme: "haip-vp",
-        requestUriMethod: "post", walletNonce: "capture-wallet-nonce-20261116" }), now: EUDI_AT });
+        requestUriMethod: "post", walletNonce: "capture-wallet-nonce-20261116" }), now: EUDI_POST_AT });
     equal("the captured post-form JAR passes R1-R11 with the wallet_nonce it echoes", [posted.ok, posted.request.walletNonce],
         [true, "capture-wallet-nonce-20261116"]);
     const wrongNonce = await checkRequestOf(postRequest, { link: linkParams({ clientId: eudiHash, scheme: "haip-vp",
-        requestUriMethod: "post", walletNonce: "another-nonce" }), now: EUDI_AT });
+        requestUriMethod: "post", walletNonce: "another-nonce" }), now: EUDI_POST_AT });
     refusesWith("and R4 refuses it when the wallet sent another nonce", wrongNonce, "R4", /carries "capture-wallet-nonce-20261116"/);
 
     const multipazRequest = readFileSync(resolve(HOSTED_DIR, "mp-request.jwt"), "utf8").trim();
@@ -3005,6 +3261,22 @@ await section("27. the wallet page takes a request in (plan 4.4, I9)", async () 
     const fragmentRead = await waitFor(() => fromFragment.el("verifierCard").hidden === false);
     check("the `#://?…` form Multipaz produces is read the same way", fragmentRead, fromFragment.el("intakeStatus").textContent);
     equal("and its fragment is taken out of the address bar too", fromFragment.replacedUrls, ["/v1/certify/offer/wallet"]);
+
+    // a page served from localhost (a local stack, the CI jobs): its own scheme is http, which is not a wallet invocation
+    // scheme, so the invocation is read from its parameters and not from the page's URL
+    const localUri = "http://localhost:8090/request.jwt/4";
+    const fromLocal = openWallet(new FakeIndexedDB(), {
+        clock: NOW,
+        pageUrl: LOCAL_PAGE.href + "?client_id=x509_san_dns:verifier.example&request_uri=" + encodeURIComponent(localUri),
+        respond: (request) => (request.url === localUri
+            ? { status: 200, body: text, contentType: "application/oauth-authz-req+jwt" } : undefined),
+    });
+    const localRead = await waitFor(() => fromLocal.el("verifierCard").hidden === false);
+    check("a same-device invocation of a page served from http://localhost is read and its card shown", localRead,
+        fromLocal.el("intakeStatus").textContent);
+    equal("its request object was fetched once, and its address bar cleared",
+        [fromLocal.requests.filter((request) => request.url === localUri).length, fromLocal.replacedUrls],
+        [1, ["/v1/certify/offer/wallet"]]);
 
     const pasted = openWallet(new FakeIndexedDB(), { clock: NOW });
     await waitFor(() => pasted.el("readRequest").disabled === false);

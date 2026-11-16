@@ -6,7 +6,7 @@
  * 1. `parseLink` reads what a verifier handed the page: one of the wallet invocation schemes of VP section 9, or an
  *    https link that only carries parameters, or a request object by value, or - only with the `redirect_uri:` client
  *    identifier prefix, which cannot be signed (VP section 5.9.3) - plain parameters.
- * 2. `fetchRequest` reads the request object a `request_uri` names, once per page lifetime and never twice (EUDI's
+ * 2. `fetchRequestObject` reads the request object a `request_uri` names, once per page lifetime and never twice (EUDI's
  *    object is single use, plan 2.2), with `redirect: "error"` so a redirect is a refusal and not a fetch of somewhere
  *    else, and with the body read under a 64 KiB cap instead of whole.
  * 3. `checkRequest` checks the request and the verifier: R1-R11 of plan 4.5 (refusals), the four error cases a wallet
@@ -261,11 +261,18 @@ var Oid4vp = (function () {
       return refusedLink("the link carries " + duplicated.join(", ") + " more than once; a request parameter appears "
         + "once (RFC 6749 section 3.1).", findings);
     }
-    seen.filter(function (name) {
-      return ["client_id", "request_uri", "request_uri_method", "request"].indexOf(name) < 0;
-    }).forEach(function (name) {
-      findings.push("the link carries the parameter " + JSON.stringify(name) + ", which this page does not read.");
-    });
+    // A link that carries a request object, or names one, is read for those four parameters only, so anything else on
+    // it is a finding. A plain `redirect_uri:` link is the request itself: every parameter on it is read, and
+    // `checkPlainRequest` reports the ones that are unknown to a request, so it is not reported here as well.
+    var plainLink = link.request === undefined && link.requestUri === undefined
+      && splitClientId(link.clientId).prefix === "redirect_uri";
+    if (!plainLink) {
+      seen.filter(function (name) {
+        return ["client_id", "request_uri", "request_uri_method", "request"].indexOf(name) < 0;
+      }).forEach(function (name) {
+        findings.push("the link carries the parameter " + JSON.stringify(name) + ", which this page does not read.");
+      });
+    }
 
     var method = String(link.requestUriMethod).toLowerCase();
     if (method !== "get" && method !== "post") {
@@ -367,7 +374,7 @@ var Oid4vp = (function () {
    * Options: `requestUri`, `method` (`get`/`post`), `walletNonce` (sent for a post, and only that), `pageUrl`, `fetched`
    * (a Set of request URIs already fetched), `fetchImpl`.
    */
-  async function fetchRequest(options) {
+  async function fetchRequestObject(options) {
     var requestUri = String(options.requestUri === undefined ? "" : options.requestUri);
     var fetchImpl = options.fetchImpl;
     var pageUrl = options.pageUrl;
@@ -391,7 +398,12 @@ var Oid4vp = (function () {
 
     var method = String(options.method || "get").toLowerCase() === "post" ? "POST" : "GET";
 
-    /** The answer's body, within the request object's limit, decoded as the UTF-8 text it has to be. */
+    /**
+     * The answer's body, within the request object's limit, decoded as the UTF-8 text it has to be. `ignoreBOM` keeps a
+     * leading byte order mark in the text instead of dropping it: a compact JWS is base64url and dots from its first
+     * octet (RFC 7515 section 7.1), so a body that starts with U+FEFF is not one, and the checks refuse it as such
+     * rather than reading the bytes after it as if the verifier had sent those.
+     */
     async function finish(answer, via) {
       var read = await readCapped(answer, LIMITS.REQUEST_BYTES);
       if (read.over !== undefined) {
@@ -400,7 +412,7 @@ var Oid4vp = (function () {
       }
       var text;
       try {
-        text = new TextDecoder("utf-8", { fatal: true }).decode(read.bytes);
+        text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(read.bytes);
       } catch (error) {
         return { ok: false, via: via, message: "the request object is not UTF-8 (OpenID4VP 1.0 section 5.10)." };
       }
@@ -423,6 +435,12 @@ var Oid4vp = (function () {
         init.body = new URLSearchParams({ wallet_nonce: String(options.walletNonce) });
       }
       var answer = await fetchImpl(requestUri, init);
+      if (answer.status >= 200 && answer.status < 300 && answer.status !== 200) {
+        // a success that is not 200 is not an error, so VP section 5.10.2 is not the reason; the reason is that the page
+        // reads a request object only from the 200 answer that carries one, and nothing else is taken for it
+        return { ok: false, via: "direct", message: "the request_uri answered " + answer.status + ", a success that is "
+          + "not 200; this page reads a request object only from a 200 answer, so it stops here." };
+      }
       if (answer.status !== 200) {
         return { ok: false, via: "direct", message: "the request_uri answered " + answer.status + "; any HTTP error ends "
           + "the process (OpenID4VP 1.0 section 5.10.2)." };
@@ -507,6 +525,63 @@ var Oid4vp = (function () {
       });
     });
     return entries.length ? entries : null;
+  }
+
+  /**
+   * R8's half that holds whatever the client identifier prefix: the response_uri is there, is a URL, is `https` (`http`
+   * only while the page is served from localhost), and carries no userinfo. Returns `{target}` (the parsed URL) or
+   * `{rule, message}`. The prefix's own binding (the DNS name, or the redirect URI itself) is the caller's.
+   */
+  function responseUriFault(responseUri, localPage) {
+    if (typeof responseUri !== "string" || !responseUri.length) {
+      return { rule: "R8", message: "the request carries no response_uri, so there is nowhere to send a response "
+        + "(OpenID4VP 1.0 section 5.1)." };
+    }
+    var target;
+    try {
+      target = new URL(responseUri);
+    } catch (error) {
+      return { rule: "R8", message: "response_uri is not a URL (OpenID4VP 1.0 section 5.1)." };
+    }
+    if (target.protocol !== "https:" && !(localPage && target.protocol === "http:")) {
+      return { rule: "R8", message: "response_uri is " + target.protocol + "//" + target.host + "; https is required"
+        + (localPage ? "." : ", and http is allowed only while this page is served from localhost.") };
+    }
+    if (target.username || target.password) {
+      // a response_uri the client may use as its redirect_uri carries no userinfo (VP section 5.9.3 delegates to RFC
+      // 6749 section 3.1.2, and a URL with credentials in it is not one this page will post a credential to)
+      return { rule: "R8", message: "response_uri carries a user name or password; a response URI names a host and a "
+        + "path, and nothing is posted to a URL with credentials in it (OpenID4VP 1.0 sections 5.9.3 and 8.2)." };
+    }
+    return { target: target };
+  }
+
+  /**
+   * R11: the response type and mode this wallet implements (VP 5.6, 8.2). Both must be there: VP section 5.1 lists
+   * response_type as required, and an absent response_mode defaults to `fragment` (VP section 8.2), which this page
+   * cannot answer at all - so a request that omits either is refused rather than read as if it had said `vp_token` and
+   * `direct_post`. Returns the refusal's message, or null.
+   */
+  function responseShapeFault(responseType, responseMode) {
+    if (responseType !== "vp_token") {
+      return "the request's response_type is " + (responseType === undefined
+        ? "absent, and OpenID4VP 1.0 section 5.1 requires it" : JSON.stringify(responseType)
+          + "; section 5.6 has vp_token") + ".";
+    }
+    if (RESPONSE_MODES.indexOf(responseMode) < 0) {
+      return "the request's response_mode is " + (responseMode === undefined
+        ? "absent, which OpenID4VP 1.0 section 8.2 defaults to fragment, and this wallet answers nothing that way"
+        : JSON.stringify(responseMode) + "; this wallet implements " + RESPONSE_MODES.join(" and ")
+          + " (OpenID4VP 1.0 section 8.2)") + ".";
+    }
+    return null;
+  }
+
+  /** The request parameters this page does not read, as the one finding that lists them (plan 4.5). */
+  function unknownParametersFinding(members, findings) {
+    var unknown = Object.keys(members).filter(function (name) { return KNOWN_PARAMETERS.indexOf(name) < 0; });
+    if (unknown.length) findings.push("the request carries " + unknown.length + " parameter(s) this page does not read: "
+      + unknown.join(", ") + ".");
   }
 
   function isoOf(date) {
@@ -752,12 +827,6 @@ var Oid4vp = (function () {
       }
     }
     var leaf = certificates[0];
-    // RFC 7518 section 3.3: RS256 and PS256 need a key of 2048 bits or more. WebCrypto verifies a 1024-bit signature
-    // without complaint, so the size is checked before the key is imported.
-    if (X509.JWS_ALGORITHMS[header.alg].kind === "rsa" && leaf.publicKey.kind === "rsa" && leaf.publicKey.bits < 2048) {
-      return refused("R10", "the leaf certificate's RSA key is " + leaf.publicKey.bits + " bits; " + header.alg
-        + " requires 2048 or more (RFC 7518 section 3.3).", findings);
-    }
     if (prefix === "x509_san_dns") {
       if (!isDnsName(split.value)) {
         return refused("R6", "the client_id's value " + JSON.stringify(split.value) + " is not a DNS name (OpenID4VP "
@@ -787,7 +856,9 @@ var Oid4vp = (function () {
     try {
       verified = await X509.verifyJws(signingInput, signature, leaf, header.alg);
     } catch (error) {
-      verified = false;
+      // `verifyJws` answers false for a signature that does not verify, and throws only for a key the algorithm may not
+      // use at all: an RSA key under 2048 bits (RFC 7518 section 3.3), which is R10's
+      return refused("R10", error.message, findings);
     }
     if (!verified) {
       return refused(prefix === "x509_san_dns" ? "R6" : "R7", "the JWS does not verify with the leaf certificate's "
@@ -795,12 +866,12 @@ var Oid4vp = (function () {
         findings);
     }
 
-    // R10: what each certificate in the path must be (RFC 5280 sections 6.1.3 (g) and 6.1.4), then its validity, then
+    // R10: what each certificate in the path must be (RFC 5280 sections 4.2, 6.1.4 and 6.1.5), then its validity, then
     // the link to the next one. The role a certificate's own extensions claim is read before any signature is tried: a
     // certificate that says it is not a CA, may not sign certificates, or permits fewer CAs below it than the chain has,
     // is wrong whatever its signature turns out to be.
     for (var position = 0; position < certificates.length; position++) {
-      var fault = X509.certificateFault(certificates[position], position);
+      var fault = X509.certificateFault(certificates[position], position, certificates);
       if (fault !== null) return refused("R10", fault, findings);
     }
     for (var ensured = 0; ensured < certificates.length; ensured++) {
@@ -835,47 +906,18 @@ var Oid4vp = (function () {
     findSelfSigned(certificates, findings);
 
     // R8: the response_uri, and the host rules the client identifier prefix puts on it (VP 5.9.3, 8.2)
-    if (typeof payload.response_uri !== "string" || !payload.response_uri.length) {
-      return refused("R8", "the request object carries no response_uri, so there is nowhere to send a response "
-        + "(OpenID4VP 1.0 section 5.1).", findings);
-    }
-    var target;
-    try {
-      target = new URL(payload.response_uri);
-    } catch (error) {
-      return refused("R8", "response_uri is not a URL (OpenID4VP 1.0 section 5.1).", findings);
-    }
-    if (target.protocol !== "https:" && !(localPage && target.protocol === "http:")) {
-      return refused("R8", "response_uri is " + target.protocol + "//" + target.host + "; https is required"
-        + (localPage ? "." : ", and http is allowed only while this page is served from localhost."), findings);
-    }
-    if (target.username || target.password) {
-      // a response_uri the client may use as its redirect_uri carries no userinfo (VP section 5.9.3 delegates to RFC
-      // 6749 section 3.1.2, and a URL with credentials in it is not one this page will post a credential to)
-      return refused("R8", "response_uri carries a user name or password; a response URI names a host and a path, and "
-        + "nothing is posted to a URL with credentials in it (OpenID4VP 1.0 sections 5.9.3 and 8.2).", findings);
-    }
+    var response = responseUriFault(payload.response_uri, localPage);
+    if (response.target === undefined) return refused(response.rule, response.message, findings);
+    var target = response.target;
     if (prefix === "x509_san_dns" && target.hostname.toLowerCase() !== split.value.toLowerCase()) {
       return refused("R8", "response_uri is on " + target.hostname + " and the client_id's DNS name is " + split.value
         + "; OpenID4VP 1.0 section 8.2 requires a response_uri the client may use as its redirect_uri, and section "
         + "5.9.3 ties that to the client identifier's name.", findings);
     }
 
-    // R11: the response type and mode this wallet implements (VP 5.6, 8.2). Both must be there: VP section 5.1 lists
-    // response_type as required, and an absent response_mode defaults to `fragment` (VP section 8.2), which this page
-    // cannot answer at all - so a request object that omits either is refused rather than read as if it had said
-    // `vp_token` and `direct_post`.
-    if (payload.response_type !== "vp_token") {
-      return refused("R11", "the request object's response_type is " + (payload.response_type === undefined
-        ? "absent, and OpenID4VP 1.0 section 5.1 requires it" : JSON.stringify(payload.response_type)
-          + "; section 5.6 has vp_token") + ".", findings);
-    }
-    if (RESPONSE_MODES.indexOf(payload.response_mode) < 0) {
-      return refused("R11", "the request object's response_mode is " + (payload.response_mode === undefined
-        ? "absent, which OpenID4VP 1.0 section 8.2 defaults to fragment, and this wallet answers nothing that way"
-        : JSON.stringify(payload.response_mode) + "; this wallet implements " + RESPONSE_MODES.join(" and ")
-          + " (OpenID4VP 1.0 section 8.2)") + ".", findings);
-    }
+    // R11: the response type and mode this wallet implements
+    var shape = responseShapeFault(payload.response_type, payload.response_mode);
+    if (shape !== null) return refused("R11", shape, findings);
 
     var responseMode = payload.response_mode;
     var request = {
@@ -1002,9 +1044,7 @@ var Oid4vp = (function () {
           + JSON.stringify(kept) + ", the algorithm of the credential this wallet holds (OpenID4VP 1.0 appendix B.2.2).");
       }
     }
-    var unknown = Object.keys(payload).filter(function (name) { return KNOWN_PARAMETERS.indexOf(name) < 0; });
-    if (unknown.length) findings.push("the request object carries " + unknown.length + " parameter(s) this page does "
-      + "not read: " + unknown.join(", ") + ".");
+    unknownParametersFinding(payload, findings);
   }
 
   /**
@@ -1034,23 +1074,9 @@ var Oid4vp = (function () {
       return refused("R9", "plain parameters are accepted only with the redirect_uri: client identifier prefix "
         + "(OpenID4VP 1.0 section 5.9.3).", findings);
     }
-    var target;
-    if (typeof params.response_uri !== "string" || !params.response_uri.length) {
-      return refused("R8", "the request carries no response_uri (OpenID4VP 1.0 section 5.1).", findings);
-    }
-    try {
-      target = new URL(params.response_uri);
-    } catch (error) {
-      return refused("R8", "response_uri is not a URL (OpenID4VP 1.0 section 5.1).", findings);
-    }
-    if (target.protocol !== "https:" && !(localPage && target.protocol === "http:")) {
-      return refused("R8", "response_uri is " + target.protocol + "//" + target.host + "; https is required"
-        + (localPage ? "." : ", and http is allowed only while this page is served from localhost."), findings);
-    }
-    if (target.username || target.password) {
-      return refused("R8", "response_uri carries a user name or password; nothing is posted to a URL with credentials "
-        + "in it (OpenID4VP 1.0 sections 5.9.3 and 8.2).", findings);
-    }
+    var response = responseUriFault(params.response_uri, localPage);
+    if (response.target === undefined) return refused(response.rule, response.message, findings);
+    var target = response.target;
     var depth = jsonDepth(params, LIMITS.JSON_DEPTH);
     if (depth > LIMITS.JSON_DEPTH) {
       return refused("R1", "the request nests " + depth + " levels, over the limit of " + LIMITS.JSON_DEPTH
@@ -1058,19 +1084,9 @@ var Oid4vp = (function () {
     }
     var breach = dcqlLimitBreach(params.dcql_query);
     if (breach !== null) return refused("R1", "the DCQL query has " + breach + " (plan 4.4).", findings);
-    // R11: both halves of the response have to be named, as in `checkSignedRequest`: VP section 5.1 requires
-    // response_type, and an absent response_mode defaults to `fragment` (section 8.2), which nothing is sent to
-    if (RESPONSE_MODES.indexOf(params.response_mode) < 0) {
-      return refused("R11", "response_mode is " + (params.response_mode === undefined
-        ? "absent, which OpenID4VP 1.0 section 8.2 defaults to fragment"
-        : JSON.stringify(params.response_mode) + "; this wallet implements " + RESPONSE_MODES.join(" and ")
-          + " (OpenID4VP 1.0 section 8.2)") + ".", findings);
-    }
-    if (params.response_type !== "vp_token") {
-      return refused("R11", "response_type is " + (params.response_type === undefined
-        ? "absent, and OpenID4VP 1.0 section 5.1 requires it" : JSON.stringify(params.response_type)
-          + "; section 5.6 has vp_token") + ".", findings);
-    }
+    // R11: both halves of the response have to be named, exactly as for a signed request
+    var shape = responseShapeFault(params.response_type, params.response_mode);
+    if (shape !== null) return refused("R11", shape, findings);
     // VP section 5.9.3: with this prefix the response_uri is the client identifier, so it is the same URI. Compared as
     // written, not by origin and path: the identifier is a URI, and two spellings of one endpoint are two identifiers.
     if (params.response_uri !== split.value) {
@@ -1106,9 +1122,7 @@ var Oid4vp = (function () {
       },
     };
     var error = errorCaseOf(params, responseMode);
-    var unknown = Object.keys(params).filter(function (name) { return KNOWN_PARAMETERS.indexOf(name) < 0; });
-    if (unknown.length) findings.push("the link carries " + unknown.length + " parameter(s) this page does not read: "
-      + unknown.join(", ") + ".");
+    unknownParametersFinding(params, findings);
     var card = await fingerprintsOf([], cardOf(null, [], params, "redirect_uri", target, false));
     card.findingCount = findings.length;
     return { ok: true, request: request, card: card, findings: findings, error: error };
@@ -1138,7 +1152,7 @@ var Oid4vp = (function () {
     VALIDITY_SKEW_MS: VALIDITY_SKEW_MS,
     isRequestObject: isRequestObject,
     parseLink: parseLink,
-    fetchRequest: fetchRequest,
+    fetchRequestObject: fetchRequestObject,
     checkRequest: checkRequest,
     splitClientId: splitClientId,
     decodeBase64url: decodeBase64url,

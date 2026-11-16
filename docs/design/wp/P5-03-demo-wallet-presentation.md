@@ -466,7 +466,7 @@ harness calls them directly and also drives them through the page.
 | R7 | `x509_hash`: base64url(SHA-256(leaf DER)) differs from the client_id value; the JWS does not verify with the leaf's key | VP §5.9.3 |
 | R8 | `response_uri` is missing, not `https` (`http` only for a localhost page), or carries userinfo; for `x509_san_dns` its host differs from the DNS name; for `redirect_uri:` it differs from the client_id value as written | VP §5.9.3, §8.2 |
 | R9 | prefixes: `origin` refused (VP says MUST NOT); `redirect_uri` with a signed request refused; `decentralized_identifier`, `verifier_attestation`, `openid_federation` and pre-registered (no prefix) refused as "not supported by this demo wallet" (D-P5-03-9) | VP §5.9.3 |
-| R10 | `x5c`: a certificate that does not parse or carries an unrecognised critical extension; a certificate outside its validity (5 minutes skew); a certificate after the first that is not a CA (`basicConstraints cA=TRUE`), whose `keyUsage` omits `keyCertSign`, or that permits fewer intermediate CAs below it than the chain has; a certificate whose signature does not verify with the next one's key (ECDSA P-256/384/521 or RSA, PKCS#1 v1.5 and PSS, WebCrypto); a JWS `alg` other than ES256/ES384/ES512/PS256/RS256, or an RSA key below 2048 bits | VP §5.9.3, RFC 5280 §6.1.3 (g), §6.1.4, RFC 7518 §3.3 |
+| R10 | `x5c`: a certificate that does not parse as DER (X.690 §10-11: a DEFAULT written out, a BOOLEAN TRUE other than `0xFF`, a non-minimal INTEGER, a version other than v2/v3 when written, an extension twice, a time field out of range) or carries a critical extension the page does not process (it processes none of nameConstraints, certificatePolicies, policyMappings, policyConstraints and inhibitAnyPolicy); a certificate outside its validity (5 minutes skew); a leaf whose `keyUsage` omits `digitalSignature`; a certificate after the first that is not a CA (`basicConstraints cA=TRUE`), whose `keyUsage` omits `keyCertSign`, or that permits fewer non-self-issued intermediates below it than the chain has; a certificate whose signature does not verify with the next one's key (ECDSA P-256/384/521 with SHA-256/384/512, or RSA PKCS#1 v1.5 and PSS with SHA-256/384/512 only, WebCrypto); a JWS `alg` other than ES256/ES384/ES512/PS256/RS256; an RSA key below 2048 bits, whether it signs the request object (RFC 7518 §3.3 requires 2048 for RS256 and PS256) or a certificate in `x5c` (the page's own floor: no RFC sets one there, and WebCrypto would verify a 1024-bit signature) | VP §5.9.3, RFC 5280 §4.2, §4.2.1.3, §6.1.4, §6.1.5, RFC 4055 §3.1, RFC 7518 §3.3 |
 | R11 | `response_type` absent or other than `vp_token`; `response_mode` absent (which §8.2 defaults to `fragment`) or other than `direct_post`/`direct_post.jwt` | VP §5.1, §5.6, §8.2 |
 
 **Answered with an error response** (VP §8.5). After the checks above pass, the page shows the error and a button
@@ -712,15 +712,23 @@ proxy.
 `-Dwallet.fixture.record=true`, like the golden recorders) writes `docs/design/tools/fixtures/wallet/` through Certify's
 own `MdocFormatter`, with an Annex B IACA and DSC built by `certify-pki`. The bytes are Certify's.
 
-| File | What |
-| --- | --- |
-| `iaca.pem`, `iaca.crl` | the test IACA and its CRL (CRL DP `http://crl.wallet-ci.test/iaca.crl`, which the OIDF job serves; 4.14) |
-| `mdl-a.issuersigned`, `mdl-a.holder.jwk` | an `org.iso.18013.5.1.mDL` with the 15 demo elements of `mdl-demo-1`, and its holder's private JWK (`"comment": "TEST KEY - NOT SECRET"`) |
-| `mdl-b.issuersigned`, `mdl-b.holder.jwk` | a second mDL for another holder ("a key from another credential") |
-| `pid.issuersigned`, `pid.holder.jwk` | an `eu.europa.ec.eudi.pid.1` mdoc with four elements (a query for another doctype; `credential_sets` with two doctypes) |
-| `clock.txt` | an instant inside every fixture's validity, installed as the page's `Date.now()` by the harness |
-| `verifier/` | made by `make-verifier.sh` (OpenSSL; its output committed): a test CA with `keyCertSign`; leaves `verifier.example`, `other.example`, an expired one and one not valid yet, with P-256 keys; an intermediate; RSA, P-384 and P-521 chains; an RSA-PSS-signed leaf; a 1024-bit RSA chain; four `ca-variant` certificates for the RFC 5280 §6.1.4 refusals; a self-signed leaf; a P-256 JWE key pair with `kid`; a README with the commands. Serials are OpenSSL's default 20 octets, three of them with the top bit set |
-| `hosted/` | the request objects **captured once by hand** from `verifier-backend.eudiw.dev` on 2026-11-16 (get and post forms, `x509_hash`, a 20-octet leaf serial, a URI-only SAN, `verifier_info`, ~23 KB) and from `verifier.multipaz.org` (`x509_san_dns`, no `aud`, no `state`, a 13-octet leaf serial, and the `haip-vp://://?` link form), with their init/begin answers and `PROVENANCE.md`; for parsing tests under a faked clock at the capture instant |
+| File | What | Recorded by |
+| --- | --- | --- |
+| `iaca.pem` | the test IACA | P5-03b |
+| `iaca.crl` | the IACA's CRL (CRL DP `http://crl.wallet-ci.test/iaca.crl`, which the OIDF job serves; 4.14) | P5-03h, the only run that checks the DSC's revocation |
+| `mdl-a.issuersigned`, `mdl-a.holder.jwk` | an `org.iso.18013.5.1.mDL` with the 15 demo elements of `mdl-demo-1`, and its holder's private JWK (`"comment": "TEST KEY - NOT SECRET"`) | P5-03b |
+| `mdl-b.issuersigned`, `mdl-b.holder.jwk` | a second mDL for another holder (a second credential to choose between) | P5-03d |
+| `pid.issuersigned`, `pid.holder.jwk` | an `eu.europa.ec.eudi.pid.1` mdoc with four elements (a query for another doctype; `credential_sets` with two doctypes) | P5-03d |
+| `clock.txt` | an instant inside every fixture's validity. The harness pins it for the **verifiers** (`expected.json`'s `now`, the `@owf/mdoc` probe's `now` and the Multipaz `atTime`); the **page** is not given it, because the page makes no decision by the clock: it discloses what the user ticks and leaves the time checks to the verifier (P5-03e's expired-credential check is the exception, and it is outside test mode) | P5-03b |
+| `verifier/` | made by `make-verifier.sh` (OpenSSL; its output committed): a test CA with `keyCertSign`; leaves `verifier.example`, `other.example`, an expired one and one not valid yet, with P-256 keys; an intermediate; RSA, P-384 and P-521 chains; an RSA-PSS-signed leaf; a 1024-bit RSA chain; four `ca-variant` certificates for the RFC 5280 §6.1.4 refusals; a self-signed leaf; two intermediates carrying a critical `nameConstraints` and a critical `inhibitAnyPolicy`, each with its leaf; a `keyAgreement`-only leaf; an RSA-PSS-over-SHA-1 leaf; a 2048-bit leaf under the 1024-bit CA; a GeneralizedTime certificate; a P-256 JWE key pair with `kid`; a README with the commands. Serials are OpenSSL's default 20 octets, one of them (`other`) with the top bit set | P5-03c (the request objects it signs); P5-03e reads its JWE key |
+| `hosted/` | the request objects **captured once by hand** from `verifier-backend.eudiw.dev` on 2026-11-16 (get and post forms, `x509_hash`, a 20-octet leaf serial, a URI-only SAN, `verifier_info`, ~23 KB) and from `verifier.multipaz.org` (`x509_san_dns`, no `aud`, no `state`, a 13-octet leaf serial, and the `haip-vp://://?` link form), with their init/begin answers and `PROVENANCE.md`; for parsing tests under a faked clock at the capture instant | P5-03c |
+
+**Deferred (owner decision, 2026-11-15).** P5-03b records `iaca.pem`, `mdl-a` and `clock.txt` only. `mdl-b`, `pid`,
+`iaca.crl`, `verifier/` and `make-verifier.sh` move to the slice that first reads each one, in the table's last column,
+and each slice's acceptance checklist names the files it must record before it starts. P5-03b's "a key from another
+credential" negative test therefore does **not** use `mdl-b`: the harness generates a `HOLDER_B` P-256 key, keeps
+`mdl-a`'s record with it and asserts the page refuses to sign, and a sample signed with that key is what both verifiers
+must reject.
 
 The committed fixture keeps the harness and the probes deterministic and offline. The CI interop jobs need fresh MSOs,
 so the recorder also runs in the normal build, writing to `certify-format-mdoc/target/wallet-fixture/` with the real
@@ -1023,6 +1031,9 @@ Branch `wp/p5-03c-request-intake`. Depends on P5-03a; runs in parallel with P5-0
 
 **Acceptance checklist.**
 
+- [x] The 4.12 fixtures this package reads are recorded first: `verifier/` (built by `make-verifier.sh`, committed with
+  its README) and `hosted/` (the captured EUDI and Multipaz request objects). They were deferred from P5-03b by the
+  owner decision of 2026-11-15, so this slice owns them.
 - [x] Links: each accepted scheme; `https` with parameters; `?…` and `#://?…` same-device forms (the page replaces its
   history entry); `request=` by value; `redirect_uri:` plain parameters; a link without `client_id` (the client_id
   comes from the JAR and a finding is shown).
@@ -1041,9 +1052,13 @@ Branch `wp/p5-03c-request-intake`. Depends on P5-03a; runs in parallel with P5-0
 - [x] I1-I9 hold. In particular, no flow in this package sends anything to `response_uri` without a press.
 
 **Ticked by `wp/p5-03c-request-intake`** (review round 1, 2026-11-16), each with the harness check that proves it:
-`check-offer-wallet.mjs` sections 21, 22, 23, 24, 25 and 27. The hosted fixtures are the verifiers' own captured bytes
+`check-offer-wallet.mjs` sections 21, 22, 23, 24, 25 and 27. The fixtures item is ticked in review round 2:
+`verifier/` and its `make-verifier.sh` and `hosted/` with `PROVENANCE.md` are committed by this branch's first commit
+(`775a545d`, then the real captures in `b8ff68bd`, and the review round 2 certificates with the checks that read
+them), and the fixtures' `README.md` describes both; P5-03b (`c5dad089`) records only `iaca.pem`, `mdl-a` and
+`clock.txt`. The hosted fixtures are the verifiers' own captured bytes
 (`hosted/PROVENANCE.md`); no test contacts a verifier, and both are read under a faked clock at their capture instant.
-The relay named as a non-goal below is not here at all: `fetchRequest` reads the `request_uri` directly, and P5-03f
+The relay named as a non-goal below is not here at all: `fetchRequestObject` reads the `request_uri` directly, and P5-03f
 brings the relay together with the server half that gives its answers meaning.
 
 **Negative tests.** Each refuses, names the rule, and the fetch log shows no request to `response_uri`.
@@ -1061,6 +1076,38 @@ brings the relay together with the server half that gives its answers meaning.
 - An `x5c` whose intermediate does not sign the leaf, and an expired leaf (R10).
 - A request object of 64 KiB + 1, 6 certificates in `x5c`, and DCQL with 21 credential queries (R1, limits).
 - request_uri answering 302 (refused, `redirect: "error"`), 404 and 500 (R1).
+
+**Review round 2.** Opus left one major, nine minors and seven nits; each is fixed here, and the checks that kill
+the reverted fixes are in `check-offer-wallet.mjs` sections 20b, 21, 22, 25 and 27 (49 of the new checks fail on
+`b8ff68bd`'s page scripts).
+
+- *A critical extension the page cannot process ends the path* (RFC 5280 §4.2). nameConstraints, certificatePolicies,
+  policyMappings, policyConstraints and inhibitAnyPolicy are off the list a critical marking may pass with, because the
+  page runs no name-constraint or policy processing. `nc-intermediate` (critical `permitted;DNS:allowed.example`)
+  signing a leaf for `DNS:verifier.example` was accepted and is now R10, as `openssl verify` refuses it;
+  `iap-intermediate` (critical inhibitAnyPolicy) likewise. Neither hosted capture carries one.
+- *Same-device invocation on a localhost page.* The page hands the link reader `openid4vp://?<query>`, not its own
+  `http://localhost…` URL, which is not a wallet invocation scheme.
+- *Strict DER.* `derEcdsaToRaw` refuses `00 00 80`; an extension twice, `cA` or `critical` written as FALSE or as
+  `0x01`, a version written as v1, a version INTEGER other than 0-2, extensions on a v1/v2 certificate, an out-of-range
+  UTCTime or GeneralizedTime field (validated, never normalised by `Date.UTC`), and RSA-PSS parameters that write
+  their DEFAULT (saltLength 20, trailerField 1) or are absent (RFC 4055 §3.1) are refused.
+- *A plain `redirect_uri:` request* no longer shows link-level "does not read" findings for its own parameters; the
+  request check reports a truly unknown one once.
+- *RSA*: the 2048-bit floor applies to a certificate's signer too (`verifyIssuedBy`), and RSA-PSS accepts SHA-256/384/512
+  only, so SHA-1 cannot come back as RSA-PSS (`rsa-pss-sha1-leaf`).
+- *The leaf's keyUsage*, when present, must assert digitalSignature (`keyagreement-leaf`).
+- *PROVENANCE.md* gives the post-form capture its own instant, 05:30:35Z (its `iat`), and section 25 reads it at that
+  instant.
+- *Nits*: a negative serial is kept for display (`serialNegative`) rather than refusing the chain (RFC 5280 §4.1.2.2);
+  the fetched body is decoded with `ignoreBOM: true`, so a byte order mark is refused as not a JWS rather than dropped;
+  a non-200 2xx answer is not called an HTTP error; the RSA-2048 check for the request's key lives only in
+  `verifyJws`; R8's common half and R11 are one function each for the signed and plain paths; a self-issued
+  intermediate does not count against a pathLenConstraint (RFC 5280 §6.1.4 (l)); `fetchRequest` is
+  `fetchRequestObject`, as this section names it.
+- *Also corrected*: the RFC 5280 citations (an unprocessed critical extension is §4.2, §6.1.4 (o) and §6.1.5 (f), not
+  "§6.1.3 (g)", which does not exist; keyCertSign is §6.1.4 (n)), and 4.12's "three serials with the top bit set",
+  which is one (`other`).
 
 **Non-goals.** DCQL, consent, the response, the relay (P5-03f), scanning (P5-03g).
 
